@@ -107,24 +107,24 @@ impl ProjectResolver {
         }
 
         // Tier 2: explicit cwd header.
-        if let Some(explicit_cwd) = first_nonempty_header(&ctx.headers, "x-headroom-cwd") {
-            if let Some(ident) = identity_from_cwd(&explicit_cwd) {
-                return Some(ident);
-            }
+        if let Some(explicit_cwd) = first_nonempty_header(&ctx.headers, "x-headroom-cwd")
+            && let Some(ident) = identity_from_cwd(&explicit_cwd)
+        {
+            return Some(ident);
         }
 
         // Tier 3: CLI-level override.
-        if let Some(ref cwd_override) = ctx.project_root_override {
-            if let Some(ident) = identity_from_cwd(cwd_override) {
-                return Some(ident);
-            }
+        if let Some(ref cwd_override) = ctx.project_root_override
+            && let Some(ident) = identity_from_cwd(cwd_override)
+        {
+            return Some(ident);
         }
 
         // Tier 4: parse system prompt for a `<env>` cwd line.
-        if let Some(sys_cwd) = extract_cwd_from_system_prompt(&ctx.system_prompt) {
-            if let Some(ident) = identity_from_cwd(&sys_cwd) {
-                return Some(ident);
-            }
+        if let Some(sys_cwd) = extract_cwd_from_system_prompt(&ctx.system_prompt)
+            && let Some(ident) = identity_from_cwd(&sys_cwd)
+        {
+            return Some(ident);
         }
 
         None

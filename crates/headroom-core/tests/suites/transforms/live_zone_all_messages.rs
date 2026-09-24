@@ -12,10 +12,10 @@
 
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_anthropic_all_messages, AuthMode, BlockAction, DispatchConfig, ExclusionReason,
-    LiveZoneOutcome,
+    AuthMode, BlockAction, DispatchConfig, ExclusionReason, LiveZoneOutcome,
+    compress_anthropic_all_messages,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 
 fn body_of(value: Value) -> Vec<u8> {
@@ -220,7 +220,7 @@ fn identical_content_compresses_to_identical_bytes() {
 #[test]
 fn ccr_marker_and_original_are_stored_for_every_message() {
     use headroom_core::ccr::backends::InMemoryCcrStore;
-    use headroom_core::ccr::{compute_key, CcrStore};
+    use headroom_core::ccr::{CcrStore, compute_key};
 
     let payload = compressible_payload("old");
     let body = two_user_messages_body();

@@ -7,7 +7,7 @@
 use super::common;
 
 use common::start_proxy_with;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -70,10 +70,12 @@ async fn create_empty_requests_returns_400_anthropic_envelope() {
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("requests"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("requests")
+        );
     }
     proxy.shutdown().await;
 }

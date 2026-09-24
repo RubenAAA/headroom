@@ -35,8 +35,8 @@ use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_openai_responses_live_zone_with_config, summarize_openai_responses_no_change_reason,
-    LiveZoneError, LiveZoneOutcome,
+    LiveZoneError, LiveZoneOutcome, compress_openai_responses_live_zone_with_config,
+    summarize_openai_responses_no_change_reason,
 };
 use serde_json::Value;
 

@@ -48,7 +48,7 @@
 //! equals the total today — the `__dropped` path exists for a future
 //! budget, and per-bucket `[N]` likewise reports that bucket's kept rows.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::ir::{CellValue, Compaction, OpaqueKind, Row, Schema};
 
@@ -585,8 +585,8 @@ fn kv_field_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transforms::smart_crusher::compaction::compactor::compact;
     use crate::transforms::smart_crusher::compaction::compactor::CompactConfig;
+    use crate::transforms::smart_crusher::compaction::compactor::compact;
     use serde_json::json;
 
     fn cfg() -> CompactConfig {

@@ -13,7 +13,7 @@
 //! finished utterance per event. Forcing those two state machines together
 //! would cost more than the duplication it removed.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Wrap an event as one SSE frame.
 ///

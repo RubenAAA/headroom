@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn dense_scripts_priced_at_cjk_ratio() {
         let est = EstimatingCounter::default(); // 4.0 for Latin
-                                                // Pure CJK: cjk=3, other=0 -> 0/4 + 3/1.5 + 0.5 = 2.5 -> int -> 2
+        // Pure CJK: cjk=3, other=0 -> 0/4 + 3/1.5 + 0.5 = 2.5 -> int -> 2
         assert_eq!(est.count_text("数据库"), 2);
         // 7 CJK -> 7/1.5 + 0.5 = 5.16 -> 5 (the old flat 7/4 -> 2 under-counted ~2.5x)
         assert_eq!(est.count_text("数据库连接失败"), 5);

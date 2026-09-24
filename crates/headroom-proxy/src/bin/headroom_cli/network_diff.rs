@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use base64::Engine;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 type Error = Box<dyn std::error::Error>;
@@ -285,11 +285,7 @@ pub fn exchange_from_record(
     let body_sha = match record.get("request_body_sha256") {
         Some(v) if !v.is_null() => {
             let text = py_str(v);
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
-            }
+            if text.is_empty() { None } else { Some(text) }
         }
         _ => {
             if body.is_empty() {
@@ -849,14 +845,18 @@ mod tests {
             paired["headers"]["only_headroom"],
             json!(["x-headroom-mode"])
         );
-        assert!(paired["json"]["only_headroom"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("$.metadata")));
-        assert!(paired["json"]["changed"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("$.messages[0].content")));
+        assert!(
+            paired["json"]["only_headroom"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("$.metadata"))
+        );
+        assert!(
+            paired["json"]["changed"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("$.messages[0].content"))
+        );
         assert_eq!(paired["anthropic"]["direct"]["tools_count"], json!(0));
         assert_eq!(paired["anthropic"]["headroom"]["tools_count"], json!(1));
 

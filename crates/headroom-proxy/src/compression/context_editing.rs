@@ -74,11 +74,11 @@ pub fn inject_context_management(
             .find(|e| is_family(e, "clear_thinking"))
         {
             Some(existing) => {
-                if existing.get("keep") != Some(&keep) {
-                    if let Some(obj) = existing.as_object_mut() {
-                        obj.insert("keep".to_string(), keep);
-                        changed = true;
-                    }
+                if existing.get("keep") != Some(&keep)
+                    && let Some(obj) = existing.as_object_mut()
+                {
+                    obj.insert("keep".to_string(), keep);
+                    changed = true;
                 }
             }
             None => {
@@ -94,23 +94,23 @@ pub fn inject_context_management(
         }
     }
 
-    if let Some(keep) = clear_tool_uses_keep {
-        if !edits_arr.iter().any(|e| is_family(e, "clear_tool_uses")) {
-            let mut edit = serde_json::json!({
-                "type": "clear_tool_uses_20250919",
-                "trigger": { "type": "input_tokens", "value": clear_tool_uses_trigger },
-                "keep": { "type": "tool_uses", "value": keep },
-            });
-            // Without this the API will clear a handful of tokens and charge a
-            // full cache write for it; below the floor it skips the strategy
-            // entirely and the cached prefix survives.
-            if let Some(at_least) = clear_tool_uses_at_least {
-                edit["clear_at_least"] =
-                    serde_json::json!({ "type": "input_tokens", "value": at_least });
-            }
-            edits_arr.push(edit);
-            changed = true;
+    if let Some(keep) = clear_tool_uses_keep
+        && !edits_arr.iter().any(|e| is_family(e, "clear_tool_uses"))
+    {
+        let mut edit = serde_json::json!({
+            "type": "clear_tool_uses_20250919",
+            "trigger": { "type": "input_tokens", "value": clear_tool_uses_trigger },
+            "keep": { "type": "tool_uses", "value": keep },
+        });
+        // Without this the API will clear a handful of tokens and charge a
+        // full cache write for it; below the floor it skips the strategy
+        // entirely and the cached prefix survives.
+        if let Some(at_least) = clear_tool_uses_at_least {
+            edit["clear_at_least"] =
+                serde_json::json!({ "type": "input_tokens", "value": at_least });
         }
+        edits_arr.push(edit);
+        changed = true;
     }
 
     changed

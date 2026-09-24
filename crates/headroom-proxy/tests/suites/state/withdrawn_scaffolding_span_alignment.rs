@@ -12,9 +12,9 @@
 //! forwarded slice ran out.
 
 use headroom_proxy::cache_stabilization::prefix_replay::{
-    overlay_cached_prefix, PrefixReplayTracker,
+    PrefixReplayTracker, overlay_cached_prefix,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn user(text: &str) -> Value {
     json!({"role": "user", "content": [{"type": "text", "text": text}]})

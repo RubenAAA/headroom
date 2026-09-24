@@ -215,11 +215,11 @@ pub fn strip_spark_reasoning_summaries(messages: Vec<Value>) -> (Vec<Value>, usi
                 }
                 if let Some(parts) = block.get_mut("summary").and_then(|s| s.as_array_mut()) {
                     for part in parts.iter_mut() {
-                        if let Some(obj) = part.as_object_mut() {
-                            if obj.get("text").and_then(Value::as_str).is_some() {
-                                obj.insert("text".to_string(), Value::String(String::new()));
-                                stripped += 1;
-                            }
+                        if let Some(obj) = part.as_object_mut()
+                            && obj.get("text").and_then(Value::as_str).is_some()
+                        {
+                            obj.insert("text".to_string(), Value::String(String::new()));
+                            stripped += 1;
                         }
                     }
                 }
@@ -267,10 +267,9 @@ fn cache_control_ttls(messages: &[Value], system: Option<&Value>) -> Vec<String>
             .get("cache_control")
             .and_then(|cc| cc.get("ttl"))
             .and_then(Value::as_str)
+            && !ttls.iter().any(|t| t == ttl)
         {
-            if !ttls.iter().any(|t| t == ttl) {
-                ttls.push(ttl.to_string());
-            }
+            ttls.push(ttl.to_string());
         }
     }
 
@@ -319,13 +318,13 @@ pub fn anthropic_cache_ttl_seconds(
     if env_truthy("DISABLE_PROMPT_CACHING") {
         return None;
     }
-    if let Some(fam) = anthropic_family(model) {
-        if env_truthy(&format!(
+    if let Some(fam) = anthropic_family(model)
+        && env_truthy(&format!(
             "DISABLE_PROMPT_CACHING_{}",
             fam.to_ascii_uppercase()
-        )) {
-            return None;
-        }
+        ))
+    {
+        return None;
     }
     let ttls = cache_control_ttls(messages, system);
     if ttls.iter().any(|t| t == "1h") {
@@ -363,15 +362,16 @@ pub fn has_plaintext_reasoning(messages: &[Value]) -> bool {
         if m.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        if let Some(rc) = m.get("reasoning_content").and_then(Value::as_str) {
-            if !rc.trim().is_empty() {
-                return true;
-            }
+        if let Some(rc) = m.get("reasoning_content").and_then(Value::as_str)
+            && !rc.trim().is_empty()
+        {
+            return true;
         }
-        if let Some(c) = m.get("content").and_then(Value::as_str) {
-            if c.contains("<think>") && c.contains("</think>") {
-                return true;
-            }
+        if let Some(c) = m.get("content").and_then(Value::as_str)
+            && c.contains("<think>")
+            && c.contains("</think>")
+        {
+            return true;
         }
     }
     false
@@ -551,7 +551,7 @@ mod tests {
             "ENABLE_PROMPT_CACHING_1H",
             "FORCE_PROMPT_CACHING_5M",
         ] {
-            std::env::remove_var(v);
+            unsafe { std::env::remove_var(v) };
         }
 
         // --- request-driven ---
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(anthropic_cache_ttl_seconds("gpt-5", &[], None), Some(300));
 
         // --- env-driven ---
-        std::env::set_var("DISABLE_PROMPT_CACHING", "1");
+        unsafe { std::env::set_var("DISABLE_PROMPT_CACHING", "1") };
         assert_eq!(
             anthropic_cache_ttl_seconds("claude-opus-4-6", &m5m, None),
             None
@@ -638,20 +638,20 @@ mod tests {
             anthropic_cache_ttl_seconds("claude-opus-4-6", &m1h, None),
             None
         );
-        std::env::set_var("DISABLE_PROMPT_CACHING", "0");
+        unsafe { std::env::set_var("DISABLE_PROMPT_CACHING", "0") };
         assert_eq!(
             anthropic_cache_ttl_seconds("claude-opus-4-6", &[], None),
             Some(300)
         );
         // Truthiness is trimmed + case-folded.
-        std::env::set_var("DISABLE_PROMPT_CACHING", " TRUE ");
+        unsafe { std::env::set_var("DISABLE_PROMPT_CACHING", " TRUE ") };
         assert_eq!(
             anthropic_cache_ttl_seconds("claude-opus-4-6", &[], None),
             None
         );
-        std::env::remove_var("DISABLE_PROMPT_CACHING");
+        unsafe { std::env::remove_var("DISABLE_PROMPT_CACHING") };
 
-        std::env::set_var("DISABLE_PROMPT_CACHING_OPUS", "1");
+        unsafe { std::env::set_var("DISABLE_PROMPT_CACHING_OPUS", "1") };
         assert_eq!(
             anthropic_cache_ttl_seconds("claude-opus-4-6", &[], None),
             None
@@ -665,9 +665,9 @@ mod tests {
             anthropic_cache_ttl_seconds("claude-sonnet-4-6", &[], None),
             Some(300)
         );
-        std::env::remove_var("DISABLE_PROMPT_CACHING_OPUS");
+        unsafe { std::env::remove_var("DISABLE_PROMPT_CACHING_OPUS") };
 
-        std::env::set_var("ENABLE_PROMPT_CACHING_1H", "1");
+        unsafe { std::env::set_var("ENABLE_PROMPT_CACHING_1H", "1") };
         assert_eq!(
             anthropic_cache_ttl_seconds("claude-opus-4-6", &[], None),
             Some(3600)
@@ -677,13 +677,13 @@ mod tests {
             anthropic_cache_ttl_seconds("claude-opus-4-6", &m5m_explicit, None),
             Some(300)
         );
-        std::env::set_var("FORCE_PROMPT_CACHING_5M", "1");
+        unsafe { std::env::set_var("FORCE_PROMPT_CACHING_5M", "1") };
         assert_eq!(
             anthropic_cache_ttl_seconds("claude-opus-4-6", &[], None),
             Some(300)
         );
-        std::env::remove_var("ENABLE_PROMPT_CACHING_1H");
-        std::env::remove_var("FORCE_PROMPT_CACHING_5M");
+        unsafe { std::env::remove_var("ENABLE_PROMPT_CACHING_1H") };
+        unsafe { std::env::remove_var("FORCE_PROMPT_CACHING_5M") };
     }
 
     #[test]

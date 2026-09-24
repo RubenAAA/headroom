@@ -389,9 +389,9 @@ async fn spawned_footprint_records_what_the_inline_call_did() {
 /// is returned to the client. Mirrors the Anthropic CCR interception path.
 #[tokio::test]
 async fn handle_ccr_response_openai_responses_runs_continuation() {
+    use headroom_core::ccr::CcrStore;
     use headroom_core::ccr::backends::InMemoryCcrStore;
     use headroom_core::ccr::tool_injection::CCR_TOOL_NAME;
-    use headroom_core::ccr::CcrStore;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -591,9 +591,9 @@ async fn handle_ccr_response_anthropic_query_searches_content_index() {
 /// answer continuations with SSE, which plain JSON parsing cannot read.
 #[tokio::test]
 async fn handle_ccr_response_openai_responses_reads_sse_continuation() {
+    use headroom_core::ccr::CcrStore;
     use headroom_core::ccr::backends::InMemoryCcrStore;
     use headroom_core::ccr::tool_injection::CCR_TOOL_NAME;
-    use headroom_core::ccr::CcrStore;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -669,9 +669,9 @@ async fn handle_ccr_response_openai_responses_reads_sse_continuation() {
 /// turn answers instead of going quiet holding unanswered content.
 #[tokio::test]
 async fn handle_ccr_response_openai_responses_retries_cut_continuation() {
+    use headroom_core::ccr::CcrStore;
     use headroom_core::ccr::backends::InMemoryCcrStore;
     use headroom_core::ccr::tool_injection::CCR_TOOL_NAME;
-    use headroom_core::ccr::CcrStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -898,9 +898,9 @@ fn continuation_turn_from_body_reads_json_then_sse() {
     assert_eq!(v["output"][0]["type"], "message");
 
     let sse = bytes::Bytes::from(
-            "event: response.completed\n\
+        "event: response.completed\n\
              data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
-        );
+    );
     let v = continuation_turn_from_body(&sse, Some("text/event-stream"), "openai_responses")
         .expect("Responses SSE folds into a turn");
     assert_eq!(v["output"][0]["content"][0]["text"], "hi");
@@ -911,7 +911,7 @@ fn continuation_turn_from_body_reads_json_then_sse() {
     );
 
     let anthropic_sse = bytes::Bytes::from(
-            "event: message_start\n\
+        "event: message_start\n\
              data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"m\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n\
              event: content_block_start\n\
              data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
@@ -923,7 +923,7 @@ fn continuation_turn_from_body_reads_json_then_sse() {
              data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
              event: message_stop\n\
              data: {\"type\":\"message_stop\"}\n\n",
-        );
+    );
     let v = continuation_turn_from_body(&anthropic_sse, Some("text/event-stream"), "anthropic")
         .expect("Anthropic SSE folds into a turn");
     assert_eq!(v["content"][0]["text"], "hi");
@@ -972,11 +972,11 @@ fn continuation_stream_terminal_classifies_cut_vs_verdict() {
     // The 2026-09-17 incident: ~200 KB of reasoning deltas, EOF, no
     // terminal event. Folds to nothing and must read as a cut stream.
     let cut = bytes::Bytes::from(
-            "event: response.created\n\
+        "event: response.created\n\
              data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n\
              event: response.reasoning_summary_text.delta\n\
              data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"delta\":\"thinking about caches\"}}\n\n",
-        );
+    );
     assert_eq!(continuation_stream_terminal(&cut, "openai_responses"), None);
     assert!(
         continuation_turn_from_body(&cut, Some("text/event-stream"), "openai_responses").is_none(),
@@ -999,11 +999,11 @@ fn continuation_stream_terminal_classifies_cut_vs_verdict() {
     }
 
     let anthropic_cut = bytes::Bytes::from(
-            "event: message_start\n\
+        "event: message_start\n\
              data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{}}}\n\n\
              event: content_block_delta\n\
              data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
-        );
+    );
     assert_eq!(
         continuation_stream_terminal(&anthropic_cut, "anthropic"),
         None,
@@ -1098,10 +1098,12 @@ async fn handle_ccr_response_skips_continuation_when_everything_failed() {
     let blocks = parsed["content"].as_array().unwrap();
     assert_eq!(blocks.len(), 2);
     assert_eq!(blocks[1]["type"], "text");
-    assert!(blocks[1]["text"]
-        .as_str()
-        .unwrap()
-        .contains("ffffffffffffffffffffffff"));
+    assert!(
+        blocks[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ffffffffffffffffffffffff")
+    );
 }
 
 /// No retrieval, no extra rounds — the common path must report nothing so
@@ -1856,9 +1858,11 @@ fn ccr_context_tracker_filters_cross_workspace() {
         "auth_middleware.py login handler",
     );
 
-    assert!(tracker
-        .analyze_query("auth middleware", Some(2), "workspace-b")
-        .is_empty());
+    assert!(
+        tracker
+            .analyze_query("auth middleware", Some(2), "workspace-b")
+            .is_empty()
+    );
     let recs = tracker.analyze_query("auth middleware", Some(2), "workspace-a");
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].hash_key, "abc123");
@@ -1944,9 +1948,11 @@ fn cache_control_placement_is_not_a_rewrite() {
     let before = serde_json::json!({"role": "user", "content": [{"type": "text", "text": "hi"}]});
     let after = serde_json::json!({"role": "user", "content": [
             {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]});
-    assert!(rewritten_message_report(&[before], &[after])
-        .indices
-        .is_empty());
+    assert!(
+        rewritten_message_report(&[before], &[after])
+            .indices
+            .is_empty()
+    );
 }
 
 #[test]
@@ -2292,8 +2298,8 @@ fn replay_decline_logs_hashed_session_and_chain_identity() {
     use crate::cache_stabilization::prefix_replay::SessionReplayStore;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-    use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
 
     struct Capture(Arc<Mutex<Vec<HashMap<String, String>>>>);
 

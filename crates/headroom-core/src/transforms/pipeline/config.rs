@@ -324,12 +324,13 @@ mod tests {
         assert_eq!(cfg.offload.prose_field.min_segments, 6);
         assert_eq!(cfg.offload.prose_field.target_ratio, 0.5);
         assert!(!cfg.offload.diff_noise.lockfile_suffixes.is_empty());
-        assert!(cfg
-            .offload
-            .diff_noise
-            .lockfile_suffixes
-            .iter()
-            .any(|s| s == "Cargo.lock"));
+        assert!(
+            cfg.offload
+                .diff_noise
+                .lockfile_suffixes
+                .iter()
+                .any(|s| s == "Cargo.lock")
+        );
     }
 
     #[test]

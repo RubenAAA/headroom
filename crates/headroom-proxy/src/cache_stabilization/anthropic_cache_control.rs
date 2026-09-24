@@ -80,7 +80,7 @@
 //! 5 minutes; longer TTLs require careful auth-mode and per-tenant
 //! sizing we don't yet have).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Result of an auto-placement attempt.
 ///

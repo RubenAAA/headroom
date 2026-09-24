@@ -29,8 +29,8 @@
 //! [`super::detect_backend`], does NOT add a `count_messages` override, and
 //! does NOT add a Mistral-specific estimator density.
 
-use super::registry::try_register_hf;
 use super::HfTokenizerError;
+use super::registry::try_register_hf;
 
 /// Direct model-name → tokenizer version table.
 /// 1:1 port of `MODEL_TO_VERSION` in `headroom/tokenizers/mistral.py`.
@@ -223,7 +223,7 @@ pub fn try_register_default_mistral() -> Vec<(&'static str, HfTokenizerError)> {
 mod tests {
     use super::*;
     use crate::tokenizer::registry::test_support::{RegistryGuard, TINY_TOKENIZER_JSON};
-    use crate::tokenizer::{get_tokenizer, register_hf, Backend, HfTokenizer};
+    use crate::tokenizer::{Backend, HfTokenizer, get_tokenizer, register_hf};
 
     fn tiny(name: &str) -> HfTokenizer {
         HfTokenizer::from_bytes(name, TINY_TOKENIZER_JSON.as_bytes()).unwrap()

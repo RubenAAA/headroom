@@ -7,8 +7,8 @@
 //!
 //! [`ReformatTransform`]: crate::transforms::pipeline::traits::ReformatTransform
 
-use crate::transforms::pipeline::traits::{ReformatOutput, ReformatTransform, TransformError};
 use crate::transforms::ContentType;
+use crate::transforms::pipeline::traits::{ReformatOutput, ReformatTransform, TransformError};
 
 const NAME: &str = "json_minifier";
 

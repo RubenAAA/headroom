@@ -20,8 +20,8 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, LazyLock, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 

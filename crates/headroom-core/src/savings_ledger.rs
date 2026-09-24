@@ -19,8 +19,8 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Local, TimeZone, Timelike, Utc};
-use rustix::fs::{flock, FlockOperation};
-use serde_json::{json, Map, Value};
+use rustix::fs::{FlockOperation, flock};
+use serde_json::{Map, Value, json};
 
 pub const SCHEMA_VERSION: i64 = 1;
 pub const UNKNOWN: &str = "unknown";
@@ -330,10 +330,10 @@ fn read_events(path: Option<&Path>, retention_days: i64, now: DateTime<Utc>) -> 
             Some(p) => p,
             None => continue,
         };
-        if let Some(cutoff) = cutoff {
-            if parsed < cutoff {
-                continue;
-            }
+        if let Some(cutoff) = cutoff
+            && parsed < cutoff
+        {
+            continue;
         }
         events.push(ParsedEvent { ts: parsed, value });
     }
@@ -728,10 +728,12 @@ mod tests {
         assert_eq!(report.lifetime["tokens_saved"], json!(600));
         let expected = round_half_even(600.0 * DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN, 6);
         assert_eq!(report.lifetime["cost_usd"].as_f64().unwrap(), expected);
-        assert!(report
-            .by_model
-            .iter()
-            .any(|r| r["model"] == json!("unknown")));
+        assert!(
+            report
+                .by_model
+                .iter()
+                .any(|r| r["model"] == json!("unknown"))
+        );
     }
 
     #[test]

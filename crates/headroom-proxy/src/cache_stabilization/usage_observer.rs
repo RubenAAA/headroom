@@ -78,27 +78,27 @@ mod turn;
 #[path = "usage_observer_write_split.rs"]
 mod write_split;
 
-use self::attribution::recache_attribution;
 use self::attribution::CacheLanding;
 use self::attribution::RecacheAttribution;
+use self::attribution::recache_attribution;
 use self::events::CacheHealthSnapshot;
 use self::events::CompletedTurn;
 use self::events::CompletionClass;
 use self::events::CostSample;
+use self::events::MISS_ATTRIBUTION_PROVIDER;
 use self::events::RecacheEvent;
 pub use self::events::RecacheEventKind;
 use self::events::RecentHitRateSample;
-use self::events::MISS_ATTRIBUTION_PROVIDER;
-use self::fingerprint::hex16;
 use self::fingerprint::PrefixFingerprint;
-use self::first_turn::first_turn_reason;
+use self::fingerprint::hex16;
 use self::first_turn::FirstTurnContext;
-use self::keys::DigestSink;
+use self::first_turn::first_turn_reason;
 use self::keys::CACHE_READ_MULTIPLIER;
 use self::keys::CACHE_WRITE_1H_MULTIPLIER;
 use self::keys::CACHE_WRITE_5M_MULTIPLIER;
 use self::keys::COMMIT_LATENCY_WINDOW;
 use self::keys::CONVERSATION_CAPACITY;
+use self::keys::DigestSink;
 use self::keys::FIRST_TURN_OPENER_CAPACITY;
 use self::keys::IDENTICAL_PROMPT_FANOUT_WINDOW;
 use self::keys::IN_FLIGHT_HORIZON;
@@ -106,22 +106,22 @@ use self::keys::PENDING_CAPACITY;
 use self::keys::RECENT_COMPLETION_CAPACITY;
 use self::keys::RECENT_SAMPLE_CAPACITY;
 use self::keys::SIBLING_COMPLETION_WINDOW;
-use self::turn::classify_turn;
-use self::turn::match_stream;
+use self::turn::MAX_STREAMS_PER_CONVERSATION;
 use self::turn::TurnClass;
 use self::turn::TurnRecord;
-use self::turn::MAX_STREAMS_PER_CONVERSATION;
-use self::write_split::split_cache_write;
+use self::turn::classify_turn;
+use self::turn::match_stream;
 use self::write_split::RECACHE_SLACK_TOKENS;
 use self::write_split::UNEARNED_WRITE_FLOOR_TOKENS;
+use self::write_split::split_cache_write;
 
-pub use self::events::ActiveConversation;
 pub use self::events::ANTHROPIC_CACHE_TTL;
 pub use self::events::ANTHROPIC_CACHE_TTL_1H;
+pub use self::events::ActiveConversation;
 pub use self::fingerprint::prefix_fingerprint;
 pub use self::fingerprint::prefix_fingerprint_with_model;
-pub use self::first_turn::first_turn_context;
 pub use self::first_turn::PrefixAdoption;
+pub use self::first_turn::first_turn_context;
 pub use self::keys::conversation_key;
 pub use self::replay::ReplayAppliedEvidence;
 pub use self::replay::ReplaySkipEvidence;
@@ -562,10 +562,10 @@ impl UsageObserver {
                 stock_eligible: true,
             },
         );
-        if let Some((evicted_id, _)) = evicted {
-            if evicted_id != request_id {
-                inner.abandoned_requests_total += 1;
-            }
+        if let Some((evicted_id, _)) = evicted
+            && evicted_id != request_id
+        {
+            inner.abandoned_requests_total += 1;
         }
     }
 
@@ -1994,15 +1994,14 @@ impl UsageObserver {
                 i
             }
             None => {
-                if streams.len() >= MAX_STREAMS_PER_CONVERSATION {
-                    if let Some(oldest) = streams
+                if streams.len() >= MAX_STREAMS_PER_CONVERSATION
+                    && let Some(oldest) = streams
                         .iter()
                         .enumerate()
                         .min_by_key(|(_, r)| r.at)
                         .map(|(i, _)| i)
-                    {
-                        streams.remove(oldest);
-                    }
+                {
+                    streams.remove(oldest);
                 }
                 streams.push(record);
                 streams.len() - 1
@@ -2083,17 +2082,16 @@ impl UsageObserver {
         if let Some((evicted, evicted_streams)) = inner
             .conversations
             .push(pending.conversation_key.clone(), Vec::new())
+            && evicted != pending.conversation_key
         {
-            if evicted != pending.conversation_key {
-                let footprint = evicted_streams
-                    .last()
-                    .map(|r| {
-                        r.cache_read_input_tokens
-                            .saturating_add(r.cache_creation_input_tokens)
-                    })
-                    .unwrap_or(0);
-                inner.forgotten.put(evicted, footprint);
-            }
+            let footprint = evicted_streams
+                .last()
+                .map(|r| {
+                    r.cache_read_input_tokens
+                        .saturating_add(r.cache_creation_input_tokens)
+                })
+                .unwrap_or(0);
+            inner.forgotten.put(evicted, footprint);
         }
     }
 
@@ -2274,10 +2272,10 @@ impl UsageObserver {
             // of *this* stream reads its own prefix back. Keyed by position,
             // not by key: the index was taken from the same `Vec` above and
             // nothing between here and there touches it.
-            if let Some(streams) = inner.conversations.peek_mut(&pending.conversation_key) {
-                if let Some(rec) = streams.get_mut(m.matched_stream_idx) {
-                    rec.stock_footprint = stock_read + stock_write;
-                }
+            if let Some(streams) = inner.conversations.peek_mut(&pending.conversation_key)
+                && let Some(rec) = streams.get_mut(m.matched_stream_idx)
+            {
+                rec.stock_footprint = stock_read + stock_write;
             }
 
             // Priced in input-equivalents rather than dollars: Anthropic's
@@ -2375,10 +2373,10 @@ impl UsageObserver {
             // against it, instead of a zero this turn never earned. The
             // watchdog record above already carries this turn's own billed
             // footprint for classification; this is only the stock arm's.
-            if let Some(streams) = inner.conversations.peek_mut(&pending.conversation_key) {
-                if let Some(rec) = streams.get_mut(m.matched_stream_idx) {
-                    rec.stock_footprint = m.matched_stock_prior;
-                }
+            if let Some(streams) = inner.conversations.peek_mut(&pending.conversation_key)
+                && let Some(rec) = streams.get_mut(m.matched_stream_idx)
+            {
+                rec.stock_footprint = m.matched_stock_prior;
             }
         }
     }

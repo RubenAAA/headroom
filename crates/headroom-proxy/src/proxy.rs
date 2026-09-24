@@ -30,7 +30,7 @@ pub use self::{
 };
 
 pub(crate) use memory_continuation::{
-    handle_memory_response, memory_tool_context, MemoryToolContext,
+    MemoryToolContext, handle_memory_response, memory_tool_context,
 };
 
 use sha2::{Digest, Sha256};
@@ -40,12 +40,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use url::Url;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
-use axum::Router;
 #[cfg(test)]
 use bytes::Bytes;
 use futures_util::{StreamExt as _, TryStreamExt};
@@ -53,10 +53,10 @@ use futures_util::{StreamExt as _, TryStreamExt};
 use crate::cache_stabilization;
 use crate::cache_stabilization::beta_sticky::BetaProvider;
 use crate::cache_stabilization::drift_detector::{
-    compute_structural_hash, derive_session_key, observe_drift_with_birth, stream_lane_key,
-    ApiKind, DriftState,
+    ApiKind, DriftState, compute_structural_hash, derive_session_key, observe_drift_with_birth,
+    stream_lane_key,
 };
-use crate::cache_stabilization::prefix_replay::{SessionReplayStore, REPLAY_STORE_CAPACITY};
+use crate::cache_stabilization::prefix_replay::{REPLAY_STORE_CAPACITY, SessionReplayStore};
 use crate::compression;
 use crate::config::Config;
 use crate::error::ProxyError;
@@ -67,7 +67,7 @@ use crate::websocket::ws_handler;
 // site self-documenting. `AuthMode` is re-exported under the same
 // path for downstream handlers that read the value back out of
 // `req.extensions()` (Phase F PR-F2/F3/F4).
-use headroom_core::auth_mode::{classify as classify_auth_mode, AuthMode};
+use headroom_core::auth_mode::{AuthMode, classify as classify_auth_mode};
 use headroom_core::compression_policy::CompressionPolicy;
 
 /// Maximum number of messages allowed in a request body.
@@ -541,8 +541,8 @@ pub(crate) async fn forward_http(
         // as the inbound one. `None` means no session identity, and nothing
         // downstream observes drift either way.
         let mut request_api_kind: Option<ApiKind> = None;
-        if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
-            if let Some(shed) = forward::analyze_buffered_session(
+        if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&buffered)
+            && let Some(shed) = forward::analyze_buffered_session(
                 &mut parsed,
                 forward::RequestScope {
                     state: &state,
@@ -560,9 +560,9 @@ pub(crate) async fn forward_http(
                     pre_boundary_agreement: &mut pre_boundary_agreement,
                     outgoing_headers: &mut outgoing_headers,
                 },
-            ) {
-                return Ok(shed);
-            }
+            )
+        {
+            return Ok(shed);
         }
         if let Some(hit) =
             forward::check_semantic_cache(&state, &buffered, &request_id, &path_for_log)

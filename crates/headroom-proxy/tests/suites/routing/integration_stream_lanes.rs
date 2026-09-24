@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::start_proxy_with;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -98,7 +98,9 @@ fn system_a() -> Value {
 }
 
 fn system_b() -> Value {
-    json!("You are a focused subagent with full repository context loaded.\nTask: investigate the auth failure.")
+    json!(
+        "You are a focused subagent with full repository context loaded.\nTask: investigate the auth failure."
+    )
 }
 
 fn stream_x_turn1() -> Value {

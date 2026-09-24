@@ -249,7 +249,7 @@ mod tests {
         let now = now_secs();
         let c1 = candidate(0.5, Some(now - 86400.0 * 5.0)); // 5 days ago
         let c2 = candidate(0.8, Some(now - 86400.0 * 5.0)); // same age, higher cosine
-                                                            // With fast decay (1 day), 5-day-old content gets heavily penalized
+        // With fast decay (1 day), 5-day-old content gets heavily penalized
         let _ranked_fast = fast_decay.rank(&[c1.clone(), c2.clone()]);
         // c2 still wins because its cosine is higher, but let's check
         // that the boost factor differs

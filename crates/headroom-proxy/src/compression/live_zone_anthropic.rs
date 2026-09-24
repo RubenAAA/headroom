@@ -48,13 +48,13 @@ use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_anthropic_live_zone_with_ccr, BlockAction, DispatchConfig, ExclusionReason,
-    LiveZoneError, LiveZoneOutcome,
+    BlockAction, DispatchConfig, ExclusionReason, LiveZoneError, LiveZoneOutcome,
+    compress_anthropic_live_zone_with_ccr,
 };
 use serde_json::Value;
 
 use crate::cache_stabilization::anthropic_cache_control::{
-    auto_place_anthropic_cache_control, AutoPlaceOutcome, SkipReason,
+    AutoPlaceOutcome, SkipReason, auto_place_anthropic_cache_control,
 };
 use crate::cache_stabilization::tool_def_normalize::{
     any_tool_has_cache_control, sort_schema_keys_recursive, sort_tools_deterministically,

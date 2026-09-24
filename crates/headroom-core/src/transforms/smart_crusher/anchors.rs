@@ -96,10 +96,10 @@ pub fn extract_query_anchors(text: &str) -> HashSet<String> {
     // Quoted strings — capture group 1 (the content between quotes),
     // require trim().len() >= 2 (Python's `if len(match.strip()) >= 2`).
     for caps in QUOTED_STRING_PATTERN.captures_iter(text) {
-        if let Some(inner) = caps.get(1) {
-            if inner.as_str().trim().len() >= 2 {
-                anchors.insert(inner.as_str().to_lowercase());
-            }
+        if let Some(inner) = caps.get(1)
+            && inner.as_str().trim().len() >= 2
+        {
+            anchors.insert(inner.as_str().to_lowercase());
         }
     }
 

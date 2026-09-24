@@ -31,10 +31,10 @@ pub fn extract_tags(headers: &HeaderMap) -> HashMap<String, String> {
     for (name, value) in headers.iter() {
         // HeaderName is already lowercase, no need to re-lowercase.
         let key = name.as_str();
-        if let Some(stripped) = key.strip_prefix(INTERNAL_HEADER_PREFIX) {
-            if let Ok(v) = value.to_str() {
-                out.insert(stripped.to_string(), v.to_string());
-            }
+        if let Some(stripped) = key.strip_prefix(INTERNAL_HEADER_PREFIX)
+            && let Ok(v) = value.to_str()
+        {
+            out.insert(stripped.to_string(), v.to_string());
         }
     }
     out

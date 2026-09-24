@@ -111,10 +111,10 @@ pub fn explicit_env(environ: &HashMap<String, String>) -> HashMap<String, String
     let knobs = runtime_env_knobs();
     let mut out = HashMap::new();
     for knob in &knobs {
-        if let Some(raw) = environ.get(&knob.env) {
-            if !raw.trim().is_empty() {
-                out.insert(knob.env.clone(), raw.clone());
-            }
+        if let Some(raw) = environ.get(&knob.env)
+            && !raw.trim().is_empty()
+        {
+            out.insert(knob.env.clone(), raw.clone());
         }
     }
     out

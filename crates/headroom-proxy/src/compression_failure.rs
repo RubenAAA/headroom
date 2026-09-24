@@ -38,12 +38,11 @@ pub struct CompressionFailureAction {
 pub fn oversize_threshold_bytes(raw_env: Option<&str>) -> usize {
     if let Some(raw) = raw_env {
         let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            if let Ok(parsed) = trimmed.parse::<usize>() {
-                if parsed > 0 {
-                    return parsed;
-                }
-            }
+        if !trimmed.is_empty()
+            && let Ok(parsed) = trimmed.parse::<usize>()
+            && parsed > 0
+        {
+            return parsed;
         }
     }
     WS_COMPRESSION_OVERSIZE_BYTES_DEFAULT

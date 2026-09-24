@@ -6,8 +6,8 @@ use super::common;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,7 +17,7 @@ use hyper::body::Frame;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn sse(event: &str, data: Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")

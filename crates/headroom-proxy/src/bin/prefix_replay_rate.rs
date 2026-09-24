@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use headroom_proxy::cache_stabilization::prefix_replay::{
-    is_side_errand, overlay_cached_prefix_reported, SessionReplayStore,
+    SessionReplayStore, is_side_errand, overlay_cached_prefix_reported,
 };
 use serde_json::Value;
 

@@ -877,7 +877,7 @@ mod tests {
 
         let hashes = tracker.get_tracked_hashes();
         assert_eq!(hashes.len(), 1); // still only one entry
-                                     // Query should find the updated content
+        // Query should find the updated content
         let recs = tracker.analyze_query("new content", None, "ws");
         assert!(!recs.is_empty());
     }

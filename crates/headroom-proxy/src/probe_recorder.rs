@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn probe_recorder_from_env_returns_none_when_unset() {
-        std::env::remove_var(RECORD_DIR_ENV);
+        unsafe { std::env::remove_var(RECORD_DIR_ENV) };
         assert!(probe_recorder_from_env().is_none());
     }
 }

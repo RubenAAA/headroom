@@ -201,10 +201,10 @@ pub fn plan_relevance_split(
     if segs.len() < 2 {
         return vec![(true, content.to_string())];
     }
-    if let Some(max) = max_records {
-        if segs.len() > max {
-            return vec![(true, content.to_string())];
-        }
+    if let Some(max) = max_records
+        && segs.len() > max
+    {
+        return vec![(true, content.to_string())];
     }
 
     let seg_refs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
@@ -219,11 +219,11 @@ pub fn plan_relevance_split(
     let mut runs: Vec<(bool, String)> = Vec::new();
     for (seg, sc) in segs.iter().zip(scores.iter()) {
         let keep = sc.score >= cut;
-        if let Some(last) = runs.last_mut() {
-            if last.0 == keep {
-                last.1.push_str(seg);
-                continue;
-            }
+        if let Some(last) = runs.last_mut()
+            && last.0 == keep
+        {
+            last.1.push_str(seg);
+            continue;
         }
         runs.push((keep, seg.clone()));
     }

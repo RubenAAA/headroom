@@ -7,7 +7,7 @@
 //! These are mirrored byte-for-byte by `tests/test_auth_mode.py` —
 //! the Python helper MUST agree on every header set we test here.
 
-use headroom_core::auth_mode::{classify, AuthMode};
+use headroom_core::auth_mode::{AuthMode, classify};
 use http::{HeaderMap, HeaderValue};
 
 /// Helper: build a `HeaderMap` from `(name, value)` pairs in one

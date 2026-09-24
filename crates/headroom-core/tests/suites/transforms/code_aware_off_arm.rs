@@ -5,8 +5,8 @@
 //! the way it would inside a shared test binary.
 
 use headroom_core::transforms::live_zone::{
-    code_aware_enabled, compress_anthropic_live_zone, set_code_aware_enabled, AuthMode,
-    LiveZoneOutcome, DEFAULT_MODEL,
+    AuthMode, DEFAULT_MODEL, LiveZoneOutcome, code_aware_enabled, compress_anthropic_live_zone,
+    set_code_aware_enabled,
 };
 use serde_json::json;
 

@@ -760,10 +760,12 @@ mod tests {
         assert!(result.modified);
         assert_eq!(result.tokens_saved, 3);
         assert_eq!(result.compressed, "alpha beta");
-        assert!(result
-            .transforms_applied
-            .iter()
-            .any(|t| t.contains("kompress")));
+        assert!(
+            result
+                .transforms_applied
+                .iter()
+                .any(|t| t.contains("kompress"))
+        );
     }
 
     #[test]
@@ -1033,10 +1035,12 @@ mod tests {
         assert!(result.compressed.starts_with("short\n"));
         assert!(result.compressed.ends_with("\nshort"));
         assert!(result.tokens_saved > 0);
-        assert!(result
-            .transforms_applied
-            .iter()
-            .any(|t| t.contains("ccr_marker_preserving")));
+        assert!(
+            result
+                .transforms_applied
+                .iter()
+                .any(|t| t.contains("ccr_marker_preserving"))
+        );
     }
 
     #[test]

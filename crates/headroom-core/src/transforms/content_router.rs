@@ -1493,12 +1493,11 @@ pub fn detect_content_native(content: &str) -> ContentType {
     let result = super::content_detector::detect_content_type(&stripped);
 
     // HTML misroute guard: grep/build output with <> can be misclassified as HTML
-    if result.content_type == ContentType::Html {
-        if let Some(override_result) = super::content_detector::try_detect_log(&stripped)
+    if result.content_type == ContentType::Html
+        && let Some(override_result) = super::content_detector::try_detect_log(&stripped)
             .or_else(|| super::content_detector::try_detect_search(&stripped))
-        {
-            return override_result.content_type;
-        }
+    {
+        return override_result.content_type;
     }
 
     result.content_type
@@ -2266,14 +2265,13 @@ fn try_kompress(
     // last resort before passthrough (minified bundles, base64, RSC
     // payloads: no structural compressor understands them).
     // elide_dense char-gates internally; Some means shorter.
-    if config.enable_dense_line_elision {
-        if let Some((elided, elided_tokens)) =
+    if config.enable_dense_line_elision
+        && let Some((elided, elided_tokens)) =
             elide_dense(content, context, config, store_recoverable)
-        {
-            let mut full_chain = chain.to_vec();
-            full_chain.push("dense_elide".to_string());
-            return (elided, elided_tokens, full_chain);
-        }
+    {
+        let mut full_chain = chain.to_vec();
+        full_chain.push("dense_elide".to_string());
+        return (elided, elided_tokens, full_chain);
     }
 
     // Kompress not available or didn't help — passthrough
@@ -2454,12 +2452,12 @@ pub fn plan_relevance_split(
     let mut runs: Vec<RelevanceRun> = Vec::new();
     for (seg, &score) in segs.iter().zip(scores.iter()) {
         let keep = score >= cut;
-        if let Some(last) = runs.last_mut() {
-            if last.keep == keep {
-                last.text.push('\n');
-                last.text.push_str(seg);
-                continue;
-            }
+        if let Some(last) = runs.last_mut()
+            && last.keep == keep
+        {
+            last.text.push('\n');
+            last.text.push_str(seg);
+            continue;
         }
         runs.push(RelevanceRun {
             keep,
@@ -2583,10 +2581,11 @@ impl CompressionCache {
     /// cache for everything after it.
     pub fn record_frozen_verdict(&self, key: i64, verdict: bool) {
         let mut frozen = self.frozen.lock().unwrap();
-        if !frozen.verdicts.contains_key(&key) && frozen.verdicts.len() >= FROZEN_VERDICTS_MAX {
-            if let Some(oldest) = frozen.order.pop_front() {
-                frozen.verdicts.remove(&oldest);
-            }
+        if !frozen.verdicts.contains_key(&key)
+            && frozen.verdicts.len() >= FROZEN_VERDICTS_MAX
+            && let Some(oldest) = frozen.order.pop_front()
+        {
+            frozen.verdicts.remove(&oldest);
         }
         if frozen.verdicts.insert(key, verdict).is_none() {
             frozen.order.push_back(key);
@@ -3773,7 +3772,7 @@ mod tests {
         let content = lines.join("\n");
         let segs = segment(&content, 8, 1200);
         assert!(segs.len() >= 3); // 20 lines / 8 per window = 3 windows
-                                  // Verify lossless
+        // Verify lossless
         let rejoined = segs.join("\n");
         assert_eq!(rejoined, content);
     }
@@ -4183,15 +4182,15 @@ mod tests {
     impl FreezeFlag {
         fn on() -> Self {
             let prev = std::env::var("HEADROOM_FREEZE_BLOCK_DECISION").ok();
-            std::env::set_var("HEADROOM_FREEZE_BLOCK_DECISION", "1");
+            unsafe { std::env::set_var("HEADROOM_FREEZE_BLOCK_DECISION", "1") };
             Self(prev)
         }
     }
     impl Drop for FreezeFlag {
         fn drop(&mut self) {
             match &self.0 {
-                Some(v) => std::env::set_var("HEADROOM_FREEZE_BLOCK_DECISION", v),
-                None => std::env::remove_var("HEADROOM_FREEZE_BLOCK_DECISION"),
+                Some(v) => unsafe { std::env::set_var("HEADROOM_FREEZE_BLOCK_DECISION", v) },
+                None => unsafe { std::env::remove_var("HEADROOM_FREEZE_BLOCK_DECISION") },
             }
         }
     }
@@ -4258,7 +4257,7 @@ mod tests {
     #[test]
     fn freeze_is_inert_while_the_flag_is_off() {
         let _guard = freeze_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("HEADROOM_FREEZE_BLOCK_DECISION");
+        unsafe { std::env::remove_var("HEADROOM_FREEZE_BLOCK_DECISION") };
         let cache = CompressionCache::new(1800);
         cache.record_frozen_verdict(1, true);
         assert_eq!(
@@ -4685,8 +4684,8 @@ mod kompress_size_gate_tests {
         fn set(value: Option<&str>) -> Self {
             let prior = std::env::var("HEADROOM_KOMPRESS_MAX_TOKENS").ok();
             match value {
-                Some(v) => std::env::set_var("HEADROOM_KOMPRESS_MAX_TOKENS", v),
-                None => std::env::remove_var("HEADROOM_KOMPRESS_MAX_TOKENS"),
+                Some(v) => unsafe { std::env::set_var("HEADROOM_KOMPRESS_MAX_TOKENS", v) },
+                None => unsafe { std::env::remove_var("HEADROOM_KOMPRESS_MAX_TOKENS") },
             }
             Self(prior)
         }
@@ -4695,8 +4694,8 @@ mod kompress_size_gate_tests {
     impl Drop for CeilingGuard {
         fn drop(&mut self) {
             match &self.0 {
-                Some(v) => std::env::set_var("HEADROOM_KOMPRESS_MAX_TOKENS", v),
-                None => std::env::remove_var("HEADROOM_KOMPRESS_MAX_TOKENS"),
+                Some(v) => unsafe { std::env::set_var("HEADROOM_KOMPRESS_MAX_TOKENS", v) },
+                None => unsafe { std::env::remove_var("HEADROOM_KOMPRESS_MAX_TOKENS") },
             }
         }
     }

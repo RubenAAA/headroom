@@ -218,8 +218,8 @@ pub fn first_turn_reason(
 mod first_turn_attribution_tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
-    use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
 
     #[derive(Default)]
     struct Captured {
@@ -500,9 +500,11 @@ mod first_turn_attribution_tests {
         );
         assert!(!plain.compaction_restart);
         assert_ne!(plain.message_zero_hash, c.message_zero_hash);
-        assert!(first_turn_context(&serde_json::json!({}))
-            .message_zero_hash
-            .is_none());
+        assert!(
+            first_turn_context(&serde_json::json!({}))
+                .message_zero_hash
+                .is_none()
+        );
     }
 
     #[test]

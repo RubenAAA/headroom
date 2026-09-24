@@ -206,10 +206,10 @@ fn cache_dir() -> PathBuf {
 
 fn path_lookup(name: &str, entry: Option<&ToolEntry>) -> Option<PathBuf> {
     let mut candidates = vec![name.to_string()];
-    if let Some(binary) = entry.and_then(|e| e.binary.as_ref()) {
-        if binary != name {
-            candidates.push(binary.clone());
-        }
+    if let Some(binary) = entry.and_then(|e| e.binary.as_ref())
+        && binary != name
+    {
+        candidates.push(binary.clone());
     }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -711,11 +711,11 @@ pub fn cmd_install(tools: Vec<String>, force: bool) -> Result<i32, Error> {
         if force {
             let plat = detect_platform();
             let cached = cached_path(&name, entry, &plat);
-            if cached.exists() {
-                if let Err(e) = std::fs::remove_file(&cached) {
-                    eprintln!("{name}: failed to remove cached binary: {e}");
-                    exit_code = 1;
-                }
+            if cached.exists()
+                && let Err(e) = std::fs::remove_file(&cached)
+            {
+                eprintln!("{name}: failed to remove cached binary: {e}");
+                exit_code = 1;
             }
         }
         match resolve(&name) {

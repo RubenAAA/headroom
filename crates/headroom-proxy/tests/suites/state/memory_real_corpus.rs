@@ -123,10 +123,10 @@ fn cwd_for_slug(slug: &str) -> Option<String> {
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                     continue;
                 };
-                if let Some(cwd) = value.get("cwd").and_then(|c| c.as_str()) {
-                    if !cwd.is_empty() {
-                        return Some(cwd.to_string());
-                    }
+                if let Some(cwd) = value.get("cwd").and_then(|c| c.as_str())
+                    && !cwd.is_empty()
+                {
+                    return Some(cwd.to_string());
                 }
             }
         }

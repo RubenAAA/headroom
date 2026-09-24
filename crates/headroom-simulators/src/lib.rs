@@ -9,6 +9,6 @@ pub mod domain;
 pub mod presentation;
 
 pub use application::Simulator;
-pub use config::{load_config, SimulatorConfig};
+pub use config::{SimulatorConfig, load_config};
 pub use domain::{ProviderPath, SimulatedResponse};
 pub use presentation::build_app;

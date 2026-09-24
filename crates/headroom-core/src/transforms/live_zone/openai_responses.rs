@@ -173,10 +173,9 @@ pub fn compress_openai_responses_live_zone_with_config(
         };
         if let (Some(command), Some(call_id)) =
             (command, item.get("call_id").and_then(Value::as_str))
+            && is_read_command(&command)
         {
-            if is_read_command(&command) {
-                read_command_call_ids.insert(call_id);
-            }
+            read_command_call_ids.insert(call_id);
         }
     }
 
@@ -798,10 +797,12 @@ mod openai_responses_tests {
             LiveZoneOutcome::Modified { new_body, manifest } => {
                 let new = new_body.get();
                 assert!(new.len() < b.len());
-                assert!(manifest
-                    .block_outcomes
-                    .iter()
-                    .any(|b| matches!(b.action, BlockAction::Compressed { .. })));
+                assert!(
+                    manifest
+                        .block_outcomes
+                        .iter()
+                        .any(|b| matches!(b.action, BlockAction::Compressed { .. }))
+                );
             }
             LiveZoneOutcome::NoChange { manifest } => {
                 // RejectedNotSmaller is also an acceptable outcome

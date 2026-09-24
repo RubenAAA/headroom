@@ -45,7 +45,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::classifier::{classify_cell, CellClass, ClassifyConfig};
+use super::classifier::{CellClass, ClassifyConfig, classify_cell};
 use super::ir::{Bucket, CellValue, Compaction, FieldSpec, Row, Schema};
 use crate::ccr::CcrStore;
 
@@ -147,14 +147,14 @@ fn compact_inner(
         core_count as f64 / total_keys as f64
     };
 
-    if core_ratio < cfg.heterogeneous_core_ratio {
-        if let Some(disc) = detect_discriminator(items, &key_freqs, cfg) {
-            return bucket_by(items, &disc, cfg, store);
-        }
-        // No clean discriminator — fall through to a sparse Table
-        // rather than refusing. A sparse table is still better than
-        // letting the lossy path drop fields wholesale.
+    if core_ratio < cfg.heterogeneous_core_ratio
+        && let Some(disc) = detect_discriminator(items, &key_freqs, cfg)
+    {
+        return bucket_by(items, &disc, cfg, store);
     }
+    // No clean discriminator — fall through to a sparse Table
+    // rather than refusing. A sparse table is still better than
+    // letting the lossy path drop fields wholesale.
 
     build_homogeneous_table(items, &key_freqs, cfg, store)
 }
@@ -238,20 +238,22 @@ fn cell_from_value(v: &Value, cfg: &CompactConfig, store: Option<&Arc<dyn CcrSto
         CellClass::JsonObject => CellValue::Scalar(v.clone()), // flatten pass may promote
         CellClass::JsonArray => {
             // Recurse if the inner array is array-of-objects; else scalar.
-            if let Value::Array(items) = v {
-                if items.iter().all(|i| matches!(i, Value::Object(_))) && items.len() >= 2 {
-                    return CellValue::Nested(Box::new(compact_inner(items, cfg, store)));
-                }
+            if let Value::Array(items) = v
+                && items.iter().all(|i| matches!(i, Value::Object(_)))
+                && items.len() >= 2
+            {
+                return CellValue::Nested(Box::new(compact_inner(items, cfg, store)));
             }
             CellValue::Scalar(v.clone())
         }
         CellClass::StringifiedJson(parsed) => {
             // If the parsed JSON is an array of objects, recurse; else
             // store the parsed value as a Scalar (un-escapes for free).
-            if let Value::Array(items) = &parsed {
-                if items.iter().all(|i| matches!(i, Value::Object(_))) && items.len() >= 2 {
-                    return CellValue::Nested(Box::new(compact_inner(items, cfg, store)));
-                }
+            if let Value::Array(items) = &parsed
+                && items.iter().all(|i| matches!(i, Value::Object(_)))
+                && items.len() >= 2
+            {
+                return CellValue::Nested(Box::new(compact_inner(items, cfg, store)));
             }
             CellValue::Scalar(parsed)
         }
@@ -266,15 +268,15 @@ fn cell_from_value(v: &Value, cfg: &CompactConfig, store: Option<&Arc<dyn CcrSto
             // `walker::emit_opaque_ccr_marker`. Without this write the
             // marker points at a key that was never stored and retrieval
             // 404s (issue #1083).
-            if let Some(store) = store {
-                if !store.put(&ccr_hash, s) {
-                    tracing::warn!(
-                        event = "ccr_put_failed",
-                        target = "ccr.compactor",
-                        hash = %ccr_hash,
-                        "ccr_put_failed; marker will point at an unretrievable hash"
-                    );
-                }
+            if let Some(store) = store
+                && !store.put(&ccr_hash, s)
+            {
+                tracing::warn!(
+                    event = "ccr_put_failed",
+                    target = "ccr.compactor",
+                    hash = %ccr_hash,
+                    "ccr_put_failed; marker will point at an unretrievable hash"
+                );
             }
             CellValue::OpaqueRef {
                 ccr_hash,

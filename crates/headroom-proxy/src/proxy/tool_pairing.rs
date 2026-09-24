@@ -207,8 +207,8 @@ pub(super) fn check_outbound_tool_pairing(
 #[cfg(test)]
 mod outbound_tool_pairing_tests {
     use super::*;
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
 
     fn tool_use(id: &str) -> Value {
         json!({"type": "tool_use", "id": id, "name": "bash", "input": {}})

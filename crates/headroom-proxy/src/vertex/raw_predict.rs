@@ -29,7 +29,7 @@
 //! `tracing::warn!` event so operators can confirm the pipeline is
 //! engaged in dashboards.
 
-use axum::body::{to_bytes, Body};
+use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use std::net::SocketAddr;
@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use crate::compression;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
 use crate::proxy::AppState;
-use crate::vertex::{adc::TokenSourceError, envelope, VertexVerb};
+use crate::vertex::{VertexVerb, adc::TokenSourceError, envelope};
 
 /// Carrier struct for the bits parsed out of the URL path; passed
 /// down so logs and error paths share a consistent set of fields.
@@ -450,10 +450,10 @@ fn build_vertex_headers(
         strip_internal,
         headroom_core::auth_mode::AuthMode::OAuth,
     );
-    if !state.config.rewrite_host {
-        if let Some(h) = headers.get(http::header::HOST) {
-            outgoing_headers.insert(http::header::HOST, h.clone());
-        }
+    if !state.config.rewrite_host
+        && let Some(h) = headers.get(http::header::HOST)
+    {
+        outgoing_headers.insert(http::header::HOST, h.clone());
     }
     // Attach the bearer; if the client already sent an Authorization
     // header we replace it (Vertex rejects the wrong Auth flavour
@@ -561,14 +561,14 @@ fn stream_vertex_response(
     let rid_for_stream = request_id.clone();
     let resp_stream = upstream_resp.bytes_stream().map(move |r| match r {
         Ok(b) => {
-            if let Some(tx) = &parser_tx {
-                if let Err(e) = tx.try_send(b.clone()) {
-                    tracing::debug!(
-                        request_id = %rid_for_stream,
-                        error = %e,
-                        "vertex sse parser queue full or closed; skipping telemetry chunk"
-                    );
-                }
+            if let Some(tx) = &parser_tx
+                && let Err(e) = tx.try_send(b.clone())
+            {
+                tracing::debug!(
+                    request_id = %rid_for_stream,
+                    error = %e,
+                    "vertex sse parser queue full or closed; skipping telemetry chunk"
+                );
             }
             Ok(b)
         }

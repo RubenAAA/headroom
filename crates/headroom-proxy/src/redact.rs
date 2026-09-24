@@ -326,12 +326,11 @@ impl SessionMap {
                 Some(_) => attempt += 1,
             }
         };
-        if self.forward.len() >= SESSION_CAPACITY {
-            if let Some(oldest) = self.order.pop_front() {
-                if let Some(orig) = self.forward.remove(&oldest) {
-                    self.reverse.remove(&orig);
-                }
-            }
+        if self.forward.len() >= SESSION_CAPACITY
+            && let Some(oldest) = self.order.pop_front()
+            && let Some(orig) = self.forward.remove(&oldest)
+        {
+            self.reverse.remove(&orig);
         }
         self.forward.insert(token.clone(), original.to_string());
         self.reverse.insert(original.to_string(), token.clone());
@@ -1473,10 +1472,10 @@ fn match_named_credential(rest: &[u8]) -> Option<(usize, usize, &'static str)> {
         b"secret".as_slice(),
         b"token".as_slice(),
     ] {
-        if starts_word_insensitive(rest, name) {
-            if let Some((start, len)) = match_named_value(rest, name.len(), name.ends_with(b" ")) {
-                return Some((start, len, SECRET_KIND));
-            }
+        if starts_word_insensitive(rest, name)
+            && let Some((start, len)) = match_named_value(rest, name.len(), name.ends_with(b" "))
+        {
+            return Some((start, len, SECRET_KIND));
         }
     }
     None
@@ -1516,10 +1515,10 @@ fn match_pgpass_at_line_start(
 /// Extracted from `BodyRedactor::match_secret` without behavior change.
 fn match_postgres_url_password(rest: &[u8]) -> Option<(usize, usize, &'static str)> {
     for scheme in [b"postgres://".as_slice(), b"postgresql://".as_slice()] {
-        if rest.starts_with(scheme) {
-            if let Some((off, len)) = match_url_password(&rest[scheme.len()..]) {
-                return Some((scheme.len() + off, len, SECRET_KIND));
-            }
+        if rest.starts_with(scheme)
+            && let Some((off, len)) = match_url_password(&rest[scheme.len()..])
+        {
+            return Some((scheme.len() + off, len, SECRET_KIND));
         }
     }
     None
@@ -1979,10 +1978,12 @@ mod tests {
         let token = text.strip_prefix("check ").expect("shape");
         assert_token_shape(token, "PATH", text);
         unredact_body(&s, "sess", &mut body);
-        assert!(body["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("/home/alice/work/notes.md"));
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("/home/alice/work/notes.md")
+        );
     }
 
     /// `--redact-paths` off: secrets and emails still go, paths stay clear.
@@ -2082,10 +2083,12 @@ mod tests {
         assert!(text.contains("__HR_SECRET_"), "got: {text}");
         assert!(text.contains("__HR_EMAIL_"), "got: {text}");
         unredact_body(&s, "sess", &mut body);
-        assert!(body["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("dev@example.com"));
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("dev@example.com")
+        );
     }
 
     /// Compound credential names (`private_key`, `api-key`, `myKey`) redact

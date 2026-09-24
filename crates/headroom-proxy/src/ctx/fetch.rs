@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use headroom_core::ctx::{CtxStore, IndexOpts, SourceMeta};
 
 use super::fetch_pages::{
-    extract_and_store, route_skips_extraction, ExtractOutcome, FetchRoute, PageStore,
+    ExtractOutcome, FetchRoute, PageStore, extract_and_store, route_skips_extraction,
 };
 
 /// Default cache TTL: 24 hours.
@@ -464,8 +464,7 @@ const MAX_REDIRECTS: usize = 5;
 /// Neutral redirect-chain-exhausted message. A benign locale or consent
 /// redirect loop produces this too (measured upstream on Google devsite
 /// hosts), so it must not accuse an attack.
-const REDIRECT_CHAIN_EXHAUSTED: &str =
-    "redirect chain exceeded 5 hops, so the walk stopped before the SSRF check \
+const REDIRECT_CHAIN_EXHAUSTED: &str = "redirect chain exceeded 5 hops, so the walk stopped before the SSRF check \
     could be re-run on another hop. A benign locale or consent redirect loop produces \
     this too; it is not by itself evidence of an attack. Fetch the page from a host \
     that does not bounce, or fetch its raw source file directly.";
@@ -751,21 +750,21 @@ pub async fn fetch_and_index(
         let meta = store
             .source_meta(&label)
             .map_err(|e| format!("DB error: {e}"))?;
-        if let Some(meta) = meta {
-            if is_fresh(&meta, ttl) {
-                let age = parse_sqlite_datetime(&meta.indexed_at)
-                    .map(format_age)
-                    .unwrap_or_else(|| "unknown".to_string());
-                return Ok(FetchResult {
-                    label,
-                    chunks: meta.chunk_count,
-                    bytes: 0, // Not re-fetched
-                    cached: true,
-                    age: Some(age),
-                    rung: rung::CACHE_HIT.to_string(),
-                    extraction: None,
-                });
-            }
+        if let Some(meta) = meta
+            && is_fresh(&meta, ttl)
+        {
+            let age = parse_sqlite_datetime(&meta.indexed_at)
+                .map(format_age)
+                .unwrap_or_else(|| "unknown".to_string());
+            return Ok(FetchResult {
+                label,
+                chunks: meta.chunk_count,
+                bytes: 0, // Not re-fetched
+                cached: true,
+                age: Some(age),
+                rung: rung::CACHE_HIT.to_string(),
+                extraction: None,
+            });
         }
     }
 

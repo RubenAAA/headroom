@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 use crate::config::{ConfiguredResponse, SimulatorConfig, StubRule};
-use crate::domain::{default_response, RequestFacts, SimulatedResponse};
+use crate::domain::{RequestFacts, SimulatedResponse, default_response};
 
 #[derive(Debug, Clone)]
 pub struct Simulator {
@@ -40,10 +40,10 @@ trait MatchesRequest {
 
 impl MatchesRequest for StubRule {
     fn matches(&self, facts: &RequestFacts) -> bool {
-        if let Some(method) = &self.method {
-            if !method.eq_ignore_ascii_case(&facts.method) {
-                return false;
-            }
+        if let Some(method) = &self.method
+            && !method.eq_ignore_ascii_case(&facts.method)
+        {
+            return false;
         }
         if self.path != facts.path {
             return false;
@@ -96,8 +96,8 @@ fn configured_response(config: &ConfiguredResponse) -> SimulatedResponse {
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderMap;
-    use serde_json::json;
     use serde_json::Value;
+    use serde_json::json;
 
     use super::*;
     use crate::config::{ConfiguredResponse, JsonPointerMatch, StubRule};

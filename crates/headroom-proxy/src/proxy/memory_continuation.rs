@@ -30,9 +30,10 @@ use std::sync::Arc;
 
 use super::forward;
 use super::{
-    continuation_api_kind, continuation_cut_retryable, continuation_turn_from_body, extend_or_push,
+    AppState, CcrRoundUsage, MEMORY_CONTINUATION_RETRIES, continuation_api_kind,
+    continuation_cut_retryable, continuation_turn_from_body, extend_or_push,
     header_map_to_lowercase_strings, memory_continuation_backoff, read_continuation_body,
-    retail_continuation_breakpoint, AppState, CcrRoundUsage, MEMORY_CONTINUATION_RETRIES,
+    retail_continuation_breakpoint,
 };
 use crate::cache_stabilization::drift_detector::compute_structural_hash;
 use crate::config::Config;
@@ -489,19 +490,19 @@ fn splice_memory_trace(provider: &str, trace: &[String], current_response: &mut 
     // replays it, and the only one whose stream splice passes an added block
     // through (see `sse::ccr_stream::drop_reason`). Leading, because the calls
     // ran before the answer was written.
-    if provider == "anthropic" && !trace.is_empty() {
-        if let Some(content) = current_response
+    if provider == "anthropic"
+        && !trace.is_empty()
+        && let Some(content) = current_response
             .get_mut("content")
             .and_then(|v| v.as_array_mut())
-        {
-            content.insert(
-                0,
-                serde_json::json!({
-                    "type": "text",
-                    "text": format!("[headroom memory]\n{}", trace.join("\n")),
-                }),
-            );
-        }
+    {
+        content.insert(
+            0,
+            serde_json::json!({
+                "type": "text",
+                "text": format!("[headroom memory]\n{}", trace.join("\n")),
+            }),
+        );
     }
 }
 
@@ -646,10 +647,10 @@ fn anthropic_pair_dangling(
         if b.get("type").and_then(Value::as_str) != Some("tool_use") {
             continue;
         }
-        if let Some(id) = b.get("id").and_then(Value::as_str) {
-            if !answered.contains(id) {
-                dangling.push(format!("tool_use {id} has no tool_result after it"));
-            }
+        if let Some(id) = b.get("id").and_then(Value::as_str)
+            && !answered.contains(id)
+        {
+            dangling.push(format!("tool_use {id} has no tool_result after it"));
         }
     }
 }
@@ -840,7 +841,7 @@ fn turn_has_visible_text(response: &serde_json::Value, provider: &str) -> bool {
 /// already carries the marker keeps it exactly once, which is also what
 /// stops later alternation passes from stacking notices.
 fn append_stranded_notice(response: &mut serde_json::Value, provider: &str, text: &str) {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     if serde_json::to_string(response)
         .is_ok_and(|s| s.contains(crate::sse::ccr_stream::RETRIEVAL_DROPPED_MARKER))
     {

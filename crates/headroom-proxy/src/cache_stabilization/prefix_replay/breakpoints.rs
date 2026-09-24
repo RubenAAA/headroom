@@ -328,18 +328,18 @@ pub fn relocate_ephemeral_blocks_reported(messages: Vec<Value>) -> (Vec<Value>, 
     // Give a string-content tail block form so it can receive the scaffolding.
     // Only when there is something to move, so an ordinary turn keeps its bytes
     // byte-for-byte as the client sent them.
-    if let Some(tail_msg) = out.last_mut() {
-        if let Some(text) = tail_msg.get("content").and_then(Value::as_str) {
-            let text = text.to_string();
-            let mut blocks = Vec::with_capacity(1);
-            if !text.is_empty() {
-                blocks.push(serde_json::json!({"type": "text", "text": text}));
-            }
-            if let Some(obj) = tail_msg.as_object_mut() {
-                obj.insert("content".to_string(), Value::Array(blocks));
-            }
-            report.tail_promoted = true;
+    if let Some(tail_msg) = out.last_mut()
+        && let Some(text) = tail_msg.get("content").and_then(Value::as_str)
+    {
+        let text = text.to_string();
+        let mut blocks = Vec::with_capacity(1);
+        if !text.is_empty() {
+            blocks.push(serde_json::json!({"type": "text", "text": text}));
         }
+        if let Some(obj) = tail_msg.as_object_mut() {
+            obj.insert("content".to_string(), Value::Array(blocks));
+        }
+        report.tail_promoted = true;
     }
     if let Some(blocks) = out
         .last_mut()
@@ -607,21 +607,20 @@ pub fn place_tail_cache_breakpoints(
         if let Some(content) = out[message_idx]
             .get_mut("content")
             .and_then(|c| c.as_array_mut())
+            && let Some(Value::Object(block)) = content.get_mut(block_idx)
         {
-            if let Some(Value::Object(block)) = content.get_mut(block_idx) {
-                // A short message 0 can be both the scaffold target and the
-                // newest ordinary one. Counting the second write would report a
-                // marker that is not there and, upstream, licence a `system`
-                // strip on a budget that was never spent.
-                let already_marked = block
-                    .insert(
-                        "cache_control".to_string(),
-                        serde_json::json!({"type": "ephemeral"}),
-                    )
-                    .is_some();
-                if !already_marked {
-                    placed += 1;
-                }
+            // A short message 0 can be both the scaffold target and the
+            // newest ordinary one. Counting the second write would report a
+            // marker that is not there and, upstream, licence a `system`
+            // strip on a budget that was never spent.
+            let already_marked = block
+                .insert(
+                    "cache_control".to_string(),
+                    serde_json::json!({"type": "ephemeral"}),
+                )
+                .is_some();
+            if !already_marked {
+                placed += 1;
             }
         }
     }
@@ -831,10 +830,10 @@ pub fn strip_system_cache_control(body: &mut Value) -> usize {
     };
     let mut removed = 0;
     for block in blocks.iter_mut() {
-        if let Value::Object(obj) = block {
-            if obj.remove("cache_control").is_some() {
-                removed += 1;
-            }
+        if let Value::Object(obj) = block
+            && obj.remove("cache_control").is_some()
+        {
+            removed += 1;
         }
     }
     removed

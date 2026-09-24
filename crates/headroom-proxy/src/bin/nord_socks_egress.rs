@@ -20,9 +20,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use reqwest::blocking::{Client, Response};
 use reqwest::Proxy;
-use serde_json::{json, Value};
+use reqwest::blocking::{Client, Response};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::signal::unix::SignalKind;
 use url::Url;
@@ -830,7 +830,7 @@ fn copy_stream(mut source: TcpStream, mut destination: TcpStream) -> io::Result<
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                return Ok(())
+                return Ok(());
             }
             Err(error) => return Err(error),
         }
@@ -1107,7 +1107,9 @@ impl Manager {
         install_signal_handlers(self.running.clone());
         eprintln!("verified distinct Nord SOCKS exits; active_lanes={lane_count}/{MAX_LANES}");
         if lane_count < MAX_LANES {
-            eprintln!("warning: using {lane_count} distinct Nord SOCKS lanes; up to {MAX_LANES} are supported");
+            eprintln!(
+                "warning: using {lane_count} distinct Nord SOCKS lanes; up to {MAX_LANES} are supported"
+            );
         }
         eprintln!("Nord SOCKS relay ready ({lane_count}/{MAX_LANES} lanes)");
 

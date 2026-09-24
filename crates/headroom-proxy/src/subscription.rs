@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use headroom_core::subscription::client::{
-    read_cached_oauth_token, SubscriptionFetcher, BETA_HEADER, USAGE_URL,
+    BETA_HEADER, SubscriptionFetcher, USAGE_URL, read_cached_oauth_token,
 };
 use headroom_core::subscription::models::SubscriptionSnapshot;
 use headroom_core::subscription::tracker::SubscriptionTracker;

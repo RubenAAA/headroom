@@ -13,10 +13,10 @@
 //! would read a shifted index and drop client content.
 
 use headroom_proxy::cache_stabilization::prefix_replay::{
-    overlay_cached_prefix, overlay_cached_prefix_reported, PrefixReplayTracker, ReplaySkip,
-    SessionReplayStore,
+    PrefixReplayTracker, ReplaySkip, SessionReplayStore, overlay_cached_prefix,
+    overlay_cached_prefix_reported,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn user(text: &str) -> Value {
     json!({"role": "user", "content": [{"type": "text", "text": text}]})

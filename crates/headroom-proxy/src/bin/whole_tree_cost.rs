@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 
 use headroom_core::pricing;
-use headroom_core::tokenizer::{get_tokenizer, Tokenizer};
+use headroom_core::tokenizer::{Tokenizer, get_tokenizer};
 use serde_json::Value;
 
 fn hash_bytes(b: &[u8]) -> u64 {
@@ -252,7 +252,7 @@ fn main() {
             .map(|(_, e)| e / t.equiv * 100.0)
             .unwrap_or(0.0);
         let mut models: Vec<_> = t.models.iter().collect();
-        models.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+        models.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap());
         let mstr = models
             .iter()
             .take(4)

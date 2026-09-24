@@ -460,11 +460,7 @@ fn value_to_str(v: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Bool(b) => {
             // Python str(True) == "True".
-            if *b {
-                "True".into()
-            } else {
-                "False".into()
-            }
+            if *b { "True".into() } else { "False".into() }
         }
         Value::Null => "None".into(),
         other => other.to_string(),
@@ -643,15 +639,15 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
     };
 
     sink.record_request(booked_outcome); // 1
-                                         // Durable savings ledger, immediately after the in-memory tracker — the
-                                         // same position Python writes it from inside `record_request`. Gated on a
-                                         // real saving so uncompressed requests never touch the disk. The gate is
-                                         // the headline (message + tool-schema tags): a pure-deferral turn books
-                                         // even when message compression saved nothing.
-                                         // A rerouted turn also books here even when it compressed nothing: what it
-                                         // saved is the bill it never sent to the client's model, and that is worth
-                                         // more than any compression delta. The ledger helper still ignores a
-                                         // zero-token compression saving, so the disk write stays gated as before.
+    // Durable savings ledger, immediately after the in-memory tracker — the
+    // same position Python writes it from inside `record_request`. Gated on a
+    // real saving so uncompressed requests never touch the disk. The gate is
+    // the headline (message + tool-schema tags): a pure-deferral turn books
+    // even when message compression saved nothing.
+    // A rerouted turn also books here even when it compressed nothing: what it
+    // saved is the bill it never sent to the client's model, and that is worth
+    // more than any compression delta. The ledger helper still ignores a
+    // zero-token compression saving, so the disk write stays gated as before.
     if crate::tool_schema_savings::headline_tokens_saved(outcome.tokens_saved, &outcome.tags) > 0
         || outcome.routed_from_model.is_some()
     {

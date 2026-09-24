@@ -994,8 +994,8 @@ mod change_suppression_tests {
         let lines = Lines::default();
         let sub = tracing_subscriber::registry().with(lines.clone());
         tracing::subscriber::with_default(sub, f);
-        let out = lines.0.lock().unwrap().clone();
-        out
+
+        lines.0.lock().unwrap().clone()
     }
 
     fn warnings(lines: &[String]) -> usize {

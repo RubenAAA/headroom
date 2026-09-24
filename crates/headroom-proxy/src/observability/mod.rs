@@ -75,10 +75,10 @@ pub use compression_ratio::{
     record_rejected_by_token_check as record_compression_rejected_by_token_check,
 };
 pub use proxy_metrics::{
-    extract_rate_limit_snapshot, extract_unified_rate_limit, record_passthrough_bytes_modified,
-    record_rate_limit_snapshot, record_response_status, record_service_tier,
-    record_stream_incomplete, record_unified_rate_limit, record_upstream_retry,
-    record_upstream_retry_exhausted, retry_reason, RateLimitSnapshot, UnifiedRateLimitSnapshot,
-    UnifiedWindow,
+    RateLimitSnapshot, UnifiedRateLimitSnapshot, UnifiedWindow, extract_rate_limit_snapshot,
+    extract_unified_rate_limit, record_passthrough_bytes_modified, record_rate_limit_snapshot,
+    record_response_status, record_service_tier, record_stream_incomplete,
+    record_unified_rate_limit, record_upstream_retry, record_upstream_retry_exhausted,
+    retry_reason,
 };
 pub use recache::{observe_first_turn_write, observe_recache_event};

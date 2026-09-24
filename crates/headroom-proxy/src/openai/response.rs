@@ -4,7 +4,7 @@
 //! SSE transcript back into a single turn, and `openai_to_anthropic_response`
 //! reshapes a Chat Completions body into an Anthropic message.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Fold a Responses SSE stream into the buffered `output[]` turn the rest of
 /// the CCR machinery speaks.
@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 /// arriving whole in `output_item.done`. Returns the turn and the output-token
 /// count the outcome is booked with.
 pub(crate) fn responses_stream_to_turn(responses_text: &str) -> (Value, u64) {
-    use crate::sse::{openai_responses::ResponseState, SseFramer};
+    use crate::sse::{SseFramer, openai_responses::ResponseState};
 
     let mut framer = SseFramer::new();
     framer.push(responses_text.as_bytes());
@@ -49,30 +49,24 @@ pub(crate) fn responses_stream_to_turn(responses_text: &str) -> (Value, u64) {
             ev.event_name.as_deref(),
             Some("response.output_text.delta") | Some("output_text.delta")
         ) {
-            if let Ok(chunk) = serde_json::from_slice::<Value>(&ev.data) {
-                if chunk.get("item_id").and_then(|v| v.as_str()).is_none() {
-                    if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
-                        global_text.push_str(delta);
-                    }
-                }
+            if let Ok(chunk) = serde_json::from_slice::<Value>(&ev.data)
+                && chunk.get("item_id").and_then(|v| v.as_str()).is_none()
+                && let Some(delta) = chunk.get("delta").and_then(|v| v.as_str())
+            {
+                global_text.push_str(delta);
             }
         } else if matches!(
             ev.event_name.as_deref(),
             Some("response.output_text.done") | Some("output_text.done")
-        ) {
-            if let Ok(chunk) = serde_json::from_slice::<Value>(&ev.data) {
-                if chunk.get("item_id").and_then(|v| v.as_str()).is_none() {
-                    if let Some(text) = chunk
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| chunk.get("delta").and_then(|v| v.as_str()))
-                    {
-                        if global_text.is_empty() {
-                            global_text.push_str(text);
-                        }
-                    }
-                }
-            }
+        ) && let Ok(chunk) = serde_json::from_slice::<Value>(&ev.data)
+            && chunk.get("item_id").and_then(|v| v.as_str()).is_none()
+            && let Some(text) = chunk
+                .get("text")
+                .and_then(|v| v.as_str())
+                .or_else(|| chunk.get("delta").and_then(|v| v.as_str()))
+            && global_text.is_empty()
+        {
+            global_text.push_str(text);
         }
         let _ = state.apply(ev);
     }
@@ -92,17 +86,15 @@ pub(crate) fn responses_stream_to_turn(responses_text: &str) -> (Value, u64) {
                     .iter()
                     .any(|item| item.get("type").and_then(Value::as_str) == Some("message"))
             });
-        if !has_message {
-            if let Some(items) = turn.get_mut("output").and_then(|o| o.as_array_mut()) {
-                items.insert(
-                    0,
-                    json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": global_text}],
-                    }),
-                );
-            }
+        if !has_message && let Some(items) = turn.get_mut("output").and_then(|o| o.as_array_mut()) {
+            items.insert(
+                0,
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": global_text}],
+                }),
+            );
         }
     }
 
@@ -144,10 +136,10 @@ pub(crate) fn openai_to_anthropic_response(openai: &Value, original: &Value) -> 
         // fabricated pair would replay an item the upstream never produced.
         // The client sees the reasoning once; next turn the request
         // translator drops it as foreign, so it never reaches an upstream.
-        if let Some(reasoning) = msg.get("reasoning_content").and_then(|v| v.as_str()) {
-            if !reasoning.is_empty() {
-                content.push(json!({"type": "thinking", "thinking": reasoning}));
-            }
+        if let Some(reasoning) = msg.get("reasoning_content").and_then(|v| v.as_str())
+            && !reasoning.is_empty()
+        {
+            content.push(json!({"type": "thinking", "thinking": reasoning}));
         }
 
         match msg.get("content") {
@@ -175,10 +167,10 @@ pub(crate) fn openai_to_anthropic_response(openai: &Value, original: &Value) -> 
         // A chat-level refusal is the turn's only text; without this the
         // client receives an empty `end_turn` and cannot tell refusal apart
         // from silence.
-        if let Some(refusal) = msg.get("refusal").and_then(|v| v.as_str()) {
-            if !refusal.is_empty() {
-                content.push(json!({"type": "text", "text": refusal}));
-            }
+        if let Some(refusal) = msg.get("refusal").and_then(|v| v.as_str())
+            && !refusal.is_empty()
+        {
+            content.push(json!({"type": "text", "text": refusal}));
         }
 
         if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {

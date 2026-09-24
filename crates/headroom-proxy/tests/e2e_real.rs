@@ -9,6 +9,10 @@
 //!
 //! Reads API keys from .env at the repo root. No keys → individual tests skip.
 
+// Edition 2024 makes std::env::set_var and remove_var unsafe. Tests call them
+// to set up config; non-test code stays free of unsafe.
+#![allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+
 mod common;
 
 use std::path::PathBuf;
@@ -17,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use common::start_proxy;
 use futures_util::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -64,7 +68,7 @@ fn load_dotenv() {
             // SAFETY for tests: setting env vars in single-threaded test setup.
             // Tokio's #[tokio::test] runs each test in its own runtime; this is
             // before the runtime starts spawning concurrent tasks.
-            std::env::set_var(k, v);
+            unsafe { std::env::set_var(k, v) };
         }
     }
 }

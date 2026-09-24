@@ -20,22 +20,22 @@ pub(crate) async fn read_buffered_body(
     request_id: &str,
     path_for_log: &str,
 ) -> Result<bytes::Bytes, ProxyError> {
-    if let Some(len) = body_bytes_hint {
-        if len as usize > max {
-            tracing::warn!(
-                event = "forward_body_too_large",
-                request_id = %request_id,
-                path = %path_for_log,
-                limit_bytes = max,
-                content_length = len,
-                "compression: Content-Length exceeds buffer limit; \
-                 returning 413 without consuming body"
-            );
-            return Err(ProxyError::PayloadTooLarge(format!(
-                "request Content-Length {len} exceeds compression \
+    if let Some(len) = body_bytes_hint
+        && len as usize > max
+    {
+        tracing::warn!(
+            event = "forward_body_too_large",
+            request_id = %request_id,
+            path = %path_for_log,
+            limit_bytes = max,
+            content_length = len,
+            "compression: Content-Length exceeds buffer limit; \
+             returning 413 without consuming body"
+        );
+        return Err(ProxyError::PayloadTooLarge(format!(
+            "request Content-Length {len} exceeds compression \
                  buffer limit ({max} bytes)"
-            )));
-        }
+        )));
     }
     // Manual frame loop instead of `to_bytes`: the Content-Length
     // hint above sizes the accumulator up front (no regrows on
@@ -164,8 +164,8 @@ pub(crate) async fn send_buffered_with_retry(
                     // `run_sse_state_machine` instead.
                     let mut r = r;
                     let (prefix, leading_error) = peek_leading_sse_error(&mut r).await;
-                    if let Some(kind) = leading_error {
-                        if maybe_retry_leading_error(
+                    if let Some(kind) = leading_error
+                        && maybe_retry_leading_error(
                             state,
                             request_id,
                             kind,
@@ -173,9 +173,8 @@ pub(crate) async fn send_buffered_with_retry(
                             overload_max_attempts,
                         )
                         .await
-                        {
-                            continue;
-                        }
+                    {
+                        continue;
                     }
                     result = Some((r, prefix));
                     break;
@@ -425,33 +424,32 @@ pub(crate) fn apply_buffered_body_transforms(
     // replay store, compressor, wire bytes) sees.
     if matches!(endpoint, compression::CompressibleEndpoint::OpenAiResponses)
         && ccr_handle_responses
+        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered)
     {
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
-            let stream = parsed
-                .get("stream")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let is_chatgpt = headers_snapshot
-                .as_ref()
-                .is_some_and(crate::openai_buffered_ccr::caller_is_chatgpt_auth);
-            if crate::openai_buffered_ccr::should_buffer_openai_responses_stream_ccr(
-                stream,
-                true,
-                parsed.get("tools"),
-                is_chatgpt,
-                crate::openai_buffered_ccr::is_opencode_zen_base(upstream_base),
-            ) {
-                let mut flipped = parsed.clone();
-                flipped["stream"] = serde_json::Value::Bool(false);
-                if let Ok(rewritten) = serde_json::to_vec(&flipped) {
-                    buffered = bytes::Bytes::from(rewritten);
-                    *buffered_responses_ccr = true;
-                    tracing::info!(
-                        request_id = %request_id,
-                        event = "buffered_responses_ccr_flip",
-                        "streaming /v1/responses with headroom_retrieve flipped to buffered upstream call",
-                    );
-                }
+        let stream = parsed
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let is_chatgpt = headers_snapshot
+            .as_ref()
+            .is_some_and(crate::openai_buffered_ccr::caller_is_chatgpt_auth);
+        if crate::openai_buffered_ccr::should_buffer_openai_responses_stream_ccr(
+            stream,
+            true,
+            parsed.get("tools"),
+            is_chatgpt,
+            crate::openai_buffered_ccr::is_opencode_zen_base(upstream_base),
+        ) {
+            let mut flipped = parsed.clone();
+            flipped["stream"] = serde_json::Value::Bool(false);
+            if let Ok(rewritten) = serde_json::to_vec(&flipped) {
+                buffered = bytes::Bytes::from(rewritten);
+                *buffered_responses_ccr = true;
+                tracing::info!(
+                    request_id = %request_id,
+                    event = "buffered_responses_ccr_flip",
+                    "streaming /v1/responses with headroom_retrieve flipped to buffered upstream call",
+                );
             }
         }
     }

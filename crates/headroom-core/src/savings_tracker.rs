@@ -16,13 +16,13 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const SCHEMA_VERSION: i64 = 4;
 pub const DEFAULT_MAX_HISTORY_POINTS: usize = 5000;
@@ -91,11 +91,7 @@ fn coerce_float(value: f64) -> f64 {
 }
 
 fn coerce_signed_float(value: f64) -> f64 {
-    if value.is_finite() {
-        value
-    } else {
-        0.0
-    }
+    if value.is_finite() { value } else { 0.0 }
 }
 
 fn normalize_provider(value: Option<&str>) -> String {

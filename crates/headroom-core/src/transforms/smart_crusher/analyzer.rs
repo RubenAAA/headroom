@@ -503,10 +503,11 @@ impl SmartAnalyzer {
                 let Some(v) = obj.get(&stats.name) else {
                     continue;
                 };
-                if let Some(num) = v.as_f64() {
-                    if !num.is_nan() && (num - mean_val).abs() > threshold {
-                        anomaly_indices.insert(i);
-                    }
+                if let Some(num) = v.as_f64()
+                    && !num.is_nan()
+                    && (num - mean_val).abs() > threshold
+                {
+                    anomaly_indices.insert(i);
                 }
             }
         }
@@ -657,10 +658,10 @@ impl SmartAnalyzer {
             return CompressionStrategy::None;
         }
 
-        if let Some(c) = crushability {
-            if !c.crushable {
-                return CompressionStrategy::Skip;
-            }
+        if let Some(c) = crushability
+            && !c.crushable
+        {
+            return CompressionStrategy::Skip;
         }
 
         if pattern == "time_series" {
@@ -681,10 +682,10 @@ impl SmartAnalyzer {
                 .iter()
                 .find(|(k, _)| k.to_lowercase().contains("message"))
                 .map(|(_, v)| v);
-            if let Some(mf) = message_field {
-                if mf.unique_ratio < 0.5 {
-                    return CompressionStrategy::ClusterSample;
-                }
+            if let Some(mf) = message_field
+                && mf.unique_ratio < 0.5
+            {
+                return CompressionStrategy::ClusterSample;
             }
         }
 

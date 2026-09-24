@@ -46,9 +46,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::ccr::{max_lifetime_for, CcrStore};
+use crate::ccr::{CcrStore, max_lifetime_for};
 
 /// SQLite-backed CCR store.
 pub struct SqliteCcrStore {

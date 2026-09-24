@@ -11,7 +11,7 @@
 use std::sync::OnceLock;
 
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
@@ -215,35 +215,32 @@ pub fn scan_content_for_markers(content: &Value) -> Vec<String> {
             for block in blocks {
                 if let Some(obj) = block.as_object() {
                     // Text blocks
-                    if obj.get("type").and_then(Value::as_str) == Some("text") {
-                        if let Some(text) = obj.get("text").and_then(Value::as_str) {
-                            all_hashes.extend(scan_text_for_markers(text));
-                        }
+                    if obj.get("type").and_then(Value::as_str) == Some("text")
+                        && let Some(text) = obj.get("text").and_then(Value::as_str)
+                    {
+                        all_hashes.extend(scan_text_for_markers(text));
                     }
                     // Tool result blocks
-                    if obj.get("type").and_then(Value::as_str) == Some("tool_result") {
-                        if let Some(tool_content) = obj.get("content") {
-                            match tool_content {
-                                Value::String(text) => {
-                                    all_hashes.extend(scan_text_for_markers(text));
-                                }
-                                Value::Array(items) => {
-                                    for item in items {
-                                        if let Some(item_obj) = item.as_object() {
-                                            if item_obj.get("type").and_then(Value::as_str)
-                                                == Some("text")
-                                            {
-                                                if let Some(text) =
-                                                    item_obj.get("text").and_then(Value::as_str)
-                                                {
-                                                    all_hashes.extend(scan_text_for_markers(text));
-                                                }
-                                            }
-                                        }
+                    if obj.get("type").and_then(Value::as_str) == Some("tool_result")
+                        && let Some(tool_content) = obj.get("content")
+                    {
+                        match tool_content {
+                            Value::String(text) => {
+                                all_hashes.extend(scan_text_for_markers(text));
+                            }
+                            Value::Array(items) => {
+                                for item in items {
+                                    if let Some(item_obj) = item.as_object()
+                                        && item_obj.get("type").and_then(Value::as_str)
+                                            == Some("text")
+                                        && let Some(text) =
+                                            item_obj.get("text").and_then(Value::as_str)
+                                    {
+                                        all_hashes.extend(scan_text_for_markers(text));
                                     }
                                 }
-                                _ => {}
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -279,21 +276,21 @@ pub fn scan_message_for_markers(message: &Value) -> Vec<String> {
                     all_hashes.extend(scan_text_for_markers(text));
                 }
                 // Function response parts (tool results)
-                if let Some(func_response) = obj.get("functionResponse") {
-                    if let Some(response) = func_response.get("response") {
-                        match response {
-                            Value::String(text) => {
-                                all_hashes.extend(scan_text_for_markers(text));
-                            }
-                            Value::Object(map) => {
-                                for value in map.values() {
-                                    if let Some(text) = value.as_str() {
-                                        all_hashes.extend(scan_text_for_markers(text));
-                                    }
+                if let Some(func_response) = obj.get("functionResponse")
+                    && let Some(response) = func_response.get("response")
+                {
+                    match response {
+                        Value::String(text) => {
+                            all_hashes.extend(scan_text_for_markers(text));
+                        }
+                        Value::Object(map) => {
+                            for value in map.values() {
+                                if let Some(text) = value.as_str() {
+                                    all_hashes.extend(scan_text_for_markers(text));
                                 }
                             }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
             }
@@ -534,7 +531,7 @@ mod tests {
         assert!(def.get("description").is_some());
         assert!(def.get("input_schema").is_some());
         assert!(def.get("function").is_none()); // No function wrapper
-                                                // Both retrieval modes declared; neither required (exactly one).
+        // Both retrieval modes declared; neither required (exactly one).
         let props = &def["input_schema"]["properties"];
         assert!(props.get("hash").is_some());
         assert!(props.get("query").is_some());

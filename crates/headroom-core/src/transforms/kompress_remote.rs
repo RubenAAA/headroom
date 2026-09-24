@@ -33,7 +33,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::compressor_registry::{CompressInput, CompressOutput, Compressor, CompressorDescriptor};
-use super::kompress::{KompressResult, DEFAULT_MIN_WORDS, DEFAULT_MODEL_ID, MIN_WORDS};
+use super::kompress::{DEFAULT_MIN_WORDS, DEFAULT_MODEL_ID, KompressResult, MIN_WORDS};
 use crate::tokenizer::Tokenizer;
 
 /// Token count of a complete payload, in one consistent unit, for the CCR
@@ -336,39 +336,38 @@ impl RemoteKompressCompressor {
         // `0.8` word-ratio gate did neither: sub-20% shrinks shipped lossy
         // with no marker (and were then discarded unrecoverable), while a
         // 12→2 shrink admitted a marker that cost more than the shrink.
-        if self.config.enable_ccr && result.compressed != content {
-            if let Some(store) = &self.store {
-                if let Some(cache_key) = store(content, &result.compressed, result.original_tokens)
-                {
-                    let marked = format!(
-                        "{}{}",
-                        result.compressed,
-                        ccr_marker(
-                            result.original_tokens,
-                            result.compressed_tokens,
-                            content,
-                            &cache_key,
-                        )
-                    );
-                    let original_tokens = payload_tokens(content);
-                    let compressed_tokens = payload_tokens(&marked);
-                    if compressed_tokens >= original_tokens {
-                        return (
-                            self.passthrough(content, n_words),
-                            RemoteOutcome::Compressed(None),
-                        );
-                    }
-                    result.compressed = marked;
-                    result.original_tokens = original_tokens;
-                    result.compressed_tokens = compressed_tokens;
-                    result.compression_ratio = if original_tokens > 0 {
-                        compressed_tokens as f64 / original_tokens as f64
-                    } else {
-                        1.0
-                    };
-                    return (result, RemoteOutcome::Compressed(Some(cache_key)));
-                }
+        if self.config.enable_ccr
+            && result.compressed != content
+            && let Some(store) = &self.store
+            && let Some(cache_key) = store(content, &result.compressed, result.original_tokens)
+        {
+            let marked = format!(
+                "{}{}",
+                result.compressed,
+                ccr_marker(
+                    result.original_tokens,
+                    result.compressed_tokens,
+                    content,
+                    &cache_key,
+                )
+            );
+            let original_tokens = payload_tokens(content);
+            let compressed_tokens = payload_tokens(&marked);
+            if compressed_tokens >= original_tokens {
+                return (
+                    self.passthrough(content, n_words),
+                    RemoteOutcome::Compressed(None),
+                );
             }
+            result.compressed = marked;
+            result.original_tokens = original_tokens;
+            result.compressed_tokens = compressed_tokens;
+            result.compression_ratio = if original_tokens > 0 {
+                compressed_tokens as f64 / original_tokens as f64
+            } else {
+                1.0
+            };
+            return (result, RemoteOutcome::Compressed(Some(cache_key)));
         }
         (result, RemoteOutcome::Compressed(None))
     }
@@ -704,12 +703,14 @@ mod tests {
         let c = client(StubTransport::ok("{}")).with_headers(parse_endpoint_headers(
             "Authorization=Token abc, x-tenant-id=acme",
         ));
-        assert!(c
-            .headers
-            .contains(&("Authorization".to_string(), "Token abc".to_string())));
-        assert!(c
-            .headers
-            .contains(&("x-tenant-id".to_string(), "acme".to_string())));
+        assert!(
+            c.headers
+                .contains(&("Authorization".to_string(), "Token abc".to_string()))
+        );
+        assert!(
+            c.headers
+                .contains(&("x-tenant-id".to_string(), "acme".to_string()))
+        );
         // Replaced, not duplicated — one authorization header on the wire.
         assert_eq!(
             c.headers
@@ -735,12 +736,14 @@ mod tests {
     #[test]
     fn a_token_becomes_a_bearer_header_and_is_optional() {
         let c = client(StubTransport::ok("{}"));
-        assert!(c
-            .headers
-            .contains(&("authorization".to_string(), "Bearer s3cret".to_string())));
-        assert!(c
-            .headers
-            .contains(&("content-type".to_string(), "application/json".to_string())));
+        assert!(
+            c.headers
+                .contains(&("authorization".to_string(), "Bearer s3cret".to_string()))
+        );
+        assert!(
+            c.headers
+                .contains(&("content-type".to_string(), "application/json".to_string()))
+        );
 
         let c = RemoteKompressCompressor::new(
             "https://x",

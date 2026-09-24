@@ -247,13 +247,13 @@ impl Wire {
 /// the far side — so when the tool block is dropped the claim has to go too.
 fn rewrite_stop_reason(v: &serde_json::Value, reason: &str) -> Bytes {
     let mut v = v.clone();
-    if let Some(delta) = v.get_mut("delta") {
-        if let Some(obj) = delta.as_object_mut() {
-            obj.insert(
-                "stop_reason".to_string(),
-                serde_json::Value::String(reason.to_string()),
-            );
-        }
+    if let Some(delta) = v.get_mut("delta")
+        && let Some(obj) = delta.as_object_mut()
+    {
+        obj.insert(
+            "stop_reason".to_string(),
+            serde_json::Value::String(reason.to_string()),
+        );
     }
     frame("message_delta", &v)
 }

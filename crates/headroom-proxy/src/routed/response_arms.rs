@@ -1,10 +1,10 @@
 //! Request shaping and response arms for the routed paths.
 
 use crate::openai::response::{openai_to_anthropic_response, responses_stream_to_turn};
-use crate::openai::stream::{translate_openai_stream_to_anthropic, DeferredCcrBooking};
-use crate::routed::ccr::{resolve_routed_proxy_tools, RoutedCcr};
+use crate::openai::stream::{DeferredCcrBooking, translate_openai_stream_to_anthropic};
+use crate::routed::ccr::{RoutedCcr, resolve_routed_proxy_tools};
 use crate::routed::outcome::{
-    book_routed_outcome, book_routed_outcome_with_ccr, RoutedOutcomeContext,
+    RoutedOutcomeContext, book_routed_outcome, book_routed_outcome_with_ccr,
 };
 use crate::routed::redaction::{redact_table_for, restore_buffered, restore_streaming};
 use axum::body::Body;
@@ -857,13 +857,13 @@ mod tests {
             let dir = std::mem::ManuallyDrop::new(tempfile::tempdir().expect("tempdir"));
             dir.path().join("savings_events.jsonl")
         });
-        std::env::set_var("HEADROOM_SAVINGS_EVENTS_PATH", path);
+        unsafe { std::env::set_var("HEADROOM_SAVINGS_EVENTS_PATH", path) };
         static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         let path = DIR.get_or_init(|| {
             let dir = std::mem::ManuallyDrop::new(tempfile::tempdir().expect("tempdir"));
             dir.path().join("proxy_savings.json")
         });
-        std::env::set_var("HEADROOM_SAVINGS_PATH", path);
+        unsafe { std::env::set_var("HEADROOM_SAVINGS_PATH", path) };
     }
 
     /// Translator wired to real trackers, so a test can assert on what the

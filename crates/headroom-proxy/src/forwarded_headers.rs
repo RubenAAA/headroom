@@ -206,14 +206,13 @@ pub fn resolve_client_ip(
     headers: &axum::http::HeaderMap,
     trusted_cidrs: &[IpCidr],
 ) -> String {
-    if peer_is_trusted_gateway(peer_addr, trusted_cidrs) {
-        if let Some(xff) = headers.get("x-forwarded-for") {
-            if let Ok(val) = xff.to_str() {
-                let ip = header_first(val);
-                if !ip.is_empty() {
-                    return ip;
-                }
-            }
+    if peer_is_trusted_gateway(peer_addr, trusted_cidrs)
+        && let Some(xff) = headers.get("x-forwarded-for")
+        && let Ok(val) = xff.to_str()
+    {
+        let ip = header_first(val);
+        if !ip.is_empty() {
+            return ip;
         }
     }
     peer_addr.unwrap_or("unknown").to_string()

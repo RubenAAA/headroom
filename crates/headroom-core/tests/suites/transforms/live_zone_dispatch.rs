@@ -16,9 +16,9 @@ use headroom_core::tokenizer::get_tokenizer;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use headroom_core::transforms::{
-    compress_anthropic_live_zone, AuthMode, BlockAction, LiveZoneOutcome,
+    AuthMode, BlockAction, LiveZoneOutcome, compress_anthropic_live_zone,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 fn body_of(value: Value) -> Vec<u8> {

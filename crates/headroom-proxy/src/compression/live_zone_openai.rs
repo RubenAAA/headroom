@@ -32,7 +32,7 @@ use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_openai_chat_live_zone_with_config, LiveZoneError, LiveZoneOutcome,
+    LiveZoneError, LiveZoneOutcome, compress_openai_chat_live_zone_with_config,
 };
 use serde_json::Value;
 
@@ -522,10 +522,10 @@ pub fn should_skip_compression(body: &Bytes) -> SkipCompressionReason {
         Err(_) => return SkipCompressionReason::DoNotSkip,
     };
 
-    if let Some(n) = parsed.get("n").and_then(|v| v.as_u64()) {
-        if n > 1 {
-            return SkipCompressionReason::NGreaterThanOne(n);
-        }
+    if let Some(n) = parsed.get("n").and_then(|v| v.as_u64())
+        && n > 1
+    {
+        return SkipCompressionReason::NGreaterThanOne(n);
     }
 
     SkipCompressionReason::DoNotSkip

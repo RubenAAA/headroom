@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::Value;
 
-use super::content_detector::{detect_content_type, ContentType};
+use super::content_detector::{ContentType, detect_content_type};
 use super::content_router::bash_program;
 
 /// Programs whose output is the file itself.

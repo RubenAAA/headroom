@@ -31,12 +31,12 @@ use std::collections::HashSet;
 
 use crate::ccr::CcrStore;
 use crate::signals::{ImportanceContext, KeywordDetector, LineImportanceDetector};
+use crate::transforms::ContentType;
 use crate::transforms::log_compressor::{LogCompressor, LogCompressorConfig};
 use crate::transforms::pipeline::config::LogBloatConfig;
 use crate::transforms::pipeline::traits::{
     CompressionContext, OffloadOutput, OffloadTransform, TransformError,
 };
-use crate::transforms::ContentType;
 
 const NAME: &str = "log_offload";
 /// Confidence is high — LogCompressor has 50+ parity fixtures and

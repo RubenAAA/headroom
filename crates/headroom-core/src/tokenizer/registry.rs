@@ -128,10 +128,10 @@ pub fn get_tokenizer(model: &str) -> Box<dyn Tokenizer> {
         }
     }
     for candidate in &candidates {
-        if detect_backend(candidate) == Backend::Tiktoken {
-            if let Ok(t) = TiktokenCounter::for_model(candidate) {
-                return Box::new(t);
-            }
+        if detect_backend(candidate) == Backend::Tiktoken
+            && let Ok(t) = TiktokenCounter::for_model(candidate)
+        {
+            return Box::new(t);
         }
     }
     // No pattern matched any form — estimate, calibrating on the most

@@ -30,7 +30,7 @@ use bytes::Bytes;
 use headroom_core::transforms::cross_turn_dedup::dedup_messages;
 use serde_json::Value;
 
-use crate::compression::{resolve_frozen_count, Outcome};
+use crate::compression::{Outcome, resolve_frozen_count};
 use crate::config::{CompressionMode, Config};
 
 /// Strategy tag surfaced on [`Outcome::Compressed::strategies_applied`]
@@ -397,14 +397,18 @@ mod tests {
         };
         let parsed: Value = serde_json::from_slice(&new_body).unwrap();
         let msgs = parsed["messages"].as_array().unwrap();
-        assert!(!msgs[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("same as msg "));
-        assert!(msgs[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("same as msg "));
+        assert!(
+            !msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("same as msg ")
+        );
+        assert!(
+            msgs[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("same as msg ")
+        );
     }
 
     #[test]

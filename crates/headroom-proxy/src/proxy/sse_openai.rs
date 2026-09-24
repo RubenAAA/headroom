@@ -234,7 +234,7 @@ pub(super) fn close_openai_chat_stream(
         has_usage = state.usage.is_some(),
         "sse stream closed"
     );
-    if let Some(ref ctx) = outcome_ctx {
+    if let Some(ctx) = outcome_ctx {
         let (input_tok, cached_tok, output_tok) = extract_chat_usage(state);
         emit_openai_stream_outcome(
             ctx,
@@ -424,7 +424,7 @@ pub(super) fn close_openai_responses_stream(
         incomplete_reason = state.incomplete_reason.as_deref().unwrap_or(""),
         "sse stream closed"
     );
-    if let Some(ref ctx) = outcome_ctx {
+    if let Some(ctx) = outcome_ctx {
         let (input_tok, cached_tok, output_tok) = extract_responses_usage(state);
         emit_openai_stream_outcome(
             ctx,

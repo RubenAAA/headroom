@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use common::start_proxy;
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
 /// Spawns an upstream WS echo server. Handshake uses tungstenite over a raw TCP listener.
 async fn echo_upstream() -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {

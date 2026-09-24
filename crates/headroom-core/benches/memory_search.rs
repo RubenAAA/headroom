@@ -18,7 +18,7 @@
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use headroom_core::ctx::{CtxStore, SearchOpts};
 
 fn live_index_path() -> Option<PathBuf> {

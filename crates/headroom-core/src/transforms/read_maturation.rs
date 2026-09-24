@@ -7,7 +7,7 @@
 //! the provider cache while its file is active. Once the file has been quiet
 //! for `quiesce_turns`, the content is replaced with a CCR-backed marker.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -244,17 +244,16 @@ impl ReadMaturationManager {
                 .get("tool_call_id")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if let Some(content_str) = content.and_then(Value::as_str) {
-                if activity.read_calls.contains_key(tc_id) {
-                    let (new_content, holding) =
-                        self.handle_read(tc_id, content_str, activity, result);
-                    if let Some(nc) = new_content {
-                        let mut new_msg = msg.clone();
-                        new_msg["content"] = Value::String(nc);
-                        return (new_msg, holding);
-                    }
-                    return (msg.clone(), holding);
+            if let Some(content_str) = content.and_then(Value::as_str)
+                && activity.read_calls.contains_key(tc_id)
+            {
+                let (new_content, holding) = self.handle_read(tc_id, content_str, activity, result);
+                if let Some(nc) = new_content {
+                    let mut new_msg = msg.clone();
+                    new_msg["content"] = Value::String(nc);
+                    return (new_msg, holding);
                 }
+                return (msg.clone(), holding);
             }
             return (msg.clone(), false);
         }
@@ -268,18 +267,18 @@ impl ReadMaturationManager {
             for b in content_arr {
                 if b.get("type").and_then(Value::as_str) == Some("tool_result") {
                     let tc_id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-                    if let Some(content_str) = b.get("content").and_then(Value::as_str) {
-                        if activity.read_calls.contains_key(tc_id) {
-                            let (new_content, holding) =
-                                self.handle_read(tc_id, content_str, activity, result);
-                            holding_any = holding_any || holding;
-                            if let Some(nc) = new_content {
-                                let mut new_block = b.clone();
-                                new_block["content"] = Value::String(nc);
-                                new_blocks.push(new_block);
-                                changed = true;
-                                continue;
-                            }
+                    if let Some(content_str) = b.get("content").and_then(Value::as_str)
+                        && activity.read_calls.contains_key(tc_id)
+                    {
+                        let (new_content, holding) =
+                            self.handle_read(tc_id, content_str, activity, result);
+                        holding_any = holding_any || holding;
+                        if let Some(nc) = new_content {
+                            let mut new_block = b.clone();
+                            new_block["content"] = Value::String(nc);
+                            new_blocks.push(new_block);
+                            changed = true;
+                            continue;
                         }
                     }
                 }
@@ -354,14 +353,14 @@ impl ReadMaturationManager {
             .map(|b| format!("{:02x}", b))
             .collect();
 
-        if let Some(ref store) = self.store {
-            if !store.put(&ccr_hash, content) {
-                tracing::warn!(
-                    event = "ccr_store_failed",
-                    tool_call_id = %tc_id,
-                    "read_maturation: CCR store failed"
-                );
-            }
+        if let Some(ref store) = self.store
+            && !store.put(&ccr_hash, content)
+        {
+            tracing::warn!(
+                event = "ccr_store_failed",
+                tool_call_id = %tc_id,
+                "read_maturation: CCR store failed"
+            );
         }
 
         let file_display = if file_path.is_empty() {
@@ -424,10 +423,10 @@ pub fn relocate_cache_breakpoint(messages: &[Value], holding_msg_indices: &[usiz
 
         if has_bp {
             for b in content {
-                if let Some(cc) = b.get("cache_control") {
-                    if cc.is_object() {
-                        held_marker = Some(cc.clone());
-                    }
+                if let Some(cc) = b.get("cache_control")
+                    && cc.is_object()
+                {
+                    held_marker = Some(cc.clone());
                 }
             }
             let new_content: Vec<Value> = content
@@ -457,21 +456,20 @@ pub fn relocate_cache_breakpoint(messages: &[Value], holding_msg_indices: &[usiz
     //    the latest block-style message before the held region. Fall back
     //    to a bare ephemeral only when the client sent no marker of its own.
     for i in (0..earliest).rev() {
-        if let Some(content) = out[i].get("content").and_then(Value::as_array) {
-            if let Some(last) = content.last() {
-                if last.is_object() {
-                    let mut new_content = content.clone();
-                    let last_idx = new_content.len() - 1;
-                    if let Some(obj) = new_content[last_idx].as_object_mut() {
-                        let marker = held_marker
-                            .clone()
-                            .unwrap_or_else(|| json!({"type": "ephemeral"}));
-                        obj.insert("cache_control".to_string(), marker);
-                    }
-                    out[i]["content"] = Value::Array(new_content);
-                    break;
-                }
+        if let Some(content) = out[i].get("content").and_then(Value::as_array)
+            && let Some(last) = content.last()
+            && last.is_object()
+        {
+            let mut new_content = content.clone();
+            let last_idx = new_content.len() - 1;
+            if let Some(obj) = new_content[last_idx].as_object_mut() {
+                let marker = held_marker
+                    .clone()
+                    .unwrap_or_else(|| json!({"type": "ephemeral"}));
+                obj.insert("cache_control".to_string(), marker);
             }
+            out[i]["content"] = Value::Array(new_content);
+            break;
         }
     }
 
@@ -780,10 +778,12 @@ mod tests {
         assert_eq!(res.holding_msg_indices, vec![2]);
         let later: Vec<Value> = msgs.into_iter().chain(quiet(5)).collect();
         let res2 = m.apply(&later, 0);
-        assert!(res2.messages[2]["content"]
-            .as_str()
-            .unwrap()
-            .contains("compressed after use"));
+        assert!(
+            res2.messages[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("compressed after use")
+        );
     }
 
     #[test]

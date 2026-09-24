@@ -296,27 +296,27 @@ impl DiffCompressor {
             // `new file mode 100644` / `deleted file mode 100644` is lost on
             // emit. Includes `100755` (executable), `100600` (private),
             // `120000` (symlink), `160000` (gitlink/submodule), etc.
-            if let Some(orig) = &file.original_new_file_mode_line {
-                if orig != "new file mode 100644" {
-                    stats
-                        .file_mode_normalizations
-                        .push((label.clone(), orig.clone()));
-                }
+            if let Some(orig) = &file.original_new_file_mode_line
+                && orig != "new file mode 100644"
+            {
+                stats
+                    .file_mode_normalizations
+                    .push((label.clone(), orig.clone()));
             }
-            if let Some(orig) = &file.original_deleted_file_mode_line {
-                if orig != "deleted file mode 100644" {
-                    stats
-                        .file_mode_normalizations
-                        .push((label.clone(), orig.clone()));
-                }
+            if let Some(orig) = &file.original_deleted_file_mode_line
+                && orig != "deleted file mode 100644"
+            {
+                stats
+                    .file_mode_normalizations
+                    .push((label.clone(), orig.clone()));
             }
             // Binary detail: any line richer than the bare `Binary files
             // differ` (which is virtually all of them — git emits filenames)
             // gets simplified on emit.
-            if let Some(orig) = &file.original_binary_line {
-                if orig != "Binary files differ" {
-                    stats.binary_files_simplified.push(orig.clone());
-                }
+            if let Some(orig) = &file.original_binary_line
+                && orig != "Binary files differ"
+            {
+                stats.binary_files_simplified.push(orig.clone());
             }
         }
     }
@@ -410,15 +410,15 @@ impl DiffCompressor {
             // the LLM's retrieval tool call. When `None`, the caller
             // (typically the Python shim) is responsible — see the
             // method-level docs.
-            if let Some(s) = store {
-                if !s.put(&key, content) {
-                    tracing::warn!(
-                        target: "ccr.diff_compressor",
-                        event = "ccr_put_failed",
-                        hash = %key,
-                        "ccr_put_failed; marker will point at an unretrievable hash"
-                    );
-                }
+            if let Some(s) = store
+                && !s.put(&key, content)
+            {
+                tracing::warn!(
+                    target: "ccr.diff_compressor",
+                    event = "ccr_put_failed",
+                    hash = %key,
+                    "ccr_put_failed; marker will point at an unretrievable hash"
+                );
             }
             stats.cache_key_emitted = true;
             Some(key)
@@ -772,10 +772,10 @@ struct DiffParser {
 
 impl DiffParser {
     fn flush_hunk(&mut self) {
-        if let Some(h) = self.current_hunk.take() {
-            if let Some(f) = self.current_file.as_mut() {
-                f.hunks.push(h);
-            }
+        if let Some(h) = self.current_hunk.take()
+            && let Some(f) = self.current_file.as_mut()
+        {
+            f.hunks.push(h);
         }
     }
 
@@ -1116,12 +1116,11 @@ fn extract_line_number(header: &str) -> usize {
     // The previous implementation captured group(1) of the hunk-header
     // regex, which was the line number for `@@` only; under the new combined
     // diff regex, group(1) is the `@`-prefix.
-    if let Some(caps) = hunk_new_range_regex().captures(header) {
-        if let Some(m) = caps.get(1) {
-            if let Ok(n) = m.as_str().parse::<usize>() {
-                return n;
-            }
-        }
+    if let Some(caps) = hunk_new_range_regex().captures(header)
+        && let Some(m) = caps.get(1)
+        && let Ok(n) = m.as_str().parse::<usize>()
+    {
+        return n;
     }
     0
 }

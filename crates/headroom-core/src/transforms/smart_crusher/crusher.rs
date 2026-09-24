@@ -41,10 +41,10 @@ use serde_json::Value;
 
 use super::analyzer::SmartAnalyzer;
 use super::builder::SmartCrusherBuilder;
-use super::classifier::{classify_array, ArrayType};
+use super::classifier::{ArrayType, classify_array};
 use super::compaction::{
-    classify_cell, emit_opaque_ccr_marker, try_parse_json_container, CellClass, ClassifyConfig,
-    CompactConfig, Compaction, CompactionStage,
+    CellClass, ClassifyConfig, CompactConfig, Compaction, CompactionStage, classify_cell,
+    emit_opaque_ccr_marker, try_parse_json_container,
 };
 use super::config::SmartCrusherConfig;
 use super::crushers::{compute_k_split, crush_number_array, crush_object, crush_string_array};
@@ -966,12 +966,11 @@ impl SmartCrusher {
                 | super::compaction::OpaqueKind::Other(_) => {}
             }
         }
-        if !parsed_container_unchanged {
-            if let Some(hook) = prose_hook {
-                if let Some((compressed, key)) = hook(s, query_context) {
-                    return (Value::String(compressed), format!("string_prose:{key}"));
-                }
-            }
+        if !parsed_container_unchanged
+            && let Some(hook) = prose_hook
+            && let Some((compressed, key)) = hook(s, query_context)
+        {
+            return (Value::String(compressed), format!("string_prose:{key}"));
         }
 
         if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.to_string()), &cfg) {
@@ -1179,15 +1178,15 @@ impl SmartCrusher {
             let canonical = canonical_array_json(ccr_source);
             let h = hash_canonical(&canonical);
             let marker = format!("<<ccr:{h} {dropped_count}_rows_offloaded>>");
-            if let Some(store) = &self.ccr_store {
-                if !store.put(&h, &canonical) {
-                    tracing::warn!(
-                        event = "ccr_put_failed",
-                        target = "ccr.crusher",
-                        hash = %h,
-                        "ccr_put_failed; marker will point at an unretrievable hash"
-                    );
-                }
+            if let Some(store) = &self.ccr_store
+                && !store.put(&h, &canonical)
+            {
+                tracing::warn!(
+                    event = "ccr_put_failed",
+                    target = "ccr.crusher",
+                    hash = %h,
+                    "ccr_put_failed; marker will point at an unretrievable hash"
+                );
             }
             (Some(h), marker)
         } else {
@@ -1274,10 +1273,10 @@ impl SmartCrusher {
                     let crushed_set: std::collections::HashSet<&str> =
                         crushed.iter().map(|s| s.as_str()).collect();
                     for (i, idx) in indices.iter().enumerate() {
-                        if let Some(s) = values[i].as_str() {
-                            if crushed_set.contains(s) {
-                                keep_indices.insert(*idx);
-                            }
+                        if let Some(s) = values[i].as_str()
+                            && crushed_set.contains(s)
+                        {
+                            keep_indices.insert(*idx);
                         }
                     }
                     strategy_parts.push(format!("str:{}->{}", values.len(), crushed.len()));
@@ -1303,19 +1302,17 @@ impl SmartCrusher {
                         .iter()
                         .filter_map(|v| v.as_f64().filter(|f| f.is_finite()))
                         .collect();
-                    if finite.len() > 1 {
-                        if let Some(mean_v) = super::stats_math::mean(&finite) {
-                            if let Some(std_v) = super::stats_math::sample_stdev(&finite) {
-                                if std_v > 0.0 {
-                                    let threshold = self.config.variance_threshold * std_v;
-                                    for (i, val) in values.iter().enumerate() {
-                                        if let Some(num) = val.as_f64().filter(|f| f.is_finite()) {
-                                            if (num - mean_v).abs() > threshold {
-                                                keep_indices.insert(indices[i]);
-                                            }
-                                        }
-                                    }
-                                }
+                    if finite.len() > 1
+                        && let Some(mean_v) = super::stats_math::mean(&finite)
+                        && let Some(std_v) = super::stats_math::sample_stdev(&finite)
+                        && std_v > 0.0
+                    {
+                        let threshold = self.config.variance_threshold * std_v;
+                        for (i, val) in values.iter().enumerate() {
+                            if let Some(num) = val.as_f64().filter(|f| f.is_finite())
+                                && (num - mean_v).abs() > threshold
+                            {
+                                keep_indices.insert(indices[i]);
                             }
                         }
                     }

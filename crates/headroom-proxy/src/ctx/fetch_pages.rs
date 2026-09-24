@@ -12,12 +12,12 @@
 //! joined to `pages`. Nothing here truncates: full documents are stored
 //! whole, no size cap, no prefix, no summary.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::fetch_blocks::{
-    classify_blocks, content_text, split_blocks, template_text, BlockKind, ClassifiedBlock,
+    BlockKind, ClassifiedBlock, classify_blocks, content_text, split_blocks, template_text,
 };
 
 /// How the document reached us. `Markdown` = the site served its own

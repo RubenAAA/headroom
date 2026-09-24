@@ -303,13 +303,12 @@ pub(super) fn drop_reasoning_blocks_where(
         }
         // Still carrying means the dropped block was last, so the marker goes
         // to whatever ends the message now.
-        if let Some(cc) = carried {
-            if let Some(last) = kept.last_mut() {
-                if last.get("cache_control").is_none() {
-                    last["cache_control"] = cc;
-                    markers_moved += 1;
-                }
-            }
+        if let Some(cc) = carried
+            && let Some(last) = kept.last_mut()
+            && last.get("cache_control").is_none()
+        {
+            last["cache_control"] = cc;
+            markers_moved += 1;
         }
         *content = kept;
     }

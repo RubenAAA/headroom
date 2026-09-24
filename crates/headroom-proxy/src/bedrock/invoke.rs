@@ -50,9 +50,9 @@ use http::HeaderName;
 use url::Url;
 
 use crate::bedrock::envelope::BedrockEnvelope;
-use crate::bedrock::sigv4::{sign_request, SigningInputs};
+use crate::bedrock::sigv4::{SigningInputs, sign_request};
 use crate::compression::{
-    compress_anthropic_request, Outcome as AnthropicOutcome, PassthroughReason,
+    Outcome as AnthropicOutcome, PassthroughReason, compress_anthropic_request,
 };
 use crate::headers::filter_response_headers;
 use crate::observability::{observe_bedrock_invoke_latency, record_bedrock_invoke};

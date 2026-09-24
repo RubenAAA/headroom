@@ -340,10 +340,10 @@ pub fn detect_provider(headers: &Value, model_name: &str) -> Provider {
     if headers.get("x-api-key").is_some() || headers.get("anthropic-version").is_some() {
         return Provider::Anthropic;
     }
-    if let Some(auth) = headers.get("authorization").and_then(Value::as_str) {
-        if auth.starts_with("Bearer sk-") {
-            return Provider::Openai;
-        }
+    if let Some(auth) = headers.get("authorization").and_then(Value::as_str)
+        && auth.starts_with("Bearer sk-")
+    {
+        return Provider::Openai;
     }
 
     // Check model name patterns

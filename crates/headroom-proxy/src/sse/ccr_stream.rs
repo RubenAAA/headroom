@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::sse::anthropic::{AnthropicStreamState, BlockState, StreamStatus};
 use crate::sse::{SseEvent, SseFramer};
@@ -705,18 +705,18 @@ pub(crate) fn synthesize_blocks(content: &[Value], start_index: usize) -> Vec<By
         }
         // A thinking block's signature rides its own delta and must survive
         // byte-equal: Anthropic verifies it on the next call.
-        if block_type == "thinking" {
-            if let Some(sig) = block.get("signature").and_then(Value::as_str) {
-                out.push(event_bytes(
-                    "content_block_delta",
-                    &serde_json::to_vec(&json!({
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {"type": "signature_delta", "signature": sig},
-                    }))
-                    .unwrap_or_default(),
-                ));
-            }
+        if block_type == "thinking"
+            && let Some(sig) = block.get("signature").and_then(Value::as_str)
+        {
+            out.push(event_bytes(
+                "content_block_delta",
+                &serde_json::to_vec(&json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "signature_delta", "signature": sig},
+                }))
+                .unwrap_or_default(),
+            ));
         }
         out.push(event_bytes(
             "content_block_stop",
@@ -1282,17 +1282,17 @@ async fn resolve_retrieval(
     // translated-back stream); continuations go back upstream, where the
     // Zen outbound rename still applies. Same tool list both directions,
     // so this is a no-op unless that pass renamed something.
-    if !matches!(ctx.shape, CcrShape::Anthropic) {
-        if let Some(anthropic_request) = match &ctx.shape {
+    if !matches!(ctx.shape, CcrShape::Anthropic)
+        && let Some(anthropic_request) = match &ctx.shape {
             CcrShape::RoutedChat { anthropic_request } => Some(anthropic_request),
             CcrShape::RoutedResponses { anthropic_request } => Some(anthropic_request),
             CcrShape::Anthropic => None,
-        } {
-            crate::routed::tool_alias::ToolAlias::derive(
-                anthropic_request.get("tools").and_then(|t| t.as_array()),
-            )
-            .forward_body(&mut turn_for_handler);
         }
+    {
+        crate::routed::tool_alias::ToolAlias::derive(
+            anthropic_request.get("tools").and_then(|t| t.as_array()),
+        )
+        .forward_body(&mut turn_for_handler);
     }
     // The rebuilt turn echoes first-response usage, which is already booked
     // through the first-round path on every streaming arm. Leaving the block
@@ -1942,7 +1942,7 @@ mod tests {
 #[cfg(test)]
 mod deferred_drop_reason_tests {
     use super::*;
-    use crate::memory::deferred::{store, PendingMemoryResult};
+    use crate::memory::deferred::{PendingMemoryResult, store};
 
     /// The deferred store is a process-wide static, so these run one at a time.
     fn lock() -> std::sync::MutexGuard<'static, ()> {

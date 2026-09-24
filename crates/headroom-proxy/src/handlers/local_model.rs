@@ -6,16 +6,16 @@
 //! (`routing`, `prepare`, `translation`, `retry`, `response_arms`,
 //! `sidecar`, `auth`, `ccr`, `redaction`).
 
-use crate::proxy::{forward_http, AppState};
+use crate::proxy::{AppState, forward_http};
 use crate::routed::ccr::RoutedCcr;
-use crate::routed::outcome::{build_routed_outcome_context, RerouteOrigin};
+use crate::routed::outcome::{RerouteOrigin, build_routed_outcome_context};
 use crate::routed::prepare::prepare_turn;
-use crate::routed::quirks::{classify_upstream, UpstreamKind};
+use crate::routed::quirks::{UpstreamKind, classify_upstream};
 use crate::routed::response_arms::{
     fold_buffered, handle_passthrough, handle_routed_error_response, handle_streaming_response,
 };
 use crate::routed::retry::send_with_retry;
-use crate::routed::routing::{apply_model_routing, dispatch_route_fallback, RouteTarget};
+use crate::routed::routing::{RouteTarget, apply_model_routing, dispatch_route_fallback};
 use crate::routed::sidecar::handle_sidecar;
 use crate::routed::translation::translate_routed_request;
 use axum::body::Body;
@@ -23,7 +23,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 
 /// Handle GET `/v1/models` for Claude Code's gateway model-discovery feature
@@ -43,13 +43,13 @@ pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
 
     let mut data: Vec<Value> = Vec::new();
 
-    if let Some(local_model) = &state.config.local_model {
-        if discoverable(local_model) {
-            data.push(json!({
-                "id": local_model,
-                "display_name": format!("{local_model} (headroom local model)"),
-            }));
-        }
+    if let Some(local_model) = &state.config.local_model
+        && discoverable(local_model)
+    {
+        data.push(json!({
+            "id": local_model,
+            "display_name": format!("{local_model} (headroom local model)"),
+        }));
     }
 
     for route in &state.config.model_routes {
@@ -638,10 +638,8 @@ fn note_routing_attribution(
     // pull secrets mid-turn (memory answers, cold-tier blocks), and the
     // continuations must redact those too. Empty map snapshots are a
     // passthrough, so clean turns keep the zero-overhead path.
-    if redact_sensitive {
-        if let Some(ctx) = outcome_ctx.as_mut() {
-            ctx.redact_store = Some(redact_store.clone());
-        }
+    if redact_sensitive && let Some(ctx) = outcome_ctx.as_mut() {
+        ctx.redact_store = Some(redact_store.clone());
     }
 }
 

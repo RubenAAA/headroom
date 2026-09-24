@@ -262,10 +262,10 @@ fn optimize_content_block(item: &Value, provider: &str) -> Option<(Value, TileOp
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resized_bytes);
 
         let mut new_item = item.clone();
-        if let Some(iu) = new_item.get_mut("image_url") {
-            if let Some(url_val) = iu.get_mut("url") {
-                *url_val = Value::String(format!("data:image/jpeg;base64,{b64}"));
-            }
+        if let Some(iu) = new_item.get_mut("image_url")
+            && let Some(url_val) = iu.get_mut("url")
+        {
+            *url_val = Value::String(format!("data:image/jpeg;base64,{b64}"));
         }
 
         let result = TileOptResult {
@@ -364,8 +364,8 @@ static RESIZE_CACHE: std::sync::OnceLock<
 /// images in practice and a conversation carries a handful.
 const RESIZE_CACHE_CAPACITY: usize = 512;
 
-fn resize_cache(
-) -> &'static std::sync::Mutex<lru::LruCache<ImageCacheKey, Option<(Value, TileOptResult)>>> {
+fn resize_cache()
+-> &'static std::sync::Mutex<lru::LruCache<ImageCacheKey, Option<(Value, TileOptResult)>>> {
     RESIZE_CACHE.get_or_init(|| {
         std::sync::Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(RESIZE_CACHE_CAPACITY).expect("capacity is non-zero"),
@@ -396,10 +396,10 @@ fn optimize_content_block_cached(item: &Value, provider: &str) -> Option<(Value,
     let Some(key) = cache_key(item, provider) else {
         return optimize_content_block(item, provider);
     };
-    if let Ok(mut cache) = resize_cache().lock() {
-        if let Some(hit) = cache.get(&key) {
-            return hit.clone();
-        }
+    if let Ok(mut cache) = resize_cache().lock()
+        && let Some(hit) = cache.get(&key)
+    {
+        return hit.clone();
     }
     // Resize outside the lock: it is the slow part and nothing else needs
     // serialising. A duplicate resize under contention is wasted work, not a

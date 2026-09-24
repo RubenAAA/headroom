@@ -311,12 +311,12 @@ fn calculate_structural_uniqueness(item: &Value, all_items: &[Value]) -> f64 {
     let n_f = n as f64;
     let common: HashSet<&String> = field_counts
         .iter()
-        .filter(|(_, &c)| c as f64 >= n_f * 0.8)
+        .filter(|&(_, &c)| c as f64 >= n_f * 0.8)
         .map(|(k, _)| *k)
         .collect();
     let rare: HashSet<&String> = field_counts
         .iter()
-        .filter(|(_, &c)| (c as f64) < n_f * 0.2)
+        .filter(|&(_, &c)| (c as f64) < n_f * 0.2)
         .map(|(k, _)| *k)
         .collect();
 
@@ -1108,9 +1108,11 @@ mod tests {
 
     #[test]
     fn select_anchors_empty_returns_empty() {
-        assert!(selector()
-            .select_anchors(&[], 10, DataPattern::Generic, None)
-            .is_empty());
+        assert!(
+            selector()
+                .select_anchors(&[], 10, DataPattern::Generic, None)
+                .is_empty()
+        );
     }
 
     #[test]

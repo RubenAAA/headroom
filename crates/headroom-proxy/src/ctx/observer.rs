@@ -9,9 +9,9 @@
 //! Wiring is gated by the `ctx_capture` config flag (default off). When off,
 //! `AppState` holds `None` and nothing is constructed.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
 use std::thread;
 
 use headroom_core::ctx::{NewEvent, PrefixTurn, SessionsStore};
@@ -358,8 +358,8 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
     use tempfile::TempDir;
-    use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
 
     /// Counts every event emitted on the current thread, so a test can assert
     /// on log volume the same way a log file measures it.

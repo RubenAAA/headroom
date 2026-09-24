@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Content types recognized by the detector. String tags match Python's
 /// `ContentType` enum values 1:1.
@@ -369,43 +369,43 @@ pub fn detect_content_type(content: &str) -> DetectionResult {
     if let Some(r) = try_detect_json(content) {
         return r;
     }
-    if let Some(r) = try_detect_diff(content) {
-        if r.confidence >= 0.7 {
-            return r;
-        }
+    if let Some(r) = try_detect_diff(content)
+        && r.confidence >= 0.7
+    {
+        return r;
     }
-    if let Some(r) = try_detect_html(content) {
-        if r.confidence >= 0.7 {
-            return r;
-        }
+    if let Some(r) = try_detect_html(content)
+        && r.confidence >= 0.7
+    {
+        return r;
     }
-    if let Some(r) = try_detect_search(content) {
-        if r.confidence >= 0.6 {
-            return r;
-        }
+    if let Some(r) = try_detect_search(content)
+        && r.confidence >= 0.6
+    {
+        return r;
     }
-    if let Some(r) = try_detect_log(content) {
-        if r.confidence >= 0.5 {
-            return r;
-        }
+    if let Some(r) = try_detect_log(content)
+        && r.confidence >= 0.5
+    {
+        return r;
     }
     // Tabular detection runs after search/log so those claim content first.
-    if let Some(r) = try_detect_tabular(content) {
-        if r.confidence >= 0.6 {
-            return r;
-        }
+    if let Some(r) = try_detect_tabular(content)
+        && r.confidence >= 0.6
+    {
+        return r;
     }
     // Config detection runs after tabular and before code: a `key: value`
     // config would otherwise read as source code.
-    if let Some(r) = try_detect_structured_config(content) {
-        if r.confidence >= 0.6 {
-            return r;
-        }
+    if let Some(r) = try_detect_structured_config(content)
+        && r.confidence >= 0.6
+    {
+        return r;
     }
-    if let Some(r) = try_detect_code(content) {
-        if r.confidence >= 0.5 {
-            return r;
-        }
+    if let Some(r) = try_detect_code(content)
+        && r.confidence >= 0.5
+    {
+        return r;
     }
     DetectionResult::plain_text(0.5)
 }
@@ -535,19 +535,20 @@ pub fn try_detect_structured_config(content: &str) -> Option<DetectionResult> {
             .iter()
             .filter(|l| TOML_ASSIGN_RE.is_match(l) || INI_ASSIGN_RE.is_match(l))
             .count();
-        if assigns >= 2 && (sections + assigns) as f64 / body_len >= 0.6 {
-            if let Some(flavor) = parse_config_flavor(content) {
-                let share = (sections + assigns) as f64 / body_len;
-                let mut metadata = serde_json::Map::new();
-                metadata.insert("flavor".into(), serde_json::json!(flavor));
-                metadata.insert("sections".into(), serde_json::json!(sections));
-                metadata.insert("assignments".into(), serde_json::json!(assigns));
-                return Some(DetectionResult {
-                    content_type: ContentType::StructuredConfig,
-                    confidence: (0.7 + share * 0.25).min(0.95),
-                    metadata,
-                });
-            }
+        if assigns >= 2
+            && (sections + assigns) as f64 / body_len >= 0.6
+            && let Some(flavor) = parse_config_flavor(content)
+        {
+            let share = (sections + assigns) as f64 / body_len;
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("flavor".into(), serde_json::json!(flavor));
+            metadata.insert("sections".into(), serde_json::json!(sections));
+            metadata.insert("assignments".into(), serde_json::json!(assigns));
+            return Some(DetectionResult {
+                content_type: ContentType::StructuredConfig,
+                confidence: (0.7 + share * 0.25).min(0.95),
+                metadata,
+            });
         }
     }
 
@@ -665,11 +666,7 @@ fn decode_concatenated_json(content: &str) -> Option<Vec<Value>> {
             Err(_) => return None,
         }
     }
-    if items.is_empty() {
-        None
-    } else {
-        Some(items)
-    }
+    if items.is_empty() { None } else { Some(items) }
 }
 
 /// Convert whitespace-separated JSON objects into a canonical JSON array.
@@ -1108,7 +1105,7 @@ fn try_detect_delimited(lines: &[&str]) -> Option<DetectionResult> {
         for &c in &counts {
             *freq_map.entry(c).or_insert(0) += 1;
         }
-        let (common_count, freq) = freq_map.iter().max_by_key(|(_, &f)| f)?;
+        let (common_count, freq) = freq_map.iter().max_by_key(|&(_, &f)| f)?;
 
         if *common_count == 0 {
             continue;
@@ -1368,10 +1365,12 @@ mod tests {
     #[test]
     fn one_coincidental_line_is_not_enough() {
         assert!(try_detect_search("src/foo.py:12:def foo():").is_none());
-        assert!(try_detect_search(
-            "Meeting at 09:30:00 tomorrow.\nBring the reports.\nDo not forget coffee."
-        )
-        .is_none());
+        assert!(
+            try_detect_search(
+                "Meeting at 09:30:00 tomorrow.\nBring the reports.\nDo not forget coffee."
+            )
+            .is_none()
+        );
 
         let two = "src/foo.py:12:def foo():\nsrc/bar.py:34:    foo()";
         let r = try_detect_search(two).expect("two genuine grep lines still classify");
@@ -1381,10 +1380,12 @@ mod tests {
     /// Markup and `key=value` lines are not file paths, even carrying `:\d+:`.
     #[test]
     fn tag_like_and_key_value_prefixes_are_rejected() {
-        assert!(try_detect_search(
-            "<log time=\"10:00:00\">started</log>\n<log time=\"10:00:01\">stopped</log>"
-        )
-        .is_none());
+        assert!(
+            try_detect_search(
+                "<log time=\"10:00:00\">started</log>\n<log time=\"10:00:01\">stopped</log>"
+            )
+            .is_none()
+        );
         assert!(try_detect_search("timeout=30:12:retried\ntimeout=31:12:retried").is_none());
     }
 
@@ -1773,8 +1774,7 @@ pairs with BYTE-IDENTICAL full names: 704
     const TOML: &str = "[package]\nname = \"headroom\"\nversion = \"1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1\"\nregex = \"1\"\n";
     const INI: &str =
         "[server]\nhost = localhost\nport = 8080\ntimeout = 30\n\n[client]\nretries = 3\n";
-    const YAML: &str =
-        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  labels:\n    app: web\nspec:\n  replicas: 3\n";
+    const YAML: &str = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  labels:\n    app: web\nspec:\n  replicas: 3\n";
     const YAML_LIST: &str =
         "servers:\n  - name: a\n  - name: b\n  - name: c\nport: 80\ndebug: true\n";
 

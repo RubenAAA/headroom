@@ -10,12 +10,12 @@ use axum::body::Body;
 use axum::extract::ws::{CloseFrame, Message as AxMsg, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message as TgMsg;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame as TgCloseFrame;
-use tokio_tungstenite::tungstenite::Message as TgMsg;
 
 use crate::headers::build_forward_request_headers;
-use crate::proxy::{join_upstream_path, AppState};
+use crate::proxy::{AppState, join_upstream_path};
 
 /// Entry point invoked from the catch-all when an upgrade is detected.
 pub async fn ws_handler(
@@ -158,10 +158,10 @@ async fn run_ws_pump(
             }
             h.append(name, value.clone());
         }
-        if let Some(sp) = subprotocols {
-            if let Ok(v) = HeaderValue::from_str(&sp) {
-                h.insert(HeaderName::from_static("sec-websocket-protocol"), v);
-            }
+        if let Some(sp) = subprotocols
+            && let Ok(v) = HeaderValue::from_str(&sp)
+        {
+            h.insert(HeaderName::from_static("sec-websocket-protocol"), v);
         }
     }
 

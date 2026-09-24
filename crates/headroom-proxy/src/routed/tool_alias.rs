@@ -350,11 +350,13 @@ mod tests {
     fn derive_stays_off_without_tools_or_on_collision() {
         assert!(!ToolAlias::derive(None).active());
         assert!(!ToolAlias::derive(Some(&vec![])).active());
-        assert!(!ToolAlias::derive(Some(&vec![
-            json!({"name": "Read"}),
-            json!({"name": "read"}),
-        ]))
-        .active());
+        assert!(
+            !ToolAlias::derive(Some(&vec![
+                json!({"name": "Read"}),
+                json!({"name": "read"}),
+            ]))
+            .active()
+        );
         // Nameless entries are skipped, not fatal.
         assert!(!ToolAlias::derive(Some(&vec![json!({"description": "x"})])).active());
     }

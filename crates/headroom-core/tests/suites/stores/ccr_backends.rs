@@ -6,9 +6,9 @@
 use std::time::Duration;
 
 use headroom_core::ccr::backends::{
-    from_config, CcrBackendConfig, InMemoryCcrStore, SqliteCcrStore,
+    CcrBackendConfig, InMemoryCcrStore, SqliteCcrStore, from_config,
 };
-use headroom_core::ccr::{compute_key, CcrStore};
+use headroom_core::ccr::{CcrStore, compute_key};
 
 #[test]
 fn sqlite_round_trip() {

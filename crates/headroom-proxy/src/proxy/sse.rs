@@ -427,10 +427,10 @@ where
 /// Latch time-to-first-byte on the first upstream chunk. Every SSE arm calls
 /// this from its receive loop; the value is written once and never overwritten.
 pub(super) fn latch_ttfb(ttfb_ms: &mut f64, outcome_ctx: &Option<OutcomeContext>) {
-    if *ttfb_ms == 0.0 {
-        if let Some(ctx) = outcome_ctx.as_ref() {
-            *ttfb_ms = ctx.started_at.elapsed().as_secs_f64() * 1000.0;
-        }
+    if *ttfb_ms == 0.0
+        && let Some(ctx) = outcome_ctx.as_ref()
+    {
+        *ttfb_ms = ctx.started_at.elapsed().as_secs_f64() * 1000.0;
     }
 }
 

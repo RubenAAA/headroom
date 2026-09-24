@@ -6,7 +6,7 @@
 //! post-translation body.
 
 use crate::openai::request::{
-    anthropic_to_openai_request, anthropic_to_openai_responses_request, shape_for, RouteShape,
+    RouteShape, anthropic_to_openai_request, anthropic_to_openai_responses_request, shape_for,
 };
 use crate::routed::quirks::classify_upstream;
 use crate::routed::response_arms::apply_target_model_override;
@@ -334,7 +334,7 @@ mod tests {
     /// must not ask for a new one, but keeps the visible summary text.
     #[test]
     fn zen_route_sends_no_encrypted_reasoning() {
-        use crate::handlers::reasoning_signature::{encode_reasoning_signature, ReasoningReplay};
+        use crate::handlers::reasoning_signature::{ReasoningReplay, encode_reasoning_signature};
 
         let signature = encode_reasoning_signature(&ReasoningReplay {
             id: "rs_1".to_string(),
@@ -432,9 +432,11 @@ mod tests {
         .expect("translates");
         assert!(out.openai_body.get("max_output_tokens").is_none());
         assert_eq!(out.openai_body["reasoning"]["effort"], json!("xhigh"));
-        assert!(out.openai_body["prompt_cache_key"]
-            .as_str()
-            .is_some_and(|key| key.starts_with("ses_")));
+        assert!(
+            out.openai_body["prompt_cache_key"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("ses_"))
+        );
         assert!(out.openai_body.get("parallel_tool_calls").is_none());
     }
 

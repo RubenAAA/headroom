@@ -335,9 +335,10 @@ mod tests {
         assert_eq!(get("HEADROOM_ACCURACY_GUARD"), "strict");
         // Upstream deleted effort routing (per-turn routing measured ~15x
         // underwater): no profile may emit its knobs anymore.
-        assert!(!env
-            .iter()
-            .any(|(k, _)| *k == "HEADROOM_EFFORT_ROUTER" || *k == "HEADROOM_MECHANICAL_EFFORT"));
+        assert!(
+            !env.iter()
+                .any(|(k, _)| *k == "HEADROOM_EFFORT_ROUTER" || *k == "HEADROOM_MECHANICAL_EFFORT")
+        );
     }
 
     #[test]
@@ -345,10 +346,12 @@ mod tests {
         for name in ["coding", "general"] {
             let profile = get_agent_savings_profile(name).unwrap();
             assert!(profile.target_ratio.is_none());
-            assert!(!profile
-                .proxy_env()
-                .iter()
-                .any(|(k, _)| *k == "HEADROOM_TARGET_RATIO"));
+            assert!(
+                !profile
+                    .proxy_env()
+                    .iter()
+                    .any(|(k, _)| *k == "HEADROOM_TARGET_RATIO")
+            );
         }
     }
 
@@ -438,9 +441,9 @@ mod tests {
         assert_eq!(read_accuracy_rate(&eval_path).unwrap(), 1.0);
         // Env var mutation is process-wide; this is the only test in this
         // binary using HEADROOM_WORKSPACE_DIR.
-        std::env::set_var("HEADROOM_WORKSPACE_DIR", dir.path());
+        unsafe { std::env::set_var("HEADROOM_WORKSPACE_DIR", dir.path()) };
         let report = headroom_core::perf_analyzer::parse_log_files(0.0);
-        std::env::remove_var("HEADROOM_WORKSPACE_DIR");
+        unsafe { std::env::remove_var("HEADROOM_WORKSPACE_DIR") };
         let clients: Vec<&str> = report
             .perf_records
             .iter()

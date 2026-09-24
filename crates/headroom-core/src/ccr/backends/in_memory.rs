@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
-use crate::ccr::{max_lifetime_for, CcrStore, DEFAULT_CAPACITY, DEFAULT_TTL};
+use crate::ccr::{CcrStore, DEFAULT_CAPACITY, DEFAULT_TTL, max_lifetime_for};
 
 /// In-memory CCR store backed by [`DashMap`] for sharded concurrent
 /// access.

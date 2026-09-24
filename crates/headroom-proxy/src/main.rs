@@ -4,15 +4,19 @@
 //! port; this binary forwards every HTTP/SSE/WebSocket request verbatim to
 //! `--upstream`. See docs/notes/rust-dev.md for the operator runbook.
 
+// Edition 2024 makes std::env::set_var and remove_var unsafe. Tests call them
+// to set up config; non-test code stays free of unsafe.
+#![cfg_attr(test, allow(unsafe_code, clippy::undocumented_unsafe_blocks))]
+
 use std::net::SocketAddr;
 use std::time::UNIX_EPOCH;
 
 use clap::Parser;
 use headroom_proxy::config::CliArgs;
-use headroom_proxy::{build_app, AppState, Config};
+use headroom_proxy::{AppState, Config, build_app};
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 /// Process-wide allocator for the proxy binary. The request path is
 /// allocation-heavy (a JSON parse/strip/serialize round-trip per
@@ -39,17 +43,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map(str::to_string)
             .collect();
     }
-    std::env::remove_var("HEADROOM_ZEN_HTTP_PROXY_POOL");
-    // These are launcher/watcher controls, not proxy request configuration.
-    // Keep them out of helper processes spawned by the proxy.
-    std::env::remove_var("HEADROOM_ZEN_EGRESS_ROTATE_COMMAND");
-    std::env::remove_var("HEADROOM_ZEN_EGRESS_ROTATE_TIMEOUT");
-    std::env::remove_var("HEADROOM_ZEN_EGRESS_MODE");
-    // Clap has captured the provider-proxy URL. Remove it before creating the
-    // multithreaded runtime so helper processes spawned by the proxy do not
-    // inherit SOCKS credentials from this configuration variable.
-    if args.http_proxy.is_some() {
-        std::env::remove_var("HEADROOM_HTTP_PROXY");
+    // SAFETY: still single-threaded. Nothing above spawns a thread and the
+    // tokio runtime starts below.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::remove_var("HEADROOM_ZEN_HTTP_PROXY_POOL");
+        // These are launcher/watcher controls, not proxy request configuration.
+        // Keep them out of helper processes spawned by the proxy.
+        std::env::remove_var("HEADROOM_ZEN_EGRESS_ROTATE_COMMAND");
+        std::env::remove_var("HEADROOM_ZEN_EGRESS_ROTATE_TIMEOUT");
+        std::env::remove_var("HEADROOM_ZEN_EGRESS_MODE");
+        // Clap has captured the provider-proxy URL. Remove it before creating the
+        // multithreaded runtime so helper processes spawned by the proxy do not
+        // inherit SOCKS credentials from this configuration variable.
+        if args.http_proxy.is_some() {
+            std::env::remove_var("HEADROOM_HTTP_PROXY");
+        }
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

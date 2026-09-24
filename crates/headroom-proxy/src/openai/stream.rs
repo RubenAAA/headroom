@@ -6,9 +6,9 @@
 //! emitted. Dropping it books the turn, so a client disconnect mid-stream
 //! still reaches the cost tracker.
 
-use crate::handlers::reasoning_signature::{encode_reasoning_signature, PendingReasoning};
-use crate::routed::outcome::{book_routed_outcome, RoutedOutcomeContext};
-use serde_json::{json, Value};
+use crate::handlers::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
+use crate::routed::outcome::{RoutedOutcomeContext, book_routed_outcome};
+use serde_json::{Value, json};
 
 /// First-round provider usage captured for a turn whose booking waits
 /// downstream. Written when usage arrives and at every outcome emission, so
@@ -487,10 +487,10 @@ impl StreamTranslator {
     /// Latch time-to-first-byte. Written once and never overwritten, mirroring
     /// `latch_ttfb` on the Claude path.
     fn latch_ttfb(&mut self) {
-        if self.ttfb_ms == 0.0 {
-            if let Some(ctx) = self.outcome.as_ref() {
-                self.ttfb_ms = ctx.started_at.elapsed().as_secs_f64() * 1000.0;
-            }
+        if self.ttfb_ms == 0.0
+            && let Some(ctx) = self.outcome.as_ref()
+        {
+            self.ttfb_ms = ctx.started_at.elapsed().as_secs_f64() * 1000.0;
         }
     }
 
@@ -562,10 +562,10 @@ impl StreamTranslator {
             return events;
         }
 
-        if let Some(name) = event_name {
-            if name.starts_with("response.") || name.starts_with("output_") {
-                return self.process_responses_frame(name, data);
-            }
+        if let Some(name) = event_name
+            && (name.starts_with("response.") || name.starts_with("output_"))
+        {
+            return self.process_responses_frame(name, data);
         }
 
         let chunk: Value = match serde_json::from_str(data) {
@@ -639,11 +639,10 @@ impl StreamTranslator {
                         .get("function")
                         .and_then(|f| f.get("arguments"))
                         .and_then(|a| a.as_str())
+                        && !args.is_empty()
                     {
-                        if !args.is_empty() {
-                            self.open_block(OpenBlock::Tool, &mut events);
-                            events.push(self.emit_input_json_delta(args));
-                        }
+                        self.open_block(OpenBlock::Tool, &mut events);
+                        events.push(self.emit_input_json_delta(args));
                     }
                 }
             }
@@ -675,21 +674,21 @@ impl StreamTranslator {
 
         // Quota can ride in the stream as well as the headers, and which one
         // carries it has changed before. Take it from wherever it shows up.
-        if let Some(store) = self.codex_limits.as_ref() {
-            if let Some(limits) = crate::codex_rate_limits::extract_rate_limits(&chunk) {
-                store.record_rate_limits(&self.model, limits);
-                self.codex_rate_limits_seen = true;
-            }
+        if let Some(store) = self.codex_limits.as_ref()
+            && let Some(limits) = crate::codex_rate_limits::extract_rate_limits(&chunk)
+        {
+            store.record_rate_limits(&self.model, limits);
+            self.codex_rate_limits_seen = true;
         }
 
-        if !self.started && event_name == "response.created" {
-            if let Some(model) = chunk
+        if !self.started
+            && event_name == "response.created"
+            && let Some(model) = chunk
                 .get("response")
                 .and_then(|resp| resp.get("model"))
                 .and_then(|v| v.as_str())
-            {
-                self.model = model.to_string();
-            }
+        {
+            self.model = model.to_string();
         }
 
         if !self.started {
@@ -774,15 +773,14 @@ impl StreamTranslator {
     /// deltas it is the only copy, mirroring the message-item recovery below.
     /// Extracted from `process_responses_frame` without behavior change.
     fn on_output_text_done(&mut self, chunk: &Value, events: &mut Vec<String>) {
-        if !self.saw_text_delta {
-            if let Some(text) = chunk.get("text").and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    self.open_block(OpenBlock::Text, events);
-                    events.push(self.emit_text_delta(text));
-                    self.close_block(events);
-                    self.saw_text_delta = true;
-                }
-            }
+        if !self.saw_text_delta
+            && let Some(text) = chunk.get("text").and_then(|v| v.as_str())
+            && !text.is_empty()
+        {
+            self.open_block(OpenBlock::Text, events);
+            events.push(self.emit_text_delta(text));
+            self.close_block(events);
+            self.saw_text_delta = true;
         }
     }
 
@@ -802,27 +800,26 @@ impl StreamTranslator {
     /// `refusal.done`: replay the whole refusal when no delta arrived.
     /// Extracted from `process_responses_frame` without behavior change.
     fn on_refusal_done(&mut self, chunk: &Value, events: &mut Vec<String>) {
-        if !self.saw_refusal_delta {
-            if let Some(refusal) = chunk.get("refusal").and_then(|v| v.as_str()) {
-                if !refusal.is_empty() {
-                    self.open_block(OpenBlock::Text, events);
-                    events.push(self.emit_text_delta(refusal));
-                    self.close_block(events);
-                    self.saw_refusal_delta = true;
-                }
-            }
+        if !self.saw_refusal_delta
+            && let Some(refusal) = chunk.get("refusal").and_then(|v| v.as_str())
+            && !refusal.is_empty()
+        {
+            self.open_block(OpenBlock::Text, events);
+            events.push(self.emit_text_delta(refusal));
+            self.close_block(events);
+            self.saw_refusal_delta = true;
         }
     }
 
     /// Reasoning delta: stream into the open thinking block.
     /// Extracted from `process_responses_frame` without behavior change.
     fn on_reasoning_delta(&mut self, chunk: &Value, events: &mut Vec<String>) {
-        if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
-            if !delta.is_empty() {
-                self.open_block(OpenBlock::Thinking, events);
-                events.push(self.emit_thinking_delta(delta));
-                self.saw_thinking_text = true;
-            }
+        if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str())
+            && !delta.is_empty()
+        {
+            self.open_block(OpenBlock::Thinking, events);
+            events.push(self.emit_thinking_delta(delta));
+            self.saw_thinking_text = true;
         }
     }
 
@@ -868,13 +865,12 @@ impl StreamTranslator {
     /// tool block.
     /// Extracted from `process_responses_frame` without behavior change.
     fn on_function_args_delta(&mut self, chunk: &Value, events: &mut Vec<String>) {
-        if self.open == Some(OpenBlock::Tool) {
-            if let Some(delta) = chunk.get("delta").and_then(|v| v.as_str()) {
-                if !delta.is_empty() {
-                    events.push(self.emit_input_json_delta(delta));
-                    self.saw_arg_delta = true;
-                }
-            }
+        if self.open == Some(OpenBlock::Tool)
+            && let Some(delta) = chunk.get("delta").and_then(|v| v.as_str())
+            && !delta.is_empty()
+        {
+            events.push(self.emit_input_json_delta(delta));
+            self.saw_arg_delta = true;
         }
         // A delta arriving before `output_item.added` (no open tool
         // block to attribute it to) is skipped rather than guessed
@@ -888,13 +884,13 @@ impl StreamTranslator {
     /// the message-item recovery.
     /// Extracted from `process_responses_frame` without behavior change.
     fn on_function_args_done(&mut self, chunk: &Value, events: &mut Vec<String>) {
-        if self.open == Some(OpenBlock::Tool) && !self.saw_arg_delta {
-            if let Some(args) = chunk.get("arguments").and_then(|v| v.as_str()) {
-                if !args.is_empty() {
-                    events.push(self.emit_input_json_delta(args));
-                    self.saw_arg_delta = true;
-                }
-            }
+        if self.open == Some(OpenBlock::Tool)
+            && !self.saw_arg_delta
+            && let Some(args) = chunk.get("arguments").and_then(|v| v.as_str())
+            && !args.is_empty()
+        {
+            events.push(self.emit_input_json_delta(args));
+            self.saw_arg_delta = true;
         }
     }
 
@@ -1890,11 +1886,13 @@ mod tests {
             "messages": [{"role": "user", "content": "next"}]
         });
         let out = anthropic_to_openai_responses_request(&clean, true).unwrap();
-        assert!(!out["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|i| i["type"] == "reasoning"));
+        assert!(
+            !out["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["type"] == "reasoning")
+        );
 
         // And what is echoed is carried by the request itself, not a cache.
         let echoed = json!({
@@ -2187,7 +2185,7 @@ mod tests {
             let dir = std::mem::ManuallyDrop::new(tempfile::tempdir().expect("tempdir"));
             dir.path().join("savings_events.jsonl")
         });
-        std::env::set_var("HEADROOM_SAVINGS_EVENTS_PATH", path);
+        unsafe { std::env::set_var("HEADROOM_SAVINGS_EVENTS_PATH", path) };
     }
 
     /// Same isolation as [`redirect_savings_ledger`] for the lifetime state
@@ -2201,7 +2199,7 @@ mod tests {
             let dir = std::mem::ManuallyDrop::new(tempfile::tempdir().expect("tempdir"));
             dir.path().join("proxy_savings.json")
         });
-        std::env::set_var("HEADROOM_SAVINGS_PATH", path);
+        unsafe { std::env::set_var("HEADROOM_SAVINGS_PATH", path) };
     }
 
     fn signature_from_stream(sse: &str) -> Option<String> {
@@ -2380,7 +2378,7 @@ mod tests {
     /// usage, the stop reason, and the client's `message_stop` with it.
     #[tokio::test]
     async fn trailing_frame_without_terminator_is_flushed() {
-        use futures_util::{stream, StreamExt};
+        use futures_util::{StreamExt, stream};
         redirect_savings_ledger();
         let sse = concat!(
             "event: response.created\n",

@@ -186,8 +186,8 @@ mod tests {
     use super::*;
     use crate::transforms::smart_crusher::traits::{Constraint, CrushEvent, Observer};
     use serde_json::Value;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MarkerConstraint {
         name: &'static str,

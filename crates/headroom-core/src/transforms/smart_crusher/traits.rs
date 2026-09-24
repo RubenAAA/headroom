@@ -139,8 +139,8 @@ pub use crate::relevance::RelevanceScorer as Scorer;
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A tiny constraint that always keeps index 0 (if any items).
     /// Pins the trait shape and the additive behavior of constraint

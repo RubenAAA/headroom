@@ -133,7 +133,7 @@ fn route_auth_headers_for(var: &str, anthropic: bool) -> Result<HeaderMap, Respo
             return Err(deny(format!(
                 "model route names ${var} for its credential, but that \
                  environment variable is unset or empty"
-            )))
+            )));
         }
     };
 
@@ -166,8 +166,8 @@ fn route_auth_headers_for(var: &str, anthropic: bool) -> Result<HeaderMap, Respo
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serde_json::json;
 
     #[test]
@@ -263,7 +263,7 @@ mod tests {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let (dir, _codex_token) = codex_auth();
         let auth_path = dir.path().join("auth.json");
-        std::env::set_var("HEADROOM_TEST_ROUTE_KEY", "xai-route-token");
+        unsafe { std::env::set_var("HEADROOM_TEST_ROUTE_KEY", "xai-route-token") };
 
         let (h, is_chatgpt) = auth_for_test(
             Some("HEADROOM_TEST_ROUTE_KEY"),
@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(header(&h, "originator"), None);
         assert_eq!(header(&h, "ChatGPT-Account-ID"), None);
         assert_eq!(header(&h, "user-agent"), None);
-        std::env::remove_var("HEADROOM_TEST_ROUTE_KEY");
+        unsafe { std::env::remove_var("HEADROOM_TEST_ROUTE_KEY") };
     }
 
     /// The other half: a route naming no credential still gets Codex headers,
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn an_unset_variable_is_reported_rather_than_dropped() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("HEADROOM_TEST_MISSING_KEY");
+        unsafe { std::env::remove_var("HEADROOM_TEST_MISSING_KEY") };
 
         let err = auth_for_test(Some("HEADROOM_TEST_MISSING_KEY"), &HeaderMap::new(), None)
             .expect_err("unset variable");
@@ -324,11 +324,11 @@ mod tests {
     #[test]
     fn an_empty_variable_is_reported_too() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("HEADROOM_TEST_EMPTY_KEY", "   ");
+        unsafe { std::env::set_var("HEADROOM_TEST_EMPTY_KEY", "   ") };
         let err = auth_for_test(Some("HEADROOM_TEST_EMPTY_KEY"), &HeaderMap::new(), None)
             .expect_err("empty variable");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        std::env::remove_var("HEADROOM_TEST_EMPTY_KEY");
+        unsafe { std::env::remove_var("HEADROOM_TEST_EMPTY_KEY") };
     }
 
     /// A token pasted into a shell often keeps its trailing newline, which
@@ -336,14 +336,14 @@ mod tests {
     #[test]
     fn a_trailing_newline_is_trimmed_off_the_token() {
         let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("HEADROOM_TEST_NEWLINE_KEY", "xai-token\n");
+        unsafe { std::env::set_var("HEADROOM_TEST_NEWLINE_KEY", "xai-token\n") };
         let (h, _) = auth_for_test(Some("HEADROOM_TEST_NEWLINE_KEY"), &HeaderMap::new(), None)
             .expect("trimmed");
         assert_eq!(
             header(&h, "authorization").as_deref(),
             Some("Bearer xai-token")
         );
-        std::env::remove_var("HEADROOM_TEST_NEWLINE_KEY");
+        unsafe { std::env::remove_var("HEADROOM_TEST_NEWLINE_KEY") };
     }
 
     /// `:auth=none` declares a public anonymous upstream: no Authorization

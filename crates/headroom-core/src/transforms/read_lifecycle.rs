@@ -485,22 +485,22 @@ impl ReadLifecycleManager {
                     .get("tool_call_id")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if let Some(classification) = replacements.get(tc_id) {
-                    if let Some(content_str) = content.and_then(Value::as_str) {
-                        let (replaced, marker, ccr_hash) =
-                            self.replace_content(content_str, classification);
-                        if replaced {
-                            let mut new_msg = msg.clone();
-                            new_msg["content"] = Value::String(marker.clone());
-                            result_messages.push(new_msg);
-                            transforms.push(format_read_lifecycle_transform(classification));
-                            if let Some(hash) = ccr_hash {
-                                ccr_hashes.push(hash);
-                            }
-                            bytes_before += content_str.len();
-                            bytes_after += marker.len();
-                            continue;
+                if let Some(classification) = replacements.get(tc_id)
+                    && let Some(content_str) = content.and_then(Value::as_str)
+                {
+                    let (replaced, marker, ccr_hash) =
+                        self.replace_content(content_str, classification);
+                    if replaced {
+                        let mut new_msg = msg.clone();
+                        new_msg["content"] = Value::String(marker.clone());
+                        result_messages.push(new_msg);
+                        transforms.push(format_read_lifecycle_transform(classification));
+                        if let Some(hash) = ccr_hash {
+                            ccr_hashes.push(hash);
                         }
+                        bytes_before += content_str.len();
+                        bytes_after += marker.len();
+                        continue;
                     }
                 }
             }
@@ -560,21 +560,21 @@ impl ReadLifecycleManager {
                 .unwrap_or("");
             let tool_content = block.get("content");
 
-            if let Some(classification) = replacements.get(tc_id) {
-                if let Some(content_str) = tool_content.and_then(Value::as_str) {
-                    let (replaced, marker, ccr_hash) =
-                        self.replace_content(content_str, classification);
-                    if replaced {
-                        let mut new_block = block.clone();
-                        new_block["content"] = Value::String(marker);
-                        new_blocks.push(new_block);
-                        transforms.push(format_read_lifecycle_transform(classification));
-                        if let Some(hash) = ccr_hash {
-                            ccr_hashes.push(hash);
-                        }
-                        any_replaced = true;
-                        continue;
+            if let Some(classification) = replacements.get(tc_id)
+                && let Some(content_str) = tool_content.and_then(Value::as_str)
+            {
+                let (replaced, marker, ccr_hash) =
+                    self.replace_content(content_str, classification);
+                if replaced {
+                    let mut new_block = block.clone();
+                    new_block["content"] = Value::String(marker);
+                    new_blocks.push(new_block);
+                    transforms.push(format_read_lifecycle_transform(classification));
+                    if let Some(hash) = ccr_hash {
+                        ccr_hashes.push(hash);
                     }
+                    any_replaced = true;
+                    continue;
                 }
             }
 
@@ -610,14 +610,14 @@ impl ReadLifecycleManager {
             .collect();
 
         // Best-effort CCR persistence
-        if let Some(ref store) = self.store {
-            if !store.put(&ccr_hash, content) {
-                tracing::warn!(
-                    event = "ccr_store_failed",
-                    tool_call_id = %classification.tool_call_id,
-                    "read_lifecycle: CCR store failed"
-                );
-            }
+        if let Some(ref store) = self.store
+            && !store.put(&ccr_hash, content)
+        {
+            tracing::warn!(
+                event = "ccr_store_failed",
+                tool_call_id = %classification.tool_call_id,
+                "read_lifecycle: CCR store failed"
+            );
         }
 
         let file_display = if classification.file_path.is_empty() {
@@ -834,11 +834,13 @@ mod tests {
 
         let result = mgr.apply(&messages, 0);
         assert_eq!(result.reads_stale, 1);
-        assert!(result.messages[1]["content"]
-            .as_str()
-            .unwrap()
-            .to_lowercase()
-            .contains("stale"));
+        assert!(
+            result.messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("stale")
+        );
     }
 
     #[test]
@@ -932,11 +934,13 @@ mod tests {
         let result = mgr.apply(&messages, 0);
         assert_eq!(result.reads_superseded, 1);
         assert_eq!(result.reads_fresh, 1);
-        assert!(result.messages[1]["content"]
-            .as_str()
-            .unwrap()
-            .to_lowercase()
-            .contains("superseded"));
+        assert!(
+            result.messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("superseded")
+        );
         assert_eq!(
             result.messages[3]["content"].as_str().unwrap(),
             format!("{}_updated", &lc)
@@ -1012,11 +1016,13 @@ mod tests {
         assert_eq!(result.reads_stale, 1);
         // Second read: fresh (latest, no edit after)
         assert_eq!(result.reads_fresh, 1);
-        assert!(result.messages[1]["content"]
-            .as_str()
-            .unwrap()
-            .to_lowercase()
-            .contains("stale"));
+        assert!(
+            result.messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("stale")
+        );
         assert_eq!(
             result.messages[5]["content"].as_str().unwrap(),
             format!("{}_v2", &lc)
@@ -1046,11 +1052,13 @@ mod tests {
         let result = mgr.apply(&messages, 0);
         assert_eq!(result.reads_stale, 1);
         assert_eq!(result.reads_fresh, 1);
-        assert!(result.messages[1]["content"]
-            .as_str()
-            .unwrap()
-            .to_lowercase()
-            .contains("stale"));
+        assert!(
+            result.messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("stale")
+        );
         assert_eq!(
             result.messages[5]["content"].as_str().unwrap(),
             format!("{}_utils", &lc)
@@ -1176,9 +1184,11 @@ mod tests {
         ];
 
         let result = mgr.apply(&messages, 0);
-        assert!(result
-            .transforms_applied
-            .contains(&"read_lifecycle:stale:/src/app.py".to_string()));
+        assert!(
+            result
+                .transforms_applied
+                .contains(&"read_lifecycle:stale:/src/app.py".to_string())
+        );
     }
 
     #[test]
@@ -1198,9 +1208,11 @@ mod tests {
         ];
 
         let result = mgr.apply(&messages, 0);
-        assert!(result
-            .transforms_applied
-            .contains(&"read_lifecycle:stale:/src/notes.md".to_string()));
+        assert!(
+            result
+                .transforms_applied
+                .contains(&"read_lifecycle:stale:/src/notes.md".to_string())
+        );
     }
 
     #[test]

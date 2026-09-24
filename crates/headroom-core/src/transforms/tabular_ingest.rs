@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::transforms::content_detector::{detect_content_type, ContentType};
+use crate::transforms::content_detector::{ContentType, detect_content_type};
 
 // Mirrors content_detector's separator-cell pattern.
 fn md_sep_cell_re() -> &'static Regex {

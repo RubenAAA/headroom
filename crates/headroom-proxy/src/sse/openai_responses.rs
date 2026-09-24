@@ -216,14 +216,13 @@ impl ResponseState {
                 // `incomplete_details.reason`; we tolerate both
                 // the top-level and the nested location, since the
                 // OpenAI shape has shifted across SDK versions.
-                if let Some(resp) = v.get("response") {
-                    if let Some(reason) = resp
+                if let Some(resp) = v.get("response")
+                    && let Some(reason) = resp
                         .get("incomplete_details")
                         .and_then(|d| d.get("reason"))
                         .and_then(|x| x.as_str())
-                    {
-                        self.incomplete_reason = Some(reason.to_string());
-                    }
+                {
+                    self.incomplete_reason = Some(reason.to_string());
                 }
                 self.capture_envelope_metadata(&v);
                 Ok(())
@@ -354,10 +353,10 @@ impl ResponseState {
         // Refresh metadata to the final shape — the `done` payload
         // is authoritative.
         entry.metadata = item.clone();
-        if entry.item_type.is_empty() {
-            if let Some(t) = item.get("type").and_then(|x| x.as_str()) {
-                entry.item_type = t.to_string();
-            }
+        if entry.item_type.is_empty()
+            && let Some(t) = item.get("type").and_then(|x| x.as_str())
+        {
+            entry.item_type = t.to_string();
         }
         Ok(())
     }
@@ -407,10 +406,10 @@ impl ResponseState {
             .ok_or(StateError::MissingField {
                 field: "content_index",
             })? as usize;
-        if let Some(item) = self.items.get_mut(item_id) {
-            if let Some(part) = item.content_parts.get_mut(&part_index) {
-                part.complete = true;
-            }
+        if let Some(item) = self.items.get_mut(item_id)
+            && let Some(part) = item.content_parts.get_mut(&part_index)
+        {
+            part.complete = true;
         }
         Ok(())
     }
@@ -433,10 +432,9 @@ impl ResponseState {
             .get("content_index")
             .or_else(|| v.get("part_index"))
             .and_then(|x| x.as_u64())
+            && let Some(part) = item.content_parts.get_mut(&(part_index as usize))
         {
-            if let Some(part) = item.content_parts.get_mut(&(part_index as usize)) {
-                part.text.push_str(delta);
-            }
+            part.text.push_str(delta);
         }
         Ok(())
     }
@@ -511,10 +509,10 @@ impl ResponseState {
     fn on_response_completed(&mut self, v: &Value) -> Result<(), StateError> {
         self.status = StreamStatus::Completed;
         if let Some(resp) = v.get("response") {
-            if let Some(usage) = resp.get("usage") {
-                if !usage.is_null() {
-                    self.usage = Some(usage.clone());
-                }
+            if let Some(usage) = resp.get("usage")
+                && !usage.is_null()
+            {
+                self.usage = Some(usage.clone());
             }
             // The completed envelope carries the finished `output[]`, which
             // is authoritative over the incrementally gathered items (a call
@@ -524,10 +522,10 @@ impl ResponseState {
             // `response.completed` stream folded to zero blocks because
             // an empty array here won over items already gathered from
             // deltas / `output_item.done`. Treat empty as omitted.
-            if let Some(items) = resp.get("output").and_then(|o| o.as_array()) {
-                if !items.is_empty() {
-                    self.completed_output = Some(items.clone());
-                }
+            if let Some(items) = resp.get("output").and_then(|o| o.as_array())
+                && !items.is_empty()
+            {
+                self.completed_output = Some(items.clone());
             }
             if let Some(id) = resp.get("id").and_then(|x| x.as_str()) {
                 self.response_id = Some(id.to_string());

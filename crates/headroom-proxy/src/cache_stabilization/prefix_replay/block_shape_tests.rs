@@ -61,10 +61,12 @@ fn reminders_move_out_of_history_onto_the_newest_message() {
     );
     let tail = out[2]["content"].as_array().unwrap();
     assert_eq!(tail.len(), 2, "the reminder rides on the newest message");
-    assert!(tail[1]["text"]
-        .as_str()
-        .unwrap()
-        .contains("<system-reminder>"));
+    assert!(
+        tail[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>")
+    );
 }
 
 #[test]
@@ -105,10 +107,12 @@ fn a_reminder_only_message_is_dropped_not_emptied() {
     assert_eq!(out[0]["content"][0]["text"], "opener");
     let tail = out[1]["content"].as_array().unwrap();
     assert_eq!(tail.len(), 2, "its reminder rides on the newest message");
-    assert!(tail[1]["text"]
-        .as_str()
-        .unwrap()
-        .contains("<system-reminder>"));
+    assert!(
+        tail[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<system-reminder>")
+    );
 }
 
 /// The property that makes the whole thing work, at message level: history

@@ -52,7 +52,7 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 
-use headroom_core::auth_mode::{classify, AuthMode};
+use headroom_core::auth_mode::{AuthMode, classify};
 
 /// Inspect the inbound headers, classify the auth mode under
 /// Bedrock policy (always [`AuthMode::OAuth`], with a loud WARN
@@ -113,11 +113,11 @@ pub async fn classify_and_attach_auth_mode(mut req: Request<Body>, next: Next) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::body::Body;
     use axum::extract::Extension;
     use axum::http::{Request as HttpRequest, StatusCode};
     use axum::routing::post;
-    use axum::Router;
     use http::HeaderValue;
     use tower::util::ServiceExt;
 

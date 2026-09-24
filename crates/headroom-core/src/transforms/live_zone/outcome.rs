@@ -272,10 +272,10 @@ impl CompressionManifest {
     pub fn transforms_applied(&self) -> Vec<&'static str> {
         let mut seen: Vec<&'static str> = Vec::new();
         for b in &self.block_outcomes {
-            if let BlockAction::Compressed { strategy, .. } = &b.action {
-                if !seen.contains(strategy) {
-                    seen.push(*strategy);
-                }
+            if let BlockAction::Compressed { strategy, .. } = &b.action
+                && !seen.contains(strategy)
+            {
+                seen.push(*strategy);
             }
         }
         seen

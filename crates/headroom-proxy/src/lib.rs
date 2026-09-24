@@ -1,6 +1,10 @@
 //! headroom-proxy library: transparent reverse proxy in front of the Python
 //! Headroom proxy. Used by both `main.rs` and the integration tests.
 
+// Edition 2024 makes std::env::set_var and remove_var unsafe. Tests call them
+// to set up config; non-test code stays free of unsafe.
+#![cfg_attr(test, allow(unsafe_code, clippy::undocumented_unsafe_blocks))]
+
 pub mod audit;
 pub mod background_compression;
 pub mod bedrock;
@@ -77,4 +81,4 @@ pub mod ws_session_registry;
 
 pub use config::Config;
 pub use error::ProxyError;
-pub use proxy::{build_app, AppState};
+pub use proxy::{AppState, build_app};

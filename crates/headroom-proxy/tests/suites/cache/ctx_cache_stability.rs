@@ -16,15 +16,15 @@
 //! the same content appearing twice, and asserts our own digests trip zero
 //! findings in the volatile-content detector.
 
-use headroom_proxy::cache_stabilization::volatile_detector::{detect_volatile_content, ApiKind};
-use headroom_proxy::compression::ctx_offload::{offload_anthropic_request, CtxOffloadConfig};
-use headroom_proxy::compression::{compress_anthropic_request, Outcome};
+use headroom_proxy::cache_stabilization::volatile_detector::{ApiKind, detect_volatile_content};
+use headroom_proxy::compression::ctx_offload::{CtxOffloadConfig, offload_anthropic_request};
+use headroom_proxy::compression::{Outcome, compress_anthropic_request};
 use headroom_proxy::config::{CacheControlAutoFrozen, CompressionMode};
 use headroom_proxy::ctx::inject::InjectEngine;
 use headroom_proxy::ctx::projects::ProjectStores;
 
 use headroom_core::auth_mode::AuthMode;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tempfile::TempDir;
 

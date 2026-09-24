@@ -20,8 +20,8 @@ use super::query::MemoryQuery;
 use super::ranker::{MemoryCandidate, MemoryRanker};
 use super::router::{BackendRouter, RequestContext, ResolvedScope};
 use super::tool_adapter::{
-    self, format_tool_result, get_tool_id, get_tool_input, get_tool_name, has_memory_tool_calls,
-    inject_tools, Provider, MEMORY_TOOL_NAMES, NATIVE_MEMORY_TOOL_NAME,
+    self, MEMORY_TOOL_NAMES, NATIVE_MEMORY_TOOL_NAME, Provider, format_tool_result, get_tool_id,
+    get_tool_input, get_tool_name, has_memory_tool_calls, inject_tools,
 };
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -1035,7 +1035,7 @@ impl MemoryHandler {
             Some(b) => b,
             None => {
                 return serde_json::json!({"status": "error", "error": "backend not initialized"})
-                    .to_string()
+                    .to_string();
             }
         };
 
@@ -1117,7 +1117,7 @@ impl MemoryHandler {
         {
             Ok(m) => m,
             Err(e) => {
-                return serde_json::json!({"status": "error", "error": e.to_string()}).to_string()
+                return serde_json::json!({"status": "error", "error": e.to_string()}).to_string();
             }
         };
 
@@ -1241,7 +1241,7 @@ impl MemoryHandler {
             Some(b) => b,
             None => {
                 return serde_json::json!({"status": "error", "error": "backend not initialized"})
-                    .to_string()
+                    .to_string();
             }
         };
 
@@ -1251,7 +1251,7 @@ impl MemoryHandler {
         {
             Ok(r) => r,
             Err(e) => {
-                return serde_json::json!({"status": "error", "error": e.to_string()}).to_string()
+                return serde_json::json!({"status": "error", "error": e.to_string()}).to_string();
             }
         };
 
@@ -1324,7 +1324,7 @@ impl MemoryHandler {
             Some(b) => b,
             None => {
                 return serde_json::json!({"status": "error", "error": "backend not initialized"})
-                    .to_string()
+                    .to_string();
             }
         };
 
@@ -1389,7 +1389,7 @@ impl MemoryHandler {
             Some(b) => b,
             None => {
                 return serde_json::json!({"status": "error", "error": "backend not initialized"})
-                    .to_string()
+                    .to_string();
             }
         };
 
@@ -1419,7 +1419,7 @@ impl MemoryHandler {
             Some(b) => b,
             None => {
                 return serde_json::json!({"status": "error", "error": "backend not initialized"})
-                    .to_string()
+                    .to_string();
             }
         };
 
@@ -1429,7 +1429,7 @@ impl MemoryHandler {
         {
             Ok(r) => r,
             Err(e) => {
-                return serde_json::json!({"status": "error", "error": e.to_string()}).to_string()
+                return serde_json::json!({"status": "error", "error": e.to_string()}).to_string();
             }
         };
 
@@ -1544,11 +1544,11 @@ impl MemoryHandler {
         let mut target_idx = None;
 
         for i in (eligible_start..new_messages.len()).rev() {
-            if let Some(role) = new_messages[i].get("role").and_then(Value::as_str) {
-                if role == "user" {
-                    target_idx = Some(i);
-                    break;
-                }
+            if let Some(role) = new_messages[i].get("role").and_then(Value::as_str)
+                && role == "user"
+            {
+                target_idx = Some(i);
+                break;
             }
         }
 
@@ -1589,11 +1589,11 @@ impl MemoryHandler {
         // Walk backwards to find the last user message
         let mut target_idx = None;
         for i in (0..new_messages.len()).rev() {
-            if let Some(role) = new_messages[i].get("role").and_then(Value::as_str) {
-                if role == "user" {
-                    target_idx = Some(i);
-                    break;
-                }
+            if let Some(role) = new_messages[i].get("role").and_then(Value::as_str)
+                && role == "user"
+            {
+                target_idx = Some(i);
+                break;
             }
         }
 
@@ -1662,12 +1662,11 @@ fn extract_user_query(messages: &[Value]) -> Option<String> {
             Value::String(s) => return Some(s.clone()),
             Value::Array(blocks) => {
                 for block in blocks {
-                    if block.get("type").and_then(Value::as_str) == Some("text") {
-                        if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            if !text.is_empty() {
-                                return Some(text.to_string());
-                            }
-                        }
+                    if block.get("type").and_then(Value::as_str) == Some("text")
+                        && let Some(text) = block.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        return Some(text.to_string());
                     }
                 }
             }
@@ -1914,14 +1913,18 @@ mod tests {
             0,
         );
         assert_eq!(bytes, 14);
-        assert!(new_msgs[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("MEMORY CONTEXT"));
-        assert!(new_msgs[1]["content"]
-            .as_str()
-            .unwrap()
-            .starts_with("hello"));
+        assert!(
+            new_msgs[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("MEMORY CONTEXT")
+        );
+        assert!(
+            new_msgs[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("hello")
+        );
     }
 
     #[test]

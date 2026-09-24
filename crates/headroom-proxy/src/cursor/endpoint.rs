@@ -8,10 +8,10 @@
 //! hands out whatever tools the conversation advertised and blocks on them; it
 //! is not something to expose.
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::Value;
 
 use crate::proxy::AppState;

@@ -844,12 +844,12 @@ mod tests {
         assert!(re.is_match("42"));
         assert!(re.is_match("3.14"));
         assert!(!re.is_match("abc123")); // not standalone
-                                         // ALLCAPS
+        // ALLCAPS
         assert!(re.is_match("SIGILL"));
         assert!(re.is_match("HTTP"));
         assert!(re.is_match("EOF"));
         assert!(!re.is_match("Hi")); // too short
-                                     // Dotted paths
+        // Dotted paths
         assert!(re.is_match("libsystem_kernel.dylib"));
         assert!(re.is_match("com.example.MyClass"));
         // Unix paths
@@ -859,11 +859,11 @@ mod tests {
         assert!(re.is_match(".py"));
         assert!(re.is_match(".json"));
         assert!(!re.is_match(".a")); // too short
-                                     // CLI flags
+        // CLI flags
         assert!(re.is_match("--verbose"));
         assert!(re.is_match("-n"));
         assert!(!re.is_match("--")); // no letters after
-                                     // CamelCase
+        // CamelCase
         assert!(re.is_match("EXC_BAD_INSTRUCTION"));
         assert!(re.is_match("IndexError"));
         // Note: "HTTPServer" contains "HTTP" which matches ALLCAPS pattern -
@@ -896,24 +896,24 @@ mod tests {
     #[cfg(feature = "ml")]
     #[test]
     fn add_must_keep_words_disabled_via_env() {
-        std::env::set_var(MUST_KEEP_ENV, "0");
+        unsafe { std::env::set_var(MUST_KEEP_ENV, "0") };
         assert!(!must_keep_enabled());
-        std::env::remove_var(MUST_KEEP_ENV);
+        unsafe { std::env::remove_var(MUST_KEEP_ENV) };
     }
 
     #[cfg(feature = "ml")]
     #[test]
     fn env_usize_helper() {
         assert_eq!(env_usize("NONEXISTENT_VAR_12345"), None);
-        std::env::set_var("HEADROOM_TEST_ENV_USIZE", "42");
+        unsafe { std::env::set_var("HEADROOM_TEST_ENV_USIZE", "42") };
         assert_eq!(env_usize("HEADROOM_TEST_ENV_USIZE"), Some(42));
-        std::env::set_var("HEADROOM_TEST_ENV_USIZE", "0");
+        unsafe { std::env::set_var("HEADROOM_TEST_ENV_USIZE", "0") };
         assert_eq!(env_usize("HEADROOM_TEST_ENV_USIZE"), None);
-        std::env::set_var("HEADROOM_TEST_ENV_USIZE", "not_a_number");
+        unsafe { std::env::set_var("HEADROOM_TEST_ENV_USIZE", "not_a_number") };
         assert_eq!(env_usize("HEADROOM_TEST_ENV_USIZE"), None);
-        std::env::set_var("HEADROOM_TEST_ENV_USIZE", "");
+        unsafe { std::env::set_var("HEADROOM_TEST_ENV_USIZE", "") };
         assert_eq!(env_usize("HEADROOM_TEST_ENV_USIZE"), None);
-        std::env::remove_var("HEADROOM_TEST_ENV_USIZE");
+        unsafe { std::env::remove_var("HEADROOM_TEST_ENV_USIZE") };
     }
 
     #[test]

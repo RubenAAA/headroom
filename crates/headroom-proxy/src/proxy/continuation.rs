@@ -439,11 +439,7 @@ pub(super) fn continuation_turn_from_body(
         .get("output")
         .and_then(|o| o.as_array())
         .is_some_and(|o| !o.is_empty());
-    if has_blocks {
-        Some(turn)
-    } else {
-        None
-    }
+    if has_blocks { Some(turn) } else { None }
 }
 
 /// Read a continuation's response body, failing on silence rather than on

@@ -289,10 +289,10 @@ pub fn crush_number_array(
     if std_val > 0.0 {
         let threshold = config.variance_threshold * std_val;
         for (i, val) in items.iter().enumerate() {
-            if let Some(num) = val.as_f64().filter(|f| f.is_finite()) {
-                if (num - mean_val).abs() > threshold {
-                    outlier_indices.insert(i);
-                }
+            if let Some(num) = val.as_f64().filter(|f| f.is_finite())
+                && (num - mean_val).abs() > threshold
+            {
+                outlier_indices.insert(i);
             }
         }
     }

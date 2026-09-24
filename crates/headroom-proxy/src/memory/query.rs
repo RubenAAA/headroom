@@ -73,10 +73,10 @@ impl MemoryQuery {
                             }
                         }
                         // NOT a real user turn — continue walking
-                    } else if let Some(Value::String(text)) = content {
-                        if user_text.is_empty() {
-                            user_text = text.clone();
-                        }
+                    } else if let Some(Value::String(text)) = content
+                        && user_text.is_empty()
+                    {
+                        user_text = text.clone();
                     }
                 }
                 "assistant" => match content {
@@ -105,10 +105,11 @@ impl MemoryQuery {
                     _ => {}
                 },
                 "tool" => {
-                    if let Some(Value::String(text)) = content {
-                        if !text.is_empty() && tool_outputs.len() < lookback_tools {
-                            tool_outputs.push(text.clone());
-                        }
+                    if let Some(Value::String(text)) = content
+                        && !text.is_empty()
+                        && tool_outputs.len() < lookback_tools
+                    {
+                        tool_outputs.push(text.clone());
                     }
                 }
                 _ => {}

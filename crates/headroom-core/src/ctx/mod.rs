@@ -23,11 +23,11 @@ mod store;
 
 pub use memory_records::MemoryRecordStore;
 pub use sessions::{
-    data_hash, session_db_path, EventInsert, NewEvent, PrefixTurn, SessionsStore, StoredEvent,
+    EventInsert, NewEvent, PrefixTurn, SessionsStore, StoredEvent, data_hash, session_db_path,
 };
-pub use snapshot::{build_recall, build_resume_snapshot, INJECT_SENTINEL};
+pub use snapshot::{INJECT_SENTINEL, build_recall, build_resume_snapshot};
 pub use store::{
-    content_db_path, default_base_dir, hash_project_dir_canonical, sanitize_query,
-    sanitize_trigram_query, ContentType, CtxStore, IndexOpts, IndexSummary, SearchHit, SearchOpts,
-    SearchTimings, SortMode, SourceMeta, RRF_K,
+    ContentType, CtxStore, IndexOpts, IndexSummary, RRF_K, SearchHit, SearchOpts, SearchTimings,
+    SortMode, SourceMeta, content_db_path, default_base_dir, hash_project_dir_canonical,
+    sanitize_query, sanitize_trigram_query,
 };

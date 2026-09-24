@@ -14,14 +14,14 @@ use axum::http::HeaderMap;
 use serde_json::json;
 
 use headroom_proxy::cache_stabilization::anthropic_cache_control::{
-    auto_place_anthropic_cache_control, AutoPlaceOutcome,
+    AutoPlaceOutcome, auto_place_anthropic_cache_control,
 };
-use headroom_proxy::cache_stabilization::drift_detector::{derive_session_key_with_model, ApiKind};
+use headroom_proxy::cache_stabilization::drift_detector::{ApiKind, derive_session_key_with_model};
 use headroom_proxy::cache_stabilization::message_breakpoints::{
     push_marker_to_tail, push_newest_marker_to_tail,
 };
 use headroom_proxy::cache_stabilization::openai_cache_key::{
-    inject_prompt_cache_key, OpenAiShape, KEY_HEX_LEN,
+    KEY_HEX_LEN, OpenAiShape, inject_prompt_cache_key,
 };
 use headroom_proxy::cache_stabilization::tool_roster_pin::RosterPinStore;
 

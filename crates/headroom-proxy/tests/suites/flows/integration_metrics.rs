@@ -27,8 +27,8 @@ use super::common;
 use bytes::Bytes;
 use common::start_proxy_with;
 use headroom_proxy::observability;
-use headroom_proxy::sse::openai_responses::ResponseState;
 use headroom_proxy::sse::SseFramer;
+use headroom_proxy::sse::openai_responses::ResponseState;
 use serde_json::json;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -65,10 +65,10 @@ fn find_value_with_labels(scrape: &str, metric: &str, label_pairs: &[(&str, &str
         {
             continue;
         }
-        if let Some(value_str) = line.rsplit_once(' ').map(|(_, v)| v.trim()) {
-            if let Ok(f) = value_str.parse::<f64>() {
-                return Some(f);
-            }
+        if let Some(value_str) = line.rsplit_once(' ').map(|(_, v)| v.trim())
+            && let Ok(f) = value_str.parse::<f64>()
+        {
+            return Some(f);
         }
     }
     None

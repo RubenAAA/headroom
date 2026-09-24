@@ -101,12 +101,12 @@ use std::{
 };
 
 use serde::Deserialize;
-use serde_json::value::RawValue;
 use serde_json::Value;
+use serde_json::value::RawValue;
 use thiserror::Error;
 
 use super::code_compressor::{CodeAwareCompressor, CodeCompressorConfig};
-use super::content_detector::{detect_content_type, ContentType};
+use super::content_detector::{ContentType, detect_content_type};
 use super::content_router::detect_content_native;
 use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 #[cfg(feature = "ml")]
@@ -118,7 +118,7 @@ use super::read_protection::{
 };
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
-use crate::ccr::{compute_key, marker_for, CcrStore};
+use crate::ccr::{CcrStore, compute_key, marker_for};
 use crate::tokenizer::get_tokenizer;
 use crate::tool_exclusion::{
     is_byte_exact_excluded, is_ccr_retrieve_tool, is_tool_excluded, is_verbatim_excluded,

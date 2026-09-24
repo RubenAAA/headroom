@@ -696,8 +696,8 @@ pub(super) fn place_replay_breakpoints(
     request_id: &str,
 ) -> (Vec<serde_json::Value>, usize, usize) {
     use crate::cache_stabilization::prefix_replay::{
-        message_slots_within_budget, place_tail_cache_breakpoints,
-        trim_system_breakpoints_to_budget, ANTHROPIC_CACHE_CONTROL_LIMIT,
+        ANTHROPIC_CACHE_CONTROL_LIMIT, message_slots_within_budget, place_tail_cache_breakpoints,
+        trim_system_breakpoints_to_budget,
     };
 
     // Anthropic counts `cache_control` across `system`, `tools` and `messages`
@@ -809,17 +809,15 @@ pub(super) fn serialize_replayed_body(
     parsed["messages"] = serde_json::Value::Array(normalized.clone());
     match serde_json::to_vec(parsed) {
         Ok(b) => {
-            if replayed_prefix {
-                if let Some(observer) = observer {
-                    observer.note_replay_applied(
-                        request_id,
-                        crate::cache_stabilization::usage_observer::ReplayAppliedEvidence::new(
-                            chain_id,
-                            breakpoints_placed,
-                            system_markers_dropped,
-                        ),
-                    );
-                }
+            if replayed_prefix && let Some(observer) = observer {
+                observer.note_replay_applied(
+                    request_id,
+                    crate::cache_stabilization::usage_observer::ReplayAppliedEvidence::new(
+                        chain_id,
+                        breakpoints_placed,
+                        system_markers_dropped,
+                    ),
+                );
             }
             tracing::info!(
                 event = "prefix_replay_applied",
@@ -987,16 +985,18 @@ mod cold_fork_tests {
 
     #[test]
     fn disabled_flag_never_forks() {
-        assert!(maybe_cold_fork(
-            false,
-            true,
-            "claude-opus-5",
-            &msgs(),
-            None,
-            Some(99999.0),
-            None
-        )
-        .is_none());
+        assert!(
+            maybe_cold_fork(
+                false,
+                true,
+                "claude-opus-5",
+                &msgs(),
+                None,
+                Some(99999.0),
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]

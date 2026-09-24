@@ -9,6 +9,10 @@
 //! `forward_http`, so it covers `/v1/messages` and the generic passthrough
 //! routes alike.
 
+// Edition 2024 makes std::env::set_var and remove_var unsafe. Tests call them
+// to set up config; non-test code stays free of unsafe.
+#![allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+
 mod common;
 
 use common::{start_proxy, start_proxy_with};
@@ -32,7 +36,7 @@ fn messages_body() -> serde_json::Value {
 /// value serves every test here and setting it twice is harmless — which
 /// matters because the env is process-global and these tests run in parallel.
 fn allow_loopback_overrides() {
-    std::env::set_var("HEADROOM_ALLOWED_BASE_URLS", "127.0.0.1,localhost");
+    unsafe { std::env::set_var("HEADROOM_ALLOWED_BASE_URLS", "127.0.0.1,localhost") };
 }
 
 fn localhost_url(server: &MockServer) -> String {

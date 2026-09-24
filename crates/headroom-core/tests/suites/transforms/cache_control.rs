@@ -7,7 +7,7 @@
 
 use headroom_core::compute_frozen_count;
 use proptest::prelude::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Marker placement table-driven cases. Spec (PR-A4):
 /// - markers in `messages[i].content[*]` bump frozen_count to ≥ i+1

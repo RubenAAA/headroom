@@ -12,7 +12,7 @@
 //! message after it. One request, one cache write, and prefix replay carries
 //! the repaired history forward from there.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 /// How long an unclaimed answer is worth keeping. A conversation that never

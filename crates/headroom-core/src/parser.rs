@@ -29,7 +29,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::tokenizer::Tokenizer;
-use crate::waste_signals::{detect_waste_signals, WasteSignals};
+use crate::waste_signals::{WasteSignals, detect_waste_signals};
 
 /// Tool results below this size legitimately repeat ("ok", empty diffs, exit
 /// codes) and are not evidence of a re-read.
@@ -261,10 +261,12 @@ fn python_repr(value: &Value) -> String {
         Value::Bool(true) => "True".to_string(),
         Value::Bool(false) => "False".to_string(),
         Value::Number(n) => {
-            if let Some(f) = n.as_f64() {
-                if n.as_i64().is_none() && n.as_u64().is_none() && f.fract() == 0.0 {
-                    return format!("{f:.1}");
-                }
+            if let Some(f) = n.as_f64()
+                && n.as_i64().is_none()
+                && n.as_u64().is_none()
+                && f.fract() == 0.0
+            {
+                return format!("{f:.1}");
             }
             n.to_string()
         }
@@ -358,11 +360,11 @@ pub fn canonical_call_key(name: &str, arguments: &Value) -> String {
     // `{"b": 2, "a": 1}` land on the same key.
     let parsed;
     let mut args = arguments;
-    if let Value::String(s) = arguments {
-        if let Ok(v) = serde_json::from_str::<Value>(s) {
-            parsed = v;
-            args = &parsed;
-        }
+    if let Value::String(s) = arguments
+        && let Ok(v) = serde_json::from_str::<Value>(s)
+    {
+        parsed = v;
+        args = &parsed;
     }
     let canon = match args {
         Value::Object(_) | Value::Array(_) => json_dumps(args, true, true),
@@ -736,31 +738,30 @@ pub fn parse_messages(
     // first pass already counted are skipped so nothing is billed twice.
     let mut results_by_call_id: HashMap<&str, usize> = HashMap::new();
     for (idx, block) in all_blocks.iter().enumerate() {
-        if block.kind == BlockKind::ToolResult {
-            if let Some(tc_id) = block
+        if block.kind == BlockKind::ToolResult
+            && let Some(tc_id) = block
                 .flags
                 .tool_call_id
                 .as_deref()
                 .filter(|s| !s.is_empty())
-            {
-                results_by_call_id.entry(tc_id).or_insert(idx);
-            }
+        {
+            results_by_call_id.entry(tc_id).or_insert(idx);
         }
     }
 
     let mut call_order: Vec<String> = Vec::new();
     let mut call_groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, block) in all_blocks.iter().enumerate() {
-        if block.kind == BlockKind::ToolCall {
-            if let Some(key) = block.flags.call_key.as_deref().filter(|s| !s.is_empty()) {
-                call_groups
-                    .entry(key.to_string())
-                    .or_insert_with(|| {
-                        call_order.push(key.to_string());
-                        Vec::new()
-                    })
-                    .push(idx);
-            }
+        if block.kind == BlockKind::ToolCall
+            && let Some(key) = block.flags.call_key.as_deref().filter(|s| !s.is_empty())
+        {
+            call_groups
+                .entry(key.to_string())
+                .or_insert_with(|| {
+                    call_order.push(key.to_string());
+                    Vec::new()
+                })
+                .push(idx);
         }
     }
 

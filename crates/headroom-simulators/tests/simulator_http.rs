@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use headroom_simulators::config::{
     ConfiguredResponse, JsonPointerMatch, SimulatorConfig, StubRule,
 };
-use headroom_simulators::{build_app, Simulator};
-use serde_json::{json, Value};
+use headroom_simulators::{Simulator, build_app};
+use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 struct TestServer {

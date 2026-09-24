@@ -5,6 +5,10 @@
 //! sequentially in one test: the override is process-global env, so
 //! parallel tests must not touch it.
 
+// Edition 2024 makes std::env::set_var and remove_var unsafe. Tests call them
+// to set up config; non-test code stays free of unsafe.
+#![allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+
 mod common;
 
 use common::start_proxy;
@@ -36,13 +40,15 @@ async fn codex_live_http_call_creation() {
     // The generic default upstream must NOT see the live call. Asserted
     // below by inspecting received requests (a duplicate identical
     // matcher would shadow instead of complement).
-    std::env::set_var(
-        "HEADROOM_CODEX_REALTIME_CALLS_URL",
-        format!(
-            "{}/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas",
-            realtime.uri()
-        ),
-    );
+    unsafe {
+        std::env::set_var(
+            "HEADROOM_CODEX_REALTIME_CALLS_URL",
+            format!(
+                "{}/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas",
+                realtime.uri()
+            ),
+        )
+    };
     let proxy = start_proxy(&fallback.uri()).await;
 
     // Hand-built multipart body: also proves the parser reads raw wire
@@ -138,5 +144,5 @@ async fn codex_live_http_call_creation() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
-    std::env::remove_var("HEADROOM_CODEX_REALTIME_CALLS_URL");
+    unsafe { std::env::remove_var("HEADROOM_CODEX_REALTIME_CALLS_URL") };
 }

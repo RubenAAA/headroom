@@ -5,11 +5,11 @@
 //! `CostTracker` and `SavingsTracker` already held on `AppState`, with no
 //! external subsystem dependencies.
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;

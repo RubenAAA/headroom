@@ -30,9 +30,6 @@ use headroom_core::transforms::tag_protector::{
     protect_tags as rust_protect_tags, restore_tags as rust_restore_tags,
 };
 use headroom_core::transforms::{
-    compress_openai_responses_live_zone as rust_compress_openai_responses_live_zone,
-    detect as rust_detect_chain, is_json_array_of_dicts as rust_is_json_array_of_dicts,
-    summarize_openai_responses_no_change_reason as rust_summarize_openai_responses_no_change_reason,
     AuthMode as RustLiveZoneAuthMode, ContentType as RustContentType,
     DetectionResult as RustDetectionResult, DiffCompressionResult, DiffCompressor,
     DiffCompressorConfig, DiffCompressorStats, LiveZoneOutcome,
@@ -41,6 +38,9 @@ use headroom_core::transforms::{
     LogFormat as RustLogFormat, LogLevel as RustLogLevel,
     SearchCompressionResult as RustSearchResult, SearchCompressor as RustSearchCompressor,
     SearchCompressorConfig as RustSearchConfig, SearchCompressorStats as RustSearchStats,
+    compress_openai_responses_live_zone as rust_compress_openai_responses_live_zone,
+    detect as rust_detect_chain, is_json_array_of_dicts as rust_is_json_array_of_dicts,
+    summarize_openai_responses_no_change_reason as rust_summarize_openai_responses_no_change_reason,
 };
 use headroom_core::transforms::{
     TextCrusher as RustTextCrusher, TextCrusherConfig as RustTextCrusherConfig,

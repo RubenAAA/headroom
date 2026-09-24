@@ -581,20 +581,19 @@ impl SearchCompressor {
                 }
             };
 
-            if self.config.always_keep_first {
-                if let Some(first) = fm.first() {
-                    if file_selected.len() < remaining_cap {
-                        push_unique(first, &mut file_selected, &mut seen);
-                    }
-                }
+            if self.config.always_keep_first
+                && let Some(first) = fm.first()
+                && file_selected.len() < remaining_cap
+            {
+                push_unique(first, &mut file_selected, &mut seen);
             }
 
-            if self.config.always_keep_last && fm.matches.len() > 1 {
-                if let Some(last) = fm.last() {
-                    if file_selected.len() < remaining_cap {
-                        push_unique(last, &mut file_selected, &mut seen);
-                    }
-                }
+            if self.config.always_keep_last
+                && fm.matches.len() > 1
+                && let Some(last) = fm.last()
+                && file_selected.len() < remaining_cap
+            {
+                push_unique(last, &mut file_selected, &mut seen);
             }
 
             for m in &sorted {
@@ -647,17 +646,17 @@ impl SearchCompressor {
                     lines.push(m.raw.clone());
                 }
             }
-            if let Some(orig_fm) = original.get(file) {
-                if orig_fm.matches.len() > fm.matches.len() {
-                    let omitted = orig_fm.matches.len() - fm.matches.len();
-                    let summary = if grouped {
-                        format!("[... and {} more matches]", omitted)
-                    } else {
-                        format!("[... and {} more matches in {}]", omitted, file)
-                    };
-                    lines.push(summary.clone());
-                    summaries.insert(file.clone(), summary);
-                }
+            if let Some(orig_fm) = original.get(file)
+                && orig_fm.matches.len() > fm.matches.len()
+            {
+                let omitted = orig_fm.matches.len() - fm.matches.len();
+                let summary = if grouped {
+                    format!("[... and {} more matches]", omitted)
+                } else {
+                    format!("[... and {} more matches in {}]", omitted, file)
+                };
+                lines.push(summary.clone());
+                summaries.insert(file.clone(), summary);
             }
         }
 
@@ -1408,10 +1407,11 @@ src/main.py-44-context line";
         for fm in selected.values() {
             assert!(fm.matches.len() <= 2);
             // Survivors output in line order.
-            assert!(fm
-                .matches
-                .windows(2)
-                .all(|w| w[0].line_number < w[1].line_number));
+            assert!(
+                fm.matches
+                    .windows(2)
+                    .all(|w| w[0].line_number < w[1].line_number)
+            );
         }
     }
 

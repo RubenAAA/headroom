@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use sha2::{Digest, Sha256};
 
 // ─────────────────────────────────────────────────────────
@@ -304,10 +304,10 @@ impl CtxStore {
         if is_in_memory(&self.path) {
             return None;
         }
-        if let Ok(mut pool) = self.readers.lock() {
-            if let Some(conn) = pool.pop() {
-                return Some(conn);
-            }
+        if let Ok(mut pool) = self.readers.lock()
+            && let Some(conn) = pool.pop()
+        {
+            return Some(conn);
         }
         let conn = if self.read_only {
             Connection::open_with_flags(
@@ -324,10 +324,10 @@ impl CtxStore {
 
     /// Return a reader to the pool, or drop it once the pool is full.
     fn give_reader(&self, conn: Connection) {
-        if let Ok(mut pool) = self.readers.lock() {
-            if pool.len() < MAX_IDLE_READERS {
-                pool.push(conn);
-            }
+        if let Ok(mut pool) = self.readers.lock()
+            && pool.len() < MAX_IDLE_READERS
+        {
+            pool.push(conn);
         }
     }
 }
@@ -686,10 +686,10 @@ impl CtxStore {
         // yields "YYYY-MM-DD HH:MM:SS" (no T/Z); ISO has both. Normalize the
         // no-T form so cross-source lexical sort is consistent.
         for r in &mut results {
-            if let Some(ts) = &r.timestamp {
-                if !ts.contains('T') {
-                    r.timestamp = Some(format!("{}Z", ts.replacen(' ', "T", 1)));
-                }
+            if let Some(ts) = &r.timestamp
+                && !ts.contains('T')
+            {
+                r.timestamp = Some(format!("{}Z", ts.replacen(' ', "T", 1)));
             }
         }
 
@@ -1072,11 +1072,7 @@ fn fuzzy_correct(conn: &Connection, query: &str) -> Option<String> {
             best = Some(cand);
         }
     }
-    if best_dist <= max_dist {
-        best
-    } else {
-        None
-    }
+    if best_dist <= max_dist { best } else { None }
 }
 
 fn max_edit_distance(word_len: usize) -> usize {
@@ -1864,11 +1860,7 @@ fn parse_heading(line: &str) -> Option<(usize, String)> {
 /// `^(`{3,})` → number of leading backticks (≥3), else None.
 fn code_fence_len(line: &str) -> Option<usize> {
     let n = line.chars().take_while(|&c| c == '`').count();
-    if n >= 3 {
-        Some(n)
-    } else {
-        None
-    }
+    if n >= 3 { Some(n) } else { None }
 }
 
 /// `/^`{3,}/.test(line)` — used for has_code detection.

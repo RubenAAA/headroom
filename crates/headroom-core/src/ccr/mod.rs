@@ -38,7 +38,7 @@ pub mod tool_injection;
 
 use std::time::Duration;
 
-pub use backends::{from_config, CcrBackendConfig, CcrBackendInitError, InMemoryCcrStore};
+pub use backends::{CcrBackendConfig, CcrBackendInitError, InMemoryCcrStore, from_config};
 pub use batch_processor::{
     BatchResultProcessor, BatchResultProcessorConfig, ContinuationRequest, ProcessedBatchResult,
 };
@@ -123,9 +123,10 @@ mod tests {
     fn compute_key_is_24_hex_chars() {
         let k = compute_key(b"hello world");
         assert_eq!(k.len(), 24);
-        assert!(k
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            k.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]

@@ -152,8 +152,10 @@ mod tests {
         // path will bypass us when items is empty, but constraints
         // must still be safe to call.
         assert!(KeepErrorsConstraint.must_keep(&[], None).is_empty());
-        assert!(KeepStructuralOutliersConstraint
-            .must_keep(&[], None)
-            .is_empty());
+        assert!(
+            KeepStructuralOutliersConstraint
+                .must_keep(&[], None)
+                .is_empty()
+        );
     }
 }

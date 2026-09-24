@@ -42,8 +42,8 @@
 use sha2::{Digest, Sha256};
 
 use super::compression_units::{
-    ccr_marker_re, is_structured_shell_output, lossy_unmarked_strategies, Compressor,
-    RoutedCompressionUnit, TokenCounter, UnitCompressionResult,
+    Compressor, RoutedCompressionUnit, TokenCounter, UnitCompressionResult, ccr_marker_re,
+    is_structured_shell_output, lossy_unmarked_strategies,
 };
 use super::content_router::CompressionStrategy;
 use super::tag_protector::{protect_tags, restore_tags};
@@ -462,7 +462,12 @@ pub fn compress_batch_with_router(
     let mut replacements = match parse_batch_envelope(&restored, batch, &nonce) {
         Some(values) => values,
         None => {
-            return passthrough_batch_results(batch, tokenizer, BATCH_INVALID, Some(&router_result))
+            return passthrough_batch_results(
+                batch,
+                tokenizer,
+                BATCH_INVALID,
+                Some(&router_result),
+            );
         }
     };
 
@@ -1114,9 +1119,11 @@ mod tests {
         let batch = two_entry_batch();
         let compressor = ConstCompressor("");
         let results = compress_batch_with_router(&batch, &compressor, &WordTokenizer);
-        assert!(results
-            .iter()
-            .all(|(_, r)| r.reason.as_deref() == Some(ROUTER_NO_CHANGE)));
+        assert!(
+            results
+                .iter()
+                .all(|(_, r)| r.reason.as_deref() == Some(ROUTER_NO_CHANGE))
+        );
     }
 
     /// Measured against live Python (`garbage` scenario): dropping one
@@ -1145,9 +1152,11 @@ mod tests {
         let compressor = ConstCompressor("totally unrelated text");
         let results = compress_batch_with_router(&batch, &compressor, &WordTokenizer);
         assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|(_, r)| r.reason.as_deref() == Some(BATCH_INVALID) && !r.modified));
+        assert!(
+            results
+                .iter()
+                .all(|(_, r)| r.reason.as_deref() == Some(BATCH_INVALID) && !r.modified)
+        );
         assert_eq!(results[0].1.compressed, "alpha beta gamma delta");
     }
 

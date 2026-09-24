@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// What the proxy last observed about the account's Codex quota.
 #[derive(Debug, Clone, Default)]
@@ -148,16 +148,16 @@ impl CodexRateLimitStore {
 /// top level and one level down rather than hard-coding a path that a change
 /// upstream would silently break.
 pub fn extract_rate_limits(chunk: &Value) -> Option<Value> {
-    if let Some(found) = chunk.get("rate_limits") {
-        if !found.is_null() {
-            return Some(found.clone());
-        }
+    if let Some(found) = chunk.get("rate_limits")
+        && !found.is_null()
+    {
+        return Some(found.clone());
     }
     for key in ["response", "info", "item"] {
-        if let Some(found) = chunk.get(key).and_then(|v| v.get("rate_limits")) {
-            if !found.is_null() {
-                return Some(found.clone());
-            }
+        if let Some(found) = chunk.get(key).and_then(|v| v.get("rate_limits"))
+            && !found.is_null()
+        {
+            return Some(found.clone());
         }
     }
     // Deliberately silent. This runs on EVERY SSE frame

@@ -37,7 +37,7 @@ use super::common;
 
 use aws_credential_types::Credentials;
 use common::start_proxy_with_state;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use url::Url;

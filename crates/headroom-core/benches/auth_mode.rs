@@ -13,7 +13,7 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use headroom_core::auth_mode::classify;
 use http::{HeaderMap, HeaderValue};
 

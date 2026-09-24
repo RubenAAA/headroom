@@ -9,8 +9,8 @@
 //!     STRING; the proxy never parses them as JSON.
 //!   - `reasoning_summary.delta` fragments accumulate per item.
 
-use headroom_proxy::sse::openai_responses::{ResponseState, StreamStatus};
 use headroom_proxy::sse::SseFramer;
+use headroom_proxy::sse::openai_responses::{ResponseState, StreamStatus};
 
 fn run(state: &mut ResponseState, raw: &[u8]) {
     let mut framer = SseFramer::new();

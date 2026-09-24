@@ -42,7 +42,7 @@
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The opening of the block Claude Code appends. Matched as a prefix because
 /// the rest of the block (examples, "Do not use tools.") has changed between
@@ -636,7 +636,7 @@ async fn forward(
                 &model,
                 None,
                 &format!("serialising sidecar body: {e}"),
-            )
+            );
         }
     };
 
@@ -1137,10 +1137,12 @@ mod tests {
             json!({"role": "user", "content": [describe_block()]}),
         ];
         let tail = sidecar_tail(&messages, 4);
-        assert!(tail[0]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .ends_with(TRUNCATION_SUFFIX));
+        assert!(
+            tail[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with(TRUNCATION_SUFFIX)
+        );
         // Anything already under the cap is left exactly as it was.
         assert_eq!(tail[1]["content"][0]["text"], "short");
     }
@@ -1174,10 +1176,12 @@ mod tests {
             json!({"role": "user", "content": [describe_block()]}),
         ];
         let tail = sidecar_tail(&messages, 4);
-        assert!(tail[0]["content"]
-            .as_str()
-            .unwrap()
-            .ends_with(TRUNCATION_SUFFIX));
+        assert!(
+            tail[0]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with(TRUNCATION_SUFFIX)
+        );
     }
 
     /// The cut counts characters, so it can never land inside one.

@@ -29,12 +29,12 @@ pub mod formatter;
 pub mod ir;
 pub mod walker;
 
-pub use classifier::{classify_cell, CellClass, ClassifyConfig};
-pub use compactor::{compact, compact_with_store, CompactConfig};
+pub use classifier::{CellClass, ClassifyConfig, classify_cell};
+pub use compactor::{CompactConfig, compact, compact_with_store};
 pub use formatter::{CsvSchemaFormatter, Formatter, JsonFormatter, MarkdownKvFormatter};
 pub use ir::{Bucket, CellValue, Compaction, FieldSpec, OpaqueKind, Row, Schema};
 pub use walker::{
-    compact_document, emit_opaque_ccr_marker, try_parse_json_container, DocumentCompactor,
+    DocumentCompactor, compact_document, emit_opaque_ccr_marker, try_parse_json_container,
 };
 
 /// Composed compaction stage: a config + formatter pair.

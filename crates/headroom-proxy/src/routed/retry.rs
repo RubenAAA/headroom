@@ -501,14 +501,14 @@ async fn try_codex_token_refresh(
     refreshed: &mut bool,
     r: reqwest::Response,
 ) -> Option<reqwest::Response> {
-    if let Some(auth_file) = state.config.codex_auth_file.as_deref() {
-        if let Some(token) = refresh_codex_token(client, auth_file).await {
-            if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}")) {
-                headers.insert(http::header::AUTHORIZATION, val);
-            }
-            *refreshed = true;
-            return None;
+    if let Some(auth_file) = state.config.codex_auth_file.as_deref()
+        && let Some(token) = refresh_codex_token(client, auth_file).await
+    {
+        if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}")) {
+            headers.insert(http::header::AUTHORIZATION, val);
         }
+        *refreshed = true;
+        return None;
     }
     Some(r)
 }
@@ -914,8 +914,8 @@ mod tests {
     /// test holds milliseconds, not seconds.
     #[tokio::test]
     async fn zen_hold_recovers_flapping_429() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();
@@ -964,8 +964,8 @@ mod tests {
     /// re-takes the count and the stream carries it to the last byte.
     #[tokio::test]
     async fn zen_hold_releases_its_egress_and_skips_probes_while_rotating() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let pool = Arc::new(crate::proxy::ProviderEgressPool::new(
             vec![reqwest::Client::new()],
@@ -1046,8 +1046,8 @@ mod tests {
     /// the hold probes — only the capped backoff sets the pace.
     #[tokio::test]
     async fn zen_hold_ignores_within_cap_retry_after() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();
@@ -1101,8 +1101,8 @@ mod tests {
     /// positive budget, and the client sees only the eventual 200.
     #[tokio::test]
     async fn zen_hold_default_budget_never_gives_up() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();
@@ -1156,8 +1156,8 @@ mod tests {
     /// that is what killed subagent turns on 2026-09-14.
     #[tokio::test]
     async fn zen_hold_ignores_retry_after_past_the_cap() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();
@@ -1213,8 +1213,8 @@ mod tests {
     /// worst case — a rotation that never lands a fresh exit within budget.
     #[tokio::test]
     async fn zen_hold_gives_up_after_budget_when_never_recovering() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();
@@ -1339,8 +1339,8 @@ mod tests {
     /// fires exactly once even with budget to spare.
     #[tokio::test]
     async fn replay_strip_retries_413_once() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();
@@ -1412,8 +1412,8 @@ mod tests {
     /// the measured error arm.
     #[tokio::test]
     async fn plain_413_without_replay_is_not_retried() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = hits.clone();

@@ -373,9 +373,11 @@ mod tests {
         let processor = BatchResultProcessor::new(Some(config));
         let results = vec![serde_json::json!({"custom_id": "r1"})];
         let ctxs = HashMap::new();
-        assert!(processor
-            .analyze_results(&results, "anthropic", &ctxs)
-            .is_empty());
+        assert!(
+            processor
+                .analyze_results(&results, "anthropic", &ctxs)
+                .is_empty()
+        );
     }
 
     #[test]

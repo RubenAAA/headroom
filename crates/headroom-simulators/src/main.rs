@@ -2,10 +2,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use headroom_simulators::{build_app, load_config, Simulator};
+use headroom_simulators::{Simulator, build_app, load_config};
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(about = "Deterministic local upstream simulators for Headroom tests")]

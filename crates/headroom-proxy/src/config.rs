@@ -2,7 +2,7 @@
 
 use clap::{Parser, ValueEnum};
 use headroom_core::rollout::{
-    feature_names, split_feature_names, Feature, RolloutChannel, RolloutSnapshot,
+    Feature, RolloutChannel, RolloutSnapshot, feature_names, split_feature_names,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -3717,12 +3717,14 @@ mod shadowed_route_tests {
 
     #[test]
     fn distinct_names_are_all_reachable() {
-        assert!(shadowed(&[
-            "claude-codex-5.6=https://api.openai.com/:openai:gpt-5.6-luna",
-            "claude-codex-5.6-terra=https://api.openai.com/:openai:gpt-5.6-terra",
-            "claude-codex-5.6-sol=https://api.openai.com/:openai:gpt-5.6-sol",
-        ])
-        .is_empty());
+        assert!(
+            shadowed(&[
+                "claude-codex-5.6=https://api.openai.com/:openai:gpt-5.6-luna",
+                "claude-codex-5.6-terra=https://api.openai.com/:openai:gpt-5.6-terra",
+                "claude-codex-5.6-sol=https://api.openai.com/:openai:gpt-5.6-sol",
+            ])
+            .is_empty()
+        );
     }
 
     /// The mistake this exists to catch: three variants of one model written
@@ -3759,11 +3761,13 @@ mod shadowed_route_tests {
     /// the same two routes must stay quiet.
     #[test]
     fn the_specific_route_listed_first_is_fine() {
-        assert!(shadowed(&[
-            "claude-codex-5.6-sol=https://api.openai.com/:openai:gpt-5.6-sol",
-            "claude-codex-*=https://api.openai.com/:openai:gpt-5.6-luna",
-        ])
-        .is_empty());
+        assert!(
+            shadowed(&[
+                "claude-codex-5.6-sol=https://api.openai.com/:openai:gpt-5.6-sol",
+                "claude-codex-*=https://api.openai.com/:openai:gpt-5.6-luna",
+            ])
+            .is_empty()
+        );
     }
 }
 
@@ -3849,9 +3853,11 @@ mod rollout_input_tests {
     #[test]
     fn explicit_rollout_inputs_are_strict_and_diagnosable() {
         assert_eq!(parse_rollout_channel("CANARY").unwrap(), "canary");
-        assert!(parse_rollout_channel("stabel")
-            .unwrap_err()
-            .contains("unknown rollout channel"));
+        assert!(
+            parse_rollout_channel("stabel")
+                .unwrap_err()
+                .contains("unknown rollout channel")
+        );
         assert!(parse_rollout_features("native-bedrock").is_ok());
         let error = parse_rollout_features("native_bedrok").unwrap_err();
         assert!(error.contains("native_bedrok"));

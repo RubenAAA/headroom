@@ -10,9 +10,9 @@
 //! about the things that matter here — how a tool result is shaped, where an
 //! image goes, and whether reasoning survives the round trip.
 
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine as _;
-use serde_json::{json, Value};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use serde_json::{Value, json};
 
 use headroom_core::parser::extract_tool_result_text;
 
@@ -100,20 +100,18 @@ pub(crate) fn anthropic_to_openai_request(
         "stream": stream,
     });
 
-    if include_max_output_tokens {
-        if let Some(mt) = max_tokens {
-            // Chat Completions uses `max_tokens`; `max_output_tokens` is a
-            // Responses-API field and would be silently ignored here.
-            openai["max_tokens"] = json!(mt);
-        }
+    if include_max_output_tokens && let Some(mt) = max_tokens {
+        // Chat Completions uses `max_tokens`; `max_output_tokens` is a
+        // Responses-API field and would be silently ignored here.
+        openai["max_tokens"] = json!(mt);
     }
     if let Some(t) = temperature {
         openai["temperature"] = t.clone();
     }
-    if let Some(tools) = tools {
-        if !tools.is_empty() {
-            openai["tools"] = json!(tools);
-        }
+    if let Some(tools) = tools
+        && !tools.is_empty()
+    {
+        openai["tools"] = json!(tools);
     }
 
     Ok(openai)
@@ -216,12 +214,11 @@ pub(crate) fn anthropic_to_openai_responses_request(
                     // Strip the Agent tool's `mode` so spawned subagents
                     // inherit the session's permission mode instead of
                     // getting an explicit override.
-                    if name == "Agent" {
-                        if let Some(props) =
+                    if name == "Agent"
+                        && let Some(props) =
                             params.get_mut("properties").and_then(|p| p.as_object_mut())
-                        {
-                            props.remove("mode");
-                        }
+                    {
+                        props.remove("mode");
                     }
                     Some(json!({
                         "type": "function",
@@ -251,10 +248,10 @@ pub(crate) fn anthropic_to_openai_responses_request(
     copy_scalar_fields(anthropic, &mut openai);
 
     let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
-    if let Some(tools) = tools {
-        if !tools.is_empty() {
-            openai["tools"] = json!(tools);
-        }
+    if let Some(tools) = tools
+        && !tools.is_empty()
+    {
+        openai["tools"] = json!(tools);
     }
     if let Some(tool_choice) = anthropic.get("tool_choice") {
         let translated = match tool_choice.get("type").and_then(|t| t.as_str()) {
@@ -281,10 +278,8 @@ pub(crate) fn anthropic_to_openai_responses_request(
     if !instructions.is_empty() {
         openai["instructions"] = json!(instructions.join("\n\n"));
     }
-    if include_max_output_tokens {
-        if let Some(mt) = max_tokens {
-            openai["max_output_tokens"] = json!(mt);
-        }
+    if include_max_output_tokens && let Some(mt) = max_tokens {
+        openai["max_output_tokens"] = json!(mt);
     }
     // Note: `temperature` is deliberately NOT forwarded — the Codex
     // ResponsesApiRequest has no such field and the real CLI never sends it.
@@ -304,19 +299,19 @@ pub(crate) fn anthropic_to_openai_responses_request(
     if let Some(effort) = selector_effort {
         openai["reasoning"] = json!({"effort": effort, "summary": "auto"});
         openai["stream_options"] = json!({"reasoning_summary_delivery": "sequential_cutoff"});
-    } else if let Some(thinking) = anthropic.get("thinking") {
-        if thinking.get("type").and_then(|t| t.as_str()) == Some("enabled") {
-            let effort = match thinking.get("budget_tokens").and_then(|v| v.as_u64()) {
-                Some(b) if b <= 4096 => "low",
-                Some(b) if b <= 16384 => "medium",
-                Some(_) => "high",
-                None => "medium",
-            };
-            // `summary: auto` + sequential delivery makes the backend stream
-            // reasoning summaries, which we translate into thinking blocks.
-            openai["reasoning"] = json!({"effort": effort, "summary": "auto"});
-            openai["stream_options"] = json!({"reasoning_summary_delivery": "sequential_cutoff"});
-        }
+    } else if let Some(thinking) = anthropic.get("thinking")
+        && thinking.get("type").and_then(|t| t.as_str()) == Some("enabled")
+    {
+        let effort = match thinking.get("budget_tokens").and_then(|v| v.as_u64()) {
+            Some(b) if b <= 4096 => "low",
+            Some(b) if b <= 16384 => "medium",
+            Some(_) => "high",
+            None => "medium",
+        };
+        // `summary: auto` + sequential delivery makes the backend stream
+        // reasoning summaries, which we translate into thinking blocks.
+        openai["reasoning"] = json!({"effort": effort, "summary": "auto"});
+        openai["stream_options"] = json!({"reasoning_summary_delivery": "sequential_cutoff"});
     }
     // Stable per-session cache key enables upstream prompt caching; Claude
     // Code's metadata.user_id includes the session id.
@@ -632,26 +627,25 @@ fn translate_user_message(msg: &Value, out: &mut Vec<Value>) {
     };
 
     // Single tool_result block → tool message.
-    if content.len() == 1 {
-        if let Some(block) = content.first() {
-            if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                let tool_use_id = block
-                    .get("tool_use_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let result_content = extract_tool_result_text(block);
-                let is_error = block
-                    .get("is_error")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                out.push(json!({
+    if content.len() == 1
+        && let Some(block) = content.first()
+        && block.get("type").and_then(|v| v.as_str()) == Some("tool_result")
+    {
+        let tool_use_id = block
+            .get("tool_use_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let result_content = extract_tool_result_text(block);
+        let is_error = block
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        out.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
                     "content": if is_error { format!("Error: {result_content}") } else { result_content.to_string() }
                 }));
-                return;
-            }
-        }
+        return;
     }
 
     // Mixed content: text blocks + tool_result blocks (+ images/documents).
@@ -829,10 +823,12 @@ mod tests {
         let parts = out[0]["content"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["type"], "image_url");
-        assert!(parts[0]["image_url"]["url"]
-            .as_str()
-            .unwrap()
-            .starts_with("data:image/png;base64,"));
+        assert!(
+            parts[0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
     }
 
     /// FINDING-024: document/unknown blocks leave a placeholder instead of
@@ -882,16 +878,20 @@ mod tests {
         assert_eq!(output["input"][2]["call_id"], "call_1");
         assert_eq!(output["input"][2]["output"], "file1\nfile2");
         assert_eq!(output["max_output_tokens"], 100);
-        assert!(!output["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["role"] == "tool"));
-        assert!(!output["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["role"] == "system"));
+        assert!(
+            !output["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["role"] == "tool")
+        );
+        assert!(
+            !output["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["role"] == "system")
+        );
     }
 
     /// Anthropic sends `tool_result.content` as a plain string *or* a list of

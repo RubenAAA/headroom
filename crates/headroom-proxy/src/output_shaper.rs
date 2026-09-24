@@ -190,16 +190,16 @@ pub fn apply_verbosity_steering(body: &mut Value, level: i32) -> bool {
     if let Some(Value::Array(blocks)) = system {
         // Check if already applied at this level
         for block in blocks {
-            if let Some(obj) = block.as_object() {
-                if let Some(Value::String(t)) = obj.get("text") {
-                    if t.starts_with(STEERING_SENTINEL) && *t == text {
-                        return false; // already applied at this level
-                    }
-                    // Level changed — would need to replace in place
-                    // but we can't mutate through the Value easily.
-                    // Append and let dedup handle it.
-                }
+            if let Some(obj) = block.as_object()
+                && let Some(Value::String(t)) = obj.get("text")
+                && t.starts_with(STEERING_SENTINEL)
+                && *t == text
+            {
+                return false; // already applied at this level
             }
+            // Level changed — would need to replace in place
+            // but we can't mutate through the Value easily.
+            // Append and let dedup handle it.
         }
 
         let mut new_blocks = blocks.clone();
@@ -497,10 +497,12 @@ mod tests {
         assert!(result.changed);
         assert_eq!(result.labels, vec!["output_shaper:verbosity:L2"]);
         let tail = body["system"].as_array().unwrap().last().unwrap();
-        assert!(tail["text"]
-            .as_str()
-            .unwrap()
-            .starts_with(STEERING_SENTINEL));
+        assert!(
+            tail["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(STEERING_SENTINEL)
+        );
         assert!(steering_allowed_for(crate::modes::PROXY_MODE_TOKEN));
     }
 

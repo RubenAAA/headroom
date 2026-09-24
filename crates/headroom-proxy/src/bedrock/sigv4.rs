@@ -32,7 +32,7 @@ use std::time::SystemTime;
 
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    sign, PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings,
+    PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;

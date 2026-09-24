@@ -33,8 +33,8 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use super::classifier::{classify_cell, CellClass};
-use super::compactor::{compact_with_store, CompactConfig};
+use super::classifier::{CellClass, classify_cell};
+use super::compactor::{CompactConfig, compact_with_store};
 use super::formatter::{CsvSchemaFormatter, Formatter};
 use super::ir::OpaqueKind;
 use crate::ccr::CcrStore;
@@ -185,15 +185,15 @@ pub fn emit_opaque_ccr_marker(
         .take(6)
         .map(|b| format!("{b:02x}"))
         .collect();
-    if let Some(s) = store {
-        if !s.put(&hash, payload) {
-            tracing::warn!(
-                event = "ccr_put_failed",
-                target = "ccr.walker",
-                hash = %hash,
-                "ccr_put_failed; marker will point at an unretrievable hash"
-            );
-        }
+    if let Some(s) = store
+        && !s.put(&hash, payload)
+    {
+        tracing::warn!(
+            event = "ccr_put_failed",
+            target = "ccr.walker",
+            hash = %hash,
+            "ccr_put_failed; marker will point at an unretrievable hash"
+        );
     }
     let kind_str = match kind {
         OpaqueKind::Base64Blob => "base64",
@@ -344,16 +344,18 @@ mod tests {
         assert_eq!(out.pointer("/user_id"), Some(&json!(42)));
         assert_eq!(out.pointer("/tag"), Some(&json!("active")));
         // config preserved as object (not an array, can't tabulate).
-        assert!(out
-            .pointer("/config")
-            .map(|v| v.is_object())
-            .unwrap_or(false));
+        assert!(
+            out.pointer("/config")
+                .map(|v| v.is_object())
+                .unwrap_or(false)
+        );
         // events compacted to a string.
-        assert!(out
-            .pointer("/events")
-            .and_then(|v| v.as_str())
-            .unwrap()
-            .starts_with("[2]{"));
+        assert!(
+            out.pointer("/events")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .starts_with("[2]{")
+        );
     }
 
     #[test]

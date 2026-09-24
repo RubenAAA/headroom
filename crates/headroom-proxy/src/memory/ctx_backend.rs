@@ -37,7 +37,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use headroom_core::ctx::{
-    sanitize_query, CtxStore, IndexOpts, MemoryRecordStore, SearchOpts, SearchTimings,
+    CtxStore, IndexOpts, MemoryRecordStore, SearchOpts, SearchTimings, sanitize_query,
 };
 
 use super::backend::{MemoryBackend, MemorySearchResult};
@@ -1118,11 +1118,13 @@ mod tests {
 
         assert!(backend.delete_memory(&m.id).await.unwrap());
         assert!(backend.get_memory(&m.id).await.unwrap().is_none());
-        assert!(backend
-            .search_memories("forgettable", "alice", 10, false)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            backend
+                .search_memories("forgettable", "alice", 10, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1133,11 +1135,13 @@ mod tests {
         save(&backend, "bob note", "bob").await;
 
         assert_eq!(backend.clear_user("alice").await.unwrap(), 2);
-        assert!(backend
-            .search_memories("note", "alice", 10, false)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            backend
+                .search_memories("note", "alice", 10, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             backend
                 .search_memories("note", "bob", 10, false)

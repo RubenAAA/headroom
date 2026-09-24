@@ -37,12 +37,12 @@
 use std::collections::HashSet;
 
 use crate::ccr::CcrStore;
+use crate::transforms::ContentType;
 use crate::transforms::pipeline::config::SearchBloatConfig;
 use crate::transforms::pipeline::traits::{
     CompressionContext, OffloadOutput, OffloadTransform, TransformError,
 };
 use crate::transforms::search_compressor::{SearchCompressor, SearchCompressorConfig};
-use crate::transforms::ContentType;
 
 const NAME: &str = "search_offload";
 /// Confidence is high — SearchCompressor has parity fixtures.

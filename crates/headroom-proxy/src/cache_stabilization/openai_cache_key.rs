@@ -229,10 +229,10 @@ fn extract_system(body: &Value, shape: OpenAiShape) -> &Value {
             if let Some(instructions) = body.get("instructions") {
                 return instructions;
             }
-            if let Some(v) = body.get("input") {
-                if let Some(content) = first_system_in_array(v) {
-                    return content;
-                }
+            if let Some(v) = body.get("input")
+                && let Some(content) = first_system_in_array(v)
+            {
+                return content;
             }
             first_system_message_content(body, "messages")
         }

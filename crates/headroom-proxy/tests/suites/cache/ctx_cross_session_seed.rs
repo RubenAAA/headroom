@@ -13,12 +13,12 @@
 //! credentials, and process restarts.
 
 use headroom_proxy::cache_stabilization::drift_detector::{
-    compute_structural_hash, derive_session_key, observe_drift_with_birth, ApiKind, DriftState,
+    ApiKind, DriftState, compute_structural_hash, derive_session_key, observe_drift_with_birth,
 };
 use headroom_proxy::compression::ctx_offload::{
-    offload_anthropic_request, seed_newborn_session, CtxOffloadConfig, OffloadGate, OffloadPolicy,
+    CtxOffloadConfig, OffloadGate, OffloadPolicy, offload_anthropic_request, seed_newborn_session,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tempfile::TempDir;
 

@@ -444,8 +444,8 @@ mod tests {
         let lines = capture.0.clone();
         let subscriber = tracing_subscriber::registry().with(capture);
         tracing::subscriber::with_default(subscriber, book);
-        let joined = lines.lock().unwrap().join("\n");
-        joined
+
+        lines.lock().unwrap().join("\n")
     }
 
     /// What the reroute bought, on the turn it bought it. Without this the only

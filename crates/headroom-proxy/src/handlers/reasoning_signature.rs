@@ -23,7 +23,7 @@
 //! so envelopes from another proxy decode to `None` and are dropped rather than
 //! replayed as garbage.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 
 const PREFIX: &str = "headroom:codex:v1:";

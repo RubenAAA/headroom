@@ -6,7 +6,7 @@
 //! stubs and report `Skipped` — see the `stub_comparator!` block below for what
 //! each is waiting on.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,7 +64,7 @@ pub fn compare_fixture(
         Err(e) => {
             return Ok(ComparisonOutcome::Skipped {
                 reason: format!("comparator error: {e}"),
-            })
+            });
         }
     };
     let actual_normalized: serde_json::Value =
@@ -257,7 +257,7 @@ impl TransformComparator for CcrComparator {
         input: &serde_json::Value,
         config: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        use headroom_core::ccr::tool_injection::{create_ccr_tool_definition, CCR_TOOL_NAME};
+        use headroom_core::ccr::tool_injection::{CCR_TOOL_NAME, create_ccr_tool_definition};
 
         // The Python fixture input is the tools list.
         let tools: Vec<serde_json::Value> = input

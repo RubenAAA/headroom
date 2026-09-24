@@ -8,8 +8,8 @@
 //! Gated behind `HEADROOM_CC_SWITCH_RECONCILE=1` — off by default.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 use tokio::sync::RwLock;

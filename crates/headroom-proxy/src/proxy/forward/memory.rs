@@ -18,63 +18,63 @@ pub(crate) fn inject_memory_tool_definitions(
     request_id: &str,
     changed: &mut bool,
 ) {
-    if let Some(handler) = state.memory_handler.as_ref() {
-        if handler.is_initialized() {
-            let provider = match endpoint {
-                compression::CompressibleEndpoint::AnthropicMessages => {
-                    crate::memory::tool_adapter::Provider::Anthropic
-                }
-                compression::CompressibleEndpoint::OpenAiChatCompletions
-                | compression::CompressibleEndpoint::OpenAiResponses => {
-                    crate::memory::tool_adapter::Provider::Openai
-                }
-            };
-            // Requests without a tools array still get the
-            // memory tools - create the array on demand.
-            let existing: Vec<serde_json::Value> = value
-                .get("tools")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let (new_tools, injected) = handler.inject_memory_tools(Some(&existing), provider);
-            // Info, not debug: in tool mode this is the only
-            // proof the model was ever offered memory. Without
-            // it, "the tools never arrived" and "the model
-            // chose not to call them" both read as an empty
-            // log. Logged on both branches for that reason.
-            let added = new_tools.len().saturating_sub(existing.len());
-            // Only the definitions we appended, not the whole
-            // array: the tools block costs about $32/day in
-            // cache reads and the memory tools share of it was
-            // a guess. prefix_composition already carries the
-            // block total size, so this is the other half of
-            // the ratio. Serialising the tail is a handful of
-            // small objects; serialising the array would not be.
-            let added_bytes: usize = new_tools
-                .iter()
-                .skip(existing.len())
-                .filter_map(|t| serde_json::to_string(t).ok())
-                .map(|s| s.len())
-                .sum();
-            if injected {
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert("tools".to_string(), serde_json::Value::Array(new_tools));
-                    *changed = true;
-                    tracing::info!(
-                        request_id = %request_id,
-                        event = "memory_tools_injected",
-                        tools_added = added,
-                        tools_total = existing.len() + added,
-                        bytes_added = added_bytes,
-                    );
-                }
-            } else {
+    if let Some(handler) = state.memory_handler.as_ref()
+        && handler.is_initialized()
+    {
+        let provider = match endpoint {
+            compression::CompressibleEndpoint::AnthropicMessages => {
+                crate::memory::tool_adapter::Provider::Anthropic
+            }
+            compression::CompressibleEndpoint::OpenAiChatCompletions
+            | compression::CompressibleEndpoint::OpenAiResponses => {
+                crate::memory::tool_adapter::Provider::Openai
+            }
+        };
+        // Requests without a tools array still get the
+        // memory tools - create the array on demand.
+        let existing: Vec<serde_json::Value> = value
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let (new_tools, injected) = handler.inject_memory_tools(Some(&existing), provider);
+        // Info, not debug: in tool mode this is the only
+        // proof the model was ever offered memory. Without
+        // it, "the tools never arrived" and "the model
+        // chose not to call them" both read as an empty
+        // log. Logged on both branches for that reason.
+        let added = new_tools.len().saturating_sub(existing.len());
+        // Only the definitions we appended, not the whole
+        // array: the tools block costs about $32/day in
+        // cache reads and the memory tools share of it was
+        // a guess. prefix_composition already carries the
+        // block total size, so this is the other half of
+        // the ratio. Serialising the tail is a handful of
+        // small objects; serialising the array would not be.
+        let added_bytes: usize = new_tools
+            .iter()
+            .skip(existing.len())
+            .filter_map(|t| serde_json::to_string(t).ok())
+            .map(|s| s.len())
+            .sum();
+        if injected {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("tools".to_string(), serde_json::Value::Array(new_tools));
+                *changed = true;
                 tracing::info!(
                     request_id = %request_id,
-                    event = "memory_tools_not_injected",
-                    tools_present = existing.len(),
+                    event = "memory_tools_injected",
+                    tools_added = added,
+                    tools_total = existing.len() + added,
+                    bytes_added = added_bytes,
                 );
             }
+        } else {
+            tracing::info!(
+                request_id = %request_id,
+                event = "memory_tools_not_injected",
+                tools_present = existing.len(),
+            );
         }
     }
 }
@@ -319,18 +319,41 @@ pub(crate) fn inject_ccr_retrieve_tool(
     {
         value["tools"] = serde_json::json!([]);
     }
-    if state.config.ccr_inject_tool && can_resolve {
-        if let Some(tools) = value.get_mut("tools").and_then(|v| v.as_array_mut()) {
-            let already_has = tools
-                .iter()
-                .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("headroom_retrieve"));
-            if !already_has {
-                let ccr_tool = match endpoint {
-                    compression::CompressibleEndpoint::AnthropicMessages => {
-                        serde_json::json!({
+    if state.config.ccr_inject_tool
+        && can_resolve
+        && let Some(tools) = value.get_mut("tools").and_then(|v| v.as_array_mut())
+    {
+        let already_has = tools
+            .iter()
+            .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("headroom_retrieve"));
+        if !already_has {
+            let ccr_tool = match endpoint {
+                compression::CompressibleEndpoint::AnthropicMessages => {
+                    serde_json::json!({
+                        "name": "headroom_retrieve",
+                        "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. Provide `hash` from a compression marker like [N items compressed... hash=abc123], or `query` with keywords to search previously offloaded content. Exactly one of the two.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "hash": {
+                                    "type": "string",
+                                    "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
+                                },
+                                "query": {
+                                    "type": "string",
+                                    "description": "Keyword query to search previously offloaded content (e.g., 'provider squad retry logic'). Use when no marker hash is at hand."
+                                }
+                            }
+                        }
+                    })
+                }
+                _ => {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
                             "name": "headroom_retrieve",
                             "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. Provide `hash` from a compression marker like [N items compressed... hash=abc123], or `query` with keywords to search previously offloaded content. Exactly one of the two.",
-                            "input_schema": {
+                            "parameters": {
                                 "type": "object",
                                 "properties": {
                                     "hash": {
@@ -343,38 +366,16 @@ pub(crate) fn inject_ccr_retrieve_tool(
                                     }
                                 }
                             }
-                        })
-                    }
-                    _ => {
-                        serde_json::json!({
-                            "type": "function",
-                            "function": {
-                                "name": "headroom_retrieve",
-                                "description": "Retrieve original uncompressed content that was compressed to save tokens. Use this when you need more data than what's shown in compressed tool results. Provide `hash` from a compression marker like [N items compressed... hash=abc123], or `query` with keywords to search previously offloaded content. Exactly one of the two.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "hash": {
-                                            "type": "string",
-                                            "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
-                                        },
-                                        "query": {
-                                            "type": "string",
-                                            "description": "Keyword query to search previously offloaded content (e.g., 'provider squad retry logic'). Use when no marker hash is at hand."
-                                        }
-                                    }
-                                }
-                            }
-                        })
-                    }
-                };
-                tools.push(ccr_tool);
-                *changed = true;
-                tracing::debug!(
-                    request_id = %request_id,
-                    "ccr: injected headroom_retrieve tool definition"
-                );
-            }
+                        }
+                    })
+                }
+            };
+            tools.push(ccr_tool);
+            *changed = true;
+            tracing::debug!(
+                request_id = %request_id,
+                "ccr: injected headroom_retrieve tool definition"
+            );
         }
     }
 }
@@ -425,88 +426,87 @@ pub(crate) async fn inject_memory_context(
     injection_budget: &crate::injection_budget::InjectionBudget,
     changed: &mut bool,
 ) {
-    if let Some(handler) = state.memory_handler.as_ref() {
-        if handler.is_initialized() {
-            let provider = match endpoint {
-                compression::CompressibleEndpoint::AnthropicMessages => {
-                    crate::memory::tool_adapter::Provider::Anthropic
-                }
-                compression::CompressibleEndpoint::OpenAiChatCompletions
-                | compression::CompressibleEndpoint::OpenAiResponses => {
-                    crate::memory::tool_adapter::Provider::Openai
-                }
-            };
-            if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
-                let msgs: Vec<serde_json::Value> = messages.clone();
-                let base_user_id = headers_snapshot
-                    .as_ref()
-                    .and_then(|h| h.get("x-headroom-user-id"))
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("default");
-                // Same partition as the tool path, so switching
-                // modes cannot make one project's memories
-                // visible to another.
-                let user_id = crate::memory::router::scoped_user_id(
-                    base_user_id,
-                    &crate::memory::router::RequestContext {
-                        headers: header_map_to_lowercase_strings(headers_snapshot.as_ref()),
-                        system_prompt: crate::memory::router::extract_system_prompt(value),
-                        base_user_id: base_user_id.to_string(),
-                        project_root_override: state.config.memory_project_root.clone(),
-                    },
-                );
-                // Memory runs last, so it sees whatever the
-                // expansion and recall stages left. Clipping
-                // here is cache-safe: this appends to the live
-                // tail, which is re-sent every turn anyway.
-                if let Some(context) = crate::memory::ctx_backend::SEARCH_REQUEST_ID
-                    .scope(
-                        request_id.to_string(),
-                        handler.search_and_format_context(
-                            &user_id, &msgs, None, // request_context
-                            None, // ranker
-                            None, // query
-                            None, // budget
-                        ),
-                    )
-                    .await
-                    .and_then(|context| {
-                        injection_budget
-                            .take(crate::injection_budget::InjectionStage::Memory, context)
-                    })
+    if let Some(handler) = state.memory_handler.as_ref()
+        && handler.is_initialized()
+    {
+        let provider = match endpoint {
+            compression::CompressibleEndpoint::AnthropicMessages => {
+                crate::memory::tool_adapter::Provider::Anthropic
+            }
+            compression::CompressibleEndpoint::OpenAiChatCompletions
+            | compression::CompressibleEndpoint::OpenAiResponses => {
+                crate::memory::tool_adapter::Provider::Openai
+            }
+        };
+        if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
+            let msgs: Vec<serde_json::Value> = messages.clone();
+            let base_user_id = headers_snapshot
+                .as_ref()
+                .and_then(|h| h.get("x-headroom-user-id"))
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("default");
+            // Same partition as the tool path, so switching
+            // modes cannot make one project's memories
+            // visible to another.
+            let user_id = crate::memory::router::scoped_user_id(
+                base_user_id,
+                &crate::memory::router::RequestContext {
+                    headers: header_map_to_lowercase_strings(headers_snapshot.as_ref()),
+                    system_prompt: crate::memory::router::extract_system_prompt(value),
+                    base_user_id: base_user_id.to_string(),
+                    project_root_override: state.config.memory_project_root.clone(),
+                },
+            );
+            // Memory runs last, so it sees whatever the
+            // expansion and recall stages left. Clipping
+            // here is cache-safe: this appends to the live
+            // tail, which is re-sent every turn anyway.
+            if let Some(context) = crate::memory::ctx_backend::SEARCH_REQUEST_ID
+                .scope(
+                    request_id.to_string(),
+                    handler.search_and_format_context(
+                        &user_id, &msgs, None, // request_context
+                        None, // ranker
+                        None, // query
+                        None, // budget
+                    ),
+                )
+                .await
+                .and_then(|context| {
+                    injection_budget.take(crate::injection_budget::InjectionStage::Memory, context)
+                })
+            {
+                // `frozen_message_count` indexes into
+                // `messages`. This passed the length of the
+                // *system* array instead — a count of system
+                // blocks standing in for a count of messages.
+                // With two system blocks the callee skipped
+                // `messages[0..2]`, so a conversation one or
+                // two messages long had no eligible tail and
+                // got no memory at all.
+                //
+                // Zero is the honest value here. The real
+                // frozen boundary comes from the prefix-replay
+                // tracker, which does not run until
+                // `apply_prefix_replay` further down. The
+                // guard is inert regardless: the callee walks
+                // backwards for the last user message, and the
+                // turn being sent is by definition not in the
+                // cached prefix.
+                let (new_msgs, bytes) =
+                    crate::memory::handler::MemoryHandler::append_to_latest_user_tail(
+                        &msgs, &context, provider, 0,
+                    );
+                if bytes > 0
+                    && let Some(msgs_val) = value.get_mut("messages")
                 {
-                    // `frozen_message_count` indexes into
-                    // `messages`. This passed the length of the
-                    // *system* array instead — a count of system
-                    // blocks standing in for a count of messages.
-                    // With two system blocks the callee skipped
-                    // `messages[0..2]`, so a conversation one or
-                    // two messages long had no eligible tail and
-                    // got no memory at all.
-                    //
-                    // Zero is the honest value here. The real
-                    // frozen boundary comes from the prefix-replay
-                    // tracker, which does not run until
-                    // `apply_prefix_replay` further down. The
-                    // guard is inert regardless: the callee walks
-                    // backwards for the last user message, and the
-                    // turn being sent is by definition not in the
-                    // cached prefix.
-                    let (new_msgs, bytes) =
-                        crate::memory::handler::MemoryHandler::append_to_latest_user_tail(
-                            &msgs, &context, provider, 0,
-                        );
-                    if bytes > 0 {
-                        if let Some(msgs_val) = value.get_mut("messages") {
-                            *msgs_val = serde_json::Value::Array(new_msgs);
-                            *changed = true;
-                            tracing::debug!(
-                                request_id = %request_id,
-                                bytes_appended = bytes,
-                                "memory: injected context into user message tail"
-                            );
-                        }
-                    }
+                    *msgs_val = serde_json::Value::Array(new_msgs);
+                    *changed = true;
+                    tracing::debug!(
+                        request_id = %request_id,
+                        bytes_appended = bytes,
+                        "memory: injected context into user message tail"
+                    );
                 }
             }
         }

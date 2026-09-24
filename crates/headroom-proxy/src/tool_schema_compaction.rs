@@ -330,11 +330,11 @@ fn compact_schema_value_inner(value: &Value, parent_key: Option<&str>) -> Value 
                 if parent_key != Some("properties") && is_drop_key(key) {
                     continue;
                 }
-                if key == "description" {
-                    if let Some(text) = child.as_str() {
-                        compacted.insert(key.clone(), Value::String(collapse_whitespace(text)));
-                        continue;
-                    }
+                if key == "description"
+                    && let Some(text) = child.as_str()
+                {
+                    compacted.insert(key.clone(), Value::String(collapse_whitespace(text)));
+                    continue;
                 }
                 compacted.insert(
                     key.clone(),
@@ -438,12 +438,12 @@ fn truncate_description(desc: &str, max_chars: i64) -> String {
         let first_len = first.chars().count();
         if first_len <= max {
             let rest = desc[first.len()..].trim();
-            if !rest.is_empty() {
-                if let Some(second) = first_sentence(rest) {
-                    let budget = (max_chars as f64 * 1.5) as usize;
-                    if first_len + 1 + second.chars().count() <= budget {
-                        return format!("{first} {second}");
-                    }
+            if !rest.is_empty()
+                && let Some(second) = first_sentence(rest)
+            {
+                let budget = (max_chars as f64 * 1.5) as usize;
+                if first_len + 1 + second.chars().count() <= budget {
+                    return format!("{first} {second}");
                 }
             }
             return first.to_string();
@@ -483,22 +483,22 @@ fn truncate_descriptions_in_schema(
         Value::Object(map) => {
             let mut compacted = Map::new();
             for (key, child) in map {
-                if key == "description" {
-                    if let Some(text) = child.as_str() {
-                        // Layer 3: drop the description on a self-explanatory
-                        // param — the name alone is enough.
-                        if strip_semantic
-                            && grandparent_key == Some("properties")
-                            && parent_key.is_some_and(is_semantic_param_name)
-                        {
-                            continue;
-                        }
-                        compacted.insert(
-                            key.clone(),
-                            Value::String(truncate_description(text, max_chars)),
-                        );
+                if key == "description"
+                    && let Some(text) = child.as_str()
+                {
+                    // Layer 3: drop the description on a self-explanatory
+                    // param — the name alone is enough.
+                    if strip_semantic
+                        && grandparent_key == Some("properties")
+                        && parent_key.is_some_and(is_semantic_param_name)
+                    {
                         continue;
                     }
+                    compacted.insert(
+                        key.clone(),
+                        Value::String(truncate_description(text, max_chars)),
+                    );
+                    continue;
                 }
                 compacted.insert(
                     key.clone(),
@@ -713,7 +713,11 @@ mod tests {
                 10,
                 "No termina…",
             ),
-            ("Multi\nline  desc.   Second sentence.", 15, "Multi line desc…"),
+            (
+                "Multi\nline  desc.   Second sentence.",
+                15,
+                "Multi line desc…",
+            ),
             ("Hi! There? Ok.", 5, "Hi!"),
             ("abc.", 0, "abc."),
             (
@@ -798,7 +802,7 @@ mod tests {
     #[test]
     fn layer2_truncates_tool_descriptions() {
         let _guard = compaction_test_lock();
-        std::env::remove_var("HEADROOM_TOOL_DESC_STRIP_SEMANTIC");
+        unsafe { std::env::remove_var("HEADROOM_TOOL_DESC_STRIP_SEMANTIC") };
         reset_env_cache();
         invalidate_cache();
 
@@ -904,24 +908,24 @@ mod tests {
     #[test]
     fn env_helpers_read_the_environment_once() {
         let _guard = compaction_test_lock();
-        std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "128");
-        std::env::set_var("HEADROOM_TOOL_DESC_STRIP_SEMANTIC", "1");
+        unsafe { std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "128") };
+        unsafe { std::env::set_var("HEADROOM_TOOL_DESC_STRIP_SEMANTIC", "1") };
         reset_env_cache();
         assert_eq!(tool_desc_max_chars(), 128);
         assert!(strip_semantic_params());
 
         // Memoised: later env changes are ignored until the cache resets.
-        std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "7");
+        unsafe { std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "7") };
         assert_eq!(tool_desc_max_chars(), 128);
 
-        std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "not-a-number");
-        std::env::remove_var("HEADROOM_TOOL_DESC_STRIP_SEMANTIC");
+        unsafe { std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "not-a-number") };
+        unsafe { std::env::remove_var("HEADROOM_TOOL_DESC_STRIP_SEMANTIC") };
         reset_env_cache();
         // Python's `int(...)` raises ValueError, caught and mapped to 0.
         assert_eq!(tool_desc_max_chars(), 0);
         assert!(!strip_semantic_params());
 
-        std::env::remove_var("HEADROOM_TOOL_DESC_MAX_CHARS");
+        unsafe { std::env::remove_var("HEADROOM_TOOL_DESC_MAX_CHARS") };
         reset_env_cache();
         invalidate_cache();
     }

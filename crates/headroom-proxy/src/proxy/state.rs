@@ -666,8 +666,8 @@ impl AppState {
 
     /// Background compression worker flag chain.
     /// Extracted from `AppState::new` without behavior change.
-    pub(super) fn build_background_compressor(
-    ) -> Option<Arc<crate::background_compression::BackgroundCompressor>> {
+    pub(super) fn build_background_compressor()
+    -> Option<Arc<crate::background_compression::BackgroundCompressor>> {
         std::env::var("HEADROOM_BACKGROUND_COMPRESSION")
             .ok()
             .map(|v| v == "1" || v.to_lowercase() == "true")

@@ -13,7 +13,7 @@ use crate::routed::response_arms::{apply_target_model_override, streaming_body_r
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A model route the spinner sidecar may take off-Claude.
 ///
@@ -398,8 +398,8 @@ pub(crate) async fn handle_sidecar(
     let sidecar_model = crate::sidecar::direct_sidecar_model(&state.config)
         .unwrap_or_else(|| crate::sidecar::DEFAULT_SIDECAR_MODEL.to_string());
     let base = state.effective_upstream().await;
-    if let Ok(url) = crate::proxy::build_upstream_url(&base, uri) {
-        if let Some(resp) = crate::sidecar::try_handle(
+    if let Ok(url) = crate::proxy::build_upstream_url(&base, uri)
+        && let Some(resp) = crate::sidecar::try_handle(
             &state.client,
             &url,
             request_id,
@@ -409,9 +409,8 @@ pub(crate) async fn handle_sidecar(
             crate::sidecar::SidecarRetry::from_config(&state.config),
         )
         .await
-        {
-            return Some(resp);
-        }
+    {
+        return Some(resp);
     }
     None
 }
@@ -639,7 +638,7 @@ mod tests {
     /// session key, so placeholders match what the next real turn writes.
     #[test]
     fn sidecar_redaction_uses_the_conversation_session_key() {
-        use crate::cache_stabilization::drift_detector::{derive_session_key, ApiKind};
+        use crate::cache_stabilization::drift_detector::{ApiKind, derive_session_key};
         let headers = axum::http::HeaderMap::new();
         let addr: std::net::SocketAddr = "127.0.0.1:8787".parse().unwrap();
         let parsed = json!({

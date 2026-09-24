@@ -352,34 +352,34 @@ pub fn dedup_blocks_with(
         let n = lines.len();
         while i < n {
             let m = longest_match(&lines, i, &anchor_index, &corpus);
-            if let Some((mlen, mbp, _mli, mdelta)) = m {
-                if mlen >= min_lines {
-                    let span = &lines[i..i + mlen];
-                    let span_text = span.join("\n");
-                    // Chars, not bytes — Python's `len()` gates on characters,
-                    // so a multibyte span would otherwise clear the threshold
-                    // in Rust while Python left it alone.
-                    if span_text.chars().count() >= min_chars {
-                        let ref_turn = blocks[mbp].turn;
-                        let ptr = pointer(span, ref_turn, mdelta);
-                        // Python's `len()` counts CHARACTERS. The pointer now
-                        // contains `↑` (3 bytes, 1 char), so byte lengths would
-                        // under-report the saving by 2 per fold and drift from
-                        // the Python-reported stats.
-                        stats.chars_removed += span_text
-                            .chars()
-                            .count()
-                            .saturating_sub(ptr.chars().count());
-                        out.push(ptr);
-                        // Folded span is NOT verbatim in this block's output:
-                        // mark None so it can't seed a later contiguous match,
-                        // and don't index it (keep-earliest).
-                        verbatim.extend(std::iter::repeat_n(None, mlen));
-                        stats.spans_folded += 1;
-                        stats.lines_removed += mlen;
-                        i += mlen;
-                        continue;
-                    }
+            if let Some((mlen, mbp, _mli, mdelta)) = m
+                && mlen >= min_lines
+            {
+                let span = &lines[i..i + mlen];
+                let span_text = span.join("\n");
+                // Chars, not bytes — Python's `len()` gates on characters,
+                // so a multibyte span would otherwise clear the threshold
+                // in Rust while Python left it alone.
+                if span_text.chars().count() >= min_chars {
+                    let ref_turn = blocks[mbp].turn;
+                    let ptr = pointer(span, ref_turn, mdelta);
+                    // Python's `len()` counts CHARACTERS. The pointer now
+                    // contains `↑` (3 bytes, 1 char), so byte lengths would
+                    // under-report the saving by 2 per fold and drift from
+                    // the Python-reported stats.
+                    stats.chars_removed += span_text
+                        .chars()
+                        .count()
+                        .saturating_sub(ptr.chars().count());
+                    out.push(ptr);
+                    // Folded span is NOT verbatim in this block's output:
+                    // mark None so it can't seed a later contiguous match,
+                    // and don't index it (keep-earliest).
+                    verbatim.extend(std::iter::repeat_n(None, mlen));
+                    stats.spans_folded += 1;
+                    stats.lines_removed += mlen;
+                    i += mlen;
+                    continue;
                 }
             }
             out.push(lines[i].to_string());
@@ -911,10 +911,12 @@ mod tests {
         // The unprotected re-read still folds, so protection is scoped to the
         // marked block rather than switching the whole pass off.
         assert_eq!(stats.spans_folded, 1);
-        assert!(messages[2]["content"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("same as msg "));
+        assert!(
+            messages[2]["content"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("same as msg ")
+        );
     }
 
     /// OpenAI-shaped `role: "tool"` messages carry their text as a plain string
@@ -928,14 +930,18 @@ mod tests {
         ];
         let stats = dedup_messages(&mut messages, 0);
         assert_eq!(stats.spans_folded, 1);
-        assert!(!messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("same as msg "));
-        assert!(messages[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("same as msg "));
+        assert!(
+            !messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("same as msg ")
+        );
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("same as msg ")
+        );
     }
 
     /// Appending a turn must not change a single byte of what came before, or

@@ -249,9 +249,9 @@ fn a_parent_conversation_outlives_a_large_fan_out() {
         .previous_turn_for("S", &next, None)
         .expect("the parent's prefix must still be held");
     assert_ne!(
-            chain_id, 0,
-            "the parent was evicted by a fan-out that fits the message budget,              so its next turn re-caches the whole prefix"
-        );
+        chain_id, 0,
+        "the parent was evicted by a fan-out that fits the message budget,              so its next turn re-caches the whole prefix"
+    );
     let guard = store.trackers.lock().unwrap();
     let held: usize = guard
         .peek("S")

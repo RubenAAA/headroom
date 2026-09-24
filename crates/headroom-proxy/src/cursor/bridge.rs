@@ -19,10 +19,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// A `tools/call` held open, on its way up to the turn loop.
 ///
@@ -399,10 +399,10 @@ impl Bridge {
                 "a conversation was abandoned mid-tool; killing its agent"
             );
             parked.driver.shutdown().await;
-            if let Some(session) = self.sessions.lock().await.remove(&key) {
-                if let Some(id) = session.chat_id().await {
-                    self.chat_ids.lock().await.insert(key.clone(), id);
-                }
+            if let Some(session) = self.sessions.lock().await.remove(&key)
+                && let Some(id) = session.chat_id().await
+            {
+                self.chat_ids.lock().await.insert(key.clone(), id);
             }
         }
         reaped
@@ -416,11 +416,11 @@ impl Bridge {
     pub(crate) async fn close(&self, key: &str) {
         let removed = self.sessions.lock().await.remove(key);
         let mut stashed = false;
-        if let Some(session) = removed {
-            if let Some(id) = session.chat_id().await {
-                self.chat_ids.lock().await.insert(key.to_string(), id);
-                stashed = true;
-            }
+        if let Some(session) = removed
+            && let Some(id) = session.chat_id().await
+        {
+            self.chat_ids.lock().await.insert(key.to_string(), id);
+            stashed = true;
         }
         // A close that stashes nothing is what makes the next turn respawn, so
         // it is worth a line of its own: the alternative is reading the absence
@@ -810,7 +810,7 @@ mod tests {
         assert_eq!(session.chat_id().await.as_deref(), Some("cf8812c0"));
     }
 
-    use super::super::agent::{spawn_stub, AgentTurn, Workspace};
+    use super::super::agent::{AgentTurn, Workspace, spawn_stub};
     use super::super::turn::Conversation;
 
     /// A driver whose agent sits doing nothing, so it can be parked and reaped

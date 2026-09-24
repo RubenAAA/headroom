@@ -44,17 +44,17 @@ use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message as TgMsg;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::tungstenite::Message as TgMsg;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use headroom_core::auth_mode::AuthMode;
-use headroom_core::request_outcome::{emit_request_outcome, OutcomeSink, RequestOutcome};
+use headroom_core::request_outcome::{OutcomeSink, RequestOutcome, emit_request_outcome};
 
 use crate::compression::{self, Outcome, PassthroughReason};
 use crate::compression_failure::{
-    decide_compression_failure_action, oversize_threshold_bytes, WS_COMPRESSION_OVERSIZE_BYTES_ENV,
+    WS_COMPRESSION_OVERSIZE_BYTES_ENV, decide_compression_failure_action, oversize_threshold_bytes,
 };
 use crate::config::CompressionMode;
 use crate::observability::proxy_counters::{
@@ -288,11 +288,11 @@ pub(crate) fn resolve_codex_routing(headers: &mut HeaderMap) -> bool {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    if let Some(id) = account_id {
-        if let Ok(v) = HeaderValue::from_str(id) {
-            headers.insert(HeaderName::from_static("chatgpt-account-id"), v);
-            return true;
-        }
+    if let Some(id) = account_id
+        && let Ok(v) = HeaderValue::from_str(id)
+    {
+        headers.insert(HeaderName::from_static("chatgpt-account-id"), v);
+        return true;
     }
     false
 }
@@ -388,7 +388,7 @@ fn compress_response_create_frame(
         Some(_) => {
             return FrameCompression::Passthrough {
                 reason: "invalid_inner_payload",
-            }
+            };
         }
         None => false,
     };
@@ -404,7 +404,7 @@ fn compress_response_create_frame(
         Err(_) => {
             return FrameCompression::Passthrough {
                 reason: "serialize_failed",
-            }
+            };
         }
     };
     // FINDING-026: inner-payload bytes, not the outer envelope — the
@@ -449,7 +449,7 @@ fn compress_response_create_frame(
                     Err(_) => {
                         return FrameCompression::Passthrough {
                             reason: "serialize_failed",
-                        }
+                        };
                     }
                 }
             } else {
@@ -458,7 +458,7 @@ fn compress_response_create_frame(
                     Err(_) => {
                         return FrameCompression::Passthrough {
                             reason: "compressed_payload_not_utf8",
-                        }
+                        };
                     }
                 }
             };
@@ -1090,10 +1090,10 @@ fn merge_codex_beta(upstream_headers: &mut HeaderMap) {
         .map(|s| s.to_string());
     let merged =
         crate::headers::merge_beta_tokens(client_beta.as_deref(), &[RESPONSES_WS_REQUIRED_BETA]);
-    if !merged.is_empty() {
-        if let Ok(v) = HeaderValue::from_str(&merged) {
-            upstream_headers.insert(HeaderName::from_static("openai-beta"), v);
-        }
+    if !merged.is_empty()
+        && let Ok(v) = HeaderValue::from_str(&merged)
+    {
+        upstream_headers.insert(HeaderName::from_static("openai-beta"), v);
     }
 }
 
@@ -1306,10 +1306,10 @@ async fn connect_upstream_with_retry(
             for (name, value) in upstream_headers.iter() {
                 h.append(name.clone(), value.clone());
             }
-            if !subprotocols.is_empty() {
-                if let Ok(v) = HeaderValue::from_str(&subprotocols.join(", ")) {
-                    h.insert(HeaderName::from_static("sec-websocket-protocol"), v);
-                }
+            if !subprotocols.is_empty()
+                && let Ok(v) = HeaderValue::from_str(&subprotocols.join(", "))
+            {
+                h.insert(HeaderName::from_static("sec-websocket-protocol"), v);
             }
         }
         let mut config = WebSocketConfig::default();
@@ -1700,12 +1700,11 @@ async fn run_codex_session_inner(
                             // Binary/ping/pong: forward untouched (superset of
                             // Python, which only reads text frames).
                             other => {
-                                if let Some(tg) = ax_to_tg(other) {
-                                    if up_sink.send(tg).await.is_err() {
+                                if let Some(tg) = ax_to_tg(other)
+                                    && up_sink.send(tg).await.is_err() {
                                         had_error = true;
                                         break;
                                     }
-                                }
                             }
                         }
                     }
@@ -1807,11 +1806,10 @@ async fn run_codex_session_inner(
                                     let mut t = totals.lock().expect("totals lock");
                                     t.ws_upstream_frames_total += 1;
                                 }
-                                if let Some(ax) = tg_to_ax(other) {
-                                    if client_sink.send(ax).await.is_err() {
+                                if let Some(ax) = tg_to_ax(other)
+                                    && client_sink.send(ax).await.is_err() {
                                         break;
                                     }
-                                }
                             }
                         }
                     }
@@ -1913,12 +1911,12 @@ fn note_first_frame_shape(totals: &Arc<Mutex<SessionTotals>>, first_msg: &str) {
             .unwrap_or(0);
     }
     t.ws_client_frames_total += 1;
-    if let Ok(parsed) = serde_json::from_str::<Value>(first_msg) {
-        if let Some(ty) = parsed.get("type").and_then(Value::as_str) {
-            t.ws_last_client_frame_type = Some(ty.to_string());
-            if ty == "response.create" {
-                t.ws_response_create_frames += 1;
-            }
+    if let Ok(parsed) = serde_json::from_str::<Value>(first_msg)
+        && let Some(ty) = parsed.get("type").and_then(Value::as_str)
+    {
+        t.ws_last_client_frame_type = Some(ty.to_string());
+        if ty == "response.create" {
+            t.ws_response_create_frames += 1;
         }
     }
 }
@@ -2096,13 +2094,13 @@ fn fallback_http_body(first_msg_raw: &str) -> Value {
                 inner.clone()
             } else if parsed.is_object() {
                 let mut obj = parsed;
-                if let Some(map) = obj.as_object_mut() {
-                    if matches!(
+                if let Some(map) = obj.as_object_mut()
+                    && matches!(
                         map.get("type").and_then(Value::as_str),
                         Some("response.create") | Some("response")
-                    ) {
-                        map.remove("type");
-                    }
+                    )
+                {
+                    map.remove("type");
                 }
                 obj
             } else {

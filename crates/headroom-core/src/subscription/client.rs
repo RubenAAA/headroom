@@ -94,15 +94,15 @@ mod tests {
     #[test]
     fn env_token_takes_priority() {
         let _g = env_guard();
-        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "  env-token  ");
+        unsafe { std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "  env-token  ") };
         assert_eq!(read_cached_oauth_token().as_deref(), Some("env-token"));
-        std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        unsafe { std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") };
     }
 
     #[test]
     fn reads_unexpired_token_from_credentials_file() {
         let _g = env_guard();
-        std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        unsafe { std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") };
         let dir = tempfile::tempdir().unwrap();
         let future_ms = (Utc::now().timestamp_millis() + 3_600_000) as f64;
         std::fs::write(
@@ -113,15 +113,15 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        std::env::set_var("CLAUDE_CONFIG_DIR", dir.path());
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir.path()) };
         assert_eq!(read_cached_oauth_token().as_deref(), Some("file-token"));
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
     }
 
     #[test]
     fn expired_token_returns_none() {
         let _g = env_guard();
-        std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        unsafe { std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") };
         let dir = tempfile::tempdir().unwrap();
         let past_ms = (Utc::now().timestamp_millis() - 1000) as f64;
         std::fs::write(
@@ -132,8 +132,8 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        std::env::set_var("CLAUDE_CONFIG_DIR", dir.path());
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir.path()) };
         assert_eq!(read_cached_oauth_token(), None);
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
     }
 }

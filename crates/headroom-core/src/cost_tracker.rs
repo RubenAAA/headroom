@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Re-export so callers use one canonical `summarize_transforms` (it lives in
 /// [`crate::request_outcome`], not duplicated here).
@@ -301,11 +301,7 @@ impl CostTracker {
             + cr * cr_rate
             + cw * cw_rate
             + cw_1h * cw_1h_rate;
-        if total > 0.0 {
-            Some(total)
-        } else {
-            None
-        }
+        if total > 0.0 { Some(total) } else { None }
     }
 
     /// List input price ($/token) for a model, or `None`.
@@ -875,14 +871,14 @@ pub fn build_prefix_cache_stats(input: &PrefixCacheStatsInput) -> PrefixCacheSta
         // cannot express a model's actual published cache rates. The table
         // stays as the fallback for models with no vendored cache pricing.
         let mut pricing_source = "provider_default";
-        if let Some(matched) = find_provider_model(provider, input.model_prices) {
-            if let Some(p) = crate::pricing::lookup(matched) {
-                let uncached = p.input_cost_per_token;
-                if uncached > 0.0 {
-                    read_mult = p.cache_read_cost_per_token.unwrap_or(uncached) / uncached;
-                    write_mult = p.cache_write_cost_per_token.unwrap_or(uncached) / uncached;
-                    pricing_source = "vendored";
-                }
+        if let Some(matched) = find_provider_model(provider, input.model_prices)
+            && let Some(p) = crate::pricing::lookup(matched)
+        {
+            let uncached = p.input_cost_per_token;
+            if uncached > 0.0 {
+                read_mult = p.cache_read_cost_per_token.unwrap_or(uncached) / uncached;
+                write_mult = p.cache_write_cost_per_token.unwrap_or(uncached) / uncached;
+                pricing_source = "vendored";
             }
         }
 
@@ -1362,7 +1358,7 @@ pub fn build_session_summary(input: &SessionSummaryInput) -> SessionSummary {
     let primary_model = input
         .requests_by_model
         .iter()
-        .max_by_key(|(_, &count)| count)
+        .max_by_key(|&(_, &count)| count)
         .map(|(m, _)| m.clone())
         .unwrap_or_else(|| "unknown".into());
     let api_requests: i64 = input

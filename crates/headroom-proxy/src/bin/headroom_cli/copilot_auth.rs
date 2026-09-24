@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub const DEFAULT_GITHUB_HOST: &str = "github.com";
@@ -326,7 +326,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("auth.json");
         // Env var mutation is process-wide; this is the only test using it.
-        std::env::set_var(headroom_core::paths::HEADROOM_COPILOT_AUTH_FILE_ENV, &file);
+        unsafe { std::env::set_var(headroom_core::paths::HEADROOM_COPILOT_AUTH_FILE_ENV, &file) };
         let path = save_oauth_token("gho_secret", "GitHub.com").unwrap();
         assert_eq!(path, file);
         let payload: Value =
@@ -344,7 +344,7 @@ mod tests {
         // Wrong type → None.
         std::fs::write(&file, r#"{"type":"pat","refresh":"x"}"#).unwrap();
         assert_eq!(read_oauth_token(), None);
-        std::env::remove_var(headroom_core::paths::HEADROOM_COPILOT_AUTH_FILE_ENV);
+        unsafe { std::env::remove_var(headroom_core::paths::HEADROOM_COPILOT_AUTH_FILE_ENV) };
     }
 
     #[test]

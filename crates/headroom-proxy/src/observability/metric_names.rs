@@ -18,16 +18,14 @@
 // ---------- proxy_cache_hit_rate_per_session ----------
 
 pub const METRIC_PROXY_CACHE_HIT_RATE_PER_SESSION: &str = "proxy_cache_hit_rate_per_session";
-pub const METRIC_PROXY_CACHE_HIT_RATE_PER_SESSION_HELP: &str =
-    "Per-session cache hit rate observed at the Rust proxy from \
+pub const METRIC_PROXY_CACHE_HIT_RATE_PER_SESSION_HELP: &str = "Per-session cache hit rate observed at the Rust proxy from \
      usage.cache_read_input_tokens / (input + cache_read + cache_creation). \
      Phase H canary gate: parity with the Python proxy baseline.";
 
 // ---------- proxy_cache_recache_events_total ----------
 
 pub const METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL: &str = "proxy_cache_recache_events_total";
-pub const METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL_HELP: &str =
-    "CTX-7: count of re-cache events — turns where usage showed the \
+pub const METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL_HELP: &str = "CTX-7: count of re-cache events — turns where usage showed the \
      prompt-cache prefix was re-written inside the TTL window instead \
      of read back. Labelled by reason (drift axis from PR-E6, or \
      'unknown' when the drift detector saw stable bytes).";
@@ -36,8 +34,7 @@ pub const METRIC_PROXY_CACHE_RECACHE_EVENTS_TOTAL_HELP: &str =
 
 pub const METRIC_PROXY_CACHE_FIRST_TURN_WRITE_TOKENS_TOTAL: &str =
     "proxy_cache_first_turn_write_tokens_total";
-pub const METRIC_PROXY_CACHE_FIRST_TURN_WRITE_TOKENS_TOTAL_HELP: &str =
-    "CTX-7: cache_creation_input_tokens billed on the first completed turn \
+pub const METRIC_PROXY_CACHE_FIRST_TURN_WRITE_TOKENS_TOTAL_HELP: &str = "CTX-7: cache_creation_input_tokens billed on the first completed turn \
      under each conversation key, which the recache classifier has no \
      previous turn to score against. Labelled by attribution reason \
      (compaction_restart, session_key_drift, identical_prompt_fanout, \
@@ -47,8 +44,7 @@ pub const METRIC_PROXY_CACHE_FIRST_TURN_WRITE_TOKENS_TOTAL_HELP: &str =
 
 pub const METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL: &str =
     "proxy_cache_recache_wasted_tokens_total";
-pub const METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL_HELP: &str =
-    "CTX-7: cumulative billed tokens wasted re-writing prompt-cache \
+pub const METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL_HELP: &str = "CTX-7: cumulative billed tokens wasted re-writing prompt-cache \
      prefixes that should have been cache reads (summed wasted_tokens \
      across recache events).";
 
@@ -56,8 +52,7 @@ pub const METRIC_PROXY_CACHE_RECACHE_WASTED_TOKENS_TOTAL_HELP: &str =
 
 pub const METRIC_PROXY_CACHE_REPLAY_ALTERNATES_EVICTED_TOTAL: &str =
     "proxy_cache_replay_alternates_evicted_total";
-pub const METRIC_PROXY_CACHE_REPLAY_ALTERNATES_EVICTED_TOTAL_HELP: &str =
-    "Count of stored branch prefixes dropped from a session's alternates \
+pub const METRIC_PROXY_CACHE_REPLAY_ALTERNATES_EVICTED_TOTAL_HELP: &str = "Count of stored branch prefixes dropped from a session's alternates \
      because the count or message budget was full. One session key carries \
      several interleaved streams, and each holds the prefix its own next turn \
      replays; an evicted stream busts instead. Deep conversations spend the \
@@ -66,8 +61,7 @@ pub const METRIC_PROXY_CACHE_REPLAY_ALTERNATES_EVICTED_TOTAL_HELP: &str =
 // ---------- proxy_compression_ratio_by_strategy ----------
 
 pub const METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY: &str = "proxy_compression_ratio_by_strategy";
-pub const METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY_HELP: &str =
-    "Compression ratio (compressed_tokens / original_tokens) observed \
+pub const METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY_HELP: &str = "Compression ratio (compressed_tokens / original_tokens) observed \
      per block that was actually shrunk by the live-zone dispatcher. \
      Labelled by strategy (smart_crusher/log_compressor/…) and \
      detected content_type.";
@@ -75,8 +69,7 @@ pub const METRIC_PROXY_COMPRESSION_RATIO_BY_STRATEGY_HELP: &str =
 // ---------- proxy_tokens_saved_total ----------
 
 pub const METRIC_PROXY_TOKENS_SAVED_TOTAL: &str = "proxy_tokens_saved_total";
-pub const METRIC_PROXY_TOKENS_SAVED_TOTAL_HELP: &str =
-    "Cumulative input tokens removed from the wire by the live-zone \
+pub const METRIC_PROXY_TOKENS_SAVED_TOTAL_HELP: &str = "Cumulative input tokens removed from the wire by the live-zone \
      dispatcher (original_tokens - compressed_tokens, summed per shrunk \
      block). The running 'you saved X tokens' total the per-block \
      ratio histogram can't express. Labelled by strategy + content_type.";
@@ -85,8 +78,7 @@ pub const METRIC_PROXY_TOKENS_SAVED_TOTAL_HELP: &str =
 
 pub const METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL: &str =
     "proxy_compression_rejected_by_token_check_total";
-pub const METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL_HELP: &str =
-    "Count of compressor runs whose output failed the tokenizer-validated \
+pub const METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL_HELP: &str = "Count of compressor runs whose output failed the tokenizer-validated \
      shrink check (compressed_tokens >= original_tokens). Surfaces 'we ran \
      but kept the original' cases that would otherwise be invisible.";
 
@@ -94,8 +86,7 @@ pub const METRIC_PROXY_COMPRESSION_REJECTED_BY_TOKEN_CHECK_TOTAL_HELP: &str =
 
 pub const METRIC_PROXY_COMPRESSION_DECLINED_NO_SHRINK_TOTAL: &str =
     "proxy_compression_declined_no_shrink_total";
-pub const METRIC_PROXY_COMPRESSION_DECLINED_NO_SHRINK_TOTAL_HELP: &str =
-    "Count of compressor runs the dispatcher declined because the output was \
+pub const METRIC_PROXY_COMPRESSION_DECLINED_NO_SHRINK_TOTAL_HELP: &str = "Count of compressor runs the dispatcher declined because the output was \
      not smaller in bytes than the input. These used to travel to the \
      tokenizer and land in proxy_compression_rejected_by_token_check_total; \
      counting them here keeps that visible. Read alongside \
@@ -107,36 +98,31 @@ pub const METRIC_PROXY_COMPRESSION_DECLINED_NO_SHRINK_TOTAL_HELP: &str =
 
 pub const METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL: &str =
     "proxy_passthrough_bytes_modified_total";
-pub const METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL_HELP: &str =
-    "Bytes modified on a path that is supposed to passthrough verbatim. \
+pub const METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL_HELP: &str = "Bytes modified on a path that is supposed to passthrough verbatim. \
      MUST stay 0 outside the compression-on hot path. Any non-zero rate \
      fires the cache-safety alarm.";
 
 // ---------- proxy_rate_limit_remaining_* ----------
 
 pub const METRIC_PROXY_RATE_LIMIT_REMAINING_REQUESTS: &str = "proxy_rate_limit_remaining_requests";
-pub const METRIC_PROXY_RATE_LIMIT_REMAINING_REQUESTS_HELP: &str =
-    "Upstream-reported remaining requests for the current window, \
+pub const METRIC_PROXY_RATE_LIMIT_REMAINING_REQUESTS_HELP: &str = "Upstream-reported remaining requests for the current window, \
      extracted from rate-limit response headers (anthropic-ratelimit-* \
      or x-ratelimit-*). Per-provider, per-window-bucket gauge.";
 
 pub const METRIC_PROXY_RATE_LIMIT_REMAINING_TOKENS: &str = "proxy_rate_limit_remaining_tokens";
-pub const METRIC_PROXY_RATE_LIMIT_REMAINING_TOKENS_HELP: &str =
-    "Upstream-reported remaining tokens for the current window, extracted \
+pub const METRIC_PROXY_RATE_LIMIT_REMAINING_TOKENS_HELP: &str = "Upstream-reported remaining tokens for the current window, extracted \
      from rate-limit response headers (anthropic-ratelimit-*-tokens or \
      x-ratelimit-remaining-tokens).";
 
 pub const METRIC_PROXY_RATE_LIMIT_REMAINING_INPUT_TOKENS: &str =
     "proxy_rate_limit_remaining_input_tokens";
-pub const METRIC_PROXY_RATE_LIMIT_REMAINING_INPUT_TOKENS_HELP: &str =
-    "Upstream-reported remaining INPUT tokens for the current window. \
+pub const METRIC_PROXY_RATE_LIMIT_REMAINING_INPUT_TOKENS_HELP: &str = "Upstream-reported remaining INPUT tokens for the current window. \
      Anthropic separates input and output token budgets in its \
      ratelimit headers; this gauge tracks the input bucket.";
 
 pub const METRIC_PROXY_RATE_LIMIT_REMAINING_OUTPUT_TOKENS: &str =
     "proxy_rate_limit_remaining_output_tokens";
-pub const METRIC_PROXY_RATE_LIMIT_REMAINING_OUTPUT_TOKENS_HELP: &str =
-    "Upstream-reported remaining OUTPUT tokens for the current window. \
+pub const METRIC_PROXY_RATE_LIMIT_REMAINING_OUTPUT_TOKENS_HELP: &str = "Upstream-reported remaining OUTPUT tokens for the current window. \
      Anthropic-only header on present providers.";
 
 // ---------- proxy_ratelimit_unified_* (subscription / OAuth) ----------
@@ -149,22 +135,19 @@ pub const METRIC_PROXY_RATE_LIMIT_REMAINING_OUTPUT_TOKENS_HELP: &str =
 // subscription headroom — the number a subscription operator wants.
 
 pub const METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION: &str = "proxy_ratelimit_unified_utilization";
-pub const METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION_HELP: &str =
-    "Consumed fraction [0,1] of a Claude-subscription rate-limit window, \
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_UTILIZATION_HELP: &str = "Consumed fraction [0,1] of a Claude-subscription rate-limit window, \
      from anthropic-ratelimit-unified-<window>-utilization. `1 - value` \
      is the remaining headroom. Labelled by window (5h, 7d, per-model \
      like 7d_sonnet).";
 
 pub const METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS: &str =
     "proxy_ratelimit_unified_reset_seconds";
-pub const METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS_HELP: &str =
-    "Unix epoch (seconds) at which a subscription rate-limit window \
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_RESET_SECONDS_HELP: &str = "Unix epoch (seconds) at which a subscription rate-limit window \
      resets, from anthropic-ratelimit-unified-<window>-reset. Window \
      `overall` carries the top-level anthropic-ratelimit-unified-reset.";
 
 pub const METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED: &str = "proxy_ratelimit_unified_throttled";
-pub const METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED_HELP: &str =
-    "1 when a subscription window's status is anything other than \
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED_HELP: &str = "1 when a subscription window's status is anything other than \
      'allowed' (rejected/queueing/blocked), else 0. Boolean alarm \
      signal per window; the full status string is on the structured \
      log line paired with each update. Window `overage` carries \
@@ -172,24 +155,21 @@ pub const METRIC_PROXY_RATELIMIT_UNIFIED_THROTTLED_HELP: &str =
 
 pub const METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE: &str =
     "proxy_ratelimit_unified_fallback_percentage";
-pub const METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE_HELP: &str =
-    "anthropic-ratelimit-unified-fallback-percentage [0,1]: the share \
+pub const METRIC_PROXY_RATELIMIT_UNIFIED_FALLBACK_PERCENTAGE_HELP: &str = "anthropic-ratelimit-unified-fallback-percentage [0,1]: the share \
      of traffic the upstream is steering to fallback capacity. \
      Top-level (no window label).";
 
 // ---------- proxy_service_tier_count_total ----------
 
 pub const METRIC_PROXY_SERVICE_TIER_COUNT_TOTAL: &str = "proxy_service_tier_count_total";
-pub const METRIC_PROXY_SERVICE_TIER_COUNT_TOTAL_HELP: &str =
-    "Count of requests/responses observed at the proxy, labelled by the \
+pub const METRIC_PROXY_SERVICE_TIER_COUNT_TOTAL_HELP: &str = "Count of requests/responses observed at the proxy, labelled by the \
      OpenAI Responses service_tier the request resolved into (auto, \
      default, flex, on_demand, priority).";
 
 // ---------- proxy_response_status_count_total ----------
 
 pub const METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL: &str = "proxy_response_status_count_total";
-pub const METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP: &str =
-    "Count of OpenAI Responses outcomes labelled by terminal status \
+pub const METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP: &str = "Count of OpenAI Responses outcomes labelled by terminal status \
      (completed, incomplete, failed, cancelled, in_progress). \
      'incomplete' detail lands in the structured log paired with each \
      increment.";
@@ -207,8 +187,7 @@ pub const METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP: &str =
 // ---------- proxy_upstream_retries_total ----------
 
 pub const METRIC_PROXY_UPSTREAM_RETRIES_TOTAL: &str = "proxy_upstream_retries_total";
-pub const METRIC_PROXY_UPSTREAM_RETRIES_TOTAL_HELP: &str =
-    "Count of upstream requests re-sent after a transient failure, labelled \
+pub const METRIC_PROXY_UPSTREAM_RETRIES_TOTAL_HELP: &str = "Count of upstream requests re-sent after a transient failure, labelled \
      by forward path (anthropic, routed) and reason (status_429, \
      status_529, status_5xx, transport). One increment per re-send, so a \
      request that succeeds on its third try contributes 2. Retries cost \
@@ -218,8 +197,7 @@ pub const METRIC_PROXY_UPSTREAM_RETRIES_TOTAL_HELP: &str =
 // ---------- ctx_proactive_expansion_bytes_total ----------
 
 pub const METRIC_CTX_PROACTIVE_EXPANSION_BYTES_TOTAL: &str = "ctx_proactive_expansion_bytes_total";
-pub const METRIC_CTX_PROACTIVE_EXPANSION_BYTES_TOTAL_HELP: &str =
-    "CCR Phase 4: cumulative bytes of previously-offloaded content appended \
+pub const METRIC_CTX_PROACTIVE_EXPANSION_BYTES_TOTAL_HELP: &str = "CCR Phase 4: cumulative bytes of previously-offloaded content appended \
      back into the latest user turn by proactive expansion. This is the \
      counterweight to ctx_offloaded_bytes_total — offload removes bytes, \
      expansion puts them back, and only the difference is a real saving.";
@@ -228,8 +206,7 @@ pub const METRIC_CTX_PROACTIVE_EXPANSION_BYTES_TOTAL_HELP: &str =
 
 pub const METRIC_CTX_PROACTIVE_EXPANSION_CACHE_WRITE_TOKENS_TOTAL: &str =
     "ctx_proactive_expansion_cache_write_tokens_total";
-pub const METRIC_CTX_PROACTIVE_EXPANSION_CACHE_WRITE_TOKENS_TOTAL_HELP: &str =
-    "CCR Phase 4: Anthropic cache-creation input tokens on requests that \
+pub const METRIC_CTX_PROACTIVE_EXPANSION_CACHE_WRITE_TOKENS_TOTAL_HELP: &str = "CCR Phase 4: Anthropic cache-creation input tokens on requests that \
      injected proactive expansion. Provider usage cannot split the expansion \
      from the rest of that newly-written cache segment, so this records the \
      actual write charged to the affected request rather than estimating from \
@@ -238,15 +215,13 @@ pub const METRIC_CTX_PROACTIVE_EXPANSION_CACHE_WRITE_TOKENS_TOTAL_HELP: &str =
 // ---------- ctx_proactive_expansions_total ----------
 
 pub const METRIC_CTX_PROACTIVE_EXPANSIONS_TOTAL: &str = "ctx_proactive_expansions_total";
-pub const METRIC_CTX_PROACTIVE_EXPANSIONS_TOTAL_HELP: &str =
-    "CCR Phase 4: count of requests that had at least one previously-offloaded \
+pub const METRIC_CTX_PROACTIVE_EXPANSIONS_TOTAL_HELP: &str = "CCR Phase 4: count of requests that had at least one previously-offloaded \
      block re-inserted into the latest user turn.";
 
 // ---------- proxy_stream_incomplete_total ----------
 
 pub const METRIC_PROXY_STREAM_INCOMPLETE_TOTAL: &str = "proxy_stream_incomplete_total";
-pub const METRIC_PROXY_STREAM_INCOMPLETE_TOTAL_HELP: &str =
-    "Count of SSE streams that ended without their terminal event \
+pub const METRIC_PROXY_STREAM_INCOMPLETE_TOTAL_HELP: &str = "Count of SSE streams that ended without their terminal event \
      (Anthropic `message_stop`), labelled by provider. Usage totals arrive \
      with that event, so these turns are dropped from the cost and savings \
      books rather than booked at their partial figures. A rising rate means \
@@ -255,15 +230,13 @@ pub const METRIC_PROXY_STREAM_INCOMPLETE_TOTAL_HELP: &str =
 // ---------- ctx_offloaded_bytes_total ----------
 
 pub const METRIC_CTX_OFFLOADED_BYTES_TOTAL: &str = "ctx_offloaded_bytes_total";
-pub const METRIC_CTX_OFFLOADED_BYTES_TOTAL_HELP: &str =
-    "CTX-5/6: cumulative bytes whose tool_result originals are stored in CCR \
+pub const METRIC_CTX_OFFLOADED_BYTES_TOTAL_HELP: &str = "CTX-5/6: cumulative bytes whose tool_result originals are stored in CCR \
      and searchable in the project FTS index.";
 
 // ---------- ctx_offloaded_blocks_total ----------
 
 pub const METRIC_CTX_OFFLOADED_BLOCKS_TOTAL: &str = "ctx_offloaded_blocks_total";
-pub const METRIC_CTX_OFFLOADED_BLOCKS_TOTAL_HELP: &str =
-    "CTX-5/6: count of tool_result blocks offloaded (replaced with a \
+pub const METRIC_CTX_OFFLOADED_BLOCKS_TOTAL_HELP: &str = "CTX-5/6: count of tool_result blocks offloaded (replaced with a \
      deterministic digest) across all requests.";
 
 // ---------- CTX-3 index outbox ----------
@@ -296,8 +269,7 @@ pub const METRIC_CTX_OFFLOAD_INDEX_BATCH_DURATION_SECONDS_HELP: &str =
 // ---------- ctx_offloaded_blocks_by_tool_total ----------
 
 pub const METRIC_CTX_OFFLOADED_BLOCKS_BY_TOOL_TOTAL: &str = "ctx_offloaded_blocks_by_tool_total";
-pub const METRIC_CTX_OFFLOADED_BLOCKS_BY_TOOL_TOTAL_HELP: &str =
-    "CTX-5/6: offloaded tool_result blocks broken down by the tool that \
+pub const METRIC_CTX_OFFLOADED_BLOCKS_BY_TOOL_TOTAL_HELP: &str = "CTX-5/6: offloaded tool_result blocks broken down by the tool that \
      produced them. `ctx_offloaded_blocks_total` cannot show whether the \
      file and search results converted or only Bash output did. The tool \
      label comes from the request body and is collapsed onto a fixed \
@@ -306,15 +278,13 @@ pub const METRIC_CTX_OFFLOADED_BLOCKS_BY_TOOL_TOTAL_HELP: &str =
 // ---------- ctx_recall_injections_total ----------
 
 pub const METRIC_CTX_RECALL_INJECTIONS_TOTAL: &str = "ctx_recall_injections_total";
-pub const METRIC_CTX_RECALL_INJECTIONS_TOTAL_HELP: &str =
-    "CTX-5/6: count of recall/resume blocks injected into the first user \
+pub const METRIC_CTX_RECALL_INJECTIONS_TOTAL_HELP: &str = "CTX-5/6: count of recall/resume blocks injected into the first user \
      message of a conversation (CTX-4 injection engine).";
 
 // ---------- offload_gate_seeded_total ----------
 
 pub const METRIC_OFFLOAD_GATE_SEEDED_TOTAL: &str = "offload_gate_seeded_total";
-pub const METRIC_OFFLOAD_GATE_SEEDED_TOTAL_HELP: &str =
-    "CTX-3: newborn sessions whose offload gate was seeded from the same \
+pub const METRIC_OFFLOAD_GATE_SEEDED_TOTAL_HELP: &str = "CTX-3: newborn sessions whose offload gate was seeded from the same \
      conversation's prior session (model switch, resume). Seeded sessions \
      convert known blocks on first sight instead of stalling Deferred.";
 
@@ -322,8 +292,7 @@ pub const METRIC_OFFLOAD_GATE_SEEDED_TOTAL_HELP: &str =
 
 pub const METRIC_OFFLOAD_GATE_SEED_REFUSED_LIVE_TOTAL: &str =
     "offload_gate_seed_refused_live_total";
-pub const METRIC_OFFLOAD_GATE_SEED_REFUSED_LIVE_TOTAL_HELP: &str =
-    "CTX-3: seeding attempts refused because the gate already knew the \
+pub const METRIC_OFFLOAD_GATE_SEED_REFUSED_LIVE_TOTAL_HELP: &str = "CTX-3: seeding attempts refused because the gate already knew the \
      session (live session, drift-eviction rebirth with surviving gate \
      state, or concurrent double birth). Refusal is the safe outcome — \
      merging into a live session would shift its prefix.";
@@ -331,31 +300,27 @@ pub const METRIC_OFFLOAD_GATE_SEED_REFUSED_LIVE_TOTAL_HELP: &str =
 // ---------- ctx_injection_clipped_bytes_total ----------
 
 pub const METRIC_CTX_INJECTION_CLIPPED_BYTES_TOTAL: &str = "ctx_injection_clipped_bytes_total";
-pub const METRIC_CTX_INJECTION_CLIPPED_BYTES_TOTAL_HELP: &str =
-    "Bytes dropped by the shared per-request injection budget, labelled by \
+pub const METRIC_CTX_INJECTION_CLIPPED_BYTES_TOTAL_HELP: &str = "Bytes dropped by the shared per-request injection budget, labelled by \
      stage (proactive_expansion / recall / memory). Non-zero means a stage \
      wanted more room than --max-injection-bytes allowed.";
 
 // ---------- ctx_retrieval_hits_total ----------
 
 pub const METRIC_CTX_RETRIEVAL_HITS_TOTAL: &str = "ctx_retrieval_hits_total";
-pub const METRIC_CTX_RETRIEVAL_HITS_TOTAL_HELP: &str =
-    "PR-J5: count of /ctx/get retrievals that found the offloaded original \
+pub const METRIC_CTX_RETRIEVAL_HITS_TOTAL_HELP: &str = "PR-J5: count of /ctx/get retrievals that found the offloaded original \
      in the CCR store.";
 
 // ---------- ctx_retrieval_misses_total ----------
 
 pub const METRIC_CTX_RETRIEVAL_MISSES_TOTAL: &str = "ctx_retrieval_misses_total";
-pub const METRIC_CTX_RETRIEVAL_MISSES_TOTAL_HELP: &str =
-    "PR-J5: count of /ctx/get retrievals for a hash absent from the CCR \
+pub const METRIC_CTX_RETRIEVAL_MISSES_TOTAL_HELP: &str = "PR-J5: count of /ctx/get retrievals for a hash absent from the CCR \
      store (expired, evicted, or never offloaded). A rising rate flags an \
      information-loss risk — see docs/notes/realignment/13 §8.";
 
 // ---------- ctx_retrieval_bytes_total ----------
 
 pub const METRIC_CTX_RETRIEVAL_BYTES_TOTAL: &str = "ctx_retrieval_bytes_total";
-pub const METRIC_CTX_RETRIEVAL_BYTES_TOTAL_HELP: &str =
-    "Bytes of offloaded content handed back to the model via retrieval, \
+pub const METRIC_CTX_RETRIEVAL_BYTES_TOTAL_HELP: &str = "Bytes of offloaded content handed back to the model via retrieval, \
      labelled by path (hash = marker-hash fetch, query = keyword search, \
      api = /ctx/get). The counterweight to ctx_offloaded_bytes_total: \
      offload saves only the bytes the model never re-fetches.";
@@ -369,8 +334,7 @@ pub const METRIC_CTX_SEARCH_QUERIES_TOTAL_HELP: &str =
 // ---------- proxy_ctx_events_deduped_total ----------
 
 pub const METRIC_PROXY_CTX_EVENTS_DEDUPED_TOTAL: &str = "proxy_ctx_events_deduped_total";
-pub const METRIC_PROXY_CTX_EVENTS_DEDUPED_TOTAL_HELP: &str =
-    "CTX-2a: session events the capture path offered a second time and the \
+pub const METRIC_PROXY_CTX_EVENTS_DEDUPED_TOTAL_HELP: &str = "CTX-2a: session events the capture path offered a second time and the \
      store refused, because a row with the same (session_id, type, data_hash) \
      was already there. A steady non-zero rate means the incremental capture \
      high-water mark is not holding and the extractor is re-reading history.";
@@ -378,16 +342,14 @@ pub const METRIC_PROXY_CTX_EVENTS_DEDUPED_TOTAL_HELP: &str =
 // ---------- proxy_upstream_responses_total ----------
 
 pub const METRIC_PROXY_UPSTREAM_RESPONSES_TOTAL: &str = "proxy_upstream_responses_total";
-pub const METRIC_PROXY_UPSTREAM_RESPONSES_TOTAL_HELP: &str =
-    "Responses received from upstream, of any status. The denominator \
+pub const METRIC_PROXY_UPSTREAM_RESPONSES_TOTAL_HELP: &str = "Responses received from upstream, of any status. The denominator \
      for the rejection rate — a refusal count on its own says nothing \
      about whether the proxy is healthy.";
 
 // ---------- proxy_upstream_rejections_total ----------
 
 pub const METRIC_PROXY_UPSTREAM_REJECTIONS_TOTAL: &str = "proxy_upstream_rejections_total";
-pub const METRIC_PROXY_UPSTREAM_REJECTIONS_TOTAL_HELP: &str =
-    "Non-2xx responses from upstream, labelled by HTTP status. A \
+pub const METRIC_PROXY_UPSTREAM_REJECTIONS_TOTAL_HELP: &str = "Non-2xx responses from upstream, labelled by HTTP status. A \
      rejected turn is work lost and a cached prefix rewritten, so this \
      is costlier than any cache miss. 429 is kept separate by its label \
      because rate limiting is the provider throttling a healthy proxy.";
@@ -395,8 +357,7 @@ pub const METRIC_PROXY_UPSTREAM_REJECTIONS_TOTAL_HELP: &str =
 // ---------- proxy_sidecar_total ----------
 
 pub const METRIC_PROXY_SIDECAR_TOTAL: &str = "proxy_sidecar_total";
-pub const METRIC_PROXY_SIDECAR_TOTAL_HELP: &str =
-    "Client sidecar requests answered on a shrunk request instead of being \
+pub const METRIC_PROXY_SIDECAR_TOTAL_HELP: &str = "Client sidecar requests answered on a shrunk request instead of being \
      forwarded whole, by kind. `describe_action` is Claude Code asking for \
      its spinner line: it resends the entire conversation for four words of \
      output, and forwarding it whole both billed a full prefix read and left \
@@ -410,8 +371,7 @@ pub const METRIC_PROXY_SIDECAR_TOTAL_HELP: &str =
 
 pub const METRIC_PROXY_CCR_SPLICE_DROPPED_BLOCKS_TOTAL: &str =
     "proxy_ccr_splice_dropped_blocks_total";
-pub const METRIC_PROXY_CCR_SPLICE_DROPPED_BLOCKS_TOTAL_HELP: &str =
-    "Content blocks the CCR retrieval splice refused to forward to the \
+pub const METRIC_PROXY_CCR_SPLICE_DROPPED_BLOCKS_TOTAL_HELP: &str = "Content blocks the CCR retrieval splice refused to forward to the \
      client, labelled by reason. `unresolved_proxy_tool` and \
      `continuation_thinking` are routine; `already_streamed` is the shape \
      that made upstream refuse the *following* turn, so a non-zero \
@@ -420,8 +380,7 @@ pub const METRIC_PROXY_CCR_SPLICE_DROPPED_BLOCKS_TOTAL_HELP: &str =
 // ---------- proxy_ccr_retrieval_outcomes_total ----------
 
 pub const METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL: &str = "proxy_ccr_retrieval_outcomes_total";
-pub const METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL_HELP: &str =
-    "How each buffered `headroom_retrieve` ended, labelled by outcome. \
+pub const METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL_HELP: &str = "How each buffered `headroom_retrieve` ended, labelled by outcome. \
      `continuation` is the normal path: a second upstream call carried the \
      content back as a tool_result. `spliced_mixed` is a turn that also held \
      a real client tool call, so the content went in as text instead — that \
@@ -432,8 +391,7 @@ pub const METRIC_PROXY_CCR_RETRIEVAL_OUTCOMES_TOTAL_HELP: &str =
 // ---------- proxy_ccr_cross_project_hits_total ----------
 
 pub const METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL: &str = "proxy_ccr_cross_project_hits_total";
-pub const METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL_HELP: &str =
-    "Retrievals the CCR store missed that the per-project content index still \
+pub const METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL_HELP: &str = "Retrievals the CCR store missed that the per-project content index still \
      held. `ccr.db` drops a block after a week idle; the index keeps it, so \
      this counts blocks recovered from the cold tier instead of being lost. \
      Each one saved a continuation round and a re-read. Rising alongside \
@@ -444,8 +402,7 @@ pub const METRIC_PROXY_CCR_CROSS_PROJECT_HITS_TOTAL_HELP: &str =
 // ---------- proxy_ccr_local_tier_hits_total ----------
 
 pub const METRIC_PROXY_CCR_LOCAL_TIER_HITS_TOTAL: &str = "proxy_ccr_local_tier_hits_total";
-pub const METRIC_PROXY_CCR_LOCAL_TIER_HITS_TOTAL_HELP: &str =
-    "Retrievals the CCR store missed that the requesting project's own \
+pub const METRIC_PROXY_CCR_LOCAL_TIER_HITS_TOTAL_HELP: &str = "Retrievals the CCR store missed that the requesting project's own \
      content index still held (same-project fast path ahead of the \
      cross-project sweep, which skips it by design). Same expiry shape as \
      the cross-project hits, so true information loss reads as \
@@ -456,16 +413,14 @@ pub const METRIC_PROXY_CCR_LOCAL_TIER_HITS_TOTAL_HELP: &str =
 
 pub const METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL: &str =
     "proxy_ccr_continuation_retries_total";
-pub const METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL_HELP: &str =
-    "Continuation POSTs re-sent after a transport error, a 5xx, or a 429. \
+pub const METRIC_PROXY_CCR_CONTINUATION_RETRIES_TOTAL_HELP: &str = "Continuation POSTs re-sent after a transport error, a 5xx, or a 429. \
      Read it against `proxy_ccr_retrieval_outcomes_total`: retries rising \
      while `unresolved` stays at zero means the backoff is doing its job.";
 
 // ---------- proxy_cache_tail_breakpoint_total ----------
 
 pub const METRIC_PROXY_CACHE_BREAKPOINT_SPREAD_TOTAL: &str = "proxy_cache_tail_breakpoint_total";
-pub const METRIC_PROXY_CACHE_BREAKPOINT_SPREAD_TOTAL_HELP: &str =
-    "Anthropic requests the tail-breakpoint stage looked at, labelled by \
+pub const METRIC_PROXY_CACHE_BREAKPOINT_SPREAD_TOTAL_HELP: &str = "Anthropic requests the tail-breakpoint stage looked at, labelled by \
      whether it moved the message marker. Most requests need no move and the \
      refusals are silent, so `applied` against `skipped` is the only way to \
      tell the stage is working from the stage never firing.";
@@ -474,8 +429,7 @@ pub const METRIC_PROXY_CACHE_BREAKPOINT_SPREAD_TOTAL_HELP: &str =
 
 pub const METRIC_PROXY_UPSTREAM_RETRIES_EXHAUSTED_TOTAL: &str =
     "proxy_upstream_retries_exhausted_total";
-pub const METRIC_PROXY_UPSTREAM_RETRIES_EXHAUSTED_TOTAL_HELP: &str =
-    "Turns the retry loop gave up on, by path and reason. \
+pub const METRIC_PROXY_UPSTREAM_RETRIES_EXHAUSTED_TOTAL_HELP: &str = "Turns the retry loop gave up on, by path and reason. \
      `proxy_upstream_retries_total` says retries happened, not whether they \
      worked — a budget too short for the outage it is riding out looks \
      healthy there and loses the turn anyway. This is the denominator that \

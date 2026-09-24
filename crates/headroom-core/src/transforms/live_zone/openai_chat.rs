@@ -114,11 +114,11 @@ pub fn compress_openai_chat_live_zone_with_config(
             all_slots.push((idx, slot));
         }
     }
-    if let Some(idx) = latest_user_idx {
-        if let Ok(slots) = plan_openai_user_message(body_raw, idx) {
-            for s in slots {
-                all_slots.push((idx, s));
-            }
+    if let Some(idx) = latest_user_idx
+        && let Ok(slots) = plan_openai_user_message(body_raw, idx)
+    {
+        for s in slots {
+            all_slots.push((idx, s));
         }
     }
 
@@ -469,10 +469,12 @@ mod openai_chat_tests {
             LiveZoneOutcome::NoChange { manifest } => {
                 // Both latest tool (idx 2) and latest user (idx 0)
                 // contributed a slot; both below threshold.
-                assert!(manifest
-                    .block_outcomes
-                    .iter()
-                    .all(|b| matches!(b.action, BlockAction::BelowByteThreshold { .. })));
+                assert!(
+                    manifest
+                        .block_outcomes
+                        .iter()
+                        .all(|b| matches!(b.action, BlockAction::BelowByteThreshold { .. }))
+                );
             }
             _ => panic!("expected NoChange"),
         }

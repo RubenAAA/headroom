@@ -395,8 +395,8 @@ mod tests {
         assert_eq!(got[1].0, "b");
     }
 
-    use super::super::agent::{spawn_stub, AgentTurn};
-    use super::super::bridge::{handle_rpc, Bridge, ToolOutcome};
+    use super::super::agent::{AgentTurn, spawn_stub};
+    use super::super::bridge::{Bridge, ToolOutcome, handle_rpc};
 
     /// A stand-in for `cursor-agent` that speaks, then blocks the way the real
     /// one blocks on an MCP call, then finishes once released.

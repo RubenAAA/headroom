@@ -48,11 +48,11 @@
 //! comparison strips ASCII whitespace by hand.
 
 use crate::ccr::CcrStore;
+use crate::transforms::ContentType;
 use crate::transforms::pipeline::config::DiffNoiseConfig;
 use crate::transforms::pipeline::traits::{
     CompressionContext, OffloadOutput, OffloadTransform, TransformError,
 };
-use crate::transforms::ContentType;
 
 use md5::{Digest, Md5};
 
@@ -460,9 +460,10 @@ mod tests {
         let r = offload()
             .apply(&diff, &CompressionContext::default(), &store)
             .expect("must compress");
-        assert!(r
-            .output
-            .contains("[diff_noise: whitespace-only hunks dropped"));
+        assert!(
+            r.output
+                .contains("[diff_noise: whitespace-only hunks dropped")
+        );
         assert!(r.bytes_saved > 0);
     }
 

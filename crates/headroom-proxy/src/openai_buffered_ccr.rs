@@ -41,7 +41,7 @@
 
 use bytes::Bytes;
 use http::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The tool the proxy must answer itself. Keep in step with
 /// `headroom_core::ccr::tool_injection::CCR_TOOL_NAME`.
@@ -221,91 +221,91 @@ pub(crate) fn responses_json_to_sse(response: &Value) -> Vec<Bytes> {
             json!({"output_index": out_idx, "item": added_item}),
         );
 
-        if item_obj.get("type").and_then(Value::as_str) == Some("message") {
-            if let Some(content) = item_obj.get("content").and_then(Value::as_array) {
-                for (c_idx, part) in content.iter().enumerate() {
-                    let Some(part_obj) = part.as_object() else {
-                        continue;
+        if item_obj.get("type").and_then(Value::as_str) == Some("message")
+            && let Some(content) = item_obj.get("content").and_then(Value::as_array)
+        {
+            for (c_idx, part) in content.iter().enumerate() {
+                let Some(part_obj) = part.as_object() else {
+                    continue;
+                };
+                let loc = json!({
+                    "item_id": item_id,
+                    "output_index": out_idx,
+                    "content_index": c_idx,
+                });
+                let part_type = part_obj.get("type").and_then(Value::as_str);
+                if part_type == Some("output_text") || part_type == Some("text") {
+                    let text = part_obj
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let mut added = loc.clone();
+                    added["part"] = {
+                        let mut p = part_obj.clone();
+                        p.insert("text".to_string(), Value::String(String::new()));
+                        Value::Object(p)
                     };
-                    let loc = json!({
-                        "item_id": item_id,
-                        "output_index": out_idx,
-                        "content_index": c_idx,
-                    });
-                    let part_type = part_obj.get("type").and_then(Value::as_str);
-                    if part_type == Some("output_text") || part_type == Some("text") {
-                        let text = part_obj
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let mut added = loc.clone();
-                        added["part"] = {
-                            let mut p = part_obj.clone();
-                            p.insert("text".to_string(), Value::String(String::new()));
-                            Value::Object(p)
-                        };
-                        let mut m = added.as_object().cloned().unwrap_or_default();
-                        m.insert(
-                            "type".to_string(),
-                            Value::String("response.content_part.added".to_string()),
-                        );
+                    let mut m = added.as_object().cloned().unwrap_or_default();
+                    m.insert(
+                        "type".to_string(),
+                        Value::String("response.content_part.added".to_string()),
+                    );
+                    emit(
+                        &mut events,
+                        &mut seq,
+                        "response.content_part.added",
+                        Value::Object(m),
+                    );
+                    if !text.is_empty() {
+                        let mut d = loc.clone();
+                        d["delta"] = Value::String(text.to_string());
+                        let m = d.as_object().cloned().unwrap_or_default();
                         emit(
                             &mut events,
                             &mut seq,
-                            "response.content_part.added",
-                            Value::Object(m),
-                        );
-                        if !text.is_empty() {
-                            let mut d = loc.clone();
-                            d["delta"] = Value::String(text.to_string());
-                            let m = d.as_object().cloned().unwrap_or_default();
-                            emit(
-                                &mut events,
-                                &mut seq,
-                                "response.output_text.delta",
-                                Value::Object(m),
-                            );
-                        }
-                        let mut done = loc.clone();
-                        done["text"] = Value::String(text.to_string());
-                        let m = done.as_object().cloned().unwrap_or_default();
-                        emit(
-                            &mut events,
-                            &mut seq,
-                            "response.output_text.done",
-                            Value::Object(m),
-                        );
-                        let mut pdone = loc.clone();
-                        pdone["part"] = part.clone();
-                        let m = pdone.as_object().cloned().unwrap_or_default();
-                        emit(
-                            &mut events,
-                            &mut seq,
-                            "response.content_part.done",
-                            Value::Object(m),
-                        );
-                    } else {
-                        // Non-text part (e.g. refusal): add + done with the
-                        // full part.
-                        let mut added = loc.clone();
-                        added["part"] = part.clone();
-                        let m = added.as_object().cloned().unwrap_or_default();
-                        emit(
-                            &mut events,
-                            &mut seq,
-                            "response.content_part.added",
-                            Value::Object(m),
-                        );
-                        let mut done = loc.clone();
-                        done["part"] = part.clone();
-                        let m = done.as_object().cloned().unwrap_or_default();
-                        emit(
-                            &mut events,
-                            &mut seq,
-                            "response.content_part.done",
+                            "response.output_text.delta",
                             Value::Object(m),
                         );
                     }
+                    let mut done = loc.clone();
+                    done["text"] = Value::String(text.to_string());
+                    let m = done.as_object().cloned().unwrap_or_default();
+                    emit(
+                        &mut events,
+                        &mut seq,
+                        "response.output_text.done",
+                        Value::Object(m),
+                    );
+                    let mut pdone = loc.clone();
+                    pdone["part"] = part.clone();
+                    let m = pdone.as_object().cloned().unwrap_or_default();
+                    emit(
+                        &mut events,
+                        &mut seq,
+                        "response.content_part.done",
+                        Value::Object(m),
+                    );
+                } else {
+                    // Non-text part (e.g. refusal): add + done with the
+                    // full part.
+                    let mut added = loc.clone();
+                    added["part"] = part.clone();
+                    let m = added.as_object().cloned().unwrap_or_default();
+                    emit(
+                        &mut events,
+                        &mut seq,
+                        "response.content_part.added",
+                        Value::Object(m),
+                    );
+                    let mut done = loc.clone();
+                    done["part"] = part.clone();
+                    let m = done.as_object().cloned().unwrap_or_default();
+                    emit(
+                        &mut events,
+                        &mut seq,
+                        "response.content_part.done",
+                        Value::Object(m),
+                    );
                 }
             }
         }
@@ -346,10 +346,10 @@ pub(crate) fn responses_completed_from_sse(sse_text: &str) -> Option<Value> {
         let Ok(data): Result<Value, _> = serde_json::from_str(&data_str) else {
             return;
         };
-        if data.get("type").and_then(Value::as_str) == Some("response.completed") {
-            if let Some(response) = data.get("response").filter(|v| v.is_object()) {
-                *completed = Some(response.clone());
-            }
+        if data.get("type").and_then(Value::as_str) == Some("response.completed")
+            && let Some(response) = data.get("response").filter(|v| v.is_object())
+        {
+            *completed = Some(response.clone());
         }
     }
 
@@ -687,10 +687,10 @@ mod tests {
 
     #[test]
     fn completed_extraction_returns_none_without_terminal_event() {
-        assert!(responses_completed_from_sse(
-            "event: response.created\ndata: {\"type\":\"other\"}\n\n"
-        )
-        .is_none());
+        assert!(
+            responses_completed_from_sse("event: response.created\ndata: {\"type\":\"other\"}\n\n")
+                .is_none()
+        );
         assert!(responses_completed_from_sse("").is_none());
     }
 }

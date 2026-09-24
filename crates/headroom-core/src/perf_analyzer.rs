@@ -290,14 +290,14 @@ impl Parser {
             }
             let ts = ts.to_string();
             self.track_window(&ts);
-            if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&m["payload"]) {
-                if let Some(stages) = payload.get("stages").and_then(|v| v.as_object()) {
-                    let parsed: HashMap<String, f64> = stages
-                        .iter()
-                        .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
-                        .collect();
-                    self.stages_by_rid.insert(m["rid"].to_string(), parsed);
-                }
+            if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&m["payload"])
+                && let Some(stages) = payload.get("stages").and_then(|v| v.as_object())
+            {
+                let parsed: HashMap<String, f64> = stages
+                    .iter()
+                    .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
+                    .collect();
+                self.stages_by_rid.insert(m["rid"].to_string(), parsed);
             }
             return;
         }
@@ -354,38 +354,39 @@ impl Parser {
             return;
         }
 
-        if line.contains("content_router:") && line.contains("msgs") {
-            if let Some(m) = router_re().captures(line) {
-                let ts: String = line.chars().take(23).collect();
-                if !self.within_window(&ts) {
-                    self.report.records_filtered_out += 1;
-                    return;
-                }
-                self.track_window(&ts);
-                let mut rec = RouterRecord {
-                    timestamp: ts,
-                    num_messages: m["msgs"].parse().unwrap_or(0),
-                    ..Default::default()
-                };
-                static NUM_KIND: OnceLock<Regex> = OnceLock::new();
-                let num_kind = NUM_KIND.get_or_init(|| Regex::new(r"^(\d+)\s+(\w+)").unwrap());
-                for part in m["detail"].split(',') {
-                    let part = part.trim();
-                    if let Some(nm) = num_kind.captures(part) {
-                        let count: i64 = nm[1].parse().unwrap_or(0);
-                        match &nm[2] {
-                            "compressed" => rec.compressed = count,
-                            "excluded" => rec.excluded = count,
-                            "skipped" => rec.skipped = count,
-                            "unchanged" => rec.unchanged = count,
-                            "content" if part.contains("block") => rec.content_blocks = count,
-                            _ => {}
-                        }
-                    }
-                }
-                self.report.router_records.push(rec);
+        if line.contains("content_router:")
+            && line.contains("msgs")
+            && let Some(m) = router_re().captures(line)
+        {
+            let ts: String = line.chars().take(23).collect();
+            if !self.within_window(&ts) {
+                self.report.records_filtered_out += 1;
                 return;
             }
+            self.track_window(&ts);
+            let mut rec = RouterRecord {
+                timestamp: ts,
+                num_messages: m["msgs"].parse().unwrap_or(0),
+                ..Default::default()
+            };
+            static NUM_KIND: OnceLock<Regex> = OnceLock::new();
+            let num_kind = NUM_KIND.get_or_init(|| Regex::new(r"^(\d+)\s+(\w+)").unwrap());
+            for part in m["detail"].split(',') {
+                let part = part.trim();
+                if let Some(nm) = num_kind.captures(part) {
+                    let count: i64 = nm[1].parse().unwrap_or(0);
+                    match &nm[2] {
+                        "compressed" => rec.compressed = count,
+                        "excluded" => rec.excluded = count,
+                        "skipped" => rec.skipped = count,
+                        "unchanged" => rec.unchanged = count,
+                        "content" if part.contains("block") => rec.content_blocks = count,
+                        _ => {}
+                    }
+                }
+            }
+            self.report.router_records.push(rec);
+            return;
         }
 
         if let Some(m) = transform_re().captures(line) {
@@ -458,10 +459,10 @@ pub fn log_dir() -> PathBuf {
 
 fn configured_active_log() -> Option<PathBuf> {
     let configured = std::env::var(HEADROOM_PROXY_LOG_PATH_ENV).ok();
-    if let Some(configured) = configured.map(|path| path.trim().to_string()) {
-        if !configured.is_empty() {
-            return Some(PathBuf::from(configured));
-        }
+    if let Some(configured) = configured.map(|path| path.trim().to_string())
+        && !configured.is_empty()
+    {
+        return Some(PathBuf::from(configured));
     }
 
     // A launcher-owned stdout log is the normal live path only under the
@@ -487,12 +488,11 @@ fn collect_log_files(
             Some((mtime, e.path()))
         })
         .collect();
-    if let Some(path) = active_log {
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            if let Ok(mtime) = metadata.modified() {
-                files.push((mtime, path));
-            }
-        }
+    if let Some(path) = active_log
+        && let Ok(metadata) = std::fs::metadata(&path)
+        && let Ok(mtime) = metadata.modified()
+    {
+        files.push((mtime, path));
     }
     let mut seen = HashSet::new();
     files.retain(|(_, path)| seen.insert(path.clone()));
@@ -598,10 +598,10 @@ fn throughput_stats(records: &[&PerfRecord], window_seconds: f64) -> ThroughputS
             .stages
             .get("compression_first_stage")
             .or_else(|| r.stages.get("compression"));
-        if let Some(&d) = duration_ms {
-            if d > 0.0 {
-                compression_rates.push(r.tokens_before as f64 / (d / 1000.0));
-            }
+        if let Some(&d) = duration_ms
+            && d > 0.0
+        {
+            compression_rates.push(r.tokens_before as f64 / (d / 1000.0));
         }
         if r.tokens_out > 0 {
             let mut duration_ms = r.total_ms;
@@ -718,13 +718,14 @@ pub fn generate_recommendations(report: &PerfReport) -> Vec<String> {
         }
     }
 
-    if let Some(latest) = report.toin_records.last() {
-        if latest.retrieval_rate == 0.0 && latest.compressions > 100 {
-            recs.push(format!(
-                "TOIN has 0% retrieval rate with {} compressions — review CCR integration",
-                commafy(latest.compressions)
-            ));
-        }
+    if let Some(latest) = report.toin_records.last()
+        && latest.retrieval_rate == 0.0
+        && latest.compressions > 100
+    {
+        recs.push(format!(
+            "TOIN has 0% retrieval rate with {} compressions — review CCR integration",
+            commafy(latest.compressions)
+        ));
     }
 
     for tr in &report.transform_records {
@@ -933,11 +934,7 @@ fn commafy(value: i64) -> String {
         }
         out.push(*b as char);
     }
-    if negative {
-        format!("-{out}")
-    } else {
-        out
-    }
+    if negative { format!("-{out}") } else { out }
 }
 
 /// Python `{:g}`-ish for the window header: trim a trailing `.0`.
@@ -1732,8 +1729,11 @@ mod tests {
         let report = parse_lines(&[PERF_LINE], 0.0);
         let text = format_report(&report, None);
         assert!(text.contains("Headroom Performance Report"));
-        assert!(text
-            .contains("Window: all data (actual data: 2026-06-10 10:00:00 → 2026-06-10 10:00:00)"));
+        assert!(
+            text.contains(
+                "Window: all data (actual data: 2026-06-10 10:00:00 → 2026-06-10 10:00:00)"
+            )
+        );
         assert!(text.contains("Requests:     1"));
         assert!(text.contains("Tokens:       1,000 -> 80 (92.0% reduction)"));
         assert!(text.contains("Total saved:  920 tokens"));
@@ -1762,9 +1762,10 @@ mod tests {
         let report = parse_lines(&[line, toin], 0.0);
         let recs = generate_recommendations(&report);
         assert!(recs.iter().any(|r| r.contains("Cache prefix unstable")));
-        assert!(recs
-            .iter()
-            .any(|r| r.contains("TOIN has 0% retrieval rate with 3,837 compressions")));
+        assert!(
+            recs.iter()
+                .any(|r| r.contains("TOIN has 0% retrieval rate with 3,837 compressions"))
+        );
     }
 
     #[test]
@@ -1789,9 +1790,9 @@ mod tests {
         std::fs::write(logs.join("proxy.log.1"), format!("{PERF_LINE}\n")).unwrap();
         std::fs::write(logs.join("other.txt"), "ignored\n").unwrap();
         // Serialized via env var; no other test in this module touches it.
-        std::env::set_var(paths::HEADROOM_WORKSPACE_DIR_ENV, dir.path());
+        unsafe { std::env::set_var(paths::HEADROOM_WORKSPACE_DIR_ENV, dir.path()) };
         let report = parse_log_files(0.0);
-        std::env::remove_var(paths::HEADROOM_WORKSPACE_DIR_ENV);
+        unsafe { std::env::remove_var(paths::HEADROOM_WORKSPACE_DIR_ENV) };
         assert_eq!(report.log_files_read, 2);
         assert_eq!(report.perf_records.len(), 2);
         assert_eq!(report.total_lines_parsed, 2);

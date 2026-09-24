@@ -66,7 +66,7 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 
 use crate::observability;
-use crate::proxy::{forward_http, AppState};
+use crate::proxy::{AppState, forward_http};
 
 const CODEX_ADDITIONAL_TOOLS_LIFT_ENV: &str = "HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT";
 

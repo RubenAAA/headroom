@@ -299,12 +299,12 @@ pub fn search_dir_unheading(text: &str) -> String {
     while i < n {
         let line = lines[i];
         let is_data = dir_data_re().is_match(line);
-        if let Some(dir) = current_dir {
-            if is_data {
-                out.push(format!("{dir}{line}"));
-                i += 1;
-                continue;
-            }
+        if let Some(dir) = current_dir
+            && is_data
+        {
+            out.push(format!("{dir}{line}"));
+            i += 1;
+            continue;
         }
         if line.ends_with('/') && i + 1 < n && dir_data_re().is_match(lines[i + 1]) {
             current_dir = Some(line);
@@ -372,12 +372,12 @@ pub fn path_unheading(text: &str) -> String {
     let mut i = 0;
     while i < n {
         let line = lines[i];
-        if let Some(dir) = current {
-            if is_base(line) {
-                out.push(format!("{dir}{line}"));
-                i += 1;
-                continue;
-            }
+        if let Some(dir) = current
+            && is_base(line)
+        {
+            out.push(format!("{dir}{line}"));
+            i += 1;
+            continue;
         }
         if line.ends_with('/') && i + 1 < n && is_base(lines[i + 1]) {
             current = Some(line);
@@ -444,18 +444,16 @@ pub fn expand_runs(text: &str) -> String {
     let n = lines.len();
     while i < n {
         let line = lines[i];
-        if i + 1 < n {
-            if let Some(caps) = run_marker_re().captures(lines[i + 1]) {
-                if let Some(count_str) = caps.get(1) {
-                    if let Ok(count) = count_str.as_str().parse::<usize>() {
-                        for _ in 0..count {
-                            out.push(line.to_string());
-                        }
-                        i += 2;
-                        continue;
-                    }
-                }
+        if i + 1 < n
+            && let Some(caps) = run_marker_re().captures(lines[i + 1])
+            && let Some(count_str) = caps.get(1)
+            && let Ok(count) = count_str.as_str().parse::<usize>()
+        {
+            for _ in 0..count {
+                out.push(line.to_string());
             }
+            i += 2;
+            continue;
         }
         out.push(line.to_string());
         i += 1;
@@ -523,16 +521,16 @@ pub fn search_unheading(text: &str) -> String {
     while i < n {
         let line = lines[i];
         let is_data = heading_row_re().is_match(line);
-        if let Some(path) = current_path {
-            if is_data {
-                if let Some(caps) = heading_row_re().captures(line) {
-                    let line_num = caps.name("line").unwrap().as_str();
-                    let content = caps.name("content").unwrap().as_str();
-                    out.push(format!("{}:{}:{}", path, line_num, content));
-                }
-                i += 1;
-                continue;
+        if let Some(path) = current_path
+            && is_data
+        {
+            if let Some(caps) = heading_row_re().captures(line) {
+                let line_num = caps.name("line").unwrap().as_str();
+                let content = caps.name("content").unwrap().as_str();
+                out.push(format!("{}:{}:{}", path, line_num, content));
             }
+            i += 1;
+            continue;
         }
         // Not a data row under an active header. Decide if THIS line is a new
         // header: it must not be a data row itself and must be followed by a

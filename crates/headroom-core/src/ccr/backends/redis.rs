@@ -29,7 +29,7 @@
 
 use redis::Commands;
 
-use crate::ccr::{max_lifetime_for, CcrStore};
+use crate::ccr::{CcrStore, max_lifetime_for};
 
 /// Key prefix applied to every CCR entry. Configurable per-deployment
 /// so multiple proxies sharing one Redis don't collide.

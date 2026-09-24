@@ -27,7 +27,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use headroom_core::ctx::{content_db_path, session_db_path, CtxStore, SessionsStore};
+use headroom_core::ctx::{CtxStore, SessionsStore, content_db_path, session_db_path};
 use lru::LruCache;
 
 /// Open sqlite handles kept per store kind. Sixteen matches the memory
@@ -268,15 +268,15 @@ impl ProjectStores {
         if let Some(store) = guard.get(project_dir) {
             return Some(Arc::clone(store));
         }
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(
-                    event = "ctx_project_store_dir_failed",
-                    path = %parent.display(),
-                    error = %e,
-                );
-                return None;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(
+                event = "ctx_project_store_dir_failed",
+                path = %parent.display(),
+                error = %e,
+            );
+            return None;
         }
         match open(path) {
             Ok(store) => {
@@ -373,10 +373,12 @@ mod tests {
             ..Default::default()
         };
         let reopened = stores.content("/home/dev/alpha").unwrap();
-        assert!(!reopened
-            .search(&["remembers".to_string()], &opts)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !reopened
+                .search(&["remembers".to_string()], &opts)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -482,10 +484,12 @@ mod tests {
             .unwrap()
             .index_content("notes", "alpha stored this", &IndexOpts::default())
             .unwrap();
-        assert!(stores
-            .find_content_any_project("ffffffffffffffffffffffff", "/home/dev/beta")
-            .found
-            .is_none());
+        assert!(
+            stores
+                .find_content_any_project("ffffffffffffffffffffffff", "/home/dev/beta")
+                .found
+                .is_none()
+        );
     }
 
     /// The sweep is bounded and reports what it cost, so a fallback that goes

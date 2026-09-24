@@ -4,6 +4,10 @@
 //! to the upstream transparently. When configured, matching requests
 //! are translated to OpenAI format and forwarded to the local upstream.
 
+// Edition 2024 makes std::env::set_var and remove_var unsafe. Tests call them
+// to set up config; non-test code stays free of unsafe.
+#![allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+
 mod common;
 
 use common::{start_proxy_with, start_proxy_with_state};
@@ -1589,7 +1593,7 @@ async fn cursor_turn_books_cli_reported_counts() {
 
 #[tokio::test]
 async fn anthropic_target_route_rewrites_model_and_auth() {
-    std::env::set_var("HEADROOM_TEST_ZEN_KEY", "zen-route-key");
+    unsafe { std::env::set_var("HEADROOM_TEST_ZEN_KEY", "zen-route-key") };
 
     let mock = MockServer::start().await;
     let received: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
@@ -1685,13 +1689,13 @@ async fn anthropic_target_route_rewrites_model_and_auth() {
         "the caller's credential must never leak upstream"
     );
 
-    std::env::remove_var("HEADROOM_TEST_ZEN_KEY");
+    unsafe { std::env::remove_var("HEADROOM_TEST_ZEN_KEY") };
     proxy.shutdown().await;
 }
 
 #[tokio::test]
 async fn anthropic_target_route_missing_auth_is_reported() {
-    std::env::remove_var("HEADROOM_TEST_ZEN_MISSING");
+    unsafe { std::env::remove_var("HEADROOM_TEST_ZEN_MISSING") };
 
     let mock = MockServer::start().await;
     let proxy = start_proxy_with(mock.uri().as_str(), |cfg| {

@@ -57,7 +57,7 @@ use axum::http::Request;
 use axum::response::Response;
 use std::net::SocketAddr;
 
-use crate::proxy::{forward_http, AppState};
+use crate::proxy::{AppState, forward_http};
 
 /// Common forwarding tail shared by every conversations handler.
 /// Logs the breadcrumb, then defers to `forward_http`. Kept inline

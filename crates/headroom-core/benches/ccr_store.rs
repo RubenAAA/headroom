@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use headroom_core::ccr::{CcrStore, InMemoryCcrStore};
 
 // ─── Baseline: the old single-Mutex<HashMap> design ────────────────

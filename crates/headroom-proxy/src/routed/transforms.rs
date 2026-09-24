@@ -8,7 +8,7 @@
 use crate::proxy::AppState;
 use crate::routed::outcome::count_tools_tokens;
 use axum::http::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 
 /// Inject memory tool definitions into a routed body (memory-tools stage).
@@ -29,15 +29,13 @@ fn inject_memory_tools(
         .cloned()
         .unwrap_or_default();
     let (new_tools, injected) = handler.inject_memory_tools(Some(&existing), provider);
-    if injected {
-        if let Some(obj) = parsed.as_object_mut() {
-            obj.insert("tools".to_string(), Value::Array(new_tools));
-            tracing::debug!(
-                event = "codex_memory_tools",
-                "injected memory tool definitions into routed-model request"
-            );
-            return true;
-        }
+    if injected && let Some(obj) = parsed.as_object_mut() {
+        obj.insert("tools".to_string(), Value::Array(new_tools));
+        tracing::debug!(
+            event = "codex_memory_tools",
+            "injected memory tool definitions into routed-model request"
+        );
+        return true;
     }
     false
 }
@@ -105,31 +103,29 @@ async fn append_memory_context(
     user_id: &str,
     provider: crate::memory::tool_adapter::Provider,
 ) -> bool {
-    if let Some(messages) = parsed.get("messages").and_then(|v| v.as_array()).cloned() {
-        if let Some(context) = handler
+    if let Some(messages) = parsed.get("messages").and_then(|v| v.as_array()).cloned()
+        && let Some(context) = handler
             .search_and_format_context(user_id, &messages, None, None, None, None)
             .await
+    {
+        let frozen = parsed
+            .get("system")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let (new_msgs, bytes) = crate::memory::handler::MemoryHandler::append_to_latest_user_tail(
+            &messages, &context, provider, frozen,
+        );
+        if bytes > 0
+            && let Some(msgs) = parsed.get_mut("messages")
         {
-            let frozen = parsed
-                .get("system")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
-            let (new_msgs, bytes) =
-                crate::memory::handler::MemoryHandler::append_to_latest_user_tail(
-                    &messages, &context, provider, frozen,
-                );
-            if bytes > 0 {
-                if let Some(msgs) = parsed.get_mut("messages") {
-                    *msgs = Value::Array(new_msgs);
-                    tracing::debug!(
-                        event = "codex_memory_context",
-                        bytes_appended = bytes,
-                        "injected recalled memory into routed-model request"
-                    );
-                    return true;
-                }
-            }
+            *msgs = Value::Array(new_msgs);
+            tracing::debug!(
+                event = "codex_memory_context",
+                bytes_appended = bytes,
+                "injected recalled memory into routed-model request"
+            );
+            return true;
         }
     }
     false
@@ -274,8 +270,8 @@ fn expand_ccr_proactive(
     request_id: &str,
     injection_budget: &crate::injection_budget::InjectionBudget,
 ) -> bool {
-    if let Some((workspace_key, workspace_label)) = ccr_workspace.as_ref() {
-        if crate::proxy::maybe_append_ccr_proactive_expansion(
+    if let Some((workspace_key, workspace_label)) = ccr_workspace.as_ref()
+        && crate::proxy::maybe_append_ccr_proactive_expansion(
             state,
             parsed,
             user_query,
@@ -284,9 +280,9 @@ fn expand_ccr_proactive(
             turn_number,
             request_id,
             injection_budget,
-        ) {
-            return true;
-        }
+        )
+    {
+        return true;
     }
     false
 }
@@ -307,20 +303,20 @@ fn inject_recall_block(
     injection_budget: &crate::injection_budget::InjectionBudget,
     request_id: &str,
 ) -> bool {
-    if let Some(engine) = state.ctx_inject.as_ref() {
-        if engine.maybe_inject_for_request(
+    if let Some(engine) = state.ctx_inject.as_ref()
+        && engine.maybe_inject_for_request(
             parsed,
             session_key,
             ctx_project,
             injection_budget,
             request_id,
-        ) {
-            tracing::debug!(
-                event = "codex_ctx_inject",
-                "injected recall/resume block into routed-model request"
-            );
-            return true;
-        }
+        )
+    {
+        tracing::debug!(
+            event = "codex_ctx_inject",
+            "injected recall/resume block into routed-model request"
+        );
+        return true;
     }
     false
 }
@@ -447,10 +443,11 @@ fn inject_turn_tools(state: &AppState, parsed: &mut Value, report: &mut CtxTrans
     // Memory: inject tool definitions. Without this, a routed model has no way
     // to write memories at all — `--memory` looked enabled and silently did
     // nothing.
-    if let Some(handler) = state.memory_handler.as_ref() {
-        if handler.is_initialized() && inject_memory_tools(handler, parsed, PROVIDER) {
-            report.transforms_applied.push("memory_tools".to_string());
-        }
+    if let Some(handler) = state.memory_handler.as_ref()
+        && handler.is_initialized()
+        && inject_memory_tools(handler, parsed, PROVIDER)
+    {
+        report.transforms_applied.push("memory_tools".to_string());
     }
 
     // CCR: the `headroom_retrieve` tool, so the model can pull back original
@@ -479,15 +476,15 @@ async fn recall_memory_context(state: &AppState, headers: &HeaderMap, parsed: &m
     const PROVIDER: crate::memory::tool_adapter::Provider =
         crate::memory::tool_adapter::Provider::Anthropic;
 
-    if let Some(handler) = state.memory_handler.as_ref() {
-        if handler.is_initialized() {
-            let user_id = headers
-                .get("x-headroom-user-id")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("default");
-            if append_memory_context(handler, parsed, user_id, PROVIDER).await {
-                return true;
-            }
+    if let Some(handler) = state.memory_handler.as_ref()
+        && handler.is_initialized()
+    {
+        let user_id = headers
+            .get("x-headroom-user-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("default");
+        if append_memory_context(handler, parsed, user_id, PROVIDER).await {
+            return true;
         }
     }
     false
@@ -504,7 +501,7 @@ pub(crate) async fn apply_ctx_request_transforms(
 ) -> CtxTransformReport {
     let mut report = CtxTransformReport::default();
     use crate::cache_stabilization::drift_detector::{
-        compute_structural_hash, derive_session_key_with_model, observe_drift_with_birth, ApiKind,
+        ApiKind, compute_structural_hash, derive_session_key_with_model, observe_drift_with_birth,
     };
 
     // PR-E5: volatile-content detector. Pure observer — one WARN per finding
@@ -554,20 +551,19 @@ pub(crate) async fn apply_ctx_request_transforms(
     // `proxy.rs` drift block) — newborn lane, gate-unknown session inherits
     // its lineage's conversions before the offload policy below reads the
     // gate. `parsed` is still the client's pre-transform body here.
-    if lane_birth {
-        if let Some(runtime) = state.ctx_offload.as_ref() {
-            if runtime.config.cross_session_seed {
-                crate::compression::ctx_offload::seed_newborn_session(
-                    &runtime.gate,
-                    headers,
-                    client_addr,
-                    parsed,
-                    ApiKind::Anthropic,
-                    &session_key,
-                    request_id,
-                );
-            }
-        }
+    if lane_birth
+        && let Some(runtime) = state.ctx_offload.as_ref()
+        && runtime.config.cross_session_seed
+    {
+        crate::compression::ctx_offload::seed_newborn_session(
+            &runtime.gate,
+            headers,
+            client_addr,
+            parsed,
+            ApiKind::Anthropic,
+            &session_key,
+            request_id,
+        );
     }
 
     // CTX-7: park conversation identity + drift dims under the request id so

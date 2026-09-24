@@ -211,11 +211,11 @@ pub fn sort_schema_keys_recursive(value: &mut Value) -> bool {
             let mut ordered = true;
             let mut prev: Option<&str> = None;
             for k in map.keys() {
-                if let Some(p) = prev {
-                    if p > k.as_str() {
-                        ordered = false;
-                        break;
-                    }
+                if let Some(p) = prev
+                    && p > k.as_str()
+                {
+                    ordered = false;
+                    break;
                 }
                 prev = Some(k);
             }

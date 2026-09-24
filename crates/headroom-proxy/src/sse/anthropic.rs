@@ -483,17 +483,17 @@ impl AnthropicStreamState {
             // to parse the final string. Failure is logged but does
             // not error — the raw fragment is still available for
             // replay/telemetry.
-            if !block.partial_json.is_empty() {
-                if let Err(e) = serde_json::from_str::<Value>(&block.partial_json) {
-                    tracing::warn!(
-                        event = "sse_partial_json_unparseable",
-                        provider = "anthropic",
-                        block_index = index,
-                        error = %e,
-                        "input_json_delta accumulated string did not parse; \
-                         keeping raw fragment in BlockState.partial_json"
-                    );
-                }
+            if !block.partial_json.is_empty()
+                && let Err(e) = serde_json::from_str::<Value>(&block.partial_json)
+            {
+                tracing::warn!(
+                    event = "sse_partial_json_unparseable",
+                    provider = "anthropic",
+                    block_index = index,
+                    error = %e,
+                    "input_json_delta accumulated string did not parse; \
+                     keeping raw fragment in BlockState.partial_json"
+                );
             }
         }
         Ok(())
@@ -501,10 +501,10 @@ impl AnthropicStreamState {
 
     fn on_message_delta(&mut self, event: &SseEvent) -> Result<(), StateError> {
         let v: Value = parse_json(&event.data)?;
-        if let Some(delta) = v.get("delta") {
-            if let Some(stop_reason) = delta.get("stop_reason").and_then(|x| x.as_str()) {
-                self.stop_reason = Some(stop_reason.to_string());
-            }
+        if let Some(delta) = v.get("delta")
+            && let Some(stop_reason) = delta.get("stop_reason").and_then(|x| x.as_str())
+        {
+            self.stop_reason = Some(stop_reason.to_string());
         }
         if let Some(usage) = v.get("usage") {
             self.usage.merge_from(usage);
@@ -710,10 +710,10 @@ impl AnthropicStreamState {
                 "tool_search_tool_result"
                 | "web_search_tool_result"
                 | "code_execution_tool_result" => {
-                    if let Some(id) = b.metadata.get("tool_use_id").and_then(|x| x.as_str()) {
-                        if !call_ids.contains(id) {
-                            orphans.push(format!("{}:{id}", b.block_type));
-                        }
+                    if let Some(id) = b.metadata.get("tool_use_id").and_then(|x| x.as_str())
+                        && !call_ids.contains(id)
+                    {
+                        orphans.push(format!("{}:{id}", b.block_type));
                     }
                 }
                 _ => {}

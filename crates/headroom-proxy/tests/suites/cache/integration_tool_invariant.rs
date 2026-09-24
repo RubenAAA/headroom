@@ -25,7 +25,7 @@ use hyper::body::Frame;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 /// Tools the proxy injects and therefore owes an answer for. Keep in step with

@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use headroom_proxy::vertex::TokenSource;
-use headroom_proxy::{build_app, AppState, Config};
+use headroom_proxy::{AppState, Config, build_app};
 use tokio::sync::oneshot;
 use url::Url;
 

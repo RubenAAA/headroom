@@ -26,12 +26,12 @@
 //! cache multipliers (read 0.10x, write 1.25x). Absolute numbers are
 //! approximate; the *ranking* across configs is what J0 produces.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use headroom_core::compute_frozen_count;
-use headroom_core::tokenizer::{get_tokenizer, Tokenizer};
+use headroom_core::tokenizer::{Tokenizer, get_tokenizer};
 use serde_json::Value;
 
 const CACHE_READ: f64 = 0.10;

@@ -138,15 +138,15 @@ fn gate_view_host(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    if let Ok(url) = url::Url::parse(raw) {
-        if let Some(host) = url.host_str().filter(|h| !h.is_empty()) {
-            return host.to_lowercase();
-        }
+    if let Ok(url) = url::Url::parse(raw)
+        && let Some(host) = url.host_str().filter(|h| !h.is_empty())
+    {
+        return host.to_lowercase();
     }
-    if !raw.contains("://") {
-        if let Ok(url) = url::Url::parse(&format!("http://{raw}")) {
-            return url.host_str().unwrap_or("").to_lowercase();
-        }
+    if !raw.contains("://")
+        && let Ok(url) = url::Url::parse(&format!("http://{raw}"))
+    {
+        return url.host_str().unwrap_or("").to_lowercase();
     }
     String::new()
 }
@@ -233,11 +233,11 @@ pub fn strip_for_third_party_upstream(tools: Vec<Value>) -> StripOutcome {
         {
             continue;
         }
-        if t.get("defer_loading").and_then(Value::as_bool) == Some(true) {
-            if let Some(obj) = t.as_object_mut() {
-                obj.remove("defer_loading");
-                undeferred += 1;
-            }
+        if t.get("defer_loading").and_then(Value::as_bool) == Some(true)
+            && let Some(obj) = t.as_object_mut()
+        {
+            obj.remove("defer_loading");
+            undeferred += 1;
         }
         kept.push(t);
     }
@@ -351,15 +351,15 @@ pub fn inject_deferral_with_core(tools: Vec<Value>, core_tools: &[String]) -> In
         original.extend(out.into_iter().skip(1));
         return unchanged(original);
     }
-    if dropped_cache_control && !resident_has_cache_control {
-        if let Some(idx) = last_resident_real {
-            if let Some(obj) = out[idx].as_object_mut() {
-                obj.insert(
-                    "cache_control".to_string(),
-                    dropped_marker.unwrap_or_else(|| serde_json::json!({"type": "ephemeral"})),
-                );
-            }
-        }
+    if dropped_cache_control
+        && !resident_has_cache_control
+        && let Some(idx) = last_resident_real
+        && let Some(obj) = out[idx].as_object_mut()
+    {
+        obj.insert(
+            "cache_control".to_string(),
+            dropped_marker.unwrap_or_else(|| serde_json::json!({"type": "ephemeral"})),
+        );
     }
     let deferred_tools: Vec<Value> = out
         .iter()
@@ -561,11 +561,11 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
             if block_type == Some("server_tool_use") {
                 let name = block.get("name").and_then(Value::as_str).unwrap_or("");
                 let family = server_call_family(name);
-                if let Some(id) = block.get("id").and_then(Value::as_str) {
-                    if !id.is_empty() {
-                        message_call_families.insert(id.to_string(), family);
-                        message_server_calls.push((index, id.to_string(), family));
-                    }
+                if let Some(id) = block.get("id").and_then(Value::as_str)
+                    && !id.is_empty()
+                {
+                    message_call_families.insert(id.to_string(), family);
+                    message_server_calls.push((index, id.to_string(), family));
                 }
                 continue;
             }
@@ -606,10 +606,10 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
             if family != ServerToolFamily::Search {
                 generic_placeholder_indexes.insert(index);
             }
-            if let Some(id) = id {
-                if !id.is_empty() {
-                    orphaned_ids.insert(id.to_string());
-                }
+            if let Some(id) = id
+                && !id.is_empty()
+            {
+                orphaned_ids.insert(id.to_string());
             }
         }
         neutralize_unpaired_calls(
@@ -719,19 +719,18 @@ fn neutralize_results_of_dropped_calls(
         {
             continue;
         }
-        if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
-            if message_server_calls
+        if let Some(id) = block.get("tool_use_id").and_then(Value::as_str)
+            && message_server_calls
                 .iter()
                 .any(|(i, cid, _)| cid == id && neutralize_indexes.contains(i))
+        {
+            neutralize_indexes.insert(index);
+            if block
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| server_result_family(t) != Some(ServerToolFamily::Search))
             {
-                neutralize_indexes.insert(index);
-                if block
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| server_result_family(t) != Some(ServerToolFamily::Search))
-                {
-                    generic_placeholder_indexes.insert(index);
-                }
+                generic_placeholder_indexes.insert(index);
             }
         }
     }
@@ -1209,9 +1208,11 @@ mod tests {
         let out = strip_unsupported_blocks(messages, &tools);
         assert_eq!(out.neutralized, 2);
         let content = out.messages[0]["content"].as_array().unwrap();
-        assert!(content
-            .iter()
-            .all(|b| b.get("type").and_then(Value::as_str) == Some("text")));
+        assert!(
+            content
+                .iter()
+                .all(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        );
     }
 
     #[test]
@@ -1368,11 +1369,13 @@ mod tests {
             .map(|m| m.get("role").and_then(Value::as_str).unwrap_or(""))
             .collect();
         assert_eq!(roles, vec!["user", "assistant", "user"]);
-        assert!(out.messages[1]["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|b| b.get("type").and_then(Value::as_str) == Some("text")));
+        assert!(
+            out.messages[1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        );
     }
 
     #[test]

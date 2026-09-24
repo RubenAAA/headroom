@@ -10,5 +10,5 @@ pub mod astgrep;
 pub mod base;
 
 pub use base::{
-    apply_to_messages, InterceptionResult, ToolResultInterceptor, TransformSpan, INTERCEPTORS,
+    INTERCEPTORS, InterceptionResult, ToolResultInterceptor, TransformSpan, apply_to_messages,
 };

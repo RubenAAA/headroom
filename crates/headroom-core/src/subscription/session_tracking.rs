@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::models::WindowTokens;
 use super::parse_timestamp;
@@ -187,10 +187,11 @@ pub fn compute_window_tokens(start_ts: f64, end_ts: f64) -> WindowTokens {
                 _ => continue,
             };
 
-            if let Some(msg_id) = msg.get("id").and_then(|v| v.as_str()) {
-                if !msg_id.is_empty() && !seen_message_ids.insert(msg_id.to_string()) {
-                    continue;
-                }
+            if let Some(msg_id) = msg.get("id").and_then(|v| v.as_str())
+                && !msg_id.is_empty()
+                && !seen_message_ids.insert(msg_id.to_string())
+            {
+                continue;
             }
 
             add_usage_to_tokens(&mut totals, &usage);
@@ -259,7 +260,7 @@ mod tests {
         // and clear the same variable, and this one is only correct while the
         // value it wrote is still there.
         let _guard = crate::subscription::env_guard();
-        std::env::set_var("CLAUDE_CONFIG_DIR", dir.path());
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir.path()) };
         let start = chrono::Utc
             .with_ymd_and_hms(2026, 6, 17, 0, 0, 0)
             .unwrap()
@@ -269,7 +270,7 @@ mod tests {
             .unwrap()
             .timestamp() as f64;
         let tokens = compute_window_tokens(start, end);
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
 
         assert_eq!(tokens.input, 100);
         assert_eq!(tokens.output, 20);
@@ -308,7 +309,7 @@ mod tests {
         std::fs::write(projects.join("a.jsonl"), lines).unwrap();
 
         let _guard = crate::subscription::env_guard();
-        std::env::set_var("CLAUDE_CONFIG_DIR", dir.path());
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir.path()) };
         let start = chrono::Utc
             .with_ymd_and_hms(2026, 6, 17, 0, 0, 0)
             .unwrap()
@@ -318,7 +319,7 @@ mod tests {
             .unwrap()
             .timestamp() as f64;
         let tokens = compute_window_tokens(start, end);
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
 
         assert_eq!(tokens.input, 200, "msg_a once plus msg_b once");
         assert_eq!(tokens.output, 40);

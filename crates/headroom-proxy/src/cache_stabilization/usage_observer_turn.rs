@@ -420,30 +420,36 @@ mod stream_matching_tests {
         ];
         let empty: [serde_json::Value; 0] = [];
 
-        assert!(!ReplaySkipEvidence::from_inbound_original_histories(
-            ReplaySkip::PrefixContentDiverged {
-                first_diff_index: 0,
-                replayed_prefix_msgs: 0,
-            },
-            Some(&one),
-            &two,
-        )
-        .is_inbound_tail_replacement());
-        assert!(!ReplaySkipEvidence::from_inbound_original_histories(
-            ReplaySkip::PrefixContentDiverged {
-                first_diff_index: 0,
-                replayed_prefix_msgs: 0,
-            },
-            Some(&empty),
-            &empty,
-        )
-        .is_inbound_tail_replacement());
-        assert!(!ReplaySkipEvidence::from_inbound_original_histories(
-            ReplaySkip::ForwardedCountMismatch,
-            Some(&one),
-            &one,
-        )
-        .is_inbound_tail_replacement());
+        assert!(
+            !ReplaySkipEvidence::from_inbound_original_histories(
+                ReplaySkip::PrefixContentDiverged {
+                    first_diff_index: 0,
+                    replayed_prefix_msgs: 0,
+                },
+                Some(&one),
+                &two,
+            )
+            .is_inbound_tail_replacement()
+        );
+        assert!(
+            !ReplaySkipEvidence::from_inbound_original_histories(
+                ReplaySkip::PrefixContentDiverged {
+                    first_diff_index: 0,
+                    replayed_prefix_msgs: 0,
+                },
+                Some(&empty),
+                &empty,
+            )
+            .is_inbound_tail_replacement()
+        );
+        assert!(
+            !ReplaySkipEvidence::from_inbound_original_histories(
+                ReplaySkip::ForwardedCountMismatch,
+                Some(&one),
+                &one,
+            )
+            .is_inbound_tail_replacement()
+        );
     }
 
     /// A final-message replacement that also moved the hot zone is a bust,

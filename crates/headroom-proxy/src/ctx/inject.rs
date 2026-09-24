@@ -36,10 +36,10 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use headroom_core::ctx::{
-    build_recall, build_resume_snapshot, SearchOpts, SessionsStore, INJECT_SENTINEL,
+    INJECT_SENTINEL, SearchOpts, SessionsStore, build_recall, build_resume_snapshot,
 };
 use lru::LruCache;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::identity;
 use super::projects::ProjectStores;
@@ -392,12 +392,12 @@ impl InjectEngine {
     ) -> String {
         let first_text = identity::first_user_message_text(parsed).unwrap_or_default();
 
-        if identity::has_compaction_marker(&first_text) {
-            if let Some(snapshot) = self.try_resume_snapshot(sessions, conv_id, session_key) {
-                return snapshot;
-            }
-            // Resume marker but nothing linkable → fall through to fresh recall.
+        if identity::has_compaction_marker(&first_text)
+            && let Some(snapshot) = self.try_resume_snapshot(sessions, conv_id, session_key)
+        {
+            return snapshot;
         }
+        // Resume marker but nothing linkable → fall through to fresh recall.
 
         let queries = derive_queries(&first_text);
         let opts = SearchOpts {
@@ -452,11 +452,7 @@ fn derive_queries(first_text: &str) -> Vec<String> {
         .chars()
         .take(120)
         .collect();
-    if q.is_empty() {
-        Vec::new()
-    } else {
-        vec![q]
-    }
+    if q.is_empty() { Vec::new() } else { vec![q] }
 }
 
 /// How many blocks at the head of a user message are client scaffolding.
@@ -603,10 +599,12 @@ mod tests {
         // The first user message is now an array whose first block is ours.
         let block0 = &r1["messages"][0]["content"][0];
         assert_eq!(block0["type"], "text");
-        assert!(block0["text"]
-            .as_str()
-            .unwrap()
-            .starts_with(INJECT_SENTINEL));
+        assert!(
+            block0["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(INJECT_SENTINEL)
+        );
 
         // A second, later turn of the SAME conversation replays identical bytes.
         let injected_text = block0["text"].as_str().unwrap().to_string();
@@ -795,10 +793,12 @@ mod tests {
             eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()),
             "first sight must still inject when capture wrote the current turn first"
         );
-        assert!(r["messages"][0]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with(INJECT_SENTINEL));
+        assert!(
+            r["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(INJECT_SENTINEL)
+        );
     }
 
     #[test]

@@ -21,11 +21,7 @@ pub fn mean(values: &[f64]) -> Option<f64> {
     }
     let sum: f64 = values.iter().sum();
     let m = sum / values.len() as f64;
-    if m.is_finite() {
-        Some(m)
-    } else {
-        None
-    }
+    if m.is_finite() { Some(m) } else { None }
 }
 
 /// Sample variance with `n-1` denominator (Python `statistics.variance`).
@@ -39,11 +35,7 @@ pub fn sample_variance(values: &[f64]) -> Option<f64> {
     let m = mean(values)?;
     let sum_sq_diff: f64 = values.iter().map(|v| (v - m).powi(2)).sum();
     let var = sum_sq_diff / (values.len() - 1) as f64;
-    if var.is_finite() {
-        Some(var)
-    } else {
-        None
-    }
+    if var.is_finite() { Some(var) } else { None }
 }
 
 /// Sample standard deviation — sqrt of `sample_variance`. Same n>=2

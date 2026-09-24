@@ -10,7 +10,7 @@ struct CeilingGuard(Option<String>);
 impl CeilingGuard {
     fn set(value: &str) -> Self {
         let prior = std::env::var("HEADROOM_KOMPRESS_MAX_TOKENS").ok();
-        std::env::set_var("HEADROOM_KOMPRESS_MAX_TOKENS", value);
+        unsafe { std::env::set_var("HEADROOM_KOMPRESS_MAX_TOKENS", value) };
         Self(prior)
     }
 }
@@ -18,8 +18,8 @@ impl CeilingGuard {
 impl Drop for CeilingGuard {
     fn drop(&mut self) {
         match &self.0 {
-            Some(v) => std::env::set_var("HEADROOM_KOMPRESS_MAX_TOKENS", v),
-            None => std::env::remove_var("HEADROOM_KOMPRESS_MAX_TOKENS"),
+            Some(v) => unsafe { std::env::set_var("HEADROOM_KOMPRESS_MAX_TOKENS", v) },
+            None => unsafe { std::env::remove_var("HEADROOM_KOMPRESS_MAX_TOKENS") },
         }
     }
 }

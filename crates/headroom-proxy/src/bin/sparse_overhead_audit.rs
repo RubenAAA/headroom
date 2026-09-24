@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use headroom_core::tokenizer::{get_tokenizer, Tokenizer};
+use headroom_core::tokenizer::{Tokenizer, get_tokenizer};
 use serde_json::Value;
 
 /// Separator set after a leading digit run for the run to count as a line
@@ -231,13 +231,13 @@ fn main() {
                 .cloned()
                 .unwrap_or_default()
             {
-                if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                    if let (Some(id), Some(name)) = (
+                if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                    && let (Some(id), Some(name)) = (
                         b.get("id").and_then(|i| i.as_str()),
                         b.get("name").and_then(|n| n.as_str()),
-                    ) {
-                        id_map.insert(id.to_string(), name.to_string());
-                    }
+                    )
+                {
+                    id_map.insert(id.to_string(), name.to_string());
                 }
             }
         }

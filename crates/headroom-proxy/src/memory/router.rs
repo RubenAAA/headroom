@@ -134,17 +134,17 @@ impl ProjectResolver {
         }
 
         // Tier 2: explicit cwd header
-        if let Some(cwd) = Self::first_nonempty_header(&ctx.headers, "x-headroom-cwd") {
-            if let Some(ident) = Self::identity_from_cwd(&cwd) {
-                return Some(ident);
-            }
+        if let Some(cwd) = Self::first_nonempty_header(&ctx.headers, "x-headroom-cwd")
+            && let Some(ident) = Self::identity_from_cwd(&cwd)
+        {
+            return Some(ident);
         }
 
         // Tier 3: parse system prompt for cwd
-        if let Some(sys_cwd) = Self::extract_cwd_from_system_prompt(&ctx.system_prompt) {
-            if let Some(ident) = Self::identity_from_cwd(&sys_cwd) {
-                return Some(ident);
-            }
+        if let Some(sys_cwd) = Self::extract_cwd_from_system_prompt(&ctx.system_prompt)
+            && let Some(ident) = Self::identity_from_cwd(&sys_cwd)
+        {
+            return Some(ident);
         }
 
         // Tier 4: CLI override, last resort. `--memory-project-root` documents
@@ -153,10 +153,10 @@ impl ProjectResolver {
         // Above it, one operator setting would capture every project's turns —
         // the cross-project bleed this module exists to prevent — because only
         // a request with an explicit header could escape it.
-        if let Some(ref override_root) = ctx.project_root_override {
-            if let Some(ident) = Self::identity_from_cwd(override_root) {
-                return Some(ident);
-            }
+        if let Some(ref override_root) = ctx.project_root_override
+            && let Some(ident) = Self::identity_from_cwd(override_root)
+        {
+            return Some(ident);
         }
 
         None

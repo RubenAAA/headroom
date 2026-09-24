@@ -314,9 +314,11 @@ observations = 60
     #[test]
     fn lookup_returns_none_for_missing_slice() {
         let store = RecommendationStore::from_toml_str(sample_toml()).expect("parses");
-        assert!(store
-            .lookup(AuthMode::Unknown, "gpt-4o", "cafebabe")
-            .is_none());
+        assert!(
+            store
+                .lookup(AuthMode::Unknown, "gpt-4o", "cafebabe")
+                .is_none()
+        );
     }
 
     #[test]

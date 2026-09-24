@@ -83,10 +83,10 @@ pub const OUTLINE_MARKER: &str =
 /// Extract file path from tool input, checking common key names.
 pub fn path_from_input(tool_input: &Value) -> Option<String> {
     for key in &["file_path", "path", "filePath", "filename"] {
-        if let Some(v) = tool_input.get(*key).and_then(Value::as_str) {
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
+        if let Some(v) = tool_input.get(*key).and_then(Value::as_str)
+            && !v.is_empty()
+        {
+            return Some(v.to_string());
         }
     }
     None
@@ -223,10 +223,10 @@ impl AstGrepReadOutline {
     /// Read `min_chars` from the live runtime env knob, falling back to
     /// the compiled default.
     fn effective_min_chars(&self) -> usize {
-        if let Some(raw) = crate::runtime_env::getenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", None) {
-            if let Ok(n) = raw.parse::<usize>() {
-                return n;
-            }
+        if let Some(raw) = crate::runtime_env::getenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", None)
+            && let Ok(n) = raw.parse::<usize>()
+        {
+            return n;
         }
         self.min_chars
     }
@@ -279,12 +279,12 @@ impl ToolResultInterceptor for AstGrepReadOutline {
 /// Resolve the `ast-grep` binary on PATH.
 fn find_ast_grep_binary() -> Option<std::path::PathBuf> {
     // Try `which ast-grep` equivalent: check common locations
-    if let Ok(output) = std::process::Command::new("which").arg("ast-grep").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(std::path::PathBuf::from(path));
-            }
+    if let Ok(output) = std::process::Command::new("which").arg("ast-grep").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(std::path::PathBuf::from(path));
         }
     }
     // Fallback: try running ast-grep directly (it might be on PATH)
@@ -313,7 +313,7 @@ fn run_ast_grep(lang: &str, source: &str) -> Option<Vec<AstGrepMatch>> {
     // Determine file extension for the tempfile
     let ext = EXT_TO_LANG
         .iter()
-        .find(|(_, &v)| v == lang)
+        .find(|&(_, &v)| v == lang)
         .map(|(&k, _)| k)
         .unwrap_or(".txt");
 
@@ -615,9 +615,11 @@ mod tests {
     fn progressive_key_none_without_path() {
         let interceptor = AstGrepReadOutline::default();
         let input = json!({});
-        assert!(interceptor
-            .progressive_disclosure_key(Some("Read"), &input)
-            .is_none());
+        assert!(
+            interceptor
+                .progressive_disclosure_key(Some("Read"), &input)
+                .is_none()
+        );
     }
 
     // --- Registry ---
@@ -666,7 +668,7 @@ mod tests {
         // `override_test_lock`), and the runner is multi-threaded.
         let _guard = crate::runtime_env::override_test_lock();
         crate::runtime_env::clear_overrides();
-        std::env::remove_var("HEADROOM_INTERCEPT_READ_MIN_CHARS");
+        unsafe { std::env::remove_var("HEADROOM_INTERCEPT_READ_MIN_CHARS") };
         let interceptor = AstGrepReadOutline::default();
         assert_eq!(interceptor.effective_min_chars(), MIN_CHARS_DEFAULT);
     }

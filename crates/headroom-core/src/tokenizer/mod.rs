@@ -40,7 +40,7 @@ pub use hf_impl::{HfTokenizer, HfTokenizerError};
 pub use mistral::{mistral_hf_repo, mistral_tokenizer_version, try_register_default_mistral};
 pub(crate) use registry::name_candidates;
 pub use registry::{
-    clear_hf_registrations, detect_backend, get_tokenizer, register_hf, try_register_hf, Backend,
+    Backend, clear_hf_registrations, detect_backend, get_tokenizer, register_hf, try_register_hf,
 };
 pub use tiktoken_impl::{TiktokenCounter, TiktokenError};
 

@@ -50,8 +50,8 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 /// Wire-shape `local_shell_call.action` payload. The `command` is the
 /// argv array — preserving the array structure (rather than joining

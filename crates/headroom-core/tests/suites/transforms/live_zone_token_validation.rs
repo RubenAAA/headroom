@@ -11,10 +11,10 @@
 use headroom_core::tokenizer::get_tokenizer;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_anthropic_live_zone, AuthMode, BlockAction, LiveZoneOutcome,
+    AuthMode, BlockAction, LiveZoneOutcome, compress_anthropic_live_zone,
 };
 use proptest::prelude::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn body_of(value: Value) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap()

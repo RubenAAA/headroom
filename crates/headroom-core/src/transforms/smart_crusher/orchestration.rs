@@ -266,10 +266,11 @@ fn numeric_anomaly_indices(
             let Some(v) = obj.get(field_name) else {
                 continue;
             };
-            if let Some(num) = v.as_f64() {
-                if !num.is_nan() && (num - mean_val).abs() > threshold {
-                    anomalies.insert(i);
-                }
+            if let Some(num) = v.as_f64()
+                && !num.is_nan()
+                && (num - mean_val).abs() > threshold
+            {
+                anomalies.insert(i);
             }
         }
     }

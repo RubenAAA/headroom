@@ -66,15 +66,15 @@ impl CostRule {
         if self.require_tools && !has_tools {
             return false;
         }
-        if let Some(max) = self.max_input_tokens {
-            if input_tokens > max {
-                return false;
-            }
+        if let Some(max) = self.max_input_tokens
+            && input_tokens > max
+        {
+            return false;
         }
-        if let Some(min) = self.min_input_tokens {
-            if input_tokens < min {
-                return false;
-            }
+        if let Some(min) = self.min_input_tokens
+            && input_tokens < min
+        {
+            return false;
         }
         // A rule whose `to_model` equals the current model still MATCHES (strict
         // first-match-wins): it is a no-op (`changed` is false) that short-circuits
@@ -388,15 +388,15 @@ pub fn estimate_input_tokens(
             chars += rendered.chars().count() as u64;
         }
     }
-    if let Some(v) = tools {
-        if py_truthy(v) {
-            chars += py_str(v).chars().count() as u64;
-        }
+    if let Some(v) = tools
+        && py_truthy(v)
+    {
+        chars += py_str(v).chars().count() as u64;
     }
-    if let Some(v) = system {
-        if py_truthy(v) {
-            chars += py_str(v).chars().count() as u64;
-        }
+    if let Some(v) = system
+        && py_truthy(v)
+    {
+        chars += py_str(v).chars().count() as u64;
     }
     chars / 4
 }
@@ -711,11 +711,7 @@ fn py_int_from_str(raw: &str) -> Option<i128> {
 // ---------------------------------------------------------------------------
 
 fn py_bool(b: bool) -> &'static str {
-    if b {
-        "True"
-    } else {
-        "False"
-    }
+    if b { "True" } else { "False" }
 }
 
 /// Python's `str(value)`: a top-level string renders bare, everything else

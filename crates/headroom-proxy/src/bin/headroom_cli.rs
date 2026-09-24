@@ -10,6 +10,10 @@
 //! Proxy URL defaults to `http://127.0.0.1:8787`, overridable via
 //! `--proxy-url` or `HEADROOM_PROXY_URL`.
 
+// Edition 2024 makes std::env::set_var and remove_var unsafe. Tests call them
+// to set up config; non-test code stays free of unsafe.
+#![cfg_attr(test, allow(unsafe_code, clippy::undocumented_unsafe_blocks))]
+
 use std::ffi::OsString;
 use std::io::Read;
 
@@ -400,7 +404,9 @@ fn cmd_get(base: &str, hash: &str) -> Result<(), Box<dyn std::error::Error>> {
     let resp = client().get(&url).send()?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        eprintln!("not found: {hash} (expired from the retrieval store and absent from the content index; try `headroom ctx search` for keywords instead)");
+        eprintln!(
+            "not found: {hash} (expired from the retrieval store and absent from the content index; try `headroom ctx search` for keywords instead)"
+        );
         std::process::exit(1);
     }
     if !resp.status().is_success() {
@@ -590,11 +596,7 @@ fn active_verbosity_level() -> Option<i32> {
         .and_then(|v| v.trim().parse::<i32>().ok())
         .unwrap_or(2)
         .clamp(0, 4);
-    if level == 0 {
-        None
-    } else {
-        Some(level)
-    }
+    if level == 0 { None } else { Some(level) }
 }
 
 fn format_output_savings_with_level(
@@ -1308,7 +1310,7 @@ mod tests {
 
     #[test]
     fn output_savings_modelled_report_is_labelled_range_not_ci() {
-        use headroom_core::output_savings::{register_modelled_factors, SavingsLedger};
+        use headroom_core::output_savings::{SavingsLedger, register_modelled_factors};
         // The modelled table is process-global; level 3 is registered nowhere
         // else in this binary, so no clearing or locking is needed.
         register_modelled_factors(3, 0.20, 0.40).unwrap();

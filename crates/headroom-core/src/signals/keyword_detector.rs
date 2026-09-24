@@ -268,16 +268,15 @@ impl KeywordDetector {
             }
         }
         // Markdown structural prefixes only count in Text context.
-        if matches!(ctx, ImportanceContext::Text) {
-            if let Some(prefix) = self
+        if matches!(ctx, ImportanceContext::Text)
+            && let Some(prefix) = self
                 .registry
                 .markdown_prefixes
                 .iter()
                 .find(|p| line.starts_with(*p))
-            {
-                let _ = prefix;
-                return Some((ImportanceCategory::Markdown, MARKDOWN_PRIORITY));
-            }
+        {
+            let _ = prefix;
+            return Some((ImportanceCategory::Markdown, MARKDOWN_PRIORITY));
         }
         None
     }

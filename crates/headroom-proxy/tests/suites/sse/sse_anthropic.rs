@@ -10,8 +10,8 @@
 //! mishandled in production telemetry.
 
 use bytes::Bytes;
-use headroom_proxy::sse::anthropic::{AnthropicStreamState, StreamStatus};
 use headroom_proxy::sse::SseFramer;
+use headroom_proxy::sse::anthropic::{AnthropicStreamState, StreamStatus};
 
 /// Push raw bytes into a framer and drain all framed events through
 /// the state machine. Test failure on any framing OR state-machine

@@ -15,10 +15,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use headroom_proxy::cache_stabilization::drift_detector::{
-    compute_structural_hash, observe_drift, ApiKind, DriftState,
+    ApiKind, DriftState, compute_structural_hash, observe_drift,
 };
 use headroom_proxy::compression::ctx_offload::{
-    offload_anthropic_request, CtxOffloadConfig, OffloadGate, OffloadPolicy,
+    CtxOffloadConfig, OffloadGate, OffloadPolicy, offload_anthropic_request,
 };
 use serde_json::Value;
 

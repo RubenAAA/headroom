@@ -878,9 +878,11 @@ mod waste_signal_wiring_tests {
         let signals = waste_signals_for_request(&body, "claude-3-5-sonnet-20241022")
             .expect("a base64 blob should register as waste");
 
-        assert!(signals
-            .iter()
-            .any(|(name, tokens)| name == "base64" && *tokens > 0));
+        assert!(
+            signals
+                .iter()
+                .any(|(name, tokens)| name == "base64" && *tokens > 0)
+        );
         assert!(
             signals.iter().all(|(_, tokens)| *tokens > 0),
             "only fired signals should be present, got {signals:?}"

@@ -323,7 +323,9 @@ fn main() {
     );
     println!("B fabricated blocks:       {fabricated}");
     println!("C resurgences:             {resurged}");
-    println!("D kept blocks:             {kept} (missing signature: {kept_missing_sig}, redacted kept: {redacted_kept})");
+    println!(
+        "D kept blocks:             {kept} (missing signature: {kept_missing_sig}, redacted kept: {redacted_kept})"
+    );
     println!("\n== violations ({}) ==", violations.len());
     for v in violations.iter().take(20) {
         println!("  {v}");

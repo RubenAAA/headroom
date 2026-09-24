@@ -10,9 +10,9 @@
 //! header that drifts from the CLI's is one that gets treated differently.
 
 use axum::http::HeaderMap;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use serde_json::{json, Value};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde_json::{Value, json};
 
 /// Values mirrored from the Codex CLI source (codex-rs/login/src/auth):
 /// the codex backend gates and buckets traffic by originator/user-agent,
@@ -83,8 +83,8 @@ static CODEX_TURN_STATE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, String>>,
 > = std::sync::OnceLock::new();
 
-pub(crate) fn turn_state_map(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+pub(crate) fn turn_state_map()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
     CODEX_TURN_STATE.get_or_init(Default::default)
 }
 
@@ -110,11 +110,22 @@ pub(crate) fn derive_session_uuid(user_id: &str) -> String {
     let bytes = [h1.to_be_bytes(), h2.to_be_bytes()].concat();
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-8{:01x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        bytes[6] & 0x0f, bytes[7],
-        bytes[8] & 0x0f, bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6] & 0x0f,
+        bytes[7],
+        bytes[8] & 0x0f,
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
     )
 }
 
@@ -257,10 +268,10 @@ pub(crate) fn resolve_codex_routing_headers(
     if let Ok(ua) = codex_user_agent(auth_file).parse() {
         upstream_headers.insert(http::header::USER_AGENT, ua);
     }
-    if let Some(id) = codex_installation_id(auth_file) {
-        if let Ok(val) = http::HeaderValue::from_str(&id) {
-            upstream_headers.insert("x-codex-installation-id", val);
-        }
+    if let Some(id) = codex_installation_id(auth_file)
+        && let Ok(val) = http::HeaderValue::from_str(&id)
+    {
+        upstream_headers.insert("x-codex-installation-id", val);
     }
     if let Ok(tp) = generate_traceparent().parse() {
         upstream_headers.insert("traceparent", tp);
@@ -275,29 +286,27 @@ pub(crate) fn resolve_codex_routing_headers(
         return (upstream_headers, true);
     }
 
-    if let Some(auth_file) = auth_file {
-        if let Some(token) = read_codex_access_token(auth_file) {
-            if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}")) {
-                upstream_headers.insert(http::header::AUTHORIZATION, val);
-            }
-
-            if let Some(payload) = decode_openai_bearer_payload(&token) {
-                if let Some(account_id) = payload
-                    .get("https://api.openai.com/auth")
-                    .and_then(|auth| auth.get("chatgpt_account_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    if let Ok(val) = http::HeaderValue::from_str(account_id) {
-                        upstream_headers.insert("ChatGPT-Account-ID", val);
-                        return (upstream_headers, true);
-                    }
-                }
-            }
-
-            return (upstream_headers, false);
+    if let Some(auth_file) = auth_file
+        && let Some(token) = read_codex_access_token(auth_file)
+    {
+        if let Ok(val) = http::HeaderValue::from_str(&format!("Bearer {token}")) {
+            upstream_headers.insert(http::header::AUTHORIZATION, val);
         }
+
+        if let Some(payload) = decode_openai_bearer_payload(&token)
+            && let Some(account_id) = payload
+                .get("https://api.openai.com/auth")
+                .and_then(|auth| auth.get("chatgpt_account_id"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            && let Ok(val) = http::HeaderValue::from_str(account_id)
+        {
+            upstream_headers.insert("ChatGPT-Account-ID", val);
+            return (upstream_headers, true);
+        }
+
+        return (upstream_headers, false);
     }
 
     if let Some(auth) = headers.get(http::header::AUTHORIZATION) {

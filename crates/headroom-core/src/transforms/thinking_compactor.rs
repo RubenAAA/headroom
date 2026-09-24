@@ -34,7 +34,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use lru::LruCache;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "ml")]
@@ -153,10 +153,10 @@ fn memo_compact(text: &str, kompress: Option<&dyn ThinkingCompressor>) -> Option
     let kompress = kompress?;
     let key = hex::encode(Sha256::digest(text.as_bytes()));
     // `get` is the LRU touch, matching Python's `move_to_end` on a hit.
-    if let Ok(mut cache) = memo().lock() {
-        if let Some(hit) = cache.get(&key) {
-            return Some(hit.clone());
-        }
+    if let Ok(mut cache) = memo().lock()
+        && let Some(hit) = cache.get(&key)
+    {
+        return Some(hit.clone());
     }
     // Fail OPEN — never break the proxy on a bad compressor.
     let compacted = match kompress.compress_thinking(text) {
@@ -331,13 +331,13 @@ fn compact_think_spans(
             continue;
         }
         let mut new_inner = inner.to_string();
-        if words >= min_words {
-            if let Some(comp) = memo_compact(inner, kompress).filter(|c| word_count(c) < words) {
-                wa += word_count(&comp);
-                new_inner = comp;
-                blocks += 1;
-                wb += words;
-            }
+        if words >= min_words
+            && let Some(comp) = memo_compact(inner, kompress).filter(|c| word_count(c) < words)
+        {
+            wa += word_count(&comp);
+            new_inner = comp;
+            blocks += 1;
+            wb += words;
         }
         parts.push_str(OPEN_TAG);
         parts.push_str(&new_inner);
@@ -409,16 +409,16 @@ pub fn compact_reasoning_openai_chat(
         }
 
         // (2) GLM / DeepSeek-R1: inline `<think>…</think>` in string content
-        if let Some(c) = m.get("content").and_then(Value::as_str) {
-            if c.contains(OPEN_TAG) {
-                let (new_c, b, wb, wa) = compact_think_spans(c, kompress, min_words, drop);
-                if b > 0 {
-                    nm["content"] = Value::String(new_c);
-                    changed = true;
-                    stats.blocks += b;
-                    stats.words_before += wb;
-                    stats.words_after += wa;
-                }
+        if let Some(c) = m.get("content").and_then(Value::as_str)
+            && c.contains(OPEN_TAG)
+        {
+            let (new_c, b, wb, wa) = compact_think_spans(c, kompress, min_words, drop);
+            if b > 0 {
+                nm["content"] = Value::String(new_c);
+                changed = true;
+                stats.blocks += b;
+                stats.words_before += wb;
+                stats.words_after += wa;
             }
         }
 

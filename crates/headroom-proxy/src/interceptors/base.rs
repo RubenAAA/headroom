@@ -119,10 +119,10 @@ pub fn extract_tool_result_content(msg: &Value) -> Option<String> {
     // Anthropic format
     if let Some(content) = msg.get("content").and_then(Value::as_array) {
         for block in content {
-            if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-                if let Some(inner) = block.get("content").and_then(Value::as_str) {
-                    return Some(inner.to_string());
-                }
+            if block.get("type").and_then(Value::as_str) == Some("tool_result")
+                && let Some(inner) = block.get("content").and_then(Value::as_str)
+            {
+                return Some(inner.to_string());
             }
         }
     }
@@ -207,18 +207,18 @@ pub fn tool_use_id_for_message(msg: &Value) -> Option<String> {
     // Anthropic format
     if let Some(content) = msg.get("content").and_then(Value::as_array) {
         for block in content {
-            if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-                if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
-                    return Some(id.to_string());
-                }
+            if block.get("type").and_then(Value::as_str) == Some("tool_result")
+                && let Some(id) = block.get("tool_use_id").and_then(Value::as_str)
+            {
+                return Some(id.to_string());
             }
         }
     }
     // OpenAI format
-    if msg.get("role").and_then(Value::as_str) == Some("tool") {
-        if let Some(id) = msg.get("tool_call_id").and_then(Value::as_str) {
-            return Some(id.to_string());
-        }
+    if msg.get("role").and_then(Value::as_str) == Some("tool")
+        && let Some(id) = msg.get("tool_call_id").and_then(Value::as_str)
+    {
+        return Some(id.to_string());
     }
     None
 }
@@ -314,14 +314,13 @@ pub fn apply_to_messages(messages: Vec<Value>, frozen_count: usize) -> Intercept
                 None
             });
 
-            if let Some(ref k) = key {
-                if fired
+            if let Some(ref k) = key
+                && fired
                     .get(&interceptor_name)
                     .map(|s| s.contains(k))
                     .unwrap_or(false)
-                {
-                    continue;
-                }
+            {
+                continue;
             }
 
             // matches() with panic guard
@@ -354,22 +353,22 @@ pub fn apply_to_messages(messages: Vec<Value>, frozen_count: usize) -> Intercept
                 None
             });
 
-            if let Some(rewritten) = transformed {
-                if rewritten != current {
-                    let before = count_tokens(&current);
-                    let after = count_tokens(&rewritten);
-                    if after >= before {
-                        continue;
-                    }
-                    spans.push(TransformSpan {
-                        tool: interceptor_name.clone(),
-                        tokens_before: before,
-                        tokens_after: after,
-                    });
-                    current = rewritten;
-                    if let Some(k) = key {
-                        fired.entry(interceptor_name).or_default().insert(k);
-                    }
+            if let Some(rewritten) = transformed
+                && rewritten != current
+            {
+                let before = count_tokens(&current);
+                let after = count_tokens(&rewritten);
+                if after >= before {
+                    continue;
+                }
+                spans.push(TransformSpan {
+                    tool: interceptor_name.clone(),
+                    tokens_before: before,
+                    tokens_after: after,
+                });
+                current = rewritten;
+                if let Some(k) = key {
+                    fired.entry(interceptor_name).or_default().insert(k);
                 }
             }
         }

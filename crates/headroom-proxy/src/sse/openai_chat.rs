@@ -114,15 +114,15 @@ impl ChunkState {
                 self.id = Some(id.to_string());
             }
         }
-        if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
-            if self.model.is_none() {
-                self.model = Some(m.to_string());
-            }
+        if let Some(m) = v.get("model").and_then(|x| x.as_str())
+            && self.model.is_none()
+        {
+            self.model = Some(m.to_string());
         }
-        if let Some(fp) = v.get("system_fingerprint").and_then(|x| x.as_str()) {
-            if self.system_fingerprint.is_none() {
-                self.system_fingerprint = Some(fp.to_string());
-            }
+        if let Some(fp) = v.get("system_fingerprint").and_then(|x| x.as_str())
+            && self.system_fingerprint.is_none()
+        {
+            self.system_fingerprint = Some(fp.to_string());
         }
 
         if let Some(choices) = v.get("choices").and_then(|x| x.as_array()) {
@@ -132,10 +132,10 @@ impl ChunkState {
         }
 
         // Usage (final chunk when include_usage is set).
-        if let Some(usage) = v.get("usage") {
-            if !usage.is_null() {
-                self.usage = Some(usage.clone());
-            }
+        if let Some(usage) = v.get("usage")
+            && !usage.is_null()
+        {
+            self.usage = Some(usage.clone());
         }
         Ok(())
     }
@@ -193,21 +193,21 @@ fn apply_tool_call_delta(cs: &mut ChoiceState, tc: &Value) {
     };
     let entry = cs.tool_calls.entry(idx as usize).or_default();
     // id and function.name only on first chunk for this tool call.
-    if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
-        if entry.id.is_none() {
-            entry.id = Some(id.to_string());
-        }
+    if let Some(id) = tc.get("id").and_then(|x| x.as_str())
+        && entry.id.is_none()
+    {
+        entry.id = Some(id.to_string());
     }
-    if let Some(t) = tc.get("type").and_then(|x| x.as_str()) {
-        if entry.call_type.is_none() {
-            entry.call_type = Some(t.to_string());
-        }
+    if let Some(t) = tc.get("type").and_then(|x| x.as_str())
+        && entry.call_type.is_none()
+    {
+        entry.call_type = Some(t.to_string());
     }
     if let Some(func) = tc.get("function") {
-        if let Some(n) = func.get("name").and_then(|x| x.as_str()) {
-            if entry.function_name.is_none() {
-                entry.function_name = Some(n.to_string());
-            }
+        if let Some(n) = func.get("name").and_then(|x| x.as_str())
+            && entry.function_name.is_none()
+        {
+            entry.function_name = Some(n.to_string());
         }
         if let Some(args) = func.get("arguments").and_then(|x| x.as_str()) {
             entry.function_arguments.push_str(args);

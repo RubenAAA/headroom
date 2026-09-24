@@ -10,8 +10,8 @@
 use std::sync::{Mutex, MutexGuard};
 
 use headroom_core::transforms::live_zone::{
-    compress_anthropic_live_zone, compress_openai_responses_live_zone, AuthMode, BlockAction,
-    ExclusionReason, LiveZoneOutcome,
+    AuthMode, BlockAction, ExclusionReason, LiveZoneOutcome, compress_anthropic_live_zone,
+    compress_openai_responses_live_zone,
 };
 use headroom_core::transforms::read_protection::read_protection_enabled;
 use serde_json::json;
@@ -24,9 +24,9 @@ static ENV: Mutex<()> = Mutex::new(());
 fn with_flag(on: bool) -> MutexGuard<'static, ()> {
     let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
     if on {
-        std::env::set_var("HEADROOM_PROTECT_READS", "1");
+        unsafe { std::env::set_var("HEADROOM_PROTECT_READS", "1") };
     } else {
-        std::env::remove_var("HEADROOM_PROTECT_READS");
+        unsafe { std::env::remove_var("HEADROOM_PROTECT_READS") };
     }
     guard
 }
@@ -48,10 +48,10 @@ fn the_flag_is_off_until_it_says_otherwise() {
         ("yes", true),
         ("on", true),
     ] {
-        std::env::set_var("HEADROOM_PROTECT_READS", raw);
+        unsafe { std::env::set_var("HEADROOM_PROTECT_READS", raw) };
         assert_eq!(read_protection_enabled(), want, "for {raw:?}");
     }
-    std::env::remove_var("HEADROOM_PROTECT_READS");
+    unsafe { std::env::remove_var("HEADROOM_PROTECT_READS") };
 }
 
 /// Python source, well over the byte threshold, of a kind the detector calls

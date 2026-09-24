@@ -76,12 +76,12 @@ pub fn detect_structural_outliers(items: &[Value]) -> Vec<usize> {
     let n = items.len();
     let common_fields: HashSet<String> = field_counts
         .iter()
-        .filter(|(_, &c)| c as f64 >= n as f64 * 0.8)
+        .filter(|&(_, &c)| c as f64 >= n as f64 * 0.8)
         .map(|(k, _)| (*k).to_string())
         .collect();
     let rare_fields: HashSet<&str> = field_counts
         .iter()
-        .filter(|(_, &c)| (c as f64) < n as f64 * 0.2)
+        .filter(|&(_, &c)| (c as f64) < n as f64 * 0.2)
         .map(|(k, _)| *k)
         .collect();
 

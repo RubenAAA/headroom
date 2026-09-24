@@ -7,9 +7,9 @@
 //! conversations carry a reminder in `messages[0]`, and 34 carry a standalone
 //! `role: "system"` bare-string reminder at `messages[1]`.
 
-use headroom_proxy::cache_stabilization::drift_detector::{compute_structural_hash, ApiKind};
+use headroom_proxy::cache_stabilization::drift_detector::{ApiKind, compute_structural_hash};
 use headroom_proxy::cache_stabilization::prefix_replay::canonicalize_for_prefix_compare;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `messages[1]` is the withdrawable standalone reminder; `messages[2]` is the
 /// assistant turn that slides into its slot when it goes.

@@ -596,11 +596,7 @@ pub fn item_has_preserve_field_match(
 }
 
 fn query_or_none(q: &str) -> Option<&str> {
-    if q.is_empty() {
-        None
-    } else {
-        Some(q)
-    }
+    if q.is_empty() { None } else { Some(q) }
 }
 
 fn for_each_anomaly(
@@ -629,10 +625,10 @@ fn for_each_anomaly(
             .as_object()
             .and_then(|o| o.get(field_name))
             .and_then(|v| v.as_f64())
+            && !num.is_nan()
+            && (num - mean).abs() > threshold
         {
-            if !num.is_nan() && (num - mean).abs() > threshold {
-                keep.insert(i);
-            }
+            keep.insert(i);
         }
     }
 }

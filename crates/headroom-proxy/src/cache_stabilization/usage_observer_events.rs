@@ -371,8 +371,8 @@ impl CompletionClass {
 mod prefix_on_recache_event_tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
-    use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
 
     #[derive(Default)]
     struct Captured {

@@ -81,9 +81,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::ephemeral_spans::{
-    block_carries_ephemeral_span, is_client_scaffolding_message, is_ephemeral_client_block,
-    is_ephemeral_client_text, split_ephemeral_spans, split_trailing_ephemeral_spans,
-    take_trailing_ephemeral_spans, SYSTEM_REMINDER_OPEN_TAG,
+    SYSTEM_REMINDER_OPEN_TAG, block_carries_ephemeral_span, is_client_scaffolding_message,
+    is_ephemeral_client_block, is_ephemeral_client_text, split_ephemeral_spans,
+    split_trailing_ephemeral_spans, take_trailing_ephemeral_spans,
 };
 use lru::LruCache;
 use serde_json::Value;

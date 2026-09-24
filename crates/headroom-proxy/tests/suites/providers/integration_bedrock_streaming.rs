@@ -26,7 +26,7 @@ use aws_credential_types::Credentials;
 use bytes::{Bytes, BytesMut};
 use common::start_proxy_with_state;
 use headroom_proxy::bedrock::{
-    parse_eventstream, CrcValidation, EventStreamParser, HeaderValue, MessageBuilder, ParseError,
+    CrcValidation, EventStreamParser, HeaderValue, MessageBuilder, ParseError, parse_eventstream,
 };
 use proptest::prelude::*;
 use serde_json::json;

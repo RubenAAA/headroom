@@ -23,8 +23,8 @@ use serde_json::Value;
 
 use super::client::SubscriptionFetcher;
 use super::models::{
-    synthesize_window_render, HeadroomContribution, RateLimitWindow, SubscriptionSnapshot,
-    SubscriptionState, WindowDiscrepancy, WindowTokens,
+    HeadroomContribution, RateLimitWindow, SubscriptionSnapshot, SubscriptionState,
+    WindowDiscrepancy, WindowTokens, synthesize_window_render,
 };
 use super::{session_tracking, utc_now};
 use crate::subscription::base::QuotaTracker;
@@ -447,10 +447,10 @@ fn maybe_reset_contribution(state: &mut SubscriptionState) {
     }
     let prev_resets = state.history[n - 2].five_hour.resets_at;
     let curr_resets = state.history[n - 1].five_hour.resets_at;
-    if let (Some(prev), Some(curr)) = (prev_resets, curr_resets) {
-        if curr - prev > rollover_min_advance() {
-            state.contribution = HeadroomContribution::default();
-        }
+    if let (Some(prev), Some(curr)) = (prev_resets, curr_resets)
+        && curr - prev > rollover_min_advance()
+    {
+        state.contribution = HeadroomContribution::default();
     }
 }
 
@@ -657,9 +657,9 @@ mod tests {
         let tracker = tracker_with(Some(snap));
         // PR-F3: polling reads the token from the environment/credentials
         // file, never from tracker memory.
-        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "oauth-abc");
+        unsafe { std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "oauth-abc") };
         assert!(tracker.poll_once());
-        std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        unsafe { std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") };
         let state = tracker.state();
         assert_eq!(state["poll_count"], json!(1));
         // persisted file exists and round-trips poll_count

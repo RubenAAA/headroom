@@ -32,7 +32,7 @@ use bytes::Bytes;
 use common::start_proxy_with;
 use headroom_proxy::sse::framing::SseFramer;
 use headroom_proxy::sse::openai_chat::ChunkState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};

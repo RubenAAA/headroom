@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use headroom_core::ccr::{CcrStore, InMemoryCcrStore};
 use headroom_core::transforms::smart_crusher::{
@@ -363,19 +363,21 @@ fn document_walker_with_store_roundtrips_opaque_blob() {
 
 #[test]
 fn nested_structured_prose_leaf_uses_ccr() {
+    use headroom_core::transforms::ContentType;
     use headroom_core::transforms::pipeline::config::PipelineConfig;
     use headroom_core::transforms::pipeline::offloads::JsonOffload;
     use headroom_core::transforms::pipeline::orchestrator::CompressionPipeline;
     use headroom_core::transforms::pipeline::traits::CompressionContext;
-    use headroom_core::transforms::ContentType;
 
     let prose = (0..12)
         .map(|i| format!("Segment {i} explains the durable recovery behavior for this field."))
         .collect::<Vec<_>>()
         .join(" ");
-    let input = serde_json::json!((0..5)
-        .map(|i| serde_json::json!({"id": i, "summary": prose}))
-        .collect::<Vec<_>>())
+    let input = serde_json::json!(
+        (0..5)
+            .map(|i| serde_json::json!({"id": i, "summary": prose}))
+            .collect::<Vec<_>>()
+    )
     .to_string();
     let store = InMemoryCcrStore::new();
     let config = PipelineConfig::default();
@@ -390,10 +392,12 @@ fn nested_structured_prose_leaf_uses_ccr() {
         &store,
     );
     assert!(result.bytes_saved > 0);
-    assert!(result
-        .steps_applied
-        .iter()
-        .any(|step| step == "json_offload"));
+    assert!(
+        result
+            .steps_applied
+            .iter()
+            .any(|step| step == "json_offload")
+    );
     assert!(result.output.contains("<<ccr:"));
     let marker_start = result.output.find("<<ccr:").unwrap() + 6;
     let leaf_key = result.output[marker_start..].split(">>").next().unwrap();

@@ -5,19 +5,19 @@
 //! `systemInstruction` instead of a system message. The handler converts
 //! to OpenAI format for the compression pipeline, then converts back.
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use bytes::Bytes;
-use headroom_core::auth_mode::{classify as classify_auth_mode, AuthMode};
+use headroom_core::auth_mode::{AuthMode, classify as classify_auth_mode};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
-use crate::compression::live_zone_openai::compress_openai_chat_request;
 use crate::compression::Outcome;
+use crate::compression::live_zone_openai::compress_openai_chat_request;
 use crate::config::CompressionMode;
 use crate::error::ProxyError;
 use crate::proxy::AppState;
@@ -380,19 +380,19 @@ impl GeminiRequest {
         let mut tokens_saved = 0usize;
         let mut transforms_applied: Vec<String> = Vec::new();
 
-        if decision.should_compress {
-            if let Some((compressed, before, after)) = compress_messages(
+        if decision.should_compress
+            && let Some((compressed, before, after)) = compress_messages(
                 &self.messages,
                 model,
                 state.config.compression_mode,
                 auth_mode,
                 request_id,
                 &state.config.exclude_tools,
-            ) {
-                optimized_messages = compressed;
-                tokens_saved = before.saturating_sub(after);
-                transforms_applied.push("gemini_openai_compression".to_string());
-            }
+            )
+        {
+            optimized_messages = compressed;
+            tokens_saved = before.saturating_sub(after);
+            transforms_applied.push("gemini_openai_compression".to_string());
         }
 
         let mut output_body = self.body_json.clone();

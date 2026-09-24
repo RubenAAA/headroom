@@ -472,24 +472,24 @@ pub(super) async fn fetch_one_ccr_call(
     round: usize,
 ) -> CcrToolResult {
     // Keyword-search path: the model called without a marker hash.
-    if call.hash_key.is_empty() {
-        if let Some(query) = call.query.clone() {
-            return answer_query_call(
-                &query,
-                call,
-                stores,
-                outgoing_headers,
-                current_request,
-                config,
-                redact,
-                request_id,
-                round,
-            )
-            .await;
-        }
-        // Empty hash and no query: fall through to the hash path,
-        // which reports it as malformed (existing behavior).
+    if call.hash_key.is_empty()
+        && let Some(query) = call.query.clone()
+    {
+        return answer_query_call(
+            &query,
+            call,
+            stores,
+            outgoing_headers,
+            current_request,
+            config,
+            redact,
+            request_id,
+            round,
+        )
+        .await;
     }
+    // Empty hash and no query: fall through to the hash path,
+    // which reports it as malformed (existing behavior).
     // One line per asked hash: sizes repeat-hash waste and names the
     // misses a store-side fix would have to cover.
     tracing::info!(

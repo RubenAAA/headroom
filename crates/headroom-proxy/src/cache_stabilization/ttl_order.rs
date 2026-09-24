@@ -295,9 +295,11 @@ mod tests {
             ]}]
         });
         assert!(enforce_ttl_order(&mut body, true).is_noop());
-        assert!(body["messages"][0]["content"][0]["cache_control"]
-            .get("ttl")
-            .is_none());
+        assert!(
+            body["messages"][0]["content"][0]["cache_control"]
+                .get("ttl")
+                .is_none()
+        );
     }
 
     /// A marker inside a `tool_result`'s own content counts as a breakpoint,

@@ -440,18 +440,17 @@ pub(super) fn dispatch_compressor_uncached(
         compressed,
         strategy,
     } = &result
+        && compressed.len() >= text.len()
     {
-        if compressed.len() >= text.len() {
-            // Carry which compressor declined. These blocks used to reach the
-            // tokenizer and be counted as rejections; absorbing them here
-            // without saying so would make this fix unfalsifiable — the
-            // rejection counter would fall whether the waste went away or the
-            // gate began declining work that pays.
-            return DispatchResult::NoOp {
-                content_type: content_type.as_str(),
-                declined_by: Some(strategy),
-            };
-        }
+        // Carry which compressor declined. These blocks used to reach the
+        // tokenizer and be counted as rejections; absorbing them here
+        // without saying so would make this fix unfalsifiable — the
+        // rejection counter would fall whether the waste went away or the
+        // gate began declining work that pays.
+        return DispatchResult::NoOp {
+            content_type: content_type.as_str(),
+            declined_by: Some(strategy),
+        };
     }
     result
 }

@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use super::content_detector::{detect_content_type, ContentType};
+use super::content_detector::{ContentType, detect_content_type};
 use super::lossless_compaction::compact_lossless;
 
 // ─── Flavor-specific patterns ────────────────────────────────────────────
@@ -163,19 +163,19 @@ impl ConfigCompressor {
         // recoverable.
         if self.config.enable_ccr && elision_safe(content, &flavor) {
             let (stripped, elided) = strip_comment_lines(content, &flavor);
-            if elided > 0 {
-                if let Some(hash) = store_original(content, &stripped) {
-                    let marker = format!(
-                        "[{elided} comment/blank lines elided. Retrieve original: hash={hash}]"
-                    );
-                    working = if stripped.ends_with('\n') {
-                        format!("{stripped}{marker}")
-                    } else {
-                        format!("{stripped}\n{marker}")
-                    };
-                    lines_elided = elided;
-                    ccr_hash = Some(hash);
-                }
+            if elided > 0
+                && let Some(hash) = store_original(content, &stripped)
+            {
+                let marker = format!(
+                    "[{elided} comment/blank lines elided. Retrieve original: hash={hash}]"
+                );
+                working = if stripped.ends_with('\n') {
+                    format!("{stripped}{marker}")
+                } else {
+                    format!("{stripped}\n{marker}")
+                };
+                lines_elided = elided;
+                ccr_hash = Some(hash);
             }
         }
 
@@ -183,18 +183,18 @@ impl ConfigCompressor {
         let compressed = compact_lossless(&working, "config");
 
         // Prefer the schema fold when it beats the text tiers.
-        if let Some((folded, hash)) = schema_fold {
-            if folded.len() < compressed.len() {
-                return ConfigCompressionResult {
-                    compressed: folded,
-                    original: content.to_string(),
-                    was_modified: true,
-                    flavor,
-                    lines_elided: 0,
-                    ccr_hash: Some(hash),
-                    strategy: "config_schema_fold".to_string(),
-                };
-            }
+        if let Some((folded, hash)) = schema_fold
+            && folded.len() < compressed.len()
+        {
+            return ConfigCompressionResult {
+                compressed: folded,
+                original: content.to_string(),
+                was_modified: true,
+                flavor,
+                lines_elided: 0,
+                ccr_hash: Some(hash),
+                strategy: "config_schema_fold".to_string(),
+            };
         }
 
         let savings = content.len().saturating_sub(compressed.len());
@@ -379,9 +379,10 @@ mod tests {
         assert!(r.was_modified);
         assert_eq!(r.lines_elided, 12);
         assert_eq!(r.ccr_hash.as_deref(), Some("abc123def456"));
-        assert!(r
-            .compressed
-            .contains("[12 comment/blank lines elided. Retrieve original: hash=abc123def456]"));
+        assert!(
+            r.compressed
+                .contains("[12 comment/blank lines elided. Retrieve original: hash=abc123def456]")
+        );
     }
 
     #[test]

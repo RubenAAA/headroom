@@ -14,7 +14,7 @@
 
 use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode;
-use headroom_proxy::compression::{compress_anthropic_request, Outcome};
+use headroom_proxy::compression::{Outcome, compress_anthropic_request};
 use headroom_proxy::config::{CacheControlAutoFrozen, CompressionMode};
 
 /// Log-shaped tool output: many consecutive same-shape lines, which is what

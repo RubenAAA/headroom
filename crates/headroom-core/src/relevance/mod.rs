@@ -25,7 +25,7 @@ mod bm25;
 mod embedding;
 mod hybrid;
 
-pub use base::{default_batch_score, RelevanceScore, RelevanceScorer};
+pub use base::{RelevanceScore, RelevanceScorer, default_batch_score};
 pub use bm25::BM25Scorer;
 pub use embedding::EmbeddingScorer;
 pub use hybrid::HybridScorer;

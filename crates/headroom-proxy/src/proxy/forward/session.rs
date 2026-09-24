@@ -352,22 +352,20 @@ pub(crate) fn analyze_buffered_session(
         // refuse inside `seed_if_absent` — benign. Runs before the
         // offload policy below reads the gate (S1a ordering), on the
         // client's restored body, and only when flagged on.
-        if lane_birth {
-            if let (Some(runtime), Some(headers)) =
+        if lane_birth
+            && let (Some(runtime), Some(headers)) =
                 (state.ctx_offload.as_ref(), headers_snapshot.as_ref())
-            {
-                if runtime.config.cross_session_seed {
-                    crate::compression::ctx_offload::seed_newborn_session(
-                        &runtime.gate,
-                        headers,
-                        client_addr,
-                        parsed,
-                        kind,
-                        request_session_key,
-                        request_id,
-                    );
-                }
-            }
+            && runtime.config.cross_session_seed
+        {
+            crate::compression::ctx_offload::seed_newborn_session(
+                &runtime.gate,
+                headers,
+                client_addr,
+                parsed,
+                kind,
+                request_session_key,
+                request_id,
+            );
         }
 
         // The hot zone changed, so every prefix this lane had

@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::observability::proxy_counters;
 use headroom_core::request_outcome::RequestOutcome;
@@ -310,9 +309,11 @@ fn a_replayed_1h_marker_is_contained_before_forwarding() {
 
     let out = enforce_cache_control_ttl_order(sent, &client, false, "r1");
     let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert!(parsed["messages"][0]["content"][0]["cache_control"]
-        .get("ttl")
-        .is_none());
+    assert!(
+        parsed["messages"][0]["content"][0]["cache_control"]
+            .get("ttl")
+            .is_none()
+    );
 }
 
 /// B1 authors those 1h markers on purpose, so they are not a leak and the

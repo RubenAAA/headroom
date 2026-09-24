@@ -186,17 +186,16 @@ impl ChatWire {
                         let tc_index =
                             tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                         let t = entry.tools.entry(tc_index).or_default();
-                        if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
-                            if t.id.is_none() {
-                                t.id = Some(id.to_string());
-                            }
+                        if let Some(id) = tc.get("id").and_then(|x| x.as_str())
+                            && t.id.is_none()
+                        {
+                            t.id = Some(id.to_string());
                         }
-                        if let Some(func) = tc.get("function") {
-                            if let Some(n) = func.get("name").and_then(|x| x.as_str()) {
-                                if t.name.is_none() {
-                                    t.name = Some(n.to_string());
-                                }
-                            }
+                        if let Some(func) = tc.get("function")
+                            && let Some(n) = func.get("name").and_then(|x| x.as_str())
+                            && t.name.is_none()
+                        {
+                            t.name = Some(n.to_string());
                         }
                     }
                 }
@@ -423,14 +422,14 @@ impl RespWire {
                 }
             }
             "output_item.done" => {
-                if let Some(item) = v.get("item") {
-                    if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
-                        if let Some(c) = self.message_items.get_mut(id) {
-                            *c = true;
-                        }
-                        if let Some((_, c)) = self.function_calls.get_mut(id) {
-                            *c = true;
-                        }
+                if let Some(item) = v.get("item")
+                    && let Some(id) = item.get("id").and_then(|x| x.as_str())
+                {
+                    if let Some(c) = self.message_items.get_mut(id) {
+                        *c = true;
+                    }
+                    if let Some((_, c)) = self.function_calls.get_mut(id) {
+                        *c = true;
                     }
                 }
             }
@@ -453,10 +452,10 @@ impl RespWire {
             }
             "response.completed" => {
                 self.terminal = Some("completed".to_string());
-                if let Some(resp) = v.get("response") {
-                    if let Some(id) = resp.get("id").and_then(|x| x.as_str()) {
-                        self.response_id = Some(id.to_string());
-                    }
+                if let Some(resp) = v.get("response")
+                    && let Some(id) = resp.get("id").and_then(|x| x.as_str())
+                {
+                    self.response_id = Some(id.to_string());
                 }
             }
             "response.incomplete" => {

@@ -66,16 +66,15 @@ fn env(name: &str) -> Option<String> {
 /// Expand a leading `~` to the user's home directory, mirroring Python's
 /// `Path.expanduser()`.
 fn expanduser(value: &str) -> PathBuf {
-    if let Some(rest) = value.strip_prefix("~") {
-        if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') {
-            if let Some(home) = home_dir() {
-                let rest = rest.trim_start_matches(['/', '\\']);
-                if rest.is_empty() {
-                    return home;
-                }
-                return home.join(rest);
-            }
+    if let Some(rest) = value.strip_prefix("~")
+        && (rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\'))
+        && let Some(home) = home_dir()
+    {
+        let rest = rest.trim_start_matches(['/', '\\']);
+        if rest.is_empty() {
+            return home;
         }
+        return home.join(rest);
     }
     PathBuf::from(value)
 }
@@ -95,10 +94,10 @@ fn home_dir() -> Option<PathBuf> {
 /// Apply the standard precedence: explicit > env > derived. `explicit` and the
 /// env value are both `expanduser`-expanded.
 fn resolve(explicit: Option<&Path>, env_var: &str, derived: PathBuf) -> PathBuf {
-    if let Some(path) = explicit {
-        if !path.as_os_str().is_empty() {
-            return expanduser(&path.to_string_lossy());
-        }
+    if let Some(path) = explicit
+        && !path.as_os_str().is_empty()
+    {
+        return expanduser(&path.to_string_lossy());
     }
     if let Some(env_value) = env(env_var) {
         return expanduser(&env_value);
@@ -229,24 +228,24 @@ mod tests {
     #[test]
     fn workspace_dir_uses_env_override() {
         let _g = env_guard();
-        std::env::set_var(HEADROOM_WORKSPACE_DIR_ENV, "/tmp/hr-ws");
+        unsafe { std::env::set_var(HEADROOM_WORKSPACE_DIR_ENV, "/tmp/hr-ws") };
         assert_eq!(workspace_dir(), PathBuf::from("/tmp/hr-ws"));
-        std::env::remove_var(HEADROOM_WORKSPACE_DIR_ENV);
+        unsafe { std::env::remove_var(HEADROOM_WORKSPACE_DIR_ENV) };
     }
 
     #[test]
     fn config_dir_derives_from_workspace_env() {
         let _g = env_guard();
-        std::env::remove_var(HEADROOM_CONFIG_DIR_ENV);
-        std::env::set_var(HEADROOM_WORKSPACE_DIR_ENV, "/tmp/hr-ws");
+        unsafe { std::env::remove_var(HEADROOM_CONFIG_DIR_ENV) };
+        unsafe { std::env::set_var(HEADROOM_WORKSPACE_DIR_ENV, "/tmp/hr-ws") };
         assert_eq!(config_dir(), PathBuf::from("/tmp/hr-ws/config"));
-        std::env::remove_var(HEADROOM_WORKSPACE_DIR_ENV);
+        unsafe { std::env::remove_var(HEADROOM_WORKSPACE_DIR_ENV) };
     }
 
     #[test]
     fn subscription_path_precedence_explicit_over_env() {
         let _g = env_guard();
-        std::env::set_var(HEADROOM_SUBSCRIPTION_STATE_PATH_ENV, "/tmp/from-env.json");
+        unsafe { std::env::set_var(HEADROOM_SUBSCRIPTION_STATE_PATH_ENV, "/tmp/from-env.json") };
         let explicit = PathBuf::from("/tmp/explicit.json");
         assert_eq!(
             subscription_state_path(Some(&explicit)),
@@ -256,35 +255,35 @@ mod tests {
             subscription_state_path(None),
             PathBuf::from("/tmp/from-env.json")
         );
-        std::env::remove_var(HEADROOM_SUBSCRIPTION_STATE_PATH_ENV);
+        unsafe { std::env::remove_var(HEADROOM_SUBSCRIPTION_STATE_PATH_ENV) };
     }
 
     #[test]
     fn savings_events_path_env_override() {
         let _g = env_guard();
-        std::env::set_var(HEADROOM_SAVINGS_EVENTS_PATH_ENV, "/tmp/ev.jsonl");
+        unsafe { std::env::set_var(HEADROOM_SAVINGS_EVENTS_PATH_ENV, "/tmp/ev.jsonl") };
         assert_eq!(savings_events_path(None), PathBuf::from("/tmp/ev.jsonl"));
-        std::env::remove_var(HEADROOM_SAVINGS_EVENTS_PATH_ENV);
+        unsafe { std::env::remove_var(HEADROOM_SAVINGS_EVENTS_PATH_ENV) };
     }
 
     #[test]
     fn output_savings_path_derives_from_workspace_without_env_override() {
         let _g = env_guard();
-        std::env::set_var(HEADROOM_WORKSPACE_DIR_ENV, "/tmp/hr-ws");
+        unsafe { std::env::set_var(HEADROOM_WORKSPACE_DIR_ENV, "/tmp/hr-ws") };
         assert_eq!(
             output_savings_path(),
             PathBuf::from("/tmp/hr-ws/output_savings.json")
         );
-        std::env::remove_var(HEADROOM_WORKSPACE_DIR_ENV);
+        unsafe { std::env::remove_var(HEADROOM_WORKSPACE_DIR_ENV) };
     }
 
     #[test]
     fn copilot_auth_path_honors_resource_env_override() {
         let _g = env_guard();
-        std::env::set_var(HEADROOM_WORKSPACE_DIR_ENV, "/tmp/hr-ws");
-        std::env::set_var(HEADROOM_COPILOT_AUTH_FILE_ENV, "/tmp/copilot.json");
+        unsafe { std::env::set_var(HEADROOM_WORKSPACE_DIR_ENV, "/tmp/hr-ws") };
+        unsafe { std::env::set_var(HEADROOM_COPILOT_AUTH_FILE_ENV, "/tmp/copilot.json") };
         assert_eq!(copilot_auth_path(), PathBuf::from("/tmp/copilot.json"));
-        std::env::remove_var(HEADROOM_COPILOT_AUTH_FILE_ENV);
-        std::env::remove_var(HEADROOM_WORKSPACE_DIR_ENV);
+        unsafe { std::env::remove_var(HEADROOM_COPILOT_AUTH_FILE_ENV) };
+        unsafe { std::env::remove_var(HEADROOM_WORKSPACE_DIR_ENV) };
     }
 }

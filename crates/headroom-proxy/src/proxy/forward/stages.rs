@@ -18,50 +18,50 @@ pub(crate) fn check_semantic_cache(
     request_id: &str,
     path_for_log: &str,
 ) -> Option<Response<Body>> {
-    if let Some(ref cache) = state.semantic_cache {
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(buffered) {
-            let is_streaming = parsed
-                .get("stream")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !is_streaming {
-                let model = parsed
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown");
-                if let Some(entry) = crate::semantic_cache::cache_key_inputs(&parsed)
-                    .and_then(|(messages, extra)| cache.get(&messages, model, &extra))
-                {
-                    tracing::info!(
-                        event = "semantic_cache_hit",
-                        request_id = %request_id,
-                        path = %path_for_log,
-                        model = model,
-                        hit_count = entry.hit_count,
-                        body_bytes = entry.response_body.len(),
-                        "semantic cache hit; returning cached response"
-                    );
-                    // Build a synthetic Response from the cached entry.
-                    let mut resp_headers = HeaderMap::new();
-                    for (k, v) in &entry.response_headers {
-                        if let (Ok(name), Ok(val)) = (
-                            HeaderName::from_bytes(k.as_bytes()),
-                            http::HeaderValue::from_str(v),
-                        ) {
-                            resp_headers.insert(name, val);
-                        }
+    if let Some(ref cache) = state.semantic_cache
+        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(buffered)
+    {
+        let is_streaming = parsed
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !is_streaming {
+            let model = parsed
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown");
+            if let Some(entry) = crate::semantic_cache::cache_key_inputs(&parsed)
+                .and_then(|(messages, extra)| cache.get(&messages, model, &extra))
+            {
+                tracing::info!(
+                    event = "semantic_cache_hit",
+                    request_id = %request_id,
+                    path = %path_for_log,
+                    model = model,
+                    hit_count = entry.hit_count,
+                    body_bytes = entry.response_body.len(),
+                    "semantic cache hit; returning cached response"
+                );
+                // Build a synthetic Response from the cached entry.
+                let mut resp_headers = HeaderMap::new();
+                for (k, v) in &entry.response_headers {
+                    if let (Ok(name), Ok(val)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        http::HeaderValue::from_str(v),
+                    ) {
+                        resp_headers.insert(name, val);
                     }
-                    resp_headers.insert(
-                        http::header::CONTENT_LENGTH,
-                        http::HeaderValue::from(entry.response_body.len()),
-                    );
-                    return Some(
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .body(Body::from(entry.response_body))
-                            .unwrap(),
-                    );
                 }
+                resp_headers.insert(
+                    http::header::CONTENT_LENGTH,
+                    http::HeaderValue::from(entry.response_body.len()),
+                );
+                return Some(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(entry.response_body))
+                        .unwrap(),
+                );
             }
         }
     }
@@ -456,24 +456,22 @@ pub(crate) async fn maybe_handle_sidecar(
     if compression::classify_compressible_path(uri_path)
         == Some(compression::CompressibleEndpoint::AnthropicMessages)
         && memchr::memmem::find(buffered, DESCRIBE).is_some()
+        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(buffered)
     {
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(buffered) {
-            let empty = http::HeaderMap::new();
-            if let Some(sidecar_model) = crate::sidecar::direct_sidecar_model(&state.config) {
-                if let Some(resp) = crate::sidecar::try_handle(
-                    upstream_client,
-                    upstream_url,
-                    request_id,
-                    headers_snapshot.as_ref().unwrap_or(&empty),
-                    &parsed,
-                    &sidecar_model,
-                    crate::sidecar::SidecarRetry::from_config(&state.config),
-                )
-                .await
-                {
-                    return Some(resp);
-                }
-            }
+        let empty = http::HeaderMap::new();
+        if let Some(sidecar_model) = crate::sidecar::direct_sidecar_model(&state.config)
+            && let Some(resp) = crate::sidecar::try_handle(
+                upstream_client,
+                upstream_url,
+                request_id,
+                headers_snapshot.as_ref().unwrap_or(&empty),
+                &parsed,
+                &sidecar_model,
+                crate::sidecar::SidecarRetry::from_config(&state.config),
+            )
+            .await
+        {
+            return Some(resp);
         }
     }
     None

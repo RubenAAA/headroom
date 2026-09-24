@@ -57,10 +57,10 @@ pub mod vendor;
 pub use auth_mode_layer::classify_and_attach_auth_mode;
 pub use envelope::{BedrockEnvelope, EnvelopeError};
 pub use eventstream::{
-    parse as parse_eventstream, CrcValidation, EventStreamMessage, EventStreamParser, HeaderValue,
-    MessageBuilder, ParseError,
+    CrcValidation, EventStreamMessage, EventStreamParser, HeaderValue, MessageBuilder, ParseError,
+    parse as parse_eventstream,
 };
-pub use eventstream_to_sse::{translate_message, OutputMode, TranslateError, TranslateOutcome};
+pub use eventstream_to_sse::{OutputMode, TranslateError, TranslateOutcome, translate_message};
 pub use invoke::handle_invoke;
 pub use invoke_streaming::handle_invoke_streaming;
-pub use sigv4::{sign_request, SigV4Error, SigningInputs};
+pub use sigv4::{SigV4Error, SigningInputs, sign_request};

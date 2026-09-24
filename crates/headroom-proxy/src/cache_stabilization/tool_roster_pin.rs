@@ -110,11 +110,11 @@ pub fn pin_tool_roster(tools: &mut Vec<Value>, remembered: &mut Roster) -> PinOu
     }
 
     for t in current.into_iter().flatten() {
-        if let Some(name) = tool_name(&t) {
-            if !remembered.iter().any(|(n, _)| n == name) {
-                remembered.push((name.to_string(), t.clone()));
-                outcome.appended.push(name.to_string());
-            }
+        if let Some(name) = tool_name(&t)
+            && !remembered.iter().any(|(n, _)| n == name)
+        {
+            remembered.push((name.to_string(), t.clone()));
+            outcome.appended.push(name.to_string());
         }
         out.push(t);
     }

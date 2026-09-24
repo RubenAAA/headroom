@@ -59,7 +59,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, Response, Uri};
 use axum::response::IntoResponse;
 
-use crate::proxy::{forward_http, AppState, UpstreamOverride};
+use crate::proxy::{AppState, UpstreamOverride, forward_http};
 
 /// Derive the Azure AI Foundry endpoint URL from a resource name.
 ///

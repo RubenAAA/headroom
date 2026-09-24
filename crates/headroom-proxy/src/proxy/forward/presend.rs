@@ -37,15 +37,15 @@ pub(crate) fn observe_upstream_head(
     SseStreamKind,
     (Option<String>, Option<String>, Option<String>),
 ) {
-    if let Some((key, token)) = stampede.take() {
-        if upstream_resp.status().is_success() {
-            match token {
-                Some(token) => token.first_byte(),
-                None => state.stampede_gate.touch(&key),
-            }
+    if let Some((key, token)) = stampede.take()
+        && upstream_resp.status().is_success()
+    {
+        match token {
+            Some(token) => token.first_byte(),
+            None => state.stampede_gate.touch(&key),
         }
-        // A failed leader drops its token here and releases its followers.
     }
+    // A failed leader drops its token here and releases its followers.
     // Response headers are in hand. Whatever is left after `pre_forward` is
     // the provider's own time, including retries and backoff.
     let pre_forward = stage_timer
@@ -157,41 +157,41 @@ pub(crate) fn rewrite_anthropic_body(
             request_id,
             crate::tool_search_deferral::tool_search_enabled(),
         );
-        if let Some(attr) = attribution {
-            if let Some(ctx) = outcome_ctx.as_mut() {
-                // Always tag the mode: a client stand-down must not read as
-                // the feature being off, and "none" must not read as "headroom".
-                ctx.tags
-                    .insert("tool_search_mode".to_string(), attr.mode.to_string());
-                if attr.deferred_tools > 0 {
+        if let Some(attr) = attribution
+            && let Some(ctx) = outcome_ctx.as_mut()
+        {
+            // Always tag the mode: a client stand-down must not read as
+            // the feature being off, and "none" must not read as "headroom".
+            ctx.tags
+                .insert("tool_search_mode".to_string(), attr.mode.to_string());
+            if attr.deferred_tools > 0 {
+                ctx.tags.insert(
+                    "tool_search_deferred_tools".to_string(),
+                    attr.deferred_tools.to_string(),
+                );
+                ctx.tags.insert(
+                    "tool_search_deferred_tokens".to_string(),
+                    attr.deferred_tokens.to_string(),
+                );
+                // Disjoint slice of `tool_search_deferred_tokens`, tagged
+                // only when nonzero; the experiment dashboard divides the
+                // two instead of summing them.
+                if attr.core_deferred_tokens > 0 {
                     ctx.tags.insert(
-                        "tool_search_deferred_tools".to_string(),
-                        attr.deferred_tools.to_string(),
-                    );
-                    ctx.tags.insert(
-                        "tool_search_deferred_tokens".to_string(),
-                        attr.deferred_tokens.to_string(),
-                    );
-                    // Disjoint slice of `tool_search_deferred_tokens`, tagged
-                    // only when nonzero; the experiment dashboard divides the
-                    // two instead of summing them.
-                    if attr.core_deferred_tokens > 0 {
-                        ctx.tags.insert(
-                            "core_deferred_tokens".to_string(),
-                            attr.core_deferred_tokens.to_string(),
-                        );
-                    }
-                    ctx.transforms_applied.push(format!(
-                        "router:tool_search_deferral:{}tools:{}tok",
-                        attr.deferred_tools, attr.deferred_tokens
-                    ));
-                }
-                if attr.stripped_third_party > 0 {
-                    ctx.tags.insert(
-                        "third_party_tool_search_stripped".to_string(),
-                        attr.stripped_third_party.to_string(),
+                        "core_deferred_tokens".to_string(),
+                        attr.core_deferred_tokens.to_string(),
                     );
                 }
+                ctx.transforms_applied.push(format!(
+                    "router:tool_search_deferral:{}tools:{}tok",
+                    attr.deferred_tools, attr.deferred_tokens
+                ));
+            }
+            if attr.stripped_third_party > 0 {
+                ctx.tags.insert(
+                    "third_party_tool_search_stripped".to_string(),
+                    attr.stripped_third_party.to_string(),
+                );
             }
         }
         bytes
@@ -283,14 +283,12 @@ pub(crate) fn run_presend_seam(
     if matches!(
         endpoint,
         compression::CompressibleEndpoint::AnthropicMessages
-    ) {
-        if let Some(handler) = state.memory_handler.as_ref() {
-            if handler.is_initialized() {
-                for (name, value) in handler.get_beta_headers() {
-                    if name.eq_ignore_ascii_case("anthropic-beta") {
-                        append_anthropic_beta(outgoing_headers, &value);
-                    }
-                }
+    ) && let Some(handler) = state.memory_handler.as_ref()
+        && handler.is_initialized()
+    {
+        for (name, value) in handler.get_beta_headers() {
+            if name.eq_ignore_ascii_case("anthropic-beta") {
+                append_anthropic_beta(outgoing_headers, &value);
             }
         }
     }
@@ -301,28 +299,28 @@ pub(crate) fn run_presend_seam(
     // registered" contract. A hook that shrinks the tool array is
     // deferral-shaped (removes schemas counting never saw), so its
     // saving lands in tags, additive to `tokens_saved`.
-    let body_to_send = if crate::turn_hooks::registered_turn_hooks().is_empty() {
+
+    if crate::turn_hooks::registered_turn_hooks().is_empty() {
         body_to_send
     } else {
         let (bytes, tools_saved) = apply_request_hooks(body_to_send, endpoint, request_id);
-        if tools_saved > 0 {
-            if let Some(ctx) = outcome_ctx.as_mut() {
-                let entry = ctx
-                    .tags
-                    .entry("turn_hook_tools_saved_tokens".to_string())
-                    .or_insert_with(|| "0".to_string());
-                *entry = entry
-                    .parse::<i64>()
-                    .unwrap_or(0)
-                    .saturating_add(tools_saved)
-                    .to_string();
-                ctx.transforms_applied
-                    .push(format!("turn_hook:tools:{tools_saved}tok"));
-            }
+        if tools_saved > 0
+            && let Some(ctx) = outcome_ctx.as_mut()
+        {
+            let entry = ctx
+                .tags
+                .entry("turn_hook_tools_saved_tokens".to_string())
+                .or_insert_with(|| "0".to_string());
+            *entry = entry
+                .parse::<i64>()
+                .unwrap_or(0)
+                .saturating_add(tools_saved)
+                .to_string();
+            ctx.transforms_applied
+                .push(format!("turn_hook:tools:{tools_saved}tok"));
         }
         bytes
-    };
-    body_to_send
+    }
 }
 
 /// Post-rewrite finalizers: reasoning restore, TTL order, tool-search
@@ -379,11 +377,11 @@ pub(crate) fn run_finalize_pipeline(
         compression::CompressibleEndpoint::AnthropicMessages
     ) {
         let (bytes, neutralized) = maybe_repair_tool_search_history(body_to_send, request_id);
-        if neutralized > 0 {
-            if let Some(ctx) = outcome_ctx.as_mut() {
-                ctx.transforms_applied
-                    .push(format!("router:tool_search_repair:{neutralized}blocks"));
-            }
+        if neutralized > 0
+            && let Some(ctx) = outcome_ctx.as_mut()
+        {
+            ctx.transforms_applied
+                .push(format!("router:tool_search_repair:{neutralized}blocks"));
         }
         bytes
     } else {
@@ -399,11 +397,11 @@ pub(crate) fn run_finalize_pipeline(
         compression::CompressibleEndpoint::AnthropicMessages
     ) {
         let (bytes, neutralized) = maybe_repair_ccr_retrieve_history(body_to_send, request_id);
-        if neutralized > 0 {
-            if let Some(ctx) = outcome_ctx.as_mut() {
-                ctx.transforms_applied
-                    .push(format!("router:ccr_retrieve_repair:{neutralized}blocks"));
-            }
+        if neutralized > 0
+            && let Some(ctx) = outcome_ctx.as_mut()
+        {
+            ctx.transforms_applied
+                .push(format!("router:ccr_retrieve_repair:{neutralized}blocks"));
         }
         bytes
     } else {
@@ -418,11 +416,11 @@ pub(crate) fn run_finalize_pipeline(
         compression::CompressibleEndpoint::AnthropicMessages
     ) {
         let (bytes, neutralized) = maybe_repair_orphan_tool_results(body_to_send, request_id);
-        if neutralized > 0 {
-            if let Some(ctx) = outcome_ctx.as_mut() {
-                ctx.transforms_applied
-                    .push(format!("router:orphan_tool_repair:{neutralized}blocks"));
-            }
+        if neutralized > 0
+            && let Some(ctx) = outcome_ctx.as_mut()
+        {
+            ctx.transforms_applied
+                .push(format!("router:orphan_tool_repair:{neutralized}blocks"));
         }
         bytes
     } else {
@@ -573,68 +571,68 @@ pub(crate) fn observe_forward_fingerprint(
         api_kind: request_api_kind,
         ..
     } = keys;
-    if request_api_kind.is_some() {
-        if let (Some((model, markers, breakpoints)), Some((sys, tools))) = (
+    if request_api_kind.is_some()
+        && let (Some((model, markers, breakpoints)), Some((sys, tools))) = (
             cache_key_fingerprint(body_to_send),
             preamble_digests(body_to_send),
-        ) {
-            let beta = headers_snapshot
+        )
+    {
+        let beta = headers_snapshot
+            .as_ref()
+            .and_then(|h| h.get("anthropic-beta"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        tracing::info!(
+            event = "turn_cache_fingerprint",
+            request_id = %request_id,
+            session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(
+                request_session_key
+            ),
+            conversation_key = %request_conversation_key,
+            model = %model,
+            // Both are cache-key inputs that sit ahead of message 0, so
+            // a change in either voids the whole prefix.
+            system_digest = %format!("{sys:016x}"),
+            tools_digest = %format!("{tools:016x}"),
+            markers = %markers,
+            breakpoints = breakpoints,
+            // Cross-turn stability of the forwarded messages. Within-turn
+            // rewrites are expected and harmless if deterministic; only a
+            // ladder checkpoint that moves between turns costs cache.
+            prefix_ladder = %prefix_digest_ladder(body_to_send).unwrap_or_default(),
+            // The head ladder stops doubling at 32, so on a long turn
+            // the whole disputed tail sits past its last checkpoint.
+            // These windows cover the last 1/2/4 messages instead; the
+            // smallest one that moved bounds the churn.
+            tail_ladder = %tail_digest_ladder(body_to_send).unwrap_or_default(),
+            beta_digest = %short_hash(beta),
+            // Which account sent the turn. The provider's cache is per
+            // credential, so a `/login` account switch recaches every
+            // live conversation — legitimate, but indistinguishable
+            // from waste unless it is recorded. Hashed, never the key.
+            auth_digest = %headers_snapshot
                 .as_ref()
-                .and_then(|h| h.get("anthropic-beta"))
+                .and_then(|h| h.get("authorization").or_else(|| h.get("x-api-key")))
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            tracing::info!(
-                event = "turn_cache_fingerprint",
-                request_id = %request_id,
-                session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(
-                    request_session_key
-                ),
-                conversation_key = %request_conversation_key,
-                model = %model,
-                // Both are cache-key inputs that sit ahead of message 0, so
-                // a change in either voids the whole prefix.
-                system_digest = %format!("{sys:016x}"),
-                tools_digest = %format!("{tools:016x}"),
-                markers = %markers,
-                breakpoints = breakpoints,
-                // Cross-turn stability of the forwarded messages. Within-turn
-                // rewrites are expected and harmless if deterministic; only a
-                // ladder checkpoint that moves between turns costs cache.
-                prefix_ladder = %prefix_digest_ladder(body_to_send).unwrap_or_default(),
-                // The head ladder stops doubling at 32, so on a long turn
-                // the whole disputed tail sits past its last checkpoint.
-                // These windows cover the last 1/2/4 messages instead; the
-                // smallest one that moved bounds the churn.
-                tail_ladder = %tail_digest_ladder(body_to_send).unwrap_or_default(),
-                beta_digest = %short_hash(beta),
-                // Which account sent the turn. The provider's cache is per
-                // credential, so a `/login` account switch recaches every
-                // live conversation — legitimate, but indistinguishable
-                // from waste unless it is recorded. Hashed, never the key.
-                auth_digest = %headers_snapshot
-                    .as_ref()
-                    .and_then(|h| h.get("authorization").or_else(|| h.get("x-api-key")))
-                    .and_then(|v| v.to_str().ok())
-                    .map(short_hash)
-                    .unwrap_or_default(),
-                msgs = serde_json::from_slice::<serde_json::Value>(body_to_send)
-                    .ok()
-                    .and_then(|v| v.get("messages").and_then(|m| m.as_array()).map(|a| a.len()))
-                    .unwrap_or(0),
-                "cache-key inputs of the request as forwarded"
-            );
-            // Park the cache-key inputs neither drift lane sees (beta
-            // header, marker layout, post-router model) on the pending
-            // turn, so a later recache event can say whether they moved.
-            // Short digests only — the same strings logged one line up —
-            // except the model, which is small-cardinality and logged raw.
-            state.usage_observer.note_forward_witnesses(
-                request_id,
-                short_hash(beta),
-                markers.clone(),
-                model.clone(),
-            );
-        }
+                .map(short_hash)
+                .unwrap_or_default(),
+            msgs = serde_json::from_slice::<serde_json::Value>(body_to_send)
+                .ok()
+                .and_then(|v| v.get("messages").and_then(|m| m.as_array()).map(|a| a.len()))
+                .unwrap_or(0),
+            "cache-key inputs of the request as forwarded"
+        );
+        // Park the cache-key inputs neither drift lane sees (beta
+        // header, marker layout, post-router model) on the pending
+        // turn, so a later recache event can say whether they moved.
+        // Short digests only — the same strings logged one line up —
+        // except the model, which is small-cardinality and logged raw.
+        state.usage_observer.note_forward_witnesses(
+            request_id,
+            short_hash(beta),
+            markers.clone(),
+            model.clone(),
+        );
     }
 }
 
@@ -820,10 +818,10 @@ pub(crate) fn build_outgoing_headers(
              internal x-headroom-* headers forwarded to upstream"
         );
     }
-    if !state.config.rewrite_host {
-        if let Some(h) = req.headers().get(http::header::HOST) {
-            outgoing_headers.insert(http::header::HOST, h.clone());
-        }
+    if !state.config.rewrite_host
+        && let Some(h) = req.headers().get(http::header::HOST)
+    {
+        outgoing_headers.insert(http::header::HOST, h.clone());
     }
     (outgoing_headers, strip_internal, pre_strip_internal_count)
 }

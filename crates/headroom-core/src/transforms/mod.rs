@@ -62,44 +62,45 @@ pub use cache_aligner::{
     VolatileFinding,
 };
 pub use code_compressor::{
-    detect_language, syntax_breaker_status, CodeAwareCompressor, CodeCompressionResult,
-    CodeCompressorConfig, CodeLanguage, DocstringMode, SyntaxBreakerLanguageStatus,
+    CodeAwareCompressor, CodeCompressionResult, CodeCompressorConfig, CodeLanguage, DocstringMode,
+    SyntaxBreakerLanguageStatus, detect_language, syntax_breaker_status,
 };
 pub use content_detector::{
-    detect_content_type, is_json_array_of_dicts, ContentType, DetectionResult,
+    ContentType, DetectionResult, detect_content_type, is_json_array_of_dicts,
 };
 pub use cross_turn_dedup::{
-    dedup_blocks, dedup_blocks_with, dedup_messages, is_prefix_monotonic, DedupBlock, DedupStats,
+    DedupBlock, DedupStats, dedup_blocks, dedup_blocks_with, dedup_messages, is_prefix_monotonic,
 };
 pub use detection::detect;
 pub use diff_compressor::{
     DiffCompressionResult, DiffCompressor, DiffCompressorConfig, DiffCompressorStats,
 };
 pub use html_extractor::{
-    is_html_content, HtmlExtractionResult, HtmlExtractor, HtmlExtractorConfig,
+    HtmlExtractionResult, HtmlExtractor, HtmlExtractorConfig, is_html_content,
 };
 /// The loaded ONNX model itself only exists with the `ml` feature; its config,
 /// result and error types are plain data and are re-exported either way.
 #[cfg(feature = "ml")]
 pub use kompress::Kompress;
 pub use kompress::{
-    KompressConfig, KompressError, KompressResult, DEFAULT_MODEL_ID, DEFAULT_TOKENIZER_REPO,
+    DEFAULT_MODEL_ID, DEFAULT_TOKENIZER_REPO, KompressConfig, KompressError, KompressResult,
 };
 pub use live_zone::{
-    code_aware_enabled, compress_anthropic_all_messages, compress_anthropic_live_zone,
+    AuthMode, BlockAction, BlockOutcome, CompressionManifest, DEFAULT_MODEL, DispatchConfig,
+    ExclusionReason, LiveZoneError, LiveZoneOutcome, code_aware_enabled,
+    compress_anthropic_all_messages, compress_anthropic_live_zone,
     compress_anthropic_live_zone_with_ccr, compress_block_for_offload,
     compress_openai_chat_live_zone, compress_openai_chat_live_zone_with_config,
     compress_openai_responses_live_zone, compress_openai_responses_live_zone_with_config,
     set_code_aware_enabled, set_kompress_enabled, summarize_openai_responses_no_change_reason,
-    warm_live_zone_compressors, AuthMode, BlockAction, BlockOutcome, CompressionManifest,
-    DispatchConfig, ExclusionReason, LiveZoneError, LiveZoneOutcome, DEFAULT_MODEL,
+    warm_live_zone_compressors,
 };
 pub use log_compressor::{
     LogCompressionResult, LogCompressor, LogCompressorConfig, LogCompressorStats, LogFormat,
     LogLevel, LogLine,
 };
 #[cfg(feature = "ml")]
-pub use magika_detector::{magika_detect, map_magika_label, MagikaDetectorError};
+pub use magika_detector::{MagikaDetectorError, magika_detect, map_magika_label};
 pub use pipeline::{
     CompressionContext, CompressionPipeline, CompressionPipelineBuilder, DiffNoise, DiffOffload,
     JsonMinifier, JsonOffload, LogOffload, LogTemplate, OffloadOutput, OffloadTransform,
@@ -107,20 +108,20 @@ pub use pipeline::{
     TransformError,
 };
 pub use read_lifecycle::{
-    format_read_lifecycle_transform, ReadClassification, ReadLifecycleConfig, ReadLifecycleManager,
-    ReadLifecycleResult, ReadState,
+    ReadClassification, ReadLifecycleConfig, ReadLifecycleManager, ReadLifecycleResult, ReadState,
+    format_read_lifecycle_transform,
 };
 pub use read_maturation::{
-    relocate_cache_breakpoint, MaturationResult, MaturedRead, ReadMaturationConfig,
-    ReadMaturationManager,
+    MaturationResult, MaturedRead, ReadMaturationConfig, ReadMaturationManager,
+    relocate_cache_breakpoint,
 };
-pub use recommendations::{Recommendation, RecommendationStore, RECOMMENDATIONS_PATH_ENV_VAR};
-pub use safety::{tool_pair_indices, ToolPair};
+pub use recommendations::{RECOMMENDATIONS_PATH_ENV_VAR, Recommendation, RecommendationStore};
+pub use safety::{ToolPair, tool_pair_indices};
 pub use search_compressor::{
     FileMatches, SearchCompressionResult, SearchCompressor, SearchCompressorConfig,
     SearchCompressorStats, SearchMatch,
 };
-pub use spreadsheet_ingest::{load_spreadsheet, SpreadsheetError};
-pub use tag_protector::{is_known_html_tag, protect_tags, restore_tags, ProtectStats};
+pub use spreadsheet_ingest::{SpreadsheetError, load_spreadsheet};
+pub use tag_protector::{ProtectStats, is_known_html_tag, protect_tags, restore_tags};
 pub use text_crusher::{TextCrusher, TextCrusherConfig, TextCrusherResult};
 pub use unidiff_detector::{detect_diff, is_diff};

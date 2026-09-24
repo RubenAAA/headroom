@@ -1,13 +1,13 @@
 //! CCR-backed extractive compression for prose leaves in structured payloads.
 
-use crate::ccr::{compute_key, marker_for, CcrStore};
+use crate::ccr::{CcrStore, compute_key, marker_for};
+use crate::transforms::ContentType;
 use crate::transforms::content_detector::detect_content_type;
 use crate::transforms::pipeline::config::ProseFieldConfig;
 use crate::transforms::pipeline::traits::{
     CompressionContext, OffloadOutput, OffloadTransform, TransformError,
 };
 use crate::transforms::text_crusher::TextCrusher;
-use crate::transforms::ContentType;
 
 const NAME: &str = "prose_field_offload";
 const CONFIDENCE: f32 = 0.8;
@@ -170,8 +170,6 @@ mod tests {
         let b = crusher.compress(&input, "recovery").unwrap();
         assert_eq!(a, b);
         assert!(a.0.contains("recovery"));
-        assert!(!a
-            .0
-            .contains("Segment 1 explains general context without the key term present."));
+        assert!(!a.0.contains("Segment 1 explains general context without the key term present."));
     }
 }

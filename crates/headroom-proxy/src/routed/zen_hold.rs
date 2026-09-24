@@ -237,16 +237,15 @@ fn note_still_limited(r: &reqwest::Response, state: &AppState, request_id: &str)
         .get(http::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(headroom_core::retry::retry_after_ms_uncapped)
+        && wait > state.config.retry_max_delay_ms as f64
     {
-        if wait > state.config.retry_max_delay_ms as f64 {
-            tracing::warn!(
-                event = "zen_hold_retry_after_ignored",
-                retry_after_ms = wait,
-                probe_cap_ms = state.config.retry_max_delay_ms,
-                request_id = %request_id,
-                "upstream Retry-After outruns the rotation hold; ignoring it (Zen sends a constant) and holding on"
-            );
-        }
+        tracing::warn!(
+            event = "zen_hold_retry_after_ignored",
+            retry_after_ms = wait,
+            probe_cap_ms = state.config.retry_max_delay_ms,
+            request_id = %request_id,
+            "upstream Retry-After outruns the rotation hold; ignoring it (Zen sends a constant) and holding on"
+        );
     }
 }
 

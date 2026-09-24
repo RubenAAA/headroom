@@ -27,7 +27,7 @@ use super::common;
 use bytes::Bytes;
 use common::start_proxy_with;
 use futures_util::StreamExt;
-use headroom_proxy::sse::{openai_responses::ResponseState, SseFramer};
+use headroom_proxy::sse::{SseFramer, openai_responses::ResponseState};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;

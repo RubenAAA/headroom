@@ -41,10 +41,10 @@ fn main() -> Result<()> {
         Cmd::Run { fixtures, only } => {
             let mut any_diffs = false;
             for comparator in builtin_comparators() {
-                if let Some(ref filt) = only {
-                    if filt != comparator.name() {
-                        continue;
-                    }
+                if let Some(ref filt) = only
+                    && filt != comparator.name()
+                {
+                    continue;
                 }
                 let report = run_comparator(&fixtures, comparator.as_ref())?;
                 println!(

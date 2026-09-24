@@ -48,13 +48,13 @@
 use md5::{Digest, Md5};
 
 use crate::ccr::CcrStore;
+use crate::transforms::ContentType;
 use crate::transforms::pipeline::config::{JsonOffloadConfig, PipelineConfig, ProseFieldConfig};
 use crate::transforms::pipeline::offloads::prose_field::ProseFieldOffload;
 use crate::transforms::pipeline::traits::{
     CompressionContext, OffloadOutput, OffloadTransform, TransformError,
 };
 use crate::transforms::smart_crusher::{SmartCrusher, SmartCrusherConfig};
-use crate::transforms::ContentType;
 
 const NAME: &str = "json_offload";
 /// SmartCrusher has 50+ parity fixtures and shadow-validated against

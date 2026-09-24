@@ -62,12 +62,12 @@ use std::time::Duration;
 use axum::http::HeaderMap;
 use headroom_core::ccr::compute_key;
 use headroom_core::tokenizer::get_tokenizer;
-use headroom_core::transforms::{compress_block_for_offload, DEFAULT_MODEL};
+use headroom_core::transforms::{DEFAULT_MODEL, compress_block_for_offload};
 use lru::LruCache;
 use serde_json::Value;
 
 use crate::cache_stabilization::drift_detector::{
-    model_free_lineage_key, session_key_log_prefix, ApiKind,
+    ApiKind, model_free_lineage_key, session_key_log_prefix,
 };
 
 /// Static per-request offload settings (I3: never changes mid-session).
@@ -574,16 +574,16 @@ impl OffloadGate {
         let set: HashSet<String> = loaded
             .map(|g| g.hashes.into_iter().collect())
             .unwrap_or_default();
-        if let Ok(mut guard) = self.sessions.lock() {
-            if !guard.contains(session) {
-                guard.put(session.to_string(), set);
-                if restored > 0 {
-                    tracing::info!(
-                        event = "offload_gate_rehydrated",
-                        conversions = restored,
-                        "restored offload conversions recorded before this process started"
-                    );
-                }
+        if let Ok(mut guard) = self.sessions.lock()
+            && !guard.contains(session)
+        {
+            guard.put(session.to_string(), set);
+            if restored > 0 {
+                tracing::info!(
+                    event = "offload_gate_rehydrated",
+                    conversions = restored,
+                    "restored offload conversions recorded before this process started"
+                );
             }
         }
     }
@@ -1226,12 +1226,15 @@ fn offload_tool_result(
     // PR-J4 boundary gate: a frozen block's *first* conversion only rides a
     // rebuild boundary; re-applications (hash already in the session set) and
     // live-tail blocks always pass. See [`OffloadGate`].
-    if let Some(p) = policy {
-        if !prior && !is_live && !near_tail && !p.rebuild_boundary {
-            return BlockOutcome::Deferred {
-                bytes: original.len(),
-            };
-        }
+    if let Some(p) = policy
+        && !prior
+        && !is_live
+        && !near_tail
+        && !p.rebuild_boundary
+    {
+        return BlockOutcome::Deferred {
+            bytes: original.len(),
+        };
     }
     // Structural compressor when one applies; otherwise a plain preview cut,
     // mirroring context-mode's behaviour (charSafePrefix + pointer). The
@@ -1424,20 +1427,16 @@ fn tool_result_text(content: &Value) -> Option<String> {
         Value::Array(blocks) => {
             let mut out = String::new();
             for b in blocks {
-                if b.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(t) = b.get("text").and_then(Value::as_str) {
-                        if !out.is_empty() {
-                            out.push('\n');
-                        }
-                        out.push_str(t);
+                if b.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(t) = b.get("text").and_then(Value::as_str)
+                {
+                    if !out.is_empty() {
+                        out.push('\n');
                     }
+                    out.push_str(t);
                 }
             }
-            if out.is_empty() {
-                None
-            } else {
-                Some(out)
-            }
+            if out.is_empty() { None } else { Some(out) }
         }
         _ => None,
     }
@@ -2852,7 +2851,7 @@ mod tests {
         // converts on first sight.
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        use crate::cache_stabilization::drift_detector::{model_free_lineage_key, ApiKind};
+        use crate::cache_stabilization::drift_detector::{ApiKind, model_free_lineage_key};
 
         let gate = OffloadGate::new(8);
         let body = "ERROR: disk full\n".repeat(50);

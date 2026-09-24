@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn test_decode_gzip_roundtrip() {
-        use flate2::{write::GzEncoder, Compression};
+        use flate2::{Compression, write::GzEncoder};
         use std::io::Write;
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(b"the quick brown fox").unwrap();
@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_decode_deflate_roundtrip() {
-        use flate2::{write::ZlibEncoder, Compression};
+        use flate2::{Compression, write::ZlibEncoder};
         use std::io::Write;
         let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
         enc.write_all(b"payload").unwrap();
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_decode_truncated_gzip_still_errors() {
-        use flate2::{write::GzEncoder, Compression};
+        use flate2::{Compression, write::GzEncoder};
         use std::io::Write;
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(b"truncated payload").unwrap();

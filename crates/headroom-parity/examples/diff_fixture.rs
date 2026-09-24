@@ -2,8 +2,8 @@
 //!
 //! Usage: cargo run -p headroom-parity --example diff_fixture -- <path-to-fixture.json>
 
-use anyhow::{bail, Context, Result};
-use headroom_parity::{builtin_comparators, Fixture};
+use anyhow::{Context, Result, bail};
+use headroom_parity::{Fixture, builtin_comparators};
 use std::env;
 use std::fs;
 

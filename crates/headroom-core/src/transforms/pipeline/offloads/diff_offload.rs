@@ -34,12 +34,12 @@
 //! [`OffloadTransform`]: crate::transforms::pipeline::traits::OffloadTransform
 
 use crate::ccr::CcrStore;
+use crate::transforms::ContentType;
 use crate::transforms::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 use crate::transforms::pipeline::config::DiffBloatConfig;
 use crate::transforms::pipeline::traits::{
     CompressionContext, OffloadOutput, OffloadTransform, TransformError,
 };
-use crate::transforms::ContentType;
 
 const NAME: &str = "diff_offload";
 /// Confidence is high — DiffCompressor has 20+ parity fixtures.

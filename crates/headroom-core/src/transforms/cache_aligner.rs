@@ -185,7 +185,7 @@ fn split_tokens(content: &str) -> Vec<&str> {
     content
         .split_whitespace()
         .map(|raw| {
-            let cleaned = raw.trim_matches(|c: char| {
+            raw.trim_matches(|c: char| {
                 matches!(
                     c,
                     '.' | ','
@@ -204,8 +204,7 @@ fn split_tokens(content: &str) -> Vec<&str> {
                         | '<'
                         | '>'
                 )
-            });
-            cleaned
+            })
         })
         .filter(|s| !s.is_empty())
         .collect()

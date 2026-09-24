@@ -24,9 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use headroom_core::ccr::{from_config, CcrBackendConfig, CcrStore};
+use headroom_core::ccr::{CcrBackendConfig, CcrStore, from_config};
 use headroom_core::ctx::{CtxStore, IndexOpts};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::projects::ProjectStores;
 use crate::compression::ctx_offload::OffloadRecord;

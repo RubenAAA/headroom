@@ -90,10 +90,10 @@ fn as_int(value: &Value) -> Option<i64> {
 /// the first that carries a usable number rather than assuming a format.
 fn details_reasoning(usage: &serde_json::Map<String, Value>) -> Option<i64> {
     for container_key in ["output_tokens_details", "completion_tokens_details"] {
-        if let Some(Value::Object(container)) = usage.get(container_key) {
-            if let Some(v) = container.get("reasoning_tokens").and_then(as_int) {
-                return Some(v);
-            }
+        if let Some(Value::Object(container)) = usage.get(container_key)
+            && let Some(v) = container.get("reasoning_tokens").and_then(as_int)
+        {
+            return Some(v);
         }
     }
     None

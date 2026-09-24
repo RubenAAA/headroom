@@ -11,8 +11,8 @@ use std::net::SocketAddr;
 use aws_credential_types::Credentials;
 use common::{install_static_token_source, start_proxy_with_state};
 use headroom_simulators::config::{ConfiguredResponse, SimulatorConfig, StubRule};
-use headroom_simulators::{build_app as build_simulator_app, Simulator};
-use serde_json::{json, Value};
+use headroom_simulators::{Simulator, build_app as build_simulator_app};
+use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use url::Url;
 

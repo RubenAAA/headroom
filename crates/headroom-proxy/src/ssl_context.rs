@@ -327,56 +327,56 @@ mod tests {
     fn tls_strict_disabled_default() {
         let _env = env_guard();
         // When unset, strict is NOT disabled (default is strict)
-        std::env::remove_var(TLS_STRICT_ENV);
+        unsafe { std::env::remove_var(TLS_STRICT_ENV) };
         assert!(!tls_strict_disabled());
     }
 
     #[test]
     fn tls_strict_disabled_zero() {
         let _env = env_guard();
-        std::env::set_var(TLS_STRICT_ENV, "0");
+        unsafe { std::env::set_var(TLS_STRICT_ENV, "0") };
         assert!(tls_strict_disabled());
-        std::env::remove_var(TLS_STRICT_ENV);
+        unsafe { std::env::remove_var(TLS_STRICT_ENV) };
     }
 
     #[test]
     fn tls_strict_disabled_false() {
         let _env = env_guard();
-        std::env::set_var(TLS_STRICT_ENV, "false");
+        unsafe { std::env::set_var(TLS_STRICT_ENV, "false") };
         assert!(tls_strict_disabled());
-        std::env::remove_var(TLS_STRICT_ENV);
+        unsafe { std::env::remove_var(TLS_STRICT_ENV) };
     }
 
     #[test]
     fn tls_strict_disabled_no() {
         let _env = env_guard();
-        std::env::set_var(TLS_STRICT_ENV, "no");
+        unsafe { std::env::set_var(TLS_STRICT_ENV, "no") };
         assert!(tls_strict_disabled());
-        std::env::remove_var(TLS_STRICT_ENV);
+        unsafe { std::env::remove_var(TLS_STRICT_ENV) };
     }
 
     #[test]
     fn tls_strict_disabled_off() {
         let _env = env_guard();
-        std::env::set_var(TLS_STRICT_ENV, "off");
+        unsafe { std::env::set_var(TLS_STRICT_ENV, "off") };
         assert!(tls_strict_disabled());
-        std::env::remove_var(TLS_STRICT_ENV);
+        unsafe { std::env::remove_var(TLS_STRICT_ENV) };
     }
 
     #[test]
     fn tls_strict_enabled_one() {
         let _env = env_guard();
-        std::env::set_var(TLS_STRICT_ENV, "1");
+        unsafe { std::env::set_var(TLS_STRICT_ENV, "1") };
         assert!(!tls_strict_disabled());
-        std::env::remove_var(TLS_STRICT_ENV);
+        unsafe { std::env::remove_var(TLS_STRICT_ENV) };
     }
 
     #[test]
     fn find_ca_bundle_none_when_unset() {
         let _env = env_guard();
-        std::env::remove_var("SSL_CERT_FILE");
-        std::env::remove_var("REQUESTS_CA_BUNDLE");
-        std::env::remove_var(ADDITIVE_CA_VAR);
+        unsafe { std::env::remove_var("SSL_CERT_FILE") };
+        unsafe { std::env::remove_var("REQUESTS_CA_BUNDLE") };
+        unsafe { std::env::remove_var(ADDITIVE_CA_VAR) };
         assert_eq!(find_ca_bundle(), CaBundleResult::Default);
     }
 
@@ -389,9 +389,9 @@ mod tests {
         let cert_path = dir.join("test_ca.pem");
         std::fs::write(&cert_path, "dummy").unwrap();
 
-        std::env::set_var("SSL_CERT_FILE", &cert_path);
-        std::env::remove_var("REQUESTS_CA_BUNDLE");
-        std::env::remove_var(ADDITIVE_CA_VAR);
+        unsafe { std::env::set_var("SSL_CERT_FILE", &cert_path) };
+        unsafe { std::env::remove_var("REQUESTS_CA_BUNDLE") };
+        unsafe { std::env::remove_var(ADDITIVE_CA_VAR) };
 
         let result = find_ca_bundle();
         assert_eq!(result, CaBundleResult::Replacement(cert_path.clone()));
@@ -399,7 +399,7 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_dir(&dir);
-        std::env::remove_var("SSL_CERT_FILE");
+        unsafe { std::env::remove_var("SSL_CERT_FILE") };
     }
 
     #[test]
@@ -410,9 +410,9 @@ mod tests {
         let cert_path = dir.join("test_ca.pem");
         std::fs::write(&cert_path, "dummy").unwrap();
 
-        std::env::remove_var("SSL_CERT_FILE");
-        std::env::remove_var("REQUESTS_CA_BUNDLE");
-        std::env::set_var(ADDITIVE_CA_VAR, &cert_path);
+        unsafe { std::env::remove_var("SSL_CERT_FILE") };
+        unsafe { std::env::remove_var("REQUESTS_CA_BUNDLE") };
+        unsafe { std::env::set_var(ADDITIVE_CA_VAR, &cert_path) };
 
         let result = find_ca_bundle();
         assert_eq!(result, CaBundleResult::Additive(cert_path.clone()));
@@ -420,28 +420,28 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_dir(&dir);
-        std::env::remove_var(ADDITIVE_CA_VAR);
+        unsafe { std::env::remove_var(ADDITIVE_CA_VAR) };
     }
 
     #[test]
     fn test_cc_switch_reconciler_disabled_by_default() {
         let _env = env_guard();
-        std::env::remove_var("HEADROOM_CC_SWITCH_RECONCILE");
+        unsafe { std::env::remove_var("HEADROOM_CC_SWITCH_RECONCILE") };
         assert!(!super::cc_switch_reconciler_enabled());
     }
 
     #[test]
     fn test_cc_switch_reconciler_enabled() {
         let _env = env_guard();
-        std::env::set_var("HEADROOM_CC_SWITCH_RECONCILE", "1");
+        unsafe { std::env::set_var("HEADROOM_CC_SWITCH_RECONCILE", "1") };
         assert!(super::cc_switch_reconciler_enabled());
-        std::env::remove_var("HEADROOM_CC_SWITCH_RECONCILE");
+        unsafe { std::env::remove_var("HEADROOM_CC_SWITCH_RECONCILE") };
     }
 
     #[test]
     fn test_cc_switch_route_official_disabled() {
         let _env = env_guard();
-        std::env::remove_var("HEADROOM_CC_SWITCH_ROUTE_OFFICIAL");
+        unsafe { std::env::remove_var("HEADROOM_CC_SWITCH_ROUTE_OFFICIAL") };
         assert!(!super::cc_switch_route_official());
     }
 }

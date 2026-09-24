@@ -6,9 +6,9 @@
 //!
 //! Mirrors Python's `headroom.ccr.response_handler`.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::tool_injection::{parse_tool_call, parse_tool_call_query, raw_ccr_hash, CCR_TOOL_NAME};
+use super::tool_injection::{CCR_TOOL_NAME, parse_tool_call, parse_tool_call_query, raw_ccr_hash};
 
 // ─── Residual-CCR classification ─────────────────────────────────────────
 //
@@ -949,19 +949,19 @@ impl StreamingCcrHandler {
                             .unwrap_or("")
                             .to_string();
                         tool.as_object_mut().unwrap().remove("_partial_json");
-                        if !partial.is_empty() {
-                            if let Ok(input) = serde_json::from_str::<Value>(&partial) {
-                                tool["input"] = input;
-                            }
+                        if !partial.is_empty()
+                            && let Ok(input) = serde_json::from_str::<Value>(&partial)
+                        {
+                            tool["input"] = input;
                         }
                         content.push(tool.clone());
                     }
                 }
                 "message_delta" => {
-                    if let Some(delta) = event.get("delta") {
-                        if let Some(sr) = delta.get("stop_reason") {
-                            stop_reason = Some(sr.clone());
-                        }
+                    if let Some(delta) = event.get("delta")
+                        && let Some(sr) = delta.get("stop_reason")
+                    {
+                        stop_reason = Some(sr.clone());
                     }
                 }
                 _ => {}
@@ -1886,10 +1886,12 @@ mod splice_tests {
         assert_eq!(spliced, 1);
         let blocks = response["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], "text");
-        assert!(blocks[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("the original bytes"));
+        assert!(
+            blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("the original bytes")
+        );
         // The client's own call has to survive untouched, or we have traded one
         // unanswerable tool_use for another.
         assert_eq!(blocks[1]["name"], "Bash");
@@ -2036,10 +2038,12 @@ mod splice_tests {
         assert_eq!(spliced, 1);
         let items = response["output"].as_array().unwrap();
         assert_eq!(items[0]["type"], "message");
-        assert!(items[0]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("the original bytes"));
+        assert!(
+            items[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("the original bytes")
+        );
         assert_eq!(items[1]["call_id"], "fc_2");
         assert_eq!(
             handler.residual_ccr_status(&response, "openai_responses"),

@@ -6,7 +6,7 @@
 //! between both.
 
 use chrono::{DateTime, Duration, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::{parse_timestamp, round_half_even, to_utc_iso, utc_now};
 

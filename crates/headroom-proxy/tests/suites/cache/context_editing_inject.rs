@@ -6,7 +6,7 @@
 //! never clobber, and never duplicate an edit type already present.
 
 use headroom_proxy::compression::context_editing::inject_context_management;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[test]
 fn injects_clear_tool_uses_into_body_without_context_management() {

@@ -48,11 +48,7 @@ fn result_as_text(block: &Value) -> String {
                         return None;
                     }
                     let text = b.get("text").and_then(Value::as_str).unwrap_or("");
-                    if text.is_empty() {
-                        None
-                    } else {
-                        Some(text)
-                    }
+                    if text.is_empty() { None } else { Some(text) }
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -93,10 +89,10 @@ pub fn strip_orphan_tool_results(messages: Vec<Value>) -> OrphanRepairOutcome {
         for block in content.iter_mut() {
             let block_type = block.get("type").and_then(Value::as_str);
             if block_type == Some("tool_use") {
-                if let Some(id) = block.get("id").and_then(Value::as_str) {
-                    if !id.is_empty() {
-                        seen_call_ids.insert(id.to_string());
-                    }
+                if let Some(id) = block.get("id").and_then(Value::as_str)
+                    && !id.is_empty()
+                {
+                    seen_call_ids.insert(id.to_string());
                 }
                 continue;
             }

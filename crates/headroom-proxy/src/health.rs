@@ -1,9 +1,9 @@
 //! Health endpoints. These are intercepted by Rust and never forwarded.
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
 use crate::proxy::AppState;

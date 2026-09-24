@@ -27,11 +27,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode;
 use headroom_core::ccr::response_handler::{
@@ -39,12 +39,12 @@ use headroom_core::ccr::response_handler::{
 };
 use headroom_core::ccr::tool_injection::create_ccr_tool_definition;
 use headroom_core::ccr::{BatchContext, BatchRequestContext, BatchResultProcessor, CcrStore};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::cache_stabilization::tool_def_normalize::{
     any_tool_has_cache_control, sort_tools_deterministically,
 };
-use crate::compression::live_zone_anthropic::{compress_anthropic_request, Outcome};
+use crate::compression::live_zone_anthropic::{Outcome, compress_anthropic_request};
 use crate::config::CompressionMode;
 use crate::error::ProxyError;
 use crate::handlers::batch::{
@@ -136,17 +136,16 @@ pub async fn anthropic_batch_create(
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
+        && len > state.config.max_body_bytes
     {
-        if len > state.config.max_body_bytes {
-            return anthropic_error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_too_large",
-                format!(
-                    "Request body too large. Maximum size is {}MB",
-                    state.config.max_body_bytes / (1024 * 1024)
-                ),
-            );
-        }
+        return anthropic_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            format!(
+                "Request body too large. Maximum size is {}MB",
+                state.config.max_body_bytes / (1024 * 1024)
+            ),
+        );
     }
 
     let mut parsed: Value = match serde_json::from_slice(&body) {
@@ -210,17 +209,17 @@ pub async fn anthropic_batch_create(
         Ok((status, resp_headers, resp_body)) => {
             // Store batch context (with the ORIGINAL pre-compression
             // requests) for CCR result post-processing.
-            if status == StatusCode::OK && state.config.ccr_inject_tool {
-                if let Ok(rd) = serde_json::from_slice::<Value>(&resp_body) {
-                    if let Some(batch_id) = rd.get("id").and_then(Value::as_str) {
-                        store_batch_context(
-                            &state,
-                            batch_id,
-                            &requests_list,
-                            upstream_headers.get("x-api-key").cloned(),
-                        );
-                    }
-                }
+            if status == StatusCode::OK
+                && state.config.ccr_inject_tool
+                && let Ok(rd) = serde_json::from_slice::<Value>(&resp_body)
+                && let Some(batch_id) = rd.get("id").and_then(Value::as_str)
+            {
+                store_batch_context(
+                    &state,
+                    batch_id,
+                    &requests_list,
+                    upstream_headers.get("x-api-key").cloned(),
+                );
             }
             build_response(status, &resp_headers, resp_body)
         }
@@ -747,12 +746,12 @@ async fn run_anthropic_continuation(
             Value::Array(current_messages.clone()),
         );
         body.insert("max_tokens".to_string(), max_tokens.clone());
-        if let Some(tools) = &request_context.tools {
-            if !tools.is_empty() {
-                let mut sorted = tools.clone();
-                sort_tools_deterministically(&mut sorted);
-                body.insert("tools".to_string(), Value::Array(sorted));
-            }
+        if let Some(tools) = &request_context.tools
+            && !tools.is_empty()
+        {
+            let mut sorted = tools.clone();
+            sort_tools_deterministically(&mut sorted);
+            body.insert("tools".to_string(), Value::Array(sorted));
         }
         let continuation_body = match serde_json::to_vec(&Value::Object(body)) {
             Ok(b) => b,

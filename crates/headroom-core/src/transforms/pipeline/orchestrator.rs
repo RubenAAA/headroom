@@ -63,11 +63,11 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::ccr::CcrStore;
+use crate::transforms::ContentType;
 use crate::transforms::pipeline::config::PipelineConfig;
 use crate::transforms::pipeline::traits::{
     CompressionContext, OffloadTransform, ReformatTransform, TransformError,
 };
-use crate::transforms::ContentType;
 
 /// Result returned by [`CompressionPipeline::run`].
 #[derive(Debug, Clone, Default)]

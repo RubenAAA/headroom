@@ -8,10 +8,14 @@
 //! byte-equality assertions in `integration_chat_completions.rs` would race it
 //! if both ran in one process.
 
+// Edition 2024 makes std::env::set_var and remove_var unsafe. Tests call them
+// to set up config; non-test code stays free of unsafe.
+#![allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+
 mod common;
 
 use common::start_proxy_with;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -21,7 +25,7 @@ const LONG_DESC: &str = "Search the web and return the ten most relevant results
 
 #[tokio::test]
 async fn tool_descriptions_are_truncated_before_the_upstream_sees_them() {
-    std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "20");
+    unsafe { std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "20") };
 
     let upstream = MockServer::start().await;
     let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
@@ -79,5 +83,5 @@ async fn tool_descriptions_are_truncated_before_the_upstream_sees_them() {
     assert_eq!(sent["messages"], payload["messages"]);
 
     proxy.shutdown().await;
-    std::env::remove_var("HEADROOM_TOOL_DESC_MAX_CHARS");
+    unsafe { std::env::remove_var("HEADROOM_TOOL_DESC_MAX_CHARS") };
 }

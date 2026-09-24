@@ -217,35 +217,33 @@ fn categorize_by_fields(items: &[&Value]) -> HashMap<String, usize> {
 
         let mut categorized = false;
         for field in CATEGORY_FIELDS {
-            if let Some(val) = obj.get(*field) {
-                if let Some(s) = val.as_str() {
-                    if s.len() < 50 {
-                        let clean_val = s.replace('\n', " ").replace('\r', "").trim().to_string();
-                        if !clean_val.is_empty() {
-                            *categories.entry(clean_val).or_insert(0) += 1;
-                            categorized = true;
-                            break;
-                        }
-                    }
+            if let Some(val) = obj.get(*field)
+                && let Some(s) = val.as_str()
+                && s.len() < 50
+            {
+                let clean_val = s.replace('\n', " ").replace('\r', "").trim().to_string();
+                if !clean_val.is_empty() {
+                    *categories.entry(clean_val).or_insert(0) += 1;
+                    categorized = true;
+                    break;
                 }
             }
         }
 
         if !categorized {
             for (key, val) in obj {
-                if let Some(s) = val.as_str() {
-                    if s.len() > 2
-                        && s.len() < 30
-                        && !["id", "name", "path", "url", "href", "email"].contains(&key.as_str())
-                        && !url_re().is_match(s)
-                    {
-                        let clean_val = s.replace('\n', " ").replace('\r', "").trim().to_string();
-                        let entry = categories
-                            .entry(format!("{}={}", key, clean_val))
-                            .or_insert(0);
-                        *entry += 1;
-                        break;
-                    }
+                if let Some(s) = val.as_str()
+                    && s.len() > 2
+                    && s.len() < 30
+                    && !["id", "name", "path", "url", "href", "email"].contains(&key.as_str())
+                    && !url_re().is_match(s)
+                {
+                    let clean_val = s.replace('\n', " ").replace('\r', "").trim().to_string();
+                    let entry = categories
+                        .entry(format!("{}={}", key, clean_val))
+                        .or_insert(0);
+                    *entry += 1;
+                    break;
                 }
             }
         }

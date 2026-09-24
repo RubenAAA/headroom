@@ -116,12 +116,11 @@ fn classify_string(s: &str, cfg: &ClassifyConfig) -> CellClass {
     // technically succeed as JSON-the-number, but that's a scalar,
     // not a recursion target.
     let trimmed = s.trim_start();
-    if matches!(trimmed.chars().next(), Some('{') | Some('[')) {
-        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-            if matches!(parsed, Value::Object(_) | Value::Array(_)) {
-                return CellClass::StringifiedJson(parsed);
-            }
-        }
+    if matches!(trimmed.chars().next(), Some('{') | Some('['))
+        && let Ok(parsed) = serde_json::from_str::<Value>(s)
+        && matches!(parsed, Value::Object(_) | Value::Array(_))
+    {
+        return CellClass::StringifiedJson(parsed);
     }
 
     // Opaque-blob check — only for strings above the byte threshold, and
@@ -187,12 +186,11 @@ fn looks_like_html(s: &str, min_open_brackets: usize) -> bool {
     let bytes = s.as_bytes();
     let mut tag_starts = 0usize;
     for (i, b) in bytes.iter().enumerate() {
-        if *b == b'<' {
-            if let Some(next) = bytes.get(i + 1) {
-                if next.is_ascii_alphabetic() || *next == b'/' || *next == b'!' {
-                    tag_starts += 1;
-                }
-            }
+        if *b == b'<'
+            && let Some(next) = bytes.get(i + 1)
+            && (next.is_ascii_alphabetic() || *next == b'/' || *next == b'!')
+        {
+            tag_starts += 1;
         }
     }
     tag_starts >= min_open_brackets

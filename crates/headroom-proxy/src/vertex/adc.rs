@@ -191,10 +191,10 @@ impl TokenSource for GcpAdcTokenSource {
         // Fast path: cached + fresh.
         {
             let guard = self.cached.lock().await;
-            if let Some(c) = guard.as_ref() {
-                if c.fresh() {
-                    return Ok(c.token.clone());
-                }
+            if let Some(c) = guard.as_ref()
+                && c.fresh()
+            {
+                return Ok(c.token.clone());
             }
         }
 
@@ -204,10 +204,10 @@ impl TokenSource for GcpAdcTokenSource {
         let mut guard = self.cached.lock().await;
         // Double-check inside the lock — another waiter may have
         // refreshed while we were queued.
-        if let Some(c) = guard.as_ref() {
-            if c.fresh() {
-                return Ok(c.token.clone());
-            }
+        if let Some(c) = guard.as_ref()
+            && c.fresh()
+        {
+            return Ok(c.token.clone());
         }
 
         let provider = self.ensure_provider().await?;

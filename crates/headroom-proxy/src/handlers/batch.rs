@@ -5,14 +5,14 @@
 //!
 //! Routes are mounted behind the `enable_batch_api` config flag (default off).
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use bytes::Bytes;
-use headroom_core::auth_mode::{classify as classify_auth_mode, AuthMode};
-use serde_json::{json, Map, Value};
+use headroom_core::auth_mode::{AuthMode, classify as classify_auth_mode};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 // The Gemini content-shape conversions live with the Gemini handler; the
@@ -22,8 +22,8 @@ use crate::handlers::gemini::{
     gemini_contents_to_messages, messages_to_gemini_contents, rebuild_gemini_contents,
 };
 
-use crate::compression::live_zone_openai::compress_openai_chat_request;
 use crate::compression::Outcome;
+use crate::compression::live_zone_openai::compress_openai_chat_request;
 use crate::config::CompressionMode;
 use crate::error::ProxyError;
 use crate::proxy::AppState;

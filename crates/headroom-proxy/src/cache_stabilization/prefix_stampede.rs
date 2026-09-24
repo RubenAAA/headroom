@@ -135,10 +135,10 @@ impl Drop for LeaderToken {
         if self.done {
             return;
         }
-        if let Ok(mut guard) = self.inner.entries.lock() {
-            if let Some(entry) = guard.pop(&self.key) {
-                entry.notify.notify_waiters();
-            }
+        if let Ok(mut guard) = self.inner.entries.lock()
+            && let Some(entry) = guard.pop(&self.key)
+        {
+            entry.notify.notify_waiters();
         }
     }
 }

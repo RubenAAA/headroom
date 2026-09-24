@@ -13,7 +13,7 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use headroom_proxy::config::Config;
-use headroom_proxy::proxy::{build_app, AppState};
+use headroom_proxy::proxy::{AppState, build_app};
 use std::net::SocketAddr;
 use tower::ServiceExt;
 

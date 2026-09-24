@@ -157,11 +157,7 @@ fn coerce_signed_float(value: Option<&Value>) -> f64 {
         Value::String(text) => text.trim().parse::<f64>().unwrap_or(0.0),
         _ => return 0.0,
     };
-    if result.is_finite() {
-        result
-    } else {
-        0.0
-    }
+    if result.is_finite() { result } else { 0.0 }
 }
 
 /// Round to 6 decimal places the way Python's `round(value, 6)` does.
@@ -748,11 +744,7 @@ fn clamp_float(value: f64) -> f64 {
 
 /// Preserve a finite signed delta (used for net cache savings only).
 fn clamp_signed_float(value: f64) -> f64 {
-    if value.is_finite() {
-        value
-    } else {
-        0.0
-    }
+    if value.is_finite() { value } else { 0.0 }
 }
 
 // ---------------------------------------------------------------------------

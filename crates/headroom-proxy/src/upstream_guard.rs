@@ -164,21 +164,21 @@ fn allowlisted_destinations() -> Option<Allowlist> {
         }
         if item.contains("://") {
             // A full URL pins the exact scheme/host/port triple.
-            if let Ok(u) = url::Url::parse(item) {
-                if let Some(h) = normalized_host(&u) {
-                    let scheme = u.scheme().to_ascii_lowercase();
-                    let port = u.port().unwrap_or_else(|| default_port(&scheme));
-                    origins.push((scheme, h, port));
-                }
+            if let Ok(u) = url::Url::parse(item)
+                && let Some(h) = normalized_host(&u)
+            {
+                let scheme = u.scheme().to_ascii_lowercase();
+                let port = u.port().unwrap_or_else(|| default_port(&scheme));
+                origins.push((scheme, h, port));
             }
         } else {
             // A bare host permits every safe scheme and port for that host.
             // Parsing against a dummy scheme is the cheapest way to strip any
             // port or path the operator wrote.
-            if let Ok(u) = url::Url::parse(&format!("http://{item}")) {
-                if let Some(h) = normalized_host(&u) {
-                    hosts.push(h);
-                }
+            if let Ok(u) = url::Url::parse(&format!("http://{item}"))
+                && let Some(h) = normalized_host(&u)
+            {
+                hosts.push(h);
             }
         }
     }

@@ -76,9 +76,9 @@
 
 use std::fmt::Write;
 
+use crate::transforms::ContentType;
 use crate::transforms::pipeline::config::LogTemplateConfig;
 use crate::transforms::pipeline::traits::{ReformatOutput, ReformatTransform, TransformError};
-use crate::transforms::ContentType;
 
 const NAME: &str = "log_template";
 /// Sentinel for variable positions in template strings.
@@ -213,10 +213,10 @@ impl LogTemplate {
     /// become wildcards (`None`).
     fn merge_into_template(template: &mut [Option<String>], tokens: &[&str]) {
         for (pos, tok) in tokens.iter().enumerate() {
-            if let Some(constant) = &template[pos] {
-                if constant != tok {
-                    template[pos] = None;
-                }
+            if let Some(constant) = &template[pos]
+                && constant != tok
+            {
+                template[pos] = None;
             }
         }
     }

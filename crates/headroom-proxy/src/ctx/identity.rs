@@ -229,13 +229,13 @@ fn message_text(msg: &Value) -> String {
         Some(Value::Array(blocks)) => {
             let mut out = String::new();
             for b in blocks {
-                if b.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(t) = b.get("text").and_then(Value::as_str) {
-                        if !out.is_empty() {
-                            out.push('\n');
-                        }
-                        out.push_str(t);
+                if b.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(t) = b.get("text").and_then(Value::as_str)
+                {
+                    if !out.is_empty() {
+                        out.push('\n');
                     }
+                    out.push_str(t);
                 }
             }
             out

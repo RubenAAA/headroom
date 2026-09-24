@@ -28,7 +28,7 @@
 use super::common;
 
 use common::{install_static_token_source, start_proxy_with_state};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path_regex};

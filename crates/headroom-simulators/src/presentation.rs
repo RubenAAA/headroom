@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use axum::body::{to_bytes, Body};
+use axum::Router;
+use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::{HeaderName, Request, Response, StatusCode};
 use axum::routing::{any, get};
-use axum::Router;
 
 use crate::application::Simulator;
 use crate::domain::{RequestFacts, SimulatedResponse};

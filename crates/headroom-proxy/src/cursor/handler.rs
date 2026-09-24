@@ -5,9 +5,9 @@ use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
-use super::agent::{spawn, AgentTurn, Workspace};
+use super::agent::{AgentTurn, Workspace, spawn};
 use super::bridge::Session;
-use super::turn::{tool_results_in_latest_message, Conversation, Step};
+use super::turn::{Conversation, Step, tool_results_in_latest_message};
 use crate::proxy::AppState;
 
 /// Prepended to every turn.

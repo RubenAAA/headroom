@@ -194,10 +194,10 @@ impl BaselineModel {
     /// Return `(mean, var, n)` for `key` with hierarchical back-off: trim
     /// trailing stratum fields, then fall back to the global mean.
     pub fn lookup(&self, key: &str) -> (f64, f64, i64) {
-        if let Some(acc) = self.strata.get(key) {
-            if acc.n > 0 {
-                return (acc.mean(), acc.var(), acc.n);
-            }
+        if let Some(acc) = self.strata.get(key)
+            && acc.n > 0
+        {
+            return (acc.mean(), acc.var(), acc.n);
         }
         let mut parts: Vec<&str> = key.split('|').collect();
         while parts.len() > 1 {
@@ -473,10 +473,10 @@ impl SavingsLedger {
         if estimated.n_requests > 0 {
             return estimated;
         }
-        if let Some(level) = level {
-            if let Some(modelled) = self.estimate_from_model(level) {
-                return modelled;
-            }
+        if let Some(level) = level
+            && let Some(modelled) = self.estimate_from_model(level)
+        {
+            return modelled;
         }
         estimated
     }

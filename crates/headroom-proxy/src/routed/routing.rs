@@ -5,7 +5,7 @@
 //! pick the upstream. Also owns the fallback re-dispatch when a routed
 //! upstream refuses a turn the router moved.
 
-use crate::proxy::{forward_http, AppState};
+use crate::proxy::{AppState, forward_http};
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -47,32 +47,32 @@ pub(crate) fn apply_model_routing(
     let mut identity_model: Option<String> = None;
     {
         let router = crate::model_router::ModelRouter::new(Some(state.config.model_router.clone()));
-        if router.enabled() {
-            if let Ok(buf) = serde_json::to_vec(&parsed) {
-                // Cooldowns are consulted here as well as in `forward_http`:
-                // a target parked by an earlier fallback must be passed over
-                // on this path too, or the routed upstream that just failed
-                // would be probed again on the very next turn.
-                let routed = crate::model_router::apply_to_anthropic_body_with_cooldowns(
-                    Bytes::from(buf),
-                    &router,
-                    request_id,
-                    Some(&state.model_route_cooldowns),
-                );
-                if let Ok(next) = serde_json::from_slice::<Value>(&routed) {
-                    let before = parsed
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    let after = next
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    if !after.is_empty() && after != before {
-                        identity_model = Some(before.to_string());
-                        parsed = next;
-                        body = routed;
-                    }
+        if router.enabled()
+            && let Ok(buf) = serde_json::to_vec(&parsed)
+        {
+            // Cooldowns are consulted here as well as in `forward_http`:
+            // a target parked by an earlier fallback must be passed over
+            // on this path too, or the routed upstream that just failed
+            // would be probed again on the very next turn.
+            let routed = crate::model_router::apply_to_anthropic_body_with_cooldowns(
+                Bytes::from(buf),
+                &router,
+                request_id,
+                Some(&state.model_route_cooldowns),
+            );
+            if let Ok(next) = serde_json::from_slice::<Value>(&routed) {
+                let before = parsed
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let after = next
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !after.is_empty() && after != before {
+                    identity_model = Some(before.to_string());
+                    parsed = next;
+                    body = routed;
                 }
             }
         }

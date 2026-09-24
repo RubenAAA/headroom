@@ -50,19 +50,19 @@ use axum::extract::{ConnectInfo, Extension, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use futures_util::stream::{self, Stream};
 use futures_util::StreamExt as _;
+use futures_util::stream::{self, Stream};
 use http::HeaderName;
 use std::pin::Pin;
 use url::Url;
 
 use crate::bedrock::eventstream::{EventStreamParser, ParseError};
 use crate::bedrock::eventstream_to_sse::{
-    translate_message, OutputMode, TranslateError, TranslateOutcome,
+    OutputMode, TranslateError, TranslateOutcome, translate_message,
 };
-use crate::bedrock::sigv4::{sign_request, SigningInputs};
+use crate::bedrock::sigv4::{SigningInputs, sign_request};
 use crate::compression::{
-    compress_anthropic_request, Outcome as AnthropicOutcome, PassthroughReason,
+    Outcome as AnthropicOutcome, PassthroughReason, compress_anthropic_request,
 };
 use crate::headers::filter_response_headers;
 use crate::observability::{
@@ -593,10 +593,10 @@ fn finish_streaming_response(
             // the client knows it's still EventStream. The
             // `filter_response_headers` already preserves it; this
             // is defensive in case a future filter strips it.
-            if !resp_headers.contains_key(http::header::CONTENT_TYPE) {
-                if let Ok(v) = http::HeaderValue::from_str("application/vnd.amazon.eventstream") {
-                    resp_headers.insert(http::header::CONTENT_TYPE, v);
-                }
+            if !resp_headers.contains_key(http::header::CONTENT_TYPE)
+                && let Ok(v) = http::HeaderValue::from_str("application/vnd.amazon.eventstream")
+            {
+                resp_headers.insert(http::header::CONTENT_TYPE, v);
             }
             let body_out = Body::from_stream(crate::proxy::track_streaming(upstream_stream));
             finish(status, resp_headers, body_out, &request_id, seam)

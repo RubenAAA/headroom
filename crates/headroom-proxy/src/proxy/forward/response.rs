@@ -167,44 +167,44 @@ pub(crate) fn store_semantic_cache_response(
     resp_headers: &HeaderMap,
     request_id: &str,
 ) {
-    if let Some(ref cache) = state.semantic_cache {
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(original_buffered) {
-            let is_streaming = parsed
-                .get("stream")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !is_streaming && !body_bytes.is_empty() {
-                let model = parsed
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown");
-                let response_headers: std::collections::HashMap<String, String> = resp_headers
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        v.to_str()
-                            .ok()
-                            .map(|val| (k.as_str().to_string(), val.to_string()))
-                    })
-                    .collect();
-                // Same key derivation as the lookup above; the two
-                // have to move together or the cache stops hitting.
-                if let Some((messages, extra)) = crate::semantic_cache::cache_key_inputs(&parsed) {
-                    cache.set(
-                        &messages,
-                        model,
-                        body_bytes.to_vec(),
-                        response_headers,
-                        0,
-                        &extra,
-                    );
-                    tracing::debug!(
-                        event = "semantic_cache_set",
-                        request_id = %request_id,
-                        model = model,
-                        body_bytes = body_bytes.len(),
-                        "cached non-streaming response"
-                    );
-                }
+    if let Some(ref cache) = state.semantic_cache
+        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(original_buffered)
+    {
+        let is_streaming = parsed
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !is_streaming && !body_bytes.is_empty() {
+            let model = parsed
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown");
+            let response_headers: std::collections::HashMap<String, String> = resp_headers
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.to_str()
+                        .ok()
+                        .map(|val| (k.as_str().to_string(), val.to_string()))
+                })
+                .collect();
+            // Same key derivation as the lookup above; the two
+            // have to move together or the cache stops hitting.
+            if let Some((messages, extra)) = crate::semantic_cache::cache_key_inputs(&parsed) {
+                cache.set(
+                    &messages,
+                    model,
+                    body_bytes.to_vec(),
+                    response_headers,
+                    0,
+                    &extra,
+                );
+                tracing::debug!(
+                    event = "semantic_cache_set",
+                    request_id = %request_id,
+                    model = model,
+                    body_bytes = body_bytes.len(),
+                    "cached non-streaming response"
+                );
             }
         }
     }
@@ -229,157 +229,156 @@ pub(crate) fn emit_buffered_outcome(
     // silently dropped for backend-routed non-streaming traffic.
     // Parse the buffered body's `usage` block (shape depends on
     // provider) and emit the same outcome the SSE sites build.
-    if let Some(ref ctx) = outcome_ctx {
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-            let usage = parsed.get("usage");
-            let get_i64 = |u: Option<&serde_json::Value>, key: &str| -> i64 {
-                u.and_then(|v| v.get(key))
+    if let Some(ctx) = outcome_ctx
+        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+    {
+        let usage = parsed.get("usage");
+        let get_i64 = |u: Option<&serde_json::Value>, key: &str| -> i64 {
+            u.and_then(|v| v.get(key))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+        };
+        // (attempted_input, output, cache_read, cache_write)
+        let (attempted_input, output_tok, cache_read, cache_write) = match ctx.provider.as_str() {
+            "anthropic" => (
+                get_i64(usage, "input_tokens"),
+                get_i64(usage, "output_tokens"),
+                get_i64(usage, "cache_read_input_tokens"),
+                get_i64(usage, "cache_creation_input_tokens"),
+            ),
+            "openai_responses" => {
+                let cached = usage
+                    .and_then(|u| u.get("input_tokens_details"))
+                    .and_then(|d| d.get("cached_tokens"))
                     .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-            };
-            // (attempted_input, output, cache_read, cache_write)
-            let (attempted_input, output_tok, cache_read, cache_write) = match ctx.provider.as_str()
-            {
-                "anthropic" => (
+                    .unwrap_or(0);
+                (
                     get_i64(usage, "input_tokens"),
                     get_i64(usage, "output_tokens"),
-                    get_i64(usage, "cache_read_input_tokens"),
-                    get_i64(usage, "cache_creation_input_tokens"),
-                ),
-                "openai_responses" => {
-                    let cached = usage
-                        .and_then(|u| u.get("input_tokens_details"))
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    (
-                        get_i64(usage, "input_tokens"),
-                        get_i64(usage, "output_tokens"),
-                        cached,
-                        0,
-                    )
-                }
-                // openai_chat (and any other) shape.
-                _ => {
-                    let cached = usage
-                        .and_then(|u| u.get("prompt_tokens_details"))
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    (
-                        get_i64(usage, "prompt_tokens"),
-                        get_i64(usage, "completion_tokens"),
-                        cached,
-                        0,
-                    )
-                }
-            };
-            // Anthropic's `input_tokens` already excludes cache
-            // reads and writes, so it *is* the uncached count.
-            // Both OpenAI shapes report a total that includes the
-            // cached prefix, so there the read has to come off.
-            let uncached_input = if ctx.provider == "anthropic" {
-                attempted_input
-            } else {
-                attempted_input.saturating_sub(cache_read)
-            };
-            observe_proactive_expansion_cache_write(ctx, u64::try_from(cache_write).unwrap_or(0));
-            // Fold in the CCR continuation rounds. The client saw
-            // one turn; the upstream billed several, and only the
-            // last one's usage is in `parsed`. Without this the
-            // savings figures are computed against a fraction of
-            // what the turn actually cost.
-            if !ccr_round_usage.is_empty() {
-                tracing::info!(
-                    request_id = %request_id,
-                    event = "ccr_continuation_usage",
-                    rounds = ccr_round_usage.rounds,
-                    input_tokens = ccr_round_usage.input_tokens,
-                    output_tokens = ccr_round_usage.output_tokens,
-                    cache_write_tokens = ccr_round_usage.cache_write_tokens,
-                    "billed CCR continuation rounds the client never saw"
-                );
+                    cached,
+                    0,
+                )
             }
-            let attempted_input = attempted_input + ccr_round_usage.input_tokens;
-            let output_tok = output_tok + ccr_round_usage.output_tokens;
-            let cache_read = cache_read + ccr_round_usage.cache_read_tokens;
-            let cache_write = cache_write + ccr_round_usage.cache_write_tokens;
-            let uncached_input = uncached_input + ccr_round_usage.input_tokens;
-            // Same for a turn hook's re-drives. The usage parsed
-            // above describes the one response the hook handed
-            // back; anything it called on the way there was just
-            // as billed, and leaving it out lets a token-saving
-            // hook hide its overhead behind the saving it claims.
-            if !turn_hook_usage.is_empty() {
-                tracing::info!(
-                    request_id = %request_id,
-                    event = "turn_hook_usage",
-                    calls = turn_hook_usage.calls,
-                    input_tokens = turn_hook_usage.input_tokens,
-                    output_tokens = turn_hook_usage.output_tokens,
-                    cache_write_tokens = turn_hook_usage.cache_write_tokens,
-                    "billed turn-hook re-drives the client never saw"
-                );
+            // openai_chat (and any other) shape.
+            _ => {
+                let cached = usage
+                    .and_then(|u| u.get("prompt_tokens_details"))
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                (
+                    get_i64(usage, "prompt_tokens"),
+                    get_i64(usage, "completion_tokens"),
+                    cached,
+                    0,
+                )
             }
-            // Anthropic's `input_tokens` is already the uncached
-            // count; both OpenAI shapes report a total the read
-            // has to come off, exactly as above.
-            let hook_uncached_input = if ctx.provider == "anthropic" {
-                turn_hook_usage.input_tokens
-            } else {
-                (turn_hook_usage.input_tokens - turn_hook_usage.cache_read_tokens).max(0)
-            };
-            let attempted_input = attempted_input + turn_hook_usage.input_tokens;
-            let output_tok = output_tok + turn_hook_usage.output_tokens;
-            let cache_read = cache_read + turn_hook_usage.cache_read_tokens;
-            let cache_write = cache_write + turn_hook_usage.cache_write_tokens;
-            let uncached_input = uncached_input + hook_uncached_input;
-            // Read off the pre-CCR `usage`: continuation rounds fold
-            // into the write total above but carry no TTL breakdown,
-            // so the split stays a subset of it and pricing charges
-            // the remainder at the cheaper 5m rate.
-            let (cache_write_5m, cache_write_1h) = anthropic_cache_ttl_split(usage);
-            let outcome = headroom_core::request_outcome::RequestOutcome {
-                request_id: request_id.to_owned(),
-                provider: ctx.provider.clone(),
-                model: ctx.model.clone(),
-                status_code: status.as_u16() as i64,
-                upstream_attempts: ctx.upstream_attempts,
-                provider_input_tokens: usage.map(|_| {
-                    if ctx.provider == "anthropic" {
-                        attempted_input + cache_read + cache_write
-                    } else {
-                        attempted_input
-                    }
-                }),
-                provider_output_tokens: usage.map(|_| output_tok),
-                original_tokens: ctx.sizes(attempted_input).0,
-                optimized_tokens: ctx.sizes(attempted_input).1,
-                output_tokens: output_tok,
-                tokens_saved: ctx.tokens_saved,
-                conversation_key: ctx.conversation_key.clone(),
-                conversation_tokens_saved: Some(ctx.tokens_saved),
-                attempted_input_tokens: ctx.attempted(attempted_input),
-                cache_read_tokens: cache_read,
-                cache_write_tokens: cache_write,
-                cache_write_5m_tokens: cache_write_5m,
-                cache_write_1h_tokens: cache_write_1h,
-                uncached_input_tokens: uncached_input,
-                total_latency_ms: ctx.total_latency_ms,
-                overhead_ms: ctx.overhead_ms,
-                // `ttfb_ms` stays at its 0 default: the convention
-                // is 0 for non-streaming, and this path has the
-                // whole body buffered before it runs.
-                transforms_applied: ctx.transforms_applied.clone(),
-                num_messages: ctx.num_messages,
-                tags: ctx.tags.clone(),
-                client: ctx.client.clone(),
-                project: ctx.project.clone(),
-                ..Default::default()
-            };
-            record_wire_footprint(ctx, uncached_input, cache_read, cache_write);
-            headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
+        };
+        // Anthropic's `input_tokens` already excludes cache
+        // reads and writes, so it *is* the uncached count.
+        // Both OpenAI shapes report a total that includes the
+        // cached prefix, so there the read has to come off.
+        let uncached_input = if ctx.provider == "anthropic" {
+            attempted_input
+        } else {
+            attempted_input.saturating_sub(cache_read)
+        };
+        observe_proactive_expansion_cache_write(ctx, u64::try_from(cache_write).unwrap_or(0));
+        // Fold in the CCR continuation rounds. The client saw
+        // one turn; the upstream billed several, and only the
+        // last one's usage is in `parsed`. Without this the
+        // savings figures are computed against a fraction of
+        // what the turn actually cost.
+        if !ccr_round_usage.is_empty() {
+            tracing::info!(
+                request_id = %request_id,
+                event = "ccr_continuation_usage",
+                rounds = ccr_round_usage.rounds,
+                input_tokens = ccr_round_usage.input_tokens,
+                output_tokens = ccr_round_usage.output_tokens,
+                cache_write_tokens = ccr_round_usage.cache_write_tokens,
+                "billed CCR continuation rounds the client never saw"
+            );
         }
+        let attempted_input = attempted_input + ccr_round_usage.input_tokens;
+        let output_tok = output_tok + ccr_round_usage.output_tokens;
+        let cache_read = cache_read + ccr_round_usage.cache_read_tokens;
+        let cache_write = cache_write + ccr_round_usage.cache_write_tokens;
+        let uncached_input = uncached_input + ccr_round_usage.input_tokens;
+        // Same for a turn hook's re-drives. The usage parsed
+        // above describes the one response the hook handed
+        // back; anything it called on the way there was just
+        // as billed, and leaving it out lets a token-saving
+        // hook hide its overhead behind the saving it claims.
+        if !turn_hook_usage.is_empty() {
+            tracing::info!(
+                request_id = %request_id,
+                event = "turn_hook_usage",
+                calls = turn_hook_usage.calls,
+                input_tokens = turn_hook_usage.input_tokens,
+                output_tokens = turn_hook_usage.output_tokens,
+                cache_write_tokens = turn_hook_usage.cache_write_tokens,
+                "billed turn-hook re-drives the client never saw"
+            );
+        }
+        // Anthropic's `input_tokens` is already the uncached
+        // count; both OpenAI shapes report a total the read
+        // has to come off, exactly as above.
+        let hook_uncached_input = if ctx.provider == "anthropic" {
+            turn_hook_usage.input_tokens
+        } else {
+            (turn_hook_usage.input_tokens - turn_hook_usage.cache_read_tokens).max(0)
+        };
+        let attempted_input = attempted_input + turn_hook_usage.input_tokens;
+        let output_tok = output_tok + turn_hook_usage.output_tokens;
+        let cache_read = cache_read + turn_hook_usage.cache_read_tokens;
+        let cache_write = cache_write + turn_hook_usage.cache_write_tokens;
+        let uncached_input = uncached_input + hook_uncached_input;
+        // Read off the pre-CCR `usage`: continuation rounds fold
+        // into the write total above but carry no TTL breakdown,
+        // so the split stays a subset of it and pricing charges
+        // the remainder at the cheaper 5m rate.
+        let (cache_write_5m, cache_write_1h) = anthropic_cache_ttl_split(usage);
+        let outcome = headroom_core::request_outcome::RequestOutcome {
+            request_id: request_id.to_owned(),
+            provider: ctx.provider.clone(),
+            model: ctx.model.clone(),
+            status_code: status.as_u16() as i64,
+            upstream_attempts: ctx.upstream_attempts,
+            provider_input_tokens: usage.map(|_| {
+                if ctx.provider == "anthropic" {
+                    attempted_input + cache_read + cache_write
+                } else {
+                    attempted_input
+                }
+            }),
+            provider_output_tokens: usage.map(|_| output_tok),
+            original_tokens: ctx.sizes(attempted_input).0,
+            optimized_tokens: ctx.sizes(attempted_input).1,
+            output_tokens: output_tok,
+            tokens_saved: ctx.tokens_saved,
+            conversation_key: ctx.conversation_key.clone(),
+            conversation_tokens_saved: Some(ctx.tokens_saved),
+            attempted_input_tokens: ctx.attempted(attempted_input),
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            cache_write_5m_tokens: cache_write_5m,
+            cache_write_1h_tokens: cache_write_1h,
+            uncached_input_tokens: uncached_input,
+            total_latency_ms: ctx.total_latency_ms,
+            overhead_ms: ctx.overhead_ms,
+            // `ttfb_ms` stays at its 0 default: the convention
+            // is 0 for non-streaming, and this path has the
+            // whole body buffered before it runs.
+            transforms_applied: ctx.transforms_applied.clone(),
+            num_messages: ctx.num_messages,
+            tags: ctx.tags.clone(),
+            client: ctx.client.clone(),
+            project: ctx.project.clone(),
+            ..Default::default()
+        };
+        record_wire_footprint(ctx, uncached_input, cache_read, cache_write);
+        headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
     }
 }
 
@@ -883,10 +882,10 @@ pub(crate) fn build_final_response(
         }
         // PR-A8 / P5-57: surface the upstream id in a distinct
         // header so it never conflated with the proxy own.
-        if let Some(uid) = upstream_request_id.as_deref() {
-            if let Ok(v) = http::HeaderValue::from_str(uid) {
-                h.insert(HeaderName::from_static("headroom-upstream-request-id"), v);
-            }
+        if let Some(uid) = upstream_request_id.as_deref()
+            && let Ok(v) = http::HeaderValue::from_str(uid)
+        {
+            h.insert(HeaderName::from_static("headroom-upstream-request-id"), v);
         }
     }
     let response = response

@@ -237,14 +237,14 @@ pub(super) fn complete_anthropic_replay(close: &AnthropicClose<'_>) {
     // disconnect with unreliable usage totals. `complete` is
     // a no-op when this request was never parked
     // (non-Anthropic, or the buffered path didn't run).
-    if let Some(store) = close.replay_store.as_ref() {
-        if close.state.status == crate::sse::anthropic::StreamStatus::MessageStop {
-            store.complete(
-                close.request_id,
-                close.cache_baseline_read,
-                close.cache_baseline_write,
-            );
-        }
+    if let Some(store) = close.replay_store.as_ref()
+        && close.state.status == crate::sse::anthropic::StreamStatus::MessageStop
+    {
+        store.complete(
+            close.request_id,
+            close.cache_baseline_read,
+            close.cache_baseline_write,
+        );
     }
 }
 
@@ -349,7 +349,7 @@ pub(super) fn book_anthropic_incomplete(close: &AnthropicClose<'_>) {
         // exhausted 529 served as SSE must land in `record_failed`,
         // never in the success stats nor the unbooked counter.
         if close.upstream_status.is_server_error() {
-            if let Some(ref ctx) = close.outcome_ctx {
+            if let Some(ctx) = close.outcome_ctx {
                 let outcome = headroom_core::request_outcome::RequestOutcome {
                     request_id: close.request_id.to_string(),
                     provider: ctx.provider.clone(),
@@ -371,7 +371,7 @@ pub(super) fn book_anthropic_incomplete(close: &AnthropicClose<'_>) {
                     &outcome,
                 );
             }
-        } else if let Some(ref ctx) = close.outcome_ctx {
+        } else if let Some(ctx) = close.outcome_ctx {
             ctx.sink.savings_tracker.record_unbooked_turn(
                 close.state.usage.input_tokens as i64,
                 close.state.usage.output_tokens as i64,
@@ -441,7 +441,7 @@ pub(super) fn emit_anthropic_outcome(close: &AnthropicClose<'_>) {
         );
     }
     let attempted_input = close.state.usage.input_tokens as i64 + close.ccr_rounds.input_tokens;
-    if let (Some(ref ctx), true) = (close.outcome_ctx, close.stream_completed()) {
+    if let (Some(ctx), true) = (close.outcome_ctx, close.stream_completed()) {
         // Search round-trip counts joined to the same outcome row as the
         // deferral tags: how often the model reached for the search tool this
         // turn. Zero on turns without server tools (inventory is empty, not

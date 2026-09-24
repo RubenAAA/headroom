@@ -36,37 +36,37 @@ pub(crate) fn record_compression_observations(
     compress_tokens_saved: i64,
     compress_strategies: &[String],
 ) {
-    if let Some(ref recorder) = state.probe_recorder {
-        if compress_tokens_before > 0 {
-            let event = crate::probe_recorder::CompressionEvent {
-                ts: start.elapsed().as_secs_f64(),
-                request_id: request_id.to_owned(),
-                provider: endpoint_str(&endpoint).to_string(),
-                model: String::new(),
-                tokens_before: Some(compress_tokens_before as u64),
-                tokens_after: Some((compress_tokens_before - compress_tokens_saved) as u64),
-                transforms_applied: compress_strategies.to_vec(),
-            };
-            recorder.record(&event);
-        }
+    if let Some(ref recorder) = state.probe_recorder
+        && compress_tokens_before > 0
+    {
+        let event = crate::probe_recorder::CompressionEvent {
+            ts: start.elapsed().as_secs_f64(),
+            request_id: request_id.to_owned(),
+            provider: endpoint_str(&endpoint).to_string(),
+            model: String::new(),
+            tokens_before: Some(compress_tokens_before as u64),
+            tokens_after: Some((compress_tokens_before - compress_tokens_saved) as u64),
+            transforms_applied: compress_strategies.to_vec(),
+        };
+        recorder.record(&event);
     }
     // Compression feedback: record per-tool compression patterns for learning.
-    if let Some(ref feedback) = state.compression_feedback {
-        if compress_tokens_saved > 0 {
-            let tool_name = extract_tool_name(buffered, endpoint);
-            let hash = {
-                use sha2::{Digest, Sha256};
-                let digest = Sha256::digest(buffered.as_ref());
-                hex::encode(digest)
-            };
-            feedback.record_compression(
-                tool_name.as_deref(),
-                compress_tokens_before as usize,
-                (compress_tokens_before - compress_tokens_saved) as usize,
-                compress_strategies.first().map(|s| s.as_str()),
-                Some(&hash),
-            );
-        }
+    if let Some(ref feedback) = state.compression_feedback
+        && compress_tokens_saved > 0
+    {
+        let tool_name = extract_tool_name(buffered, endpoint);
+        let hash = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(buffered.as_ref());
+            hex::encode(digest)
+        };
+        feedback.record_compression(
+            tool_name.as_deref(),
+            compress_tokens_before as usize,
+            (compress_tokens_before - compress_tokens_saved) as usize,
+            compress_strategies.first().map(|s| s.as_str()),
+            Some(&hash),
+        );
     }
 }
 
@@ -361,19 +361,19 @@ pub(crate) fn refine_compression_decision(
     let decision_headers = headers_snapshot.as_ref().unwrap_or(&empty_headers);
     let has_messages = request_has_messages(buffered, endpoint);
     // Validate message array size (mirrors Python MAX_MESSAGE_ARRAY_LENGTH).
-    if let Some(count) = message_array_length(buffered, endpoint) {
-        if count > MAX_MESSAGE_ARRAY_LENGTH {
-            tracing::warn!(
-                event = "request_message_array_too_large",
-                request_id = %request_id,
-                message_count = count,
-                max = MAX_MESSAGE_ARRAY_LENGTH,
-                "request rejected: message array too large"
-            );
-            return Err(ProxyError::PayloadTooLarge(format!(
-                "Message array too large ({count} messages). Maximum is {MAX_MESSAGE_ARRAY_LENGTH}."
-            )));
-        }
+    if let Some(count) = message_array_length(buffered, endpoint)
+        && count > MAX_MESSAGE_ARRAY_LENGTH
+    {
+        tracing::warn!(
+            event = "request_message_array_too_large",
+            request_id = %request_id,
+            message_count = count,
+            max = MAX_MESSAGE_ARRAY_LENGTH,
+            "request rejected: message array too large"
+        );
+        return Err(ProxyError::PayloadTooLarge(format!(
+            "Message array too large ({count} messages). Maximum is {MAX_MESSAGE_ARRAY_LENGTH}."
+        )));
     }
     let decision = crate::compression_decision::CompressionDecision::decide(
         decision_headers,

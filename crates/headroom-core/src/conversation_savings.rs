@@ -96,12 +96,11 @@ pub fn savings_conversation_key(body: &Value, session_id: Option<&str>) -> Optio
             }
         }
     }
-    if identity.is_empty() {
-        if let Some(sid) = session_id {
-            if !sid.is_empty() {
-                identity = format!("session:{sid}");
-            }
-        }
+    if identity.is_empty()
+        && let Some(sid) = session_id
+        && !sid.is_empty()
+    {
+        identity = format!("session:{sid}");
     }
     if identity.is_empty() {
         return None;
@@ -114,12 +113,11 @@ pub fn savings_conversation_key(body: &Value, session_id: Option<&str>) -> Optio
 
 /// Unwrap the `response.create` envelope to the inner create body.
 fn unwrap_response_create_body(body: &Value) -> &Value {
-    if body.get("type").and_then(Value::as_str) == Some("response.create") {
-        if let Some(inner) = body.get("response") {
-            if inner.is_object() {
-                return inner;
-            }
-        }
+    if body.get("type").and_then(Value::as_str) == Some("response.create")
+        && let Some(inner) = body.get("response")
+        && inner.is_object()
+    {
+        return inner;
     }
     body
 }
@@ -131,10 +129,10 @@ fn explicit_id(value: Option<&Value>) -> String {
         Some(Value::String(s)) if !s.is_empty() && !s.eq_ignore_ascii_case("auto") => s.clone(),
         Some(Value::Object(map)) => {
             for key in ["id", "conversation_id", "session_id", "thread_id"] {
-                if let Some(Value::String(s)) = map.get(key) {
-                    if !s.is_empty() {
-                        return s.clone();
-                    }
+                if let Some(Value::String(s)) = map.get(key)
+                    && !s.is_empty()
+                {
+                    return s.clone();
                 }
             }
             String::new()
@@ -243,10 +241,10 @@ pub fn conversation_ledger() -> &'static Mutex<ConversationSavings> {
 
 /// Forget every conversation. Test helper only.
 pub fn reset_conversation_ledger() {
-    if let Some(ledger) = LEDGER.get() {
-        if let Ok(guard) = ledger.lock() {
-            guard.clear();
-        }
+    if let Some(ledger) = LEDGER.get()
+        && let Ok(guard) = ledger.lock()
+    {
+        guard.clear();
     }
 }
 

@@ -195,9 +195,10 @@ mod tests {
     #[test]
     fn deregister_unknown_returns_none() {
         let mut reg = WebSocketSessionRegistry::new();
-        assert!(reg
-            .deregister("unknown", TerminationCause::Unknown)
-            .is_none());
+        assert!(
+            reg.deregister("unknown", TerminationCause::Unknown)
+                .is_none()
+        );
     }
 
     #[test]

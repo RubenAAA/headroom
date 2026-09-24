@@ -1,7 +1,7 @@
 //! Unit tests for the CTX-1 content store. `cargo test -p headroom-core ctx::`.
 
 use super::*;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 fn open_tmp() -> (TempDir, CtxStore) {
@@ -677,10 +677,12 @@ fn content_by_hash_misses_an_unknown_hash() {
     store
         .index_content("notes", "some body text", &IndexOpts::default())
         .unwrap();
-    assert!(store
-        .content_by_hash("ffffffffffffffffffffffff")
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .content_by_hash("ffffffffffffffffffffffff")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

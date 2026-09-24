@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use common::{start_proxy_with, wait_for_upstream_requests};
 use headroom_proxy::config::ProviderRoute;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

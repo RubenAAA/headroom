@@ -1,5 +1,9 @@
 //! headroom-core: foundation crate for the Rust port of Headroom.
 
+// Edition 2024 makes std::env::set_var and remove_var unsafe. Tests call them
+// to set up config; non-test code stays free of unsafe.
+#![cfg_attr(test, allow(unsafe_code, clippy::undocumented_unsafe_blocks))]
+
 pub mod auth_mode;
 pub mod cache_control;
 pub mod ccr;
@@ -84,7 +88,7 @@ pub fn hello() -> &'static str {
 ///   first run compiles and saves, subsequent runs load instantly
 #[cfg(feature = "ml")]
 pub fn init_ort_ep() {
-    use ort::execution_providers::{OpenVINO, CUDA};
+    use ort::execution_providers::{CUDA, OpenVINO};
 
     let ep = std::env::var("HEADROOM_ORT_EP").unwrap_or_default();
     let ep = ep.trim().to_lowercase();

@@ -49,7 +49,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use std::net::SocketAddr;
 
-use crate::proxy::{forward_http, AppState};
+use crate::proxy::{AppState, forward_http};
 use crate::tool_schema_compaction::{compact_tool_descriptions, tool_desc_max_chars};
 
 /// Translate the legacy OpenAI `max_tokens` field to
@@ -258,7 +258,7 @@ pub async fn handle_chat_completions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn norm(v: Value) -> Value {
         let out = normalize_openai_max_tokens(Bytes::from(serde_json::to_vec(&v).unwrap()));
@@ -339,12 +339,12 @@ mod tests {
         let body = Bytes::from(serde_json::to_vec(&chat_body_with_tools()).unwrap());
 
         // Default (unset) leaves the body byte-identical.
-        std::env::remove_var("HEADROOM_TOOL_DESC_MAX_CHARS");
+        unsafe { std::env::remove_var("HEADROOM_TOOL_DESC_MAX_CHARS") };
         reset_env_cache();
         invalidate_cache();
         assert_eq!(compact_chat_tool_descriptions(body.clone()), body);
 
-        std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "20");
+        unsafe { std::env::set_var("HEADROOM_TOOL_DESC_MAX_CHARS", "20") };
         reset_env_cache();
         invalidate_cache();
         let out = compact_chat_tool_descriptions(body.clone());
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(v["model"], json!("gpt-4o"));
         assert_eq!(v["messages"], chat_body_with_tools()["messages"]);
 
-        std::env::remove_var("HEADROOM_TOOL_DESC_MAX_CHARS");
+        unsafe { std::env::remove_var("HEADROOM_TOOL_DESC_MAX_CHARS") };
         reset_env_cache();
         invalidate_cache();
     }

@@ -24,7 +24,7 @@
 //! bridge as real `tool_use`/`tool_result` pairs. The only blocks that become
 //! real `tool_use` are the ones the bridge parks (see `super::park`).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::sse::outbound;
 
@@ -150,10 +150,10 @@ impl Translator {
         // a full respawn: the next turn re-sends the whole transcript instead
         // of resuming. Taking it from whatever arrives first removes the
         // dependency on one event's timing.
-        if self.session_id.is_none() {
-            if let Some(id) = event.get("session_id").and_then(Value::as_str) {
-                self.session_id = Some(id.to_string());
-            }
+        if self.session_id.is_none()
+            && let Some(id) = event.get("session_id").and_then(Value::as_str)
+        {
+            self.session_id = Some(id.to_string());
         }
 
         match (kind, subtype) {
@@ -769,10 +769,12 @@ mod tests {
             .find(|(e, _)| e == "content_block_delta")
             .expect("the call is surfaced");
         assert_eq!(note.1["delta"]["type"], "thinking_delta");
-        assert!(note.1["delta"]["thinking"]
-            .as_str()
-            .unwrap()
-            .contains("read"));
+        assert!(
+            note.1["delta"]["thinking"]
+                .as_str()
+                .unwrap()
+                .contains("read")
+        );
     }
 
     /// An MCP call is named by its arguments, not by the `mcpToolCall` key.
@@ -786,10 +788,12 @@ mod tests {
             .iter()
             .find(|(e, _)| e == "content_block_delta")
             .unwrap();
-        assert!(note.1["delta"]["thinking"]
-            .as_str()
-            .unwrap()
-            .contains("headroom-Read"));
+        assert!(
+            note.1["delta"]["thinking"]
+                .as_str()
+                .unwrap()
+                .contains("headroom-Read")
+        );
     }
 
     /// A built-in call the agent ran itself has its result surfaced as text.
@@ -899,9 +903,10 @@ mod tests {
     fn unknown_and_malformed_lines_are_ignored() {
         let mut t = Translator::new("m");
         assert!(t.push_line("not json at all").is_empty());
-        assert!(t
-            .push_line(r#"{"type":"somethingNew","subtype":"whatever"}"#)
-            .is_empty());
+        assert!(
+            t.push_line(r#"{"type":"somethingNew","subtype":"whatever"}"#)
+                .is_empty()
+        );
         assert!(t.push_line("").is_empty());
     }
 

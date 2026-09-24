@@ -245,10 +245,12 @@ mod tests {
         let mut counter = 0;
         let result = redact_value(&payload, false, &mut counter);
         assert_eq!(counter, 1);
-        assert!(result["random_field"]
-            .as_str()
-            .unwrap()
-            .starts_with("<image:base64-redacted"));
+        assert!(
+            result["random_field"]
+                .as_str()
+                .unwrap()
+                .starts_with("<image:base64-redacted")
+        );
     }
 
     #[test]
@@ -257,10 +259,12 @@ mod tests {
         let mut counter = 0;
         let result = redact_value(&payload, false, &mut counter);
         assert_eq!(counter, 1);
-        assert!(result["source"]["data"]
-            .as_str()
-            .unwrap()
-            .starts_with("<image:base64-redacted"));
+        assert!(
+            result["source"]["data"]
+                .as_str()
+                .unwrap()
+                .starts_with("<image:base64-redacted")
+        );
     }
 
     #[test]
@@ -288,10 +292,12 @@ mod tests {
         let mut counter = 0;
         let result = redact_value(&payload, false, &mut counter);
         assert_eq!(counter, 1);
-        assert!(result[0]
-            .as_str()
-            .unwrap()
-            .starts_with("<image:base64-redacted"));
+        assert!(
+            result[0]
+                .as_str()
+                .unwrap()
+                .starts_with("<image:base64-redacted")
+        );
         assert_eq!(result[1].as_str().unwrap(), "normal");
     }
 
@@ -321,10 +327,12 @@ mod tests {
         let mut counter = 0;
         let result = redact_value(&payload, false, &mut counter);
         assert_eq!(counter, 1);
-        assert!(result["image_url"]["url"]
-            .as_str()
-            .unwrap()
-            .starts_with("<image:base64-redacted"));
+        assert!(
+            result["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("<image:base64-redacted")
+        );
     }
 
     #[test]
@@ -430,9 +438,11 @@ mod tests {
     fn latest_matching_none_when_absent() {
         let logger = RequestLogger::new(None);
         logger.log(make_entry("req-0"));
-        assert!(logger
-            .latest_matching(|e| e.model.contains("spark"))
-            .is_none());
+        assert!(
+            logger
+                .latest_matching(|e| e.model.contains("spark"))
+                .is_none()
+        );
         let empty = RequestLogger::new(None);
         assert!(empty.latest_matching(|_| true).is_none());
     }

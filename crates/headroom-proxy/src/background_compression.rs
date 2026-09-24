@@ -9,10 +9,10 @@
 //! and cache store are injected via traits.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 /// A compression job to be executed off the request path.
 pub struct CompressionJob {

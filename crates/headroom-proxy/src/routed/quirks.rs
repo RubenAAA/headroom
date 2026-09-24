@@ -116,22 +116,22 @@ impl UpstreamKind {
             .and_then(|m| m.get("user_id"))
             .and_then(|v| v.as_str())
             .map(String::from);
-        if matches!(self, UpstreamKind::ChatGptSubscription) {
-            if let Some(key) = &session_key {
-                let session_uuid = derive_session_uuid(key);
-                if let Ok(val) = http::HeaderValue::from_str(&session_uuid) {
-                    headers.insert("session-id", val.clone());
-                    headers.insert("thread-id", val);
-                }
-                let stored = turn_state_map()
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(key).cloned());
-                if let Some(ts) = stored {
-                    if let Ok(val) = http::HeaderValue::from_str(&ts) {
-                        headers.insert("x-codex-turn-state", val);
-                    }
-                }
+        if matches!(self, UpstreamKind::ChatGptSubscription)
+            && let Some(key) = &session_key
+        {
+            let session_uuid = derive_session_uuid(key);
+            if let Ok(val) = http::HeaderValue::from_str(&session_uuid) {
+                headers.insert("session-id", val.clone());
+                headers.insert("thread-id", val);
+            }
+            let stored = turn_state_map()
+                .lock()
+                .ok()
+                .and_then(|m| m.get(key).cloned());
+            if let Some(ts) = stored
+                && let Ok(val) = http::HeaderValue::from_str(&ts)
+            {
+                headers.insert("x-codex-turn-state", val);
             }
         }
         session_key
@@ -145,16 +145,14 @@ impl UpstreamKind {
         upstream_resp: &reqwest::Response,
         session_key: Option<&str>,
     ) {
-        if let Some(key) = session_key {
-            if let Some(ts) = upstream_resp
+        if let Some(key) = session_key
+            && let Some(ts) = upstream_resp
                 .headers()
                 .get("x-codex-turn-state")
                 .and_then(|v| v.to_str().ok())
-            {
-                if let Ok(mut map) = turn_state_map().lock() {
-                    map.insert(key.to_string(), ts.to_string());
-                }
-            }
+            && let Ok(mut map) = turn_state_map().lock()
+        {
+            map.insert(key.to_string(), ts.to_string());
         }
     }
 
@@ -247,10 +245,10 @@ pub(crate) fn inject_opencode_headers(
             "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
         ),
     );
-    if let Some(project) = resolve_zen_project(&session) {
-        if let Ok(v) = http::HeaderValue::from_str(&project) {
-            headers.insert(http::HeaderName::from_static("x-opencode-project"), v);
-        }
+    if let Some(project) = resolve_zen_project(&session)
+        && let Ok(v) = http::HeaderValue::from_str(&project)
+    {
+        headers.insert(http::HeaderName::from_static("x-opencode-project"), v);
     }
 }
 
@@ -483,10 +481,10 @@ fn zen_session_db_path() -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 fn clear_zen_session_cache() {
-    if let Some(lock) = ZEN_SESSION_CACHE.get() {
-        if let Ok(mut guard) = lock.lock() {
-            *guard = (None, std::time::Instant::now() - ZEN_SESSION_CACHE_TTL);
-        }
+    if let Some(lock) = ZEN_SESSION_CACHE.get()
+        && let Ok(mut guard) = lock.lock()
+    {
+        *guard = (None, std::time::Instant::now() - ZEN_SESSION_CACHE_TTL);
     }
 }
 
@@ -689,20 +687,18 @@ fn read_session_created_since(start_ms: i64) -> Option<String> {
 /// directory that still exists (guaranteed OpenCode-accessible —
 /// sessions actively run there), else the system temp dir.
 fn mint_workdir() -> std::path::PathBuf {
-    if let Some(path) = zen_session_db_path() {
-        if let Ok(conn) =
+    if let Some(path) = zen_session_db_path()
+        && let Ok(conn) =
             rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        {
-            if let Ok(dir) = conn.query_row(
-                "SELECT directory FROM session ORDER BY time_updated DESC LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            ) {
-                let p = std::path::PathBuf::from(dir);
-                if p.is_dir() {
-                    return p;
-                }
-            }
+        && let Ok(dir) = conn.query_row(
+            "SELECT directory FROM session ORDER BY time_updated DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+    {
+        let p = std::path::PathBuf::from(dir);
+        if p.is_dir() {
+            return p;
         }
     }
     std::env::temp_dir()
@@ -811,16 +807,16 @@ mod tests {
     fn with_env(var: &str, value: Option<&str>) -> Option<String> {
         let prev = std::env::var(var).ok();
         match value {
-            Some(v) => std::env::set_var(var, v),
-            None => std::env::remove_var(var),
+            Some(v) => unsafe { std::env::set_var(var, v) },
+            None => unsafe { std::env::remove_var(var) },
         }
         prev
     }
 
     fn restore_env(var: &str, prev: Option<String>) {
         match prev {
-            Some(v) => std::env::set_var(var, v),
-            None => std::env::remove_var(var),
+            Some(v) => unsafe { std::env::set_var(var, v) },
+            None => unsafe { std::env::remove_var(var) },
         }
     }
 

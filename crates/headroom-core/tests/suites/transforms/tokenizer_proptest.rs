@@ -4,7 +4,7 @@
 //! decisions, cache keys). These are small enough to also serve as quick
 //! regression catchers if a tokenizer-rs upgrade breaks the surface API.
 
-use headroom_core::tokenizer::{get_tokenizer, EstimatingCounter, TiktokenCounter, Tokenizer};
+use headroom_core::tokenizer::{EstimatingCounter, TiktokenCounter, Tokenizer, get_tokenizer};
 use proptest::prelude::*;
 
 proptest! {

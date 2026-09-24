@@ -39,11 +39,7 @@ fn result_as_text(block: &Value) -> String {
                         return None;
                     }
                     let text = b.get("text").and_then(Value::as_str).unwrap_or("");
-                    if text.is_empty() {
-                        None
-                    } else {
-                        Some(text)
-                    }
+                    if text.is_empty() { None } else { Some(text) }
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -99,10 +95,9 @@ pub fn strip_unsupported_ccr_blocks(messages: Vec<Value>, tools: &[Value]) -> Cc
         for block in content {
             if block.get("type").and_then(Value::as_str) == Some("tool_use")
                 && block.get("name").and_then(Value::as_str) == Some(name)
+                && let Some(id) = block.get("id").and_then(Value::as_str)
             {
-                if let Some(id) = block.get("id").and_then(Value::as_str) {
-                    retrieve_ids.insert(id.to_string());
-                }
+                retrieve_ids.insert(id.to_string());
             }
         }
     }

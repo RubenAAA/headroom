@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
-use calamine::{open_workbook, Data, Reader, Xlsx};
+use calamine::{Data, Reader, Xlsx, open_workbook};
 
 /// Errors mirroring the Python reference's exception surface
 /// (`FileNotFoundError` / `ValueError` / parse failures).

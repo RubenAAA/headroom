@@ -29,7 +29,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Schema version once `memory_entities` has been built from existing records.
 const ENTITY_EDGES_VERSION: i64 = 1;
@@ -336,9 +336,10 @@ mod tests {
             1
         );
         assert_eq!(s.delete_user("alice").unwrap(), 1);
-        assert!(s
-            .memories_for_entities(&["acme".to_string()])
-            .unwrap()
-            .is_empty());
+        assert!(
+            s.memories_for_entities(&["acme".to_string()])
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -563,20 +563,20 @@ impl SessionReplayStore {
             next_chain_id: snapshot.chain_id.saturating_add(1),
         };
         let head = adoption_head_hash(&tracker.last_original_messages);
-        if let Ok(mut guard) = self.trackers.lock() {
-            if !guard.contains(session_key) {
-                let evicted = guard.push(session_key.to_string(), tracker);
-                self.unindex_evicted(session_key, evicted);
-                self.index_head(session_key, head);
-                tracing::info!(
-                    event = "prefix_replay_rehydrated",
-                    session_key_hash =
-                        %crate::cache_stabilization::drift_detector::session_key_log_prefix(session_key),
-                    prefix_msgs = messages,
-                    chain_id = snapshot.chain_id,
-                    "restored a forwarded prefix written before this process started"
-                );
-            }
+        if let Ok(mut guard) = self.trackers.lock()
+            && !guard.contains(session_key)
+        {
+            let evicted = guard.push(session_key.to_string(), tracker);
+            self.unindex_evicted(session_key, evicted);
+            self.index_head(session_key, head);
+            tracing::info!(
+                event = "prefix_replay_rehydrated",
+                session_key_hash =
+                    %crate::cache_stabilization::drift_detector::session_key_log_prefix(session_key),
+                prefix_msgs = messages,
+                chain_id = snapshot.chain_id,
+                "restored a forwarded prefix written before this process started"
+            );
         }
     }
 
@@ -1040,10 +1040,10 @@ impl SessionReplayStore {
 
     /// Invalidate a session's stored prefix (drift/rebuild boundary).
     pub fn invalidate(&self, session_key: &str) {
-        if let Ok(mut guard) = self.trackers.lock() {
-            if let Some(t) = guard.get_mut(session_key) {
-                t.invalidate();
-            }
+        if let Ok(mut guard) = self.trackers.lock()
+            && let Some(t) = guard.get_mut(session_key)
+        {
+            t.invalidate();
         }
     }
 
@@ -1148,12 +1148,12 @@ impl SessionReplayStore {
         let Some(head) = adoption_head_hash(&tracker.last_original_messages) else {
             return;
         };
-        if let Ok(mut index) = self.head_index.lock() {
-            if let Some(keys) = index.get_mut(&head) {
-                keys.retain(|k| k != session_key);
-                if keys.is_empty() {
-                    index.remove(&head);
-                }
+        if let Ok(mut index) = self.head_index.lock()
+            && let Some(keys) = index.get_mut(&head)
+        {
+            keys.retain(|k| k != session_key);
+            if keys.is_empty() {
+                index.remove(&head);
             }
         }
     }
@@ -1165,10 +1165,10 @@ impl SessionReplayStore {
         session_key: &str,
         evicted: Option<(String, PrefixReplayTracker)>,
     ) {
-        if let Some((key, tracker)) = evicted {
-            if key != session_key {
-                self.unindex_head(&key, &tracker);
-            }
+        if let Some((key, tracker)) = evicted
+            && key != session_key
+        {
+            self.unindex_head(&key, &tracker);
         }
     }
 
@@ -1242,29 +1242,29 @@ impl SessionReplayStore {
         // misfile the turn as replayed. `None` (the freshness probe, which has
         // no post-hold system yet) skips the gate — the probe only decides
         // offload, and the real path re-decides with the system in hand.
-        if let Some(current) = current_system_hash {
-            if adopted.forwarded_system_hash != current {
-                let (donor_hash, source) = match &adopted.donor {
-                    AdoptionDonor::Session(key) => (
-                        crate::cache_stabilization::drift_detector::session_key_log_prefix(key),
-                        "memory",
-                    ),
-                    AdoptionDonor::PersistedDigest(digest) => {
-                        (digest.chars().take(16).collect::<String>(), "disk")
-                    }
-                };
-                tracing::info!(
-                    event = "prefix_adoption_declined_system_mismatch",
-                    session_key_hash = %crate::cache_stabilization::drift_detector::session_key_log_prefix(session_key),
-                    donor_session_key_hash = %donor_hash,
-                    source = source,
-                    adopted_msgs = adopted.originals.len(),
-                    incoming_msgs = current_originals.len(),
-                    "a session sharing this turn's history carries a different system; \
-                     forwarding fresh bytes instead of replaying under a system no cache holds"
-                );
-                return true;
-            }
+        if let Some(current) = current_system_hash
+            && adopted.forwarded_system_hash != current
+        {
+            let (donor_hash, source) = match &adopted.donor {
+                AdoptionDonor::Session(key) => (
+                    crate::cache_stabilization::drift_detector::session_key_log_prefix(key),
+                    "memory",
+                ),
+                AdoptionDonor::PersistedDigest(digest) => {
+                    (digest.chars().take(16).collect::<String>(), "disk")
+                }
+            };
+            tracing::info!(
+                event = "prefix_adoption_declined_system_mismatch",
+                session_key_hash = %crate::cache_stabilization::drift_detector::session_key_log_prefix(session_key),
+                donor_session_key_hash = %donor_hash,
+                source = source,
+                adopted_msgs = adopted.originals.len(),
+                incoming_msgs = current_originals.len(),
+                "a session sharing this turn's history carries a different system; \
+                 forwarding fresh bytes instead of replaying under a system no cache holds"
+            );
+            return true;
         }
         let (donor_hash, source) = match &adopted.donor {
             AdoptionDonor::Session(key) => (

@@ -673,12 +673,11 @@ fn get_body_limit(
     body_limits: &HashMap<String, i64>,
     max_body_lines: i64,
 ) -> i64 {
-    if let Some(name) = func_name {
-        if !body_limits.is_empty() {
-            if let Some(&v) = body_limits.get(name) {
-                return v.min(max_body_lines);
-            }
-        }
+    if let Some(name) = func_name
+        && !body_limits.is_empty()
+        && let Some(&v) = body_limits.get(name)
+    {
+        return v.min(max_body_lines);
     }
     max_body_lines
 }
@@ -977,25 +976,20 @@ pub fn detect_language(code: &str) -> (CodeLanguage, f64) {
     if let (Some(ts), Some(_js)) = (
         get(&candidates, CodeLanguage::Typescript),
         get(&candidates, CodeLanguage::Javascript),
-    ) {
-        if ts >= 2 {
-            if let Some(e) = candidates
-                .iter_mut()
-                .find(|(x, _)| *x == CodeLanguage::Javascript)
-            {
-                e.1 = 0;
-            }
-        }
+    ) && ts >= 2
+        && let Some(e) = candidates
+            .iter_mut()
+            .find(|(x, _)| *x == CodeLanguage::Javascript)
+    {
+        e.1 = 0;
     }
     if let (Some(cpp), Some(_c)) = (
         get(&candidates, CodeLanguage::Cpp),
         get(&candidates, CodeLanguage::C),
-    ) {
-        if cpp >= 2 {
-            if let Some(e) = candidates.iter_mut().find(|(x, _)| *x == CodeLanguage::C) {
-                e.1 = 0;
-            }
-        }
+    ) && cpp >= 2
+        && let Some(e) = candidates.iter_mut().find(|(x, _)| *x == CodeLanguage::C)
+    {
+        e.1 = 0;
     }
     // Rust vs C++: `::` paths are shared, so Rust code routinely nominates
     // Cpp. Any Rust prefilter hit (`fn`/`impl`/`mod`/`pub` line-starts, a
@@ -1004,12 +998,10 @@ pub fn detect_language(code: &str) -> (CodeLanguage, f64) {
     if let (Some(rust), Some(_cpp)) = (
         get(&candidates, CodeLanguage::Rust),
         get(&candidates, CodeLanguage::Cpp),
-    ) {
-        if rust >= 1 {
-            if let Some(e) = candidates.iter_mut().find(|(x, _)| *x == CodeLanguage::Cpp) {
-                e.1 = 0;
-            }
-        }
+    ) && rust >= 1
+        && let Some(e) = candidates.iter_mut().find(|(x, _)| *x == CodeLanguage::Cpp)
+    {
+        e.1 = 0;
     }
 
     // Phase 2: tree-sitter, fewest errors then most top-level children.
@@ -1425,14 +1417,15 @@ impl CodeAwareCompressor {
         // only the offending nodes revert and the rest of the saving survives.
         // Generalized beyond Python (upstream gates on Python): the per-node
         // check is grammar-agnostic.
-        if !syntax_valid && input_valid {
-            if let Some((c, st, sc)) = self.compress_with_ast(code, detected_lang, context, true) {
-                compressed = c;
-                structure = st;
-                symbol_scores = sc;
-                compressed_tokens = estimate_tokens(&compressed);
-                syntax_valid = self.verify_syntax(&compressed, detected_lang);
-            }
+        if !syntax_valid
+            && input_valid
+            && let Some((c, st, sc)) = self.compress_with_ast(code, detected_lang, context, true)
+        {
+            compressed = c;
+            structure = st;
+            symbol_scores = sc;
+            compressed_tokens = estimate_tokens(&compressed);
+            syntax_valid = self.verify_syntax(&compressed, detected_lang);
         }
 
         // The verdict feeds the breaker only for parseable input: punishing
@@ -1830,58 +1823,58 @@ fn collect_definitions<'t>(
     bare_names: &mut HashMap<String, String>,
 ) {
     let nt = node.kind();
-    if is_def(nt) {
-        if let Some(short) = get_definition_name(node, code) {
-            let qualified = if parent_name.is_empty() {
-                short.clone()
-            } else {
-                format!("{parent_name}.{short}")
-            };
-            ordered_put(definitions, qualified.clone(), node);
-            bare_names.insert(qualified.clone(), short);
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect_definitions(
-                    child,
-                    &qualified,
-                    code,
-                    is_def,
-                    decorator_node,
-                    definitions,
-                    bare_names,
-                );
-            }
-            return;
+    if is_def(nt)
+        && let Some(short) = get_definition_name(node, code)
+    {
+        let qualified = if parent_name.is_empty() {
+            short.clone()
+        } else {
+            format!("{parent_name}.{short}")
+        };
+        ordered_put(definitions, qualified.clone(), node);
+        bare_names.insert(qualified.clone(), short);
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_definitions(
+                child,
+                &qualified,
+                code,
+                is_def,
+                decorator_node,
+                definitions,
+                bare_names,
+            );
         }
+        return;
     }
-    if let Some(dn) = decorator_node {
-        if nt == dn {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if is_def(child.kind()) {
-                    if let Some(short) = get_definition_name(child, code) {
-                        let qualified = if parent_name.is_empty() {
-                            short.clone()
-                        } else {
-                            format!("{parent_name}.{short}")
-                        };
-                        ordered_put(definitions, qualified.clone(), child);
-                        bare_names.insert(qualified.clone(), short);
-                        let mut gc = child.walk();
-                        for grandchild in child.children(&mut gc) {
-                            collect_definitions(
-                                grandchild,
-                                &qualified,
-                                code,
-                                is_def,
-                                decorator_node,
-                                definitions,
-                                bare_names,
-                            );
-                        }
-                        return;
-                    }
+    if let Some(dn) = decorator_node
+        && nt == dn
+    {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if is_def(child.kind())
+                && let Some(short) = get_definition_name(child, code)
+            {
+                let qualified = if parent_name.is_empty() {
+                    short.clone()
+                } else {
+                    format!("{parent_name}.{short}")
+                };
+                ordered_put(definitions, qualified.clone(), child);
+                bare_names.insert(qualified.clone(), short);
+                let mut gc = child.walk();
+                for grandchild in child.children(&mut gc) {
+                    collect_definitions(
+                        grandchild,
+                        &qualified,
+                        code,
+                        is_def,
+                        decorator_node,
+                        definitions,
+                        bare_names,
+                    );
                 }
+                return;
             }
         }
     }
@@ -2282,10 +2275,11 @@ impl<'a> Ctx<'a> {
             .push(self.validated_candidate(node, compressed));
         captured.insert(range);
         // Capture trailing semicolon on the same line (e.g., C++ `class Foo {} ;`).
-        if let Some(next) = node.next_sibling() {
-            if next.kind() == ";" && next.start_position().row == node.end_position().row {
-                captured.insert((next.start_byte(), next.end_byte()));
-            }
+        if let Some(next) = node.next_sibling()
+            && next.kind() == ";"
+            && next.start_position().row == node.end_position().row
+        {
+            captured.insert((next.start_byte(), next.end_byte()));
         }
         true
     }
@@ -2692,10 +2686,10 @@ impl<'a> Ctx<'a> {
             // to the BODY node, so slicing at the body's start drops it and the
             // output no longer parses. Languages that put the brace on the
             // signature line (Java, Go) already have it inside `header`.
-            if let Some(brace_line) = node_lines.get(sig_end) {
-                if brace_line.trim_start().starts_with('{') {
-                    header.push(brace_line);
-                }
+            if let Some(brace_line) = node_lines.get(sig_end)
+                && brace_line.trim_start().starts_with('{')
+            {
+                header.push(brace_line);
             }
             header
         } else {
@@ -3557,7 +3551,7 @@ mod tests {
         let _guard = breaker_test_lock();
         reset_syntax_breaker();
         for raw in ["0", "false", "off", "  Off "] {
-            std::env::set_var(SYNTAX_BREAKER_ENV, raw);
+            unsafe { std::env::set_var(SYNTAX_BREAKER_ENV, raw) };
             for _ in 0..SYNTAX_BREAKER_WINDOW {
                 record_syntax_outcome("typescript", false);
             }
@@ -3567,14 +3561,14 @@ mod tests {
             );
             reset_syntax_breaker();
         }
-        std::env::remove_var(SYNTAX_BREAKER_ENV);
+        unsafe { std::env::remove_var(SYNTAX_BREAKER_ENV) };
         // Sanity: without the opt-out the same run trips.
         for _ in 0..SYNTAX_BREAKER_MIN_FAILURES {
             record_syntax_outcome("typescript", false);
         }
         assert!(syntax_breaker_open("typescript"));
         reset_syntax_breaker();
-        std::env::remove_var(SYNTAX_BREAKER_ENV);
+        unsafe { std::env::remove_var(SYNTAX_BREAKER_ENV) };
     }
 
     #[test]

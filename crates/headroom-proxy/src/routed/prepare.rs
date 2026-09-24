@@ -10,8 +10,8 @@
 use crate::proxy::AppState;
 use crate::routed::redaction::maybe_redact_outbound;
 use crate::routed::transforms::{
-    apply_bytes_stage, apply_compression_and_replay, apply_ctx_request_transforms,
-    apply_tool_schema_compaction, merge_routed_compression_report, CtxTransformReport,
+    CtxTransformReport, apply_bytes_stage, apply_compression_and_replay,
+    apply_ctx_request_transforms, apply_tool_schema_compaction, merge_routed_compression_report,
 };
 use axum::http::HeaderMap;
 use axum::response::Response;

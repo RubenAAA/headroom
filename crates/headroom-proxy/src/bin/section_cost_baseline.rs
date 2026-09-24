@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 
 use headroom_core::pricing;
-use headroom_core::tokenizer::{get_tokenizer, Tokenizer};
+use headroom_core::tokenizer::{Tokenizer, get_tokenizer};
 use serde_json::Value;
 
 fn hash_bytes(b: &[u8]) -> u64 {
@@ -224,13 +224,13 @@ fn segmentize(
         // messages, resolved via the turn-wide map built below.
         let mut local_ids: HashMap<String, String> = HashMap::new();
         for b in &blocks {
-            if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                if let (Some(id), Some(name)) = (
+            if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && let (Some(id), Some(name)) = (
                     b.get("id").and_then(|i| i.as_str()),
                     b.get("name").and_then(|n| n.as_str()),
-                ) {
-                    local_ids.insert(id.to_string(), name.to_string());
-                }
+                )
+            {
+                local_ids.insert(id.to_string(), name.to_string());
             }
         }
 
@@ -457,13 +457,13 @@ fn main() {
                     .cloned()
                     .unwrap_or_default()
                 {
-                    if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        if let (Some(id), Some(name)) = (
+                    if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                        && let (Some(id), Some(name)) = (
                             b.get("id").and_then(|i| i.as_str()),
                             b.get("name").and_then(|n| n.as_str()),
-                        ) {
-                            id_map.insert(id.to_string(), name.to_string());
-                        }
+                        )
+                    {
+                        id_map.insert(id.to_string(), name.to_string());
                     }
                 }
             }
@@ -509,14 +509,12 @@ fn main() {
                         if si < segs.len()
                             && segs[si].section == Section::ResultUnknown
                             && b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                        {
-                            if let Some(parent) = b
+                            && let Some(parent) = b
                                 .get("tool_use_id")
                                 .and_then(|i| i.as_str())
                                 .and_then(|id| id_map.get(id))
-                            {
-                                segs[si].section = result_section(parent);
-                            }
+                        {
+                            segs[si].section = result_section(parent);
                         }
                         // Count result stats + tool call stats per block.
                         if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
@@ -533,11 +531,11 @@ fn main() {
                                 st.error_blocks += 1;
                             }
                         }
-                        if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                            if let Some(name) = b.get("name").and_then(|n| n.as_str()) {
-                                tools.entry(name.to_string()).or_default();
-                                used_names.insert(name.to_string());
-                            }
+                        if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                            && let Some(name) = b.get("name").and_then(|n| n.as_str())
+                        {
+                            tools.entry(name.to_string()).or_default();
+                            used_names.insert(name.to_string());
                         }
                         si += 1;
                     }

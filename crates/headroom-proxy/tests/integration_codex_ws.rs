@@ -3,6 +3,10 @@
 //! fallback. Mirrors the load-bearing Python assertions from
 //! `tests/test_openai_codex_ws_lifecycle.py`.
 
+// Edition 2024 makes std::env::set_var and remove_var unsafe. Tests call them
+// to set up config; non-test code stays free of unsafe.
+#![allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+
 mod common;
 
 use std::net::SocketAddr;
@@ -12,9 +16,9 @@ use std::time::Duration;
 
 use common::start_proxy_with;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request as WiremockRequest, ResponseTemplate};
 
@@ -79,11 +83,10 @@ async fn spawn_mock_upstream(
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.split(',').next())
                             .map(|s| s.trim().to_string())
+                            && let Ok(v) = http::HeaderValue::from_str(&proto)
                         {
-                            if let Ok(v) = http::HeaderValue::from_str(&proto) {
-                                resp.headers_mut()
-                                    .insert(http::header::SEC_WEBSOCKET_PROTOCOL, v);
-                            }
+                            resp.headers_mut()
+                                .insert(http::header::SEC_WEBSOCKET_PROTOCOL, v);
                         }
                         for (k, v) in &codex_headers {
                             resp.headers_mut().append(
@@ -543,7 +546,7 @@ async fn upstream_connect_failure_http_fallback() {
 async fn first_frame_timeout_closes_1001() {
     // Process-global env: other codex tests send their first frame
     // immediately after connect, so a 1s bound cannot misfire on them.
-    std::env::set_var("HEADROOM_WS_FIRST_FRAME_TIMEOUT_SECONDS", "1");
+    unsafe { std::env::set_var("HEADROOM_WS_FIRST_FRAME_TIMEOUT_SECONDS", "1") };
     let upstream = spawn_mock_upstream(vec![], false, vec![]).await;
     let proxy = start_proxy_with(&format!("http://{}", upstream.addr), live_zone_config).await;
 
@@ -569,7 +572,7 @@ async fn first_frame_timeout_closes_1001() {
         }
         other => panic!("expected Close(1001), got {other:?}"),
     }
-    std::env::remove_var("HEADROOM_WS_FIRST_FRAME_TIMEOUT_SECONDS");
+    unsafe { std::env::remove_var("HEADROOM_WS_FIRST_FRAME_TIMEOUT_SECONDS") };
     proxy.shutdown().await;
 }
 
