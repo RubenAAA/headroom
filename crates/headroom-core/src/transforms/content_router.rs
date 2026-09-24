@@ -2776,6 +2776,14 @@ pub struct CacheStats {
 
 // ─── Tests ───────────────────────────────────────────────────────────────
 
+/// The default config with `edit` applied.
+#[cfg(test)]
+fn config_with(edit: impl FnOnce(&mut ContentRouterConfig)) -> ContentRouterConfig {
+    let mut config = ContentRouterConfig::default();
+    edit(&mut config);
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3698,10 +3706,7 @@ mod tests {
 
     #[test]
     fn apply_strategy_disabled_compressor() {
-        let config = ContentRouterConfig {
-            enable_smart_crusher: false,
-            ..Default::default()
-        };
+        let config = config_with(|c| c.enable_smart_crusher = false);
         let content = "[1, 2, 3]";
         let (compressed, _tokens, chain) = apply_strategy(
             content,
@@ -3720,11 +3725,10 @@ mod tests {
         // Skip Kompress to test Log fallback directly. Non-JSON content —
         // SmartCrusher passes through unchanged, then Kompress is skipped
         // (disabled), then Log is attempted.
-        let config = ContentRouterConfig {
-            enable_log_compressor: true,
-            enable_kompress: false,
-            ..Default::default()
-        };
+        let config = config_with(|c| {
+            c.enable_log_compressor = true;
+            c.enable_kompress = false;
+        });
         let content = "unique one-off error that cannot be deduplicated or compressed";
         let original_tokens = content.split_whitespace().count();
         let (compressed, tokens, chain) = apply_strategy(
@@ -3989,11 +3993,10 @@ mod tests {
     #[test]
     fn apply_strategy_code_aware_compresses_code() {
         // Don't fall back to Kompress
-        let config = ContentRouterConfig {
-            enable_code_aware: true,
-            enable_kompress: false,
-            ..Default::default()
-        };
+        let config = config_with(|c| {
+            c.enable_code_aware = true;
+            c.enable_kompress = false;
+        });
         let content = "function hello() {\n  console.log('world');\n  return 42;\n}";
         let (compressed, _tokens, chain) = apply_strategy(
             content,
@@ -4009,10 +4012,7 @@ mod tests {
 
     #[test]
     fn apply_strategy_code_aware_disabled_falls_through() {
-        let config = ContentRouterConfig {
-            enable_code_aware: false,
-            ..Default::default()
-        };
+        let config = config_with(|c| c.enable_code_aware = false);
         let content = "function hello() { return 42; }";
         let (compressed, _tokens, chain) = apply_strategy(
             content,
@@ -4042,10 +4042,7 @@ mod tests {
 
     #[test]
     fn apply_strategy_html_disabled_falls_through() {
-        let config = ContentRouterConfig {
-            enable_html_extractor: false,
-            ..Default::default()
-        };
+        let config = config_with(|c| c.enable_html_extractor = false);
         let content = "<html><body><h1>Hello</h1></body></html>";
         let (compressed, _tokens, chain) =
             apply_strategy(content, CompressionStrategy::Html, &config, "", None, 1.0);
@@ -4068,10 +4065,7 @@ mod tests {
 
     #[test]
     fn apply_strategy_tabular_disabled_falls_through() {
-        let config = ContentRouterConfig {
-            enable_kompress: false,
-            ..Default::default()
-        };
+        let config = config_with(|c| c.enable_kompress = false);
         let content = "col1,col2,col3\n1,2,3\n4,5,6";
         let (compressed, _tokens, chain) = apply_strategy(
             content,
@@ -4088,10 +4082,7 @@ mod tests {
 
     #[test]
     fn apply_strategy_text_disabled_falls_through() {
-        let config = ContentRouterConfig {
-            enable_kompress: false,
-            ..Default::default()
-        };
+        let config = config_with(|c| c.enable_kompress = false);
         let content = "just some plain text content here";
         let (compressed, _tokens, chain) =
             apply_strategy(content, CompressionStrategy::Text, &config, "", None, 1.0);
@@ -4137,10 +4128,7 @@ mod tests {
         // Source code has no byte-lossless fold; in lossless-only mode it must be
         // left verbatim (passthrough), not lossy-dropped.
         let code = "fn main() {\n    println!(\"hi\");\n}\n";
-        let config = ContentRouterConfig {
-            lossless: true,
-            ..Default::default()
-        };
+        let config = config_with(|c| c.lossless = true);
         let (out, _t, chain) =
             apply_strategy(code, CompressionStrategy::CodeAware, &config, "", None, 1.0);
         assert_eq!(out, code);
@@ -4150,10 +4138,7 @@ mod tests {
     #[test]
     fn lossless_only_mode_folds_search() {
         let block = grep_block();
-        let config = ContentRouterConfig {
-            lossless: true,
-            ..Default::default()
-        };
+        let config = config_with(|c| c.lossless = true);
         let (out, _t, chain) =
             apply_strategy(&block, CompressionStrategy::Search, &config, "", None, 1.0);
         assert_eq!(chain, vec!["lossless_search"]);
@@ -4468,10 +4453,7 @@ mod external_compressor_tests {
     #[test]
     fn no_selection_means_the_external_path_is_never_reached() {
         let registry = registry_with(StubExternal::arc("ext", &["text/plain"], Behavior::Shrink));
-        let config = ContentRouterConfig {
-            enable_kompress: false,
-            ..Default::default()
-        };
+        let config = config_with(|c| c.enable_kompress = false);
         assert!(config.active_external_compressors.is_empty());
 
         let (with_registry, _, chain) = run(SAMPLE, &config, &registry);
@@ -4804,10 +4786,7 @@ mod kompress_size_gate_tests {
     fn dense_elide_fires_on_passthrough_bundle_dump() {
         // A minified-bundle dump: no structural compressor understands it.
         // Elision must fire on the passthrough path with the strategy named.
-        let config = ContentRouterConfig {
-            enable_kompress: false,
-            ..Default::default()
-        };
+        let config = config_with(|c| c.enable_kompress = false);
         // A minified-bundle dump with prose around it: no structural
         // compressor understands the dense lines, so elision fires on the
         // passthrough path with the strategy named.
