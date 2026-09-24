@@ -8,3 +8,6 @@
 
 # chore: renormalize line endings to LF
 efd2ac1ca4d88d8f5990259c98b673c603902896
+
+# build: edition 2024 (one-time cargo fmt of every file)
+2421330e794a0bd167367243fca7ca1414a57e28

@@ -173,19 +173,25 @@ make ci-precheck   # fmt, clippy, tests; the same gate CI runs
 ```
 
 `make install-local-hooks` registers the pre-push gate (same checks,
-plus the touched-area suites and the ratchets below — no CI, no
-network). It runs `cargo fmt --check`, `cargo clippy -- -D warnings`,
+plus the touched-area suites and the ratchets below — no CI). It runs
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 `scripts/what-to-run.sh --run`, `check-drift`, `check-log-events`,
 `check-complexity`, `check-file-size`, and `check-hygiene` (rustdoc
 links, unused deps via `cargo-machete`, TOML format via `taplo` +
-`cargo sort`). The hygiene legs need
-`cargo install cargo-machete taplo-cli cargo-sort --locked`; each
-skips gracefully when its tool is absent. Bypass per-push with
-`git push --no-verify`.
+`cargo sort`), then `cargo deny check` (advisories, licenses, bans,
+sources; `make deny` runs it alone). Only the deny leg touches the
+network, to fetch the RustSec advisory database. The hygiene legs need
+`cargo install cargo-machete taplo-cli cargo-sort --locked`, and deny
+needs `cargo install cargo-deny --locked`; each leg skips gracefully
+when its tool is absent. Bypass per-push with `git push --no-verify`.
 
 `rust-toolchain.toml` pins 1.95.0 so a clippy lint from a newer stable cannot
 break CI without firing locally. Do not bump it casually. Code must pass
-`cargo fmt --check` and `cargo clippy -- -D warnings`.
+`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
+Workspace lints in the root `Cargo.toml` deny `unsafe_code` outside
+tests: a new unsafe site needs `#[allow(unsafe_code)]` and a `// SAFETY:`
+comment. `.git-blame-ignore-revs` lists the edition-2024 reformat; run
+`git config blame.ignoreRevsFile .git-blame-ignore-revs` once per clone.
 
 `target/` is garbage-collected by `make test` / `make build-proxy` /
 `make build-wheel` (at most once a day, never fails the build) once
