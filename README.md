@@ -153,7 +153,7 @@ flag has a `HEADROOM_PROXY_*` variable, so `--cache-tail-breakpoints 2` and
 
 The launcher and the restart script source `~/.headroom-flags.sh`, a bash array
 `install.sh` writes from [`contrib/headroom-flags.sh`](contrib/headroom-flags.sh).
-That is the maintainer's measured set, about 85 flags, worth reading before you
+That is the maintainer's measured set, about 100 flags, worth reading before you
 pick your own. An existing file is left alone, unless `--link` moves it aside to
 `.bak` and symlinks the checkout copy in its place.
 

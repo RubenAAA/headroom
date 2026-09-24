@@ -7,7 +7,7 @@ Two separate systems. Conflating them is the usual mistake.
 
 ### Search before you work, not just before you save
 
-**Run `memory_search` at the start of any task involving infrastructure, hosts, credentials, DB topology, provider quirks, or past debugging.** This is the rule that actually pays. A session once spent a whole review rediscovering where `raw_payloads` lives; the answer was already stored four times over, the oldest a month old. Cost: wrong numbers reported to the user, then retracted.
+**Run `memory_search` at the start of any task involving infrastructure, hosts, credentials, DB topology, provider quirks, or past debugging.** Always pass `entities: ["<this repo's name>"]` (e.g. `headroom`) — without it, memories from unrelated projects pollute the results. This is the rule that actually pays. A session once spent a whole review rediscovering where `raw_payloads` lives; the answer was already stored four times over, the oldest a month old. Cost: wrong numbers reported to the user, then retracted.
 
 Search first also prevents duplicates. If a memory on the topic exists, `memory_update` it — don't `memory_save` a fifth copy.
 

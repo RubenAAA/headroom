@@ -24,8 +24,11 @@ hint if neither works. Without it the proxy still runs.
 
 Optional but recommended for fast test loops: `cargo-nextest` (parallel
 runner; what CI shards run) and `sccache` (compiler cache, opt in with
-`export RUSTC_WRAPPER=sccache`). `install.sh` offers both; without them
-the Makefile falls back to plain `cargo test`.
+`export RUSTC_WRAPPER=sccache`). On Linux, `mold` (fast linker for the
+80+ integration binaries; `install.sh` downloads a prebuilt copy, opt in
+with `PATH="$HOME/.local/share/mold/bin:$PATH"` plus
+`RUSTFLAGS="-C link-arg=-fuse-ld=mold"`). `install.sh` offers all three;
+without them the Makefile falls back to plain `cargo test`.
 
 Optional for the pre-push hygiene gate: `cargo-machete` (unused-dep
 check), `taplo-cli` (TOML formatting), `cargo-sort` (dep ordering).
@@ -98,7 +101,7 @@ file is `contrib/headroom-flags.sh` in the checkout, so edit either. A running
 proxy is reused as it is, and flags on a later command line are ignored, so a
 change with no restart means you are still measuring the old setting.
 
-All 131 options (133 with `-h`/`-V`): `headroom-proxy --help`, or [`docs/flags.md`](docs/flags.md),
+All 138 options (140 with `-h`/`-V`): `headroom-proxy --help`, or [`docs/flags.md`](docs/flags.md),
 generated from that output. Regenerate it when you add a flag.
 
 ## Layout for editing
