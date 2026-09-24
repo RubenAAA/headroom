@@ -84,7 +84,10 @@ or switched into service. The follow-up below was run after a cooldown.
   assigned to lane 0, confirming the proxy is using the Rust pool. The user
   authorized truncating the prior active stream, so the restart used
   `--force`. `cache-health` had no completed samples yet; use the next finished
-  model turn to assess response timing and counters.
+  model turn to assess cache counters. The request later received HTTP 200
+  response headers from `opencode.ai` on attempt 1 after 13.59 seconds; the
+  stream was still active at the last check. This is one observation, not a
+  before/after latency comparison.
 
 Live behavior approval:
 
