@@ -233,7 +233,7 @@ fn is_anchor_turn(body: &Value) -> bool {
         .get("messages")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    (count / 2) % ANCHOR_EVERY_TURNS == 0
+    (count / 2).is_multiple_of(ANCHOR_EVERY_TURNS)
 }
 
 /// Pin `cache_control.ttl` to `1h` on every marker in `body`.

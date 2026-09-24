@@ -236,7 +236,7 @@ impl ModelCooldowns {
         };
         let log = entry
             .last_logged
-            .map_or(true, |at| now.duration_since(at) >= SKIP_LOG_INTERVAL);
+            .is_none_or(|at| now.duration_since(at) >= SKIP_LOG_INTERVAL);
         if log {
             entry.last_logged = Some(now);
         }

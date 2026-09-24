@@ -374,7 +374,7 @@ pub fn dedup_blocks_with(
                         // Folded span is NOT verbatim in this block's output:
                         // mark None so it can't seed a later contiguous match,
                         // and don't index it (keep-earliest).
-                        verbatim.extend(std::iter::repeat(None).take(mlen));
+                        verbatim.extend(std::iter::repeat_n(None, mlen));
                         stats.spans_folded += 1;
                         stats.lines_removed += mlen;
                         i += mlen;

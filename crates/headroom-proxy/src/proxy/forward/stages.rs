@@ -408,7 +408,7 @@ pub(crate) fn run_ttl_pin(
     let pin_1h = state
         .usage_observer
         .client_ttl_for(request_id)
-        .map_or(true, |shape| {
+        .is_none_or(|shape| {
             cache_stabilization::cache_ttl::pin_1h_applies(
                 shape,
                 state.config.respect_client_5m_ttl,

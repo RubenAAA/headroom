@@ -350,7 +350,7 @@ pub(super) fn is_unsigned_reasoning(block: &serde_json::Value) -> bool {
     let unsigned = block
         .get("signature")
         .and_then(|s| s.as_str())
-        .map_or(true, |s| s.is_empty());
+        .is_none_or(|s| s.is_empty());
     is_reasoning && unsigned && block.get("data").is_none()
 }
 

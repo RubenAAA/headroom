@@ -57,7 +57,7 @@ pub fn thinking_drop_is_free(
     rebuild_boundary: bool,
     forwarded_agreement_len: Option<usize>,
 ) -> bool {
-    rebuild_boundary || forwarded_agreement_len.map_or(true, |n| n <= 1)
+    rebuild_boundary || forwarded_agreement_len.is_none_or(|n| n <= 1)
 }
 
 /// Remove `thinking` and `redacted_thinking` blocks from every assistant

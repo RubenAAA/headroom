@@ -1122,7 +1122,7 @@ fn try_detect_delimited(lines: &[&str]) -> Option<DetectionResult> {
             continue;
         }
         let confidence = (0.5 + consistency * 0.3 + (ncols.min(5) as f64) * 0.03).min(0.95);
-        if best.as_ref().map_or(true, |b| confidence > b.confidence) {
+        if best.as_ref().is_none_or(|b| confidence > b.confidence) {
             let mut meta = serde_json::Map::new();
             meta.insert("format".to_string(), Value::String("csv".to_string()));
             meta.insert("delimiter".to_string(), Value::String(delim.to_string()));

@@ -227,7 +227,7 @@ fn parse_buffered_turn(body_text: &str, is_responses: bool) -> Result<(Value, i6
                     .get("output")
                     .and_then(|o| o.as_array())
                     // `is_none_or` needs Rust 1.82; MSRV is 1.80.
-                    .map_or(true, |o| o.is_empty());
+                    .is_none_or(|o| o.is_empty());
                 if empty
                     && crate::proxy::continuation_stream_terminal(
                         body_text.as_bytes(),
