@@ -67,8 +67,8 @@ if command -v cargo-nextest >/dev/null 2>&1; then
     INT_CACHE="cargo nextest run -p headroom-proxy --profile ci --test cache --test capture --test ccr"
     INT_ROUTED="cargo nextest run -p headroom-proxy --profile ci --test routing --test ccr --test integration_local_model --test sse"
     UNIT_PROXY_CONFIG="cargo nextest run -p headroom-proxy --profile ci -E 'kind(lib) and test(config)'"
-    UNIT_CORE_COST="cargo nextest run -p headroom-core --profile ci -E 'kind(lib) and test(cost_tracker or pricing or savings)'"
-    UNIT_CORE_XFORM="cargo nextest run -p headroom-core --profile ci -E 'kind(lib) and test(transforms or compression or crusher)'"
+    UNIT_CORE_COST="cargo nextest run -p headroom-core --profile ci -E 'kind(lib) and (test(cost_tracker) or test(pricing) or test(savings))'"
+    UNIT_CORE_XFORM="cargo nextest run -p headroom-core --profile ci -E 'kind(lib) and (test(transforms) or test(compression) or test(crusher))'"
 else
     UNIT_PROXY_CACHE="cargo test -p headroom-proxy --lib cache_stabilization"
     INT_CACHE="cargo test -p headroom-proxy --test cache --test capture --test ccr"
