@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 description = "Configurable local provider simulators for Headroom validation pipelines."
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "headroom-simulators"
 path = "src/main.rs"

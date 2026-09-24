@@ -26,6 +26,19 @@ license = "Apache-2.0"
 repository = "https://github.com/RubenAAA/headroom"
 authors = ["Headroom Maintainers"]
 
+[workspace.lints.rust]
+# The five unsafe sites (libc calls in nord_socks_egress, one sqlite3_config)
+# carry #[allow(unsafe_code)] and a SAFETY comment; anything new must too.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+# A std MutexGuard held across .await can deadlock the runtime.
+await_holding_lock = "deny"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` makes `serde_json::Value::Object` use IndexMap so JSON

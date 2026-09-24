@@ -179,6 +179,7 @@ fn base_port() -> Result<u16, String> {
     Ok(port)
 }
 
+#[allow(unsafe_code)]
 fn ensure_state_dir() -> Result<PathBuf, String> {
     let path = state_dir();
     fs::create_dir_all(&path).map_err(|_| "could not create private relay state directory")?;
@@ -223,6 +224,7 @@ fn startup_lane_count(verified_count: usize) -> Result<usize, String> {
     })
 }
 
+#[allow(unsafe_code)]
 fn load_credentials() -> Result<Credentials, String> {
     let path = credentials_path();
     let metadata = fs::metadata(&path).map_err(|_| "could not read Nord SOCKS credentials file")?;
@@ -1252,6 +1254,7 @@ fn status_base_port(status: &Value, configured: u16) -> u16 {
         })
 }
 
+#[allow(unsafe_code)]
 fn ensure_running() -> Result<Value, String> {
     if let Ok(status) = control_request(&json!({"op": "status"}), Duration::from_secs(3)) {
         if status_is_supported(&status) {
@@ -1404,6 +1407,7 @@ fn install_signal_handlers(running: Arc<AtomicBool>) {
         });
 }
 
+#[allow(unsafe_code)]
 fn process_is_alive(pid: i32) -> bool {
     // SAFETY: kill(pid, 0) only tests process existence and has no pointer args.
     let result = unsafe { libc::kill(pid, 0) };

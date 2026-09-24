@@ -19,6 +19,9 @@ static TUNED: Once = Once::new();
 /// an older or differently-built SQLite that declines simply keeps the
 /// counters, which costs speed and nothing else.
 pub fn apply() {
+    // SAFETY: sqlite3_config takes no pointers for MEMSTATUS, and the Once
+    // runs it before any connection exists, which is all SQLite requires.
+    #[allow(unsafe_code)]
     TUNED.call_once(|| unsafe {
         rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0);
     });
