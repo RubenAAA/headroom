@@ -39,6 +39,7 @@ pub mod openai_chat;
 pub mod openai_finisher;
 pub mod openai_responses;
 pub mod outbound;
+pub(crate) mod placeholder_join;
 pub mod stream_finisher;
 pub mod stream_retry;
 

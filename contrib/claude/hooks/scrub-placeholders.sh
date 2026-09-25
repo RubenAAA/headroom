@@ -11,7 +11,7 @@
 # wedged on ungreppable ids).
 # $HOME is exempt: the tools expand it to the real home dir on write.
 #
-# PreToolUse on Write|Edit|MultiEdit and Bash. Reads the hook JSON from stdin,
+# PreToolUse on Write|Edit|MultiEdit, Bash and Skill. Reads the hook JSON from stdin,
 # scans the whole tool input for the token shape, exits 2 to block with the
 # offending token named. Never fails closed: any internal error exits 0 so a
 # broken guard never stops work.
@@ -48,6 +48,8 @@ if [ -n "$HIT" ]; then
   HINT="Rewrite with the real path instead of pasting tool output verbatim."
   if [ "$TOOL_NAME" = "Bash" ]; then
     HINT="That token is a display mask, never a value to grep for — re-issue the command with the real id or path. Searching logs for one specific token on purpose: set HEADROOM_SCRUB_BASH=0 in the session environment to skip this check (writes stay guarded)."
+  elif [ "$TOOL_NAME" = "Skill" ]; then
+    HINT="No skill has that name — call it by the name in the skill list."
   fi
   echo "BLOCKED: content contains redaction placeholder $HIT. $HINT" >&2
   exit 2

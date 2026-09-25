@@ -347,7 +347,7 @@ fn routed_sidecar_json_response(
     // Same restore as the stream arm: placeholders Zen echoed go back to
     // originals before the reply reaches the spinner.
     if let Some(table) = redact_table {
-        let (restored, _misses) = table.restore_bytes(&body_bytes);
+        let (restored, _misses) = table.restore_json_bytes(&body_bytes);
         body_bytes = restored;
     }
     Some(

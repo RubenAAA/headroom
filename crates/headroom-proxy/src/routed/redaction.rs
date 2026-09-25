@@ -47,7 +47,7 @@ pub(crate) fn restore_buffered(
     let Some(table) = crate::redact::restore_table(store, &ctx.session_key) else {
         return body;
     };
-    let (out, misses) = table.restore_bytes(&body);
+    let (out, misses) = table.restore_json_bytes(&body);
     if misses > 0 {
         tracing::warn!(
             event = "routed_redact_restore_miss",

@@ -79,9 +79,9 @@ const GLOBAL_RESTORE_CAPACITY: usize = 32_768;
 const MAX_TOKEN_HEX: usize = 2048;
 /// The longest a whole placeholder can be: prefix, kind, the hex body, and the
 /// closing `__`. The streaming restore holds back this much at a chunk edge.
-const MAX_TOKEN_LEN: usize = PREFIX.len() + 6 + 1 + MAX_TOKEN_HEX + 2;
+pub(crate) const MAX_TOKEN_LEN: usize = PREFIX.len() + 6 + 1 + MAX_TOKEN_HEX + 2;
 
-const PREFIX: &str = "__HR_";
+pub(crate) const PREFIX: &str = "__HR_";
 const PATH_KIND: &str = "PATH";
 const SECRET_KIND: &str = "SECRET";
 const EMAIL_KIND: &str = "EMAIL";
@@ -111,6 +111,11 @@ enum PathHit {
     /// Home-rooted: replace the first `prefix` bytes with the home token and
     /// leave the remainder in the clear.
     Home { total: usize, prefix: usize },
+    /// `~/…` and `$HOME/…`: nothing in either spelling names you, so the
+    /// span passes as written. Folding them into the home token restored
+    /// them as the absolute path, turning a portable `$HOME` in a script the
+    /// model wrote into a hard-coded `/home/<you>`.
+    Clear(usize),
 }
 
 /// Object keys whose string values are never redacted: ids must keep matching
@@ -135,6 +140,8 @@ const CLEAR_PREFIXES: &[&str] = &[
 const NONCE_LEN: usize = 12;
 /// Nonce + Poly1305 tag: the fixed cost of a self-inverting token.
 const TOKEN_OVERHEAD: usize = NONCE_LEN + 16;
+/// The most value one token can carry and still parse on the way back.
+const MAX_VALUE_BYTES: usize = MAX_TOKEN_HEX / 2 - TOKEN_OVERHEAD;
 
 /// Where the restore key lives. `HEADROOM_REDACT_KEY_FILE` overrides it, which
 /// is what the tests use so a run never touches the real one.
@@ -633,6 +640,10 @@ impl<'a> BodyRedactor<'a> {
                 i += len;
             } else if let Some(hit) = self.match_path(bytes, i).filter(|_| self.paths) {
                 match hit {
+                    PathHit::Clear(len) => {
+                        out.push_str(&text[i..i + len]);
+                        i += len;
+                    }
                     PathHit::Opaque(len) => {
                         let original = &text[i..i + len];
                         let token = self.mint(PATH_KIND, original);
@@ -663,7 +674,25 @@ impl<'a> BodyRedactor<'a> {
         (out, count)
     }
 
+    /// A token carries its value's ciphertext, and restore reads at most
+    /// `MAX_TOKEN_HEX` of it, so a longer value goes out as several tokens
+    /// back to back. One token for the lot was unrestorable: a PEM key or a
+    /// quoted base64 signature past ~1 KB reached the client as the token.
     fn mint(&mut self, kind: &'static str, original: &str) -> String {
+        let mut out = String::new();
+        let mut rest = original;
+        while !rest.is_empty() {
+            let mut cut = rest.len().min(MAX_VALUE_BYTES);
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.push_str(&self.mint_one(kind, &rest[..cut]));
+            rest = &rest[cut..];
+        }
+        out
+    }
+
+    fn mint_one(&mut self, kind: &'static str, original: &str) -> String {
         let mut token = String::new();
         let session = self.session_key.clone();
         let cipher = Arc::clone(&self.store.cipher);
@@ -699,7 +728,12 @@ impl<'a> BodyRedactor<'a> {
         if let Some(found) = match_pem_block(rest) {
             return Some(found);
         }
-        if let Some(found) = match_known_secret_prefix(rest) {
+        // A vendor prefix only counts at the start of a word: `sk-` inside
+        // `task-orchestrator` is a name, and redacting it handed the model a
+        // `ta<token>` skill name it then called verbatim.
+        if starts_word(bytes, i)
+            && let Some(found) = match_known_secret_prefix(rest)
+        {
             return Some(found);
         }
         if let Some(found) = match_named_credential(rest) {
@@ -729,10 +763,10 @@ impl<'a> BodyRedactor<'a> {
     /// anything else sensitive is [`PathHit::Opaque`].
     fn match_path(&self, bytes: &[u8], i: usize) -> Option<PathHit> {
         let rest = &bytes[i..];
-        if let Some(hit) = match_home_var_path(rest, self.home.is_some()) {
+        if let Some(hit) = match_home_var_path(rest) {
             return Some(hit);
         }
-        if let Some(hit) = match_tilde_path(rest, self.home.is_some()) {
+        if let Some(hit) = match_tilde_path(rest) {
             return Some(hit);
         }
         if let Some(hit) = match_explicit_home_path(rest, self.home.as_deref()) {
@@ -861,6 +895,15 @@ fn walk_strings(body: &mut Value, f: &mut impl FnMut(&mut String)) {
     }
 }
 
+/// How a restored value is written back.
+#[derive(Clone, Copy)]
+pub(crate) enum Escape {
+    /// Verbatim: decoded text, or a body that is not JSON.
+    Raw,
+    /// As the inside of a JSON string literal.
+    Json,
+}
+
 /// Snapshot of one session's map for response paths: no locking mid-stream.
 ///
 /// The snapshot answers every hit without a lock. A token the session never
@@ -870,6 +913,8 @@ pub struct RestoreTable {
     forward: HashMap<String, String>,
     max_len: usize,
     global: RedactStore,
+    /// Whether an unopenable token becomes a `[redacted:<kind>]` notice.
+    label_misses: bool,
 }
 
 /// Copy the session's map out.
@@ -895,6 +940,7 @@ pub fn restore_table(store: &RedactStore, session_key: &str) -> Option<RestoreTa
         forward,
         max_len,
         global: store.clone(),
+        label_misses: true,
     })
 }
 
@@ -907,9 +953,29 @@ impl RestoreTable {
         !self.forward.is_empty()
     }
 
-    /// Restore every placeholder in `bytes`. Returns the bytes and the count
-    /// of `__HR_` shapes that matched nothing — those stay as-is.
+    /// Restore every placeholder in `bytes`, writing values verbatim. Returns
+    /// the bytes and the count of `__HR_` shapes that matched nothing — those
+    /// become redaction notices.
     pub fn restore_bytes(&self, bytes: &[u8]) -> (Vec<u8>, usize) {
+        self.restore_bytes_as(bytes, Escape::Raw)
+    }
+
+    /// Restore a serialized JSON document. Every token in one sits inside a
+    /// string literal, so each value goes in JSON-escaped: a raw `"` or `\`
+    /// in a secret or path would otherwise end the string early and break
+    /// the document the client parses.
+    pub fn restore_json_bytes(&self, bytes: &[u8]) -> (Vec<u8>, usize) {
+        self.restore_bytes_as(bytes, Escape::Json)
+    }
+
+    pub(crate) fn restore_bytes_as(&self, bytes: &[u8], escape: Escape) -> (Vec<u8>, usize) {
+        let push = |out: &mut Vec<u8>, value: &str| match escape {
+            Escape::Raw => out.extend_from_slice(value.as_bytes()),
+            Escape::Json => {
+                let quoted = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
+                out.extend_from_slice(&quoted.as_bytes()[1..quoted.len() - 1]);
+            }
+        };
         let mut out = Vec::with_capacity(bytes.len());
         let mut misses = 0;
         let mut i = 0;
@@ -918,20 +984,19 @@ impl RestoreTable {
                 if let Some(original) = value_of(&self.global.cipher, token) {
                     // The token carries its own value. No map, no session, no
                     // process lifetime: this is the path that cannot miss.
-                    out.extend_from_slice(original.as_bytes());
+                    push(&mut out, &original);
                 } else if let Some(original) = self.forward.get(token) {
-                    out.extend_from_slice(original.as_bytes());
+                    push(&mut out, original);
                 } else if let Some(original) = self.global.recall(token) {
-                    out.extend_from_slice(original.as_bytes());
+                    push(&mut out, &original);
                 } else if token == HOME_TOKEN {
                     // Home is whatever this machine's home is — knowable
                     // without any memory of having minted it.
                     match std::env::var("HOME") {
-                        Ok(home) if home.starts_with('/') => out.extend_from_slice(home.as_bytes()),
+                        Ok(home) if home.starts_with('/') => push(&mut out, &home),
                         _ => {
                             misses += 1;
-                            crate::observability::redact_metrics::observe_restore_miss();
-                            out.extend_from_slice(redacted_label(token).as_bytes());
+                            self.miss(&mut out, token);
                         }
                     }
                 } else {
@@ -953,8 +1018,7 @@ impl RestoreTable {
                     // and the miss counter plus `redact_restore_miss` keep
                     // operator visibility.
                     misses += 1;
-                    crate::observability::redact_metrics::observe_restore_miss();
-                    out.extend_from_slice(redacted_label(token).as_bytes());
+                    self.miss(&mut out, token);
                 }
                 i += len;
             } else {
@@ -968,6 +1032,18 @@ impl RestoreTable {
     fn overlap(&self) -> usize {
         self.max_len.saturating_sub(1).min(MAX_OVERLAP)
     }
+
+    /// A token nothing can open. Client-bound text gets a notice (see the
+    /// miss arm above); a body going back out keeps the token, because the
+    /// fallback owes its upstream exactly what the client sent.
+    fn miss(&self, out: &mut Vec<u8>, token: &str) {
+        if self.label_misses {
+            crate::observability::redact_metrics::observe_restore_miss();
+            out.extend_from_slice(redacted_label(token).as_bytes());
+        } else {
+            out.extend_from_slice(token.as_bytes());
+        }
+    }
 }
 
 fn restore_str(store: &RedactStore, forward: &HashMap<String, String>, s: &str) -> (String, usize) {
@@ -975,6 +1051,7 @@ fn restore_str(store: &RedactStore, forward: &HashMap<String, String>, s: &str) 
         max_len: 0,
         forward: forward.clone(),
         global: store.clone(),
+        label_misses: false,
     };
     let (bytes, misses) = table.restore_bytes(s.as_bytes());
     (String::from_utf8_lossy(&bytes).into_owned(), misses)
@@ -1042,8 +1119,10 @@ fn parse_token(bytes: &[u8], i: usize) -> Option<(&str, usize)> {
 
 /// A placeholder-restoring SSE adapter. A token may straddle two chunks, so
 /// the stream holds back an overlap of `longest-token − 1` bytes and only
-/// emits what no future chunk can still complete. Built on `poll_fn` so the
-/// wrapped stream needs no `Unpin`.
+/// emits what no future chunk can still complete. A token the model streamed
+/// across several delta events is first rejoined into one
+/// (`sse::placeholder_join`). Built on `poll_fn` so the wrapped stream needs
+/// no `Unpin`.
 pub fn restore_stream<S, E>(
     inner: S,
     table: RestoreTable,
@@ -1055,6 +1134,7 @@ where
     let overlap = table.overlap();
     let mut inner = Box::pin(inner);
     let mut pending: Vec<u8> = Vec::new();
+    let mut join = crate::sse::placeholder_join::PlaceholderJoin::default();
     let mut done = false;
     futures_util::stream::poll_fn(move |cx| {
         // The inner stream must never be polled after it ended: downstream
@@ -1069,14 +1149,25 @@ where
         }
         match inner.as_mut().poll_next(cx) {
             std::task::Poll::Ready(Some(Ok(chunk))) => {
-                pending.extend_from_slice(&chunk);
-                // Never emit a token prefix: a token starting at or before
-                // the cut but extending past it must stay in pending whole.
-                // The search runs a needle-length past the cut so a start
-                // straddling it is still found, then the cut pulls back to
-                // the last start found.
-                let emit_until = hold_from(&pending, overlap).unwrap_or(pending.len());
-                let (out, misses) = table.restore_bytes(&pending[..emit_until]);
+                let mut misses = 0;
+                let joined = join.push(&chunk, &table, &mut misses);
+                let out = match join.byte_escape() {
+                    // SSE: whole events, restored already.
+                    None => joined,
+                    Some(escape) => {
+                        pending.extend_from_slice(&joined);
+                        // Never emit a token prefix: a token starting at or
+                        // before the cut but extending past it must stay in
+                        // pending whole. The search runs a needle-length past
+                        // the cut so a start straddling it is still found,
+                        // then the cut pulls back to the last start found.
+                        let emit_until = hold_from(&pending, overlap).unwrap_or(pending.len());
+                        let (out, m) = table.restore_bytes_as(&pending[..emit_until], escape);
+                        pending.drain(..emit_until);
+                        misses += m;
+                        out
+                    }
+                };
                 if misses > 0 {
                     tracing::warn!(
                         event = "redact_restore_miss",
@@ -1085,7 +1176,6 @@ where
                         "placeholders no session could restore; emitted as redacted notices"
                     );
                 }
-                pending.drain(..emit_until);
                 std::task::Poll::Ready(Some(Ok(Bytes::from(out))))
             }
             std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
@@ -1094,11 +1184,19 @@ where
                 // the consumer for one poll, and the next poll must not
                 // touch the terminated inner (see the guard above).
                 done = true;
-                if pending.is_empty() {
+                let mut misses = 0;
+                let out = match join.byte_escape() {
+                    None => join.finish(&table, &mut misses),
+                    Some(escape) => {
+                        let (out, m) = table.restore_bytes_as(&pending, escape);
+                        pending.clear();
+                        misses += m;
+                        out
+                    }
+                };
+                if out.is_empty() {
                     return std::task::Poll::Ready(None);
                 }
-                let tail = std::mem::take(&mut pending);
-                let (out, misses) = table.restore_bytes(&tail);
                 if misses > 0 {
                     tracing::warn!(
                         event = "redact_restore_miss",
@@ -1248,6 +1346,12 @@ impl RedactGate {
 
 // --- scanners (no regex; see volatile_detector for why) ---
 
+/// Nothing word-like before `i`. `=`, `:`, quotes and spaces all qualify, so
+/// `KEY=sk-…` and `"sk-…"` still match.
+fn starts_word(bytes: &[u8], i: usize) -> bool {
+    i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || matches!(bytes[i - 1], b'_' | b'-'))
+}
+
 fn is_token_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b'+' | b'=')
 }
@@ -1354,8 +1458,19 @@ fn starts_word_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
 fn match_named_value(rest: &[u8], name_len: usize, bare_value: bool) -> Option<(usize, usize)> {
     let mut j = name_len;
     let mut quote = None;
+    let mut key_quoted = false;
     if !bare_value {
+        // `input_tokens`, `secrets:`: a plural names a count or a list.
+        if rest.get(name_len) == Some(&b's') {
+            return None;
+        }
         while j < rest.len() && is_ident_char(rest[j]) {
+            j += 1;
+        }
+        // A JSON or YAML key closes its quote before the separator:
+        // `"api_key": "…"` went out in the clear without this.
+        if j < rest.len() && (rest[j] == b'"' || rest[j] == b'\'') {
+            key_quoted = true;
             j += 1;
         }
         while j < rest.len() && (rest[j] == b' ' || rest[j] == b'\t') {
@@ -1372,6 +1487,10 @@ fn match_named_value(rest: &[u8], name_len: usize, bare_value: bool) -> Option<(
         if j < rest.len() && (rest[j] == b'\'' || rest[j] == b'"') {
             quote = Some(rest[j]);
             j += 1;
+        } else if key_quoted {
+            // A quoted key with a bare value is a JSON number or literal
+            // (`"input_tokens": 12345678`), never a credential.
+            return None;
         }
     }
     let start = j;
@@ -1380,6 +1499,10 @@ fn match_named_value(rest: &[u8], name_len: usize, bare_value: bool) -> Option<(
     // opacity (and single-pass restore would stop at the inner token).
     // Leave it for `placeholder_end` to consume whole downstream.
     if parse_token(rest, start).is_some() {
+        return None;
+    }
+    // `${GITLAB_TOKEN}`, `$(grep …)`: a shell reference, not the value.
+    if rest.get(start) == Some(&b'$') {
         return None;
     }
     if let Some(q) = quote {
@@ -1391,6 +1514,9 @@ fn match_named_value(rest: &[u8], name_len: usize, bare_value: bool) -> Option<(
         while j < rest.len() && is_token_char(rest[j]) {
             j += 1;
         }
+        if names_code(&rest[start..j], rest.get(j).copied(), &rest[..name_len]) {
+            return None;
+        }
         j = extend_over_groups(rest, start, j);
     }
     if j - start >= 8 {
@@ -1398,6 +1524,29 @@ fn match_named_value(rest: &[u8], name_len: usize, bare_value: bool) -> Option<(
     } else {
         None
     }
+}
+
+/// An unquoted value that is code, not a literal: a call or type
+/// (`Optional[str]`, `pathlib.Path(`) or an attribute reference
+/// (`usage.input_tokens`). Source files are full of `password = …` and
+/// `token: …` lines whose right side names a variable — often the same one
+/// (`csrf_token=csrf_token`).
+fn names_code(value: &[u8], next: Option<u8>, name: &[u8]) -> bool {
+    if matches!(next, Some(b'(' | b'[' | b'{')) {
+        return true;
+    }
+    let name = name.trim_ascii();
+    if !name.is_empty()
+        && value
+            .windows(name.len())
+            .any(|w| w.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    value.contains(&b'.')
+        && value
+            .iter()
+            .all(|&b| b.is_ascii_alphabetic() || b == b'_' || b == b'.')
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1572,8 +1721,14 @@ fn match_high_entropy_run(bytes: &[u8], i: usize) -> Option<(usize, usize, &'sta
         j += 1;
     }
     let len = j - i;
+    // Whole runs only: a suffix of `pkg.SomeIdentifier` is no more a key
+    // than the run it came from.
+    if i > 0 && is_token_char(bytes[i - 1]) {
+        return None;
+    }
     if len >= 28
         && looks_secret(&bytes[i..j])
+        && looks_random(&bytes[i..j])
         && !looks_uuid(&bytes[i..j])
         && !has_extension(&bytes[i..j])
     {
@@ -1646,20 +1801,14 @@ fn match_url_password(rest: &[u8]) -> Option<(usize, usize)> {
 
 /// `$HOME/...` and `${HOME}/...`.
 /// Extracted from `BodyRedactor::match_path` without behavior change.
-fn match_home_var_path(rest: &[u8], home_known: bool) -> Option<PathHit> {
+fn match_home_var_path(rest: &[u8]) -> Option<PathHit> {
     for prefix in [b"$HOME".as_slice(), b"${HOME}".as_slice()] {
         if rest.starts_with(prefix) {
             let mut len = prefix.len();
             while len < rest.len() && is_path_char(rest[len]) {
                 len += 1;
             }
-            if home_known {
-                return Some(PathHit::Home {
-                    total: len,
-                    prefix: prefix.len(),
-                });
-            }
-            return Some(PathHit::Opaque(len));
+            return Some(PathHit::Clear(len));
         }
     }
     None
@@ -1667,7 +1816,7 @@ fn match_home_var_path(rest: &[u8], home_known: bool) -> Option<PathHit> {
 
 /// `~/...`.
 /// Extracted from `BodyRedactor::match_path` without behavior change.
-fn match_tilde_path(rest: &[u8], home_known: bool) -> Option<PathHit> {
+fn match_tilde_path(rest: &[u8]) -> Option<PathHit> {
     if !rest.starts_with(b"~/") {
         return None;
     }
@@ -1675,13 +1824,7 @@ fn match_tilde_path(rest: &[u8], home_known: bool) -> Option<PathHit> {
     while len < rest.len() && is_path_char(rest[len]) {
         len += 1;
     }
-    if home_known {
-        return Some(PathHit::Home {
-            total: len,
-            prefix: 1,
-        });
-    }
-    Some(PathHit::Opaque(len))
+    Some(PathHit::Clear(len))
 }
 
 /// Explicit home dir, `/home/<user>/…`, `/root/…`, `/Users/<name>/…`.
@@ -1817,7 +1960,7 @@ fn match_relative_path(bytes: &[u8], i: usize, rest: &[u8]) -> Option<PathHit> {
 /// `window` bounds how far back a candidate is honoured. A bare `__HR_` in
 /// prose never terminates, and without the bound it would hold the stream to
 /// the end; past `window` bytes it is prose, and prose can be emitted.
-fn hold_from(pending: &[u8], window: usize) -> Option<usize> {
+pub(crate) fn hold_from(pending: &[u8], window: usize) -> Option<usize> {
     let needle = PREFIX.as_bytes();
 
     // Where the last complete token ends. Nothing before this can be a hold
@@ -1875,6 +2018,33 @@ fn looks_secret(run: &[u8]) -> bool {
         }
     }
     [upper, lower, digit, symbol].iter().filter(|&&c| c).count() >= 3
+}
+
+/// Neighbouring letters and digits change class (lower, upper, digit) at
+/// least 3 times in 10. Random base62/base64 does so about 6 in 10; camelCase
+/// identifiers, paths, module names and version strings stay under 2, which
+/// is how the class count alone came to redact `pkg.NormalizeTeamName`, a
+/// kernel version and most of a Go codebase — 49k spans in 400 captured
+/// bodies, nearly all of them code.
+fn looks_random(run: &[u8]) -> bool {
+    let class = |b: u8| match b {
+        b'a'..=b'z' => Some(0u8),
+        b'A'..=b'Z' => Some(1),
+        b'0'..=b'9' => Some(2),
+        _ => None,
+    };
+    let (mut pairs, mut switches) = (0usize, 0usize);
+    for w in run.windows(2) {
+        if let (Some(a), Some(b)) = (class(w[0]), class(w[1])) {
+            pairs += 1;
+            switches += usize::from(a != b);
+        }
+    }
+    // Short camel humps (`TestFoo_HandlesBar_WhenBaz`) reach 3 in 10 too,
+    // but carry no digits; a random key of this length almost always has
+    // two, and one without them switches far more often than prose.
+    let digits = run.iter().filter(|b| b.is_ascii_digit()).count();
+    pairs > 0 && switches * 10 >= pairs * 3 && (digits >= 2 || switches * 2 >= pairs)
 }
 
 fn looks_uuid(run: &[u8]) -> bool {
@@ -2273,6 +2443,7 @@ mod tests {
             forward: HashMap::new(),
             max_len: MAX_TOKEN_LEN,
             global: s,
+            label_misses: true,
         };
         let (out, misses) = table.restore_bytes(b"cat __HR_HOME__/notes.md");
         assert_eq!(misses, 0);
@@ -2410,6 +2581,45 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "data: {\"t\": \"/home/testuser/a/very/long/path/file.py\"}\n"
+        );
+    }
+
+    /// A routed model echoes a token a few characters per delta, so SSE
+    /// framing sits between its halves. The Codex translator forwards each
+    /// fragment as its own `input_json_delta`; before the join stage the
+    /// token reached the client as a Skill name.
+    #[tokio::test]
+    async fn stream_restore_rejoins_a_token_split_across_deltas() {
+        use crate::sse::outbound::{content_block_stop, input_json_delta};
+        use futures_util::stream;
+        let s = store();
+        let mut body =
+            json!({"messages": [{"role": "user", "content": "key sk-abcdefghij1234567890"}]});
+        redact_body(&s, "sess", &mut body);
+        let text = body["messages"][0]["content"].as_str().unwrap();
+        let token = &text[text.find(PREFIX).unwrap()..];
+        let table = restore_table(&s, "sess").unwrap();
+        let mut frames = vec![input_json_delta(1, "{\"skill\":\"")];
+        frames.extend(
+            token
+                .as_bytes()
+                .chunks(7)
+                .map(|c| input_json_delta(1, std::str::from_utf8(c).unwrap())),
+        );
+        frames.push(input_json_delta(1, "\"}"));
+        frames.push(content_block_stop(1));
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            frames.into_iter().map(|f| Ok(Bytes::from(f))).collect();
+        let mut adapted = restore_stream(stream::iter(chunks), table);
+        let mut out = Vec::new();
+        while let Some(chunk) = adapted.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains(PREFIX), "token left in stream: {out}");
+        assert!(
+            out.contains("sk-abcdefghij1234567890"),
+            "not restored: {out}"
         );
     }
 
@@ -2578,6 +2788,34 @@ mod tests {
             text, "see quarterly-report-final-2024.pdf attached",
             "got: {text}"
         );
+    }
+
+    /// A vendor prefix inside a word is part of a name, not a key: the Skill
+    /// list carried `task-…` names, and redacting from `sk-` on sent the
+    /// model a skill name that did not exist.
+    #[test]
+    fn secret_prefixes_count_only_at_word_start() {
+        for name in [
+            "task-orchestrator-review",
+            "risk-assessment-template",
+            "disk-usage-inspector",
+            "XAKIAIOSFODNN7EXAMPLE",
+        ] {
+            let (text, _) = redact_one(name);
+            assert_eq!(text, name, "mid-word prefix redacted in {name}");
+        }
+        for content in [
+            "sk-abcdefghij1234567890",
+            "OPENAI_API_KEY=sk-abcdefghij1234567890",
+            "\"token\": \"ghp_abcdefghij1234567890\"",
+            "id AKIAIOSFODNN7EXAMPLE",
+        ] {
+            let (text, _) = redact_one(content);
+            assert!(
+                text.contains("__HR_SECRET_"),
+                "missed key in {content}: {text}"
+            );
+        }
     }
 
     /// Second pass over redacted text must be byte-identical: continuation
