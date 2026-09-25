@@ -395,6 +395,7 @@ elif [ -x "$BIN_DIR/nord-socks-egress" ]; then
     say "  Needs Nord SOCKS credentials; see 'Nord SOCKS5 relay pool' in contrib/README.md"
 fi
 
+
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) say "WARNING: $BIN_DIR is not on your PATH — add it to your shell profile" ;;

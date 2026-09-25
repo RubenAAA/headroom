@@ -51,7 +51,11 @@ const DEFAULT_BASE_PORT: u16 = 18_600;
 const UPSTREAM_PORT: u16 = 1080;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const EGRESS_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+// A SOCKS tunnel can be quiet in one direction while an SSE response is still
+// flowing in the other. Poll reads so only a wholly idle tunnel expires; keep
+// that bound well above Headroom's usual 600s upstream request timeout.
+const READ_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const ROTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 const ROTATION_CONTROL_TIMEOUT: Duration = Duration::from_secs(300);
@@ -788,9 +792,9 @@ impl Lane {
             }
             state.connects = state.connects.saturating_add(1);
         }
-        client.set_read_timeout(Some(IDLE_TIMEOUT))?;
+        client.set_read_timeout(Some(READ_POLL_INTERVAL))?;
         client.set_write_timeout(Some(IDLE_TIMEOUT))?;
-        upstream.set_read_timeout(Some(IDLE_TIMEOUT))?;
+        upstream.set_read_timeout(Some(READ_POLL_INTERVAL))?;
         upstream.set_write_timeout(Some(IDLE_TIMEOUT))?;
         tunnel(client, &mut upstream)
     }
@@ -801,12 +805,15 @@ fn tunnel(client: &mut TcpStream, upstream: &mut TcpStream) -> io::Result<()> {
     let upstream_write = upstream.try_clone()?;
     let upstream_read = upstream.try_clone()?;
     let client_write = client.try_clone()?;
+    let last_activity = Arc::new(Mutex::new(Instant::now()));
+    let client_to_upstream_activity = Arc::clone(&last_activity);
     let first = thread::Builder::new()
         .name("nord-socks-upstream-write".to_string())
-        .spawn(move || copy_stream(client_read, upstream_write))?;
+        .spawn(move || copy_stream(client_read, upstream_write, client_to_upstream_activity))?;
+    let upstream_to_client_activity = Arc::clone(&last_activity);
     let second = thread::Builder::new()
         .name("nord-socks-client-write".to_string())
-        .spawn(move || copy_stream(upstream_read, client_write))?;
+        .spawn(move || copy_stream(upstream_read, client_write, upstream_to_client_activity))?;
     let first_result = first
         .join()
         .unwrap_or_else(|_| Err(io::Error::other("SOCKS tunnel worker panicked")));
@@ -818,19 +825,28 @@ fn tunnel(client: &mut TcpStream, upstream: &mut TcpStream) -> io::Result<()> {
     first_result.and(second_result)
 }
 
-fn copy_stream(mut source: TcpStream, mut destination: TcpStream) -> io::Result<()> {
+fn copy_stream(
+    mut source: TcpStream,
+    mut destination: TcpStream,
+    last_activity: Arc<Mutex<Instant>>,
+) -> io::Result<()> {
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         match source.read(&mut buffer) {
             Ok(0) => return Ok(()),
-            Ok(count) => destination.write_all(&buffer[..count])?,
+            Ok(count) => {
+                destination.write_all(&buffer[..count])?;
+                *lock_unpoisoned(&last_activity) = Instant::now();
+            }
             Err(error)
                 if matches!(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                return Ok(());
+                if lock_unpoisoned(&last_activity).elapsed() >= IDLE_TIMEOUT {
+                    return Ok(());
+                }
             }
             Err(error) => return Err(error),
         }

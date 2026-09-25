@@ -4,7 +4,7 @@
 # script, so the settings command stays stable across re-installs.
 set -u
 
-here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+here=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 user_command_file="$here/statusline-user-command"
 headroom_command="$here/statusline-with-cache.sh"
 input=$(cat)
@@ -16,7 +16,8 @@ fi
 
 user_output=""
 if [ -n "$user_command" ]; then
-    user_output=$(printf '%s' "$input" | bash -c "$user_command" 2>/dev/null || true)
+    user_shell="${SHELL:-/bin/sh}"
+    user_output=$(printf '%s' "$input" | "$user_shell" -c "$user_command" 2>/dev/null || true)
 fi
 
 headroom_output=$(printf '%s' "$input" | "$headroom_command" 2>/dev/null || true)

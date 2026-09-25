@@ -22,3 +22,6 @@ number to its window; do not quote across windows.
 - [`nord-socks-connect-reply.md`](nord-socks-connect-reply.md): normalize the
   upstream SOCKS CONNECT bound address for strict local clients; the live
   trigger still needs post-fix verification.
+- [`nord-socks-one-way-idle-timeout.md`](nord-socks-one-way-idle-timeout.md):
+  a per-direction read timeout can close an otherwise active SSE tunnel; use
+  a shared bidirectional idle deadline instead.
