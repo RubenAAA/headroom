@@ -140,7 +140,7 @@ where
                 attempt += 1;
                 let delay_ms = ctx
                     .base_delay_ms
-                    .saturating_mul(1u64 << (attempt - 1))
+                    .saturating_mul(1u64.checked_shl(attempt - 1).unwrap_or(u64::MAX))
                     .min(ctx.max_delay_ms);
                 tracing::warn!(
                     event = "stream_retry_dropped",

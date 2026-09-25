@@ -560,7 +560,7 @@ fn lost_answer_text(tool: Option<&str>) -> String {
 pub(crate) fn dropped_call_text(unresolved_tool: Option<&str>) -> String {
     match unresolved_tool {
         Some(name) => format!(
-            "The proxy could not run `{name}` for this turn, so its answer is \
+            "The proxy could not complete `{name}` for this turn, so its answer is \
              missing from the reply above. Nothing was lost; ask \
              again.\n\n{RETRIEVAL_DROPPED_MARKER}"
         ),
@@ -575,7 +575,7 @@ pub(crate) fn dropped_call_text(unresolved_tool: Option<&str>) -> String {
 pub(crate) fn empty_turn_text(unresolved_tool: Option<&str>) -> String {
     match unresolved_tool {
         Some(name) => format!(
-            "The proxy could not run `{name}` for this turn, so the turn came \
+            "The proxy could not complete `{name}` for this turn, so the turn came \
              back empty. Nothing was lost; ask again.\n\n{RETRIEVAL_DROPPED_MARKER}"
         ),
         None => format!(
@@ -1224,10 +1224,9 @@ fn non_streaming_continuation_request(forwarded_request: &Bytes) -> Bytes {
 /// `HEADROOM_MEMORY_INJECT_TOOLS=1` it does reach it, on every turn where the
 /// model asks for memory.
 fn restore_stream_when_mandated(request: Bytes, upstream_url: &url::Url) -> Bytes {
-    if !matches!(
-        upstream_url.host_str(),
-        Some("chatgpt.com") | Some("opencode.ai")
-    ) {
+    if upstream_url.host_str() != Some("chatgpt.com")
+        && !crate::openai_buffered_ccr::is_opencode_zen_base(upstream_url)
+    {
         return request;
     }
     streamed_continuation_request(request)

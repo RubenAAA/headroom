@@ -36,7 +36,9 @@ pub(crate) enum UpstreamKind {
 /// Classify a routed upstream. A URL has one host, so at most one of the
 /// first two arms can match; anything else is generic.
 pub(crate) fn classify_upstream(upstream: &url::Url, is_chatgpt_auth: bool) -> UpstreamKind {
-    if upstream.host_str() == Some("opencode.ai") {
+    // Same host test as every other Zen check, `www.` included: an exact
+    // `opencode.ai` match sent www-hosted Zen traffic down the generic arm.
+    if crate::openai_buffered_ccr::is_opencode_zen_base(upstream) {
         UpstreamKind::OpenCodeZen
     } else if is_chatgpt_auth && upstream.host_str() == Some("api.openai.com") {
         UpstreamKind::ChatGptSubscription
@@ -940,6 +942,8 @@ mod tests {
         let zen_upstream: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
         let zen = classify_upstream(&zen_upstream, false);
         assert_eq!(zen, UpstreamKind::OpenCodeZen);
+        let www: url::Url = "https://www.opencode.ai/zen/v1".parse().unwrap();
+        assert_eq!(classify_upstream(&www, false), UpstreamKind::OpenCodeZen);
         assert_eq!(
             zen.responses_url(&zen_upstream),
             "https://opencode.ai/zen/v1/responses"

@@ -175,11 +175,12 @@ pub(crate) struct CtxTransformReport {
 /// the response side can classify this turn's billed usage against the
 /// conversation's previous turn. Returns the conversation key for the report.
 ///
-/// Spark turns never park: they bill from a different cache universe (no
-/// Anthropic write/TTL telemetry, translated prefix, separate per-model
-/// lineage), so scoring them against the Anthropic footprint reads as a
-/// bust on nearly every turn and drags the fleet hit rate down for no
-/// reason. Spark has its own `/spark-context` segment instead.
+/// Translated turns (Spark, Codex) park unscored: they bill from a different
+/// cache universe (no Anthropic write/TTL telemetry, translated prefix,
+/// separate per-model lineage), so scoring them against the Anthropic
+/// footprint reads as a bust on nearly every turn and drags the fleet hit
+/// rate down for no reason. They still park, so the conversation-concurrency
+/// cap can count them. Spark has its own `/spark-context` segment instead.
 /// Extracted from `apply_ctx_request_transforms` without behavior change.
 fn park_conversation_identity(
     state: &AppState,
@@ -194,9 +195,9 @@ fn park_conversation_identity(
     // `scripts/statusline-cache-health.sh` renders — without it the cache
     // segment simply has nothing to say about routed turns.
     //
-    // Translated routes (Spark, Codex) stay out: different cache universe
-    // than the Anthropic footprint the watchdog scores, so parking them
-    // reads as a bust on nearly every turn. See `translated_route_model`.
+    // Translated routes (Spark, Codex) stay out of scoring: different cache
+    // universe than the Anthropic footprint the watchdog scores, so scoring
+    // them reads as a bust on nearly every turn. See `translated_route_model`.
     let body_model_is_translated = parsed
         .get("model")
         .and_then(|v| v.as_str())
@@ -227,6 +228,17 @@ fn park_conversation_identity(
         // The watchdog still scores them; the Anthropic-priced stock arm
         // stays out rather than inventing a premium never charged.
         state.usage_observer.note_stock_ineligible(request_id);
+    } else {
+        // Parked for the conversation-concurrency cap alone: no drift dims,
+        // no fingerprint, and the stream hands it back through
+        // `end_unscored` instead of `complete`.
+        state.usage_observer.begin_request(
+            request_id,
+            conversation_key.clone(),
+            Some(session_key),
+            None,
+            None,
+        );
     }
     conversation_key
 }

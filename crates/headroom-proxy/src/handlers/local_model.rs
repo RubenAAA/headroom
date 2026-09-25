@@ -247,6 +247,28 @@ pub async fn handle_messages(
     // below match on this, never on `target_model`.
     let is_responses = translated.is_responses;
 
+    // J0 capture on the routed translate path: the forward path's
+    // `maybe_capture` never runs here, so Codex/Responses turns were
+    // invisible to the capture corpus. The wire body is the translated
+    // one (`instructions` lives there, not in the Anthropic-shaped
+    // client body), so capture that. The session key comes from the
+    // Anthropic-shaped client body, keyed as Anthropic like the rest of the
+    // routed path: an OpenAI kind reads `input`, which that body lacks, and
+    // every Responses turn from one credential collapsed onto `<branch>:-`.
+    {
+        use crate::cache_stabilization::drift_detector::{ApiKind, derive_session_key};
+        crate::cache_stabilization::capture::maybe_capture(
+            &openai_body,
+            if is_responses {
+                "openai_responses"
+            } else {
+                "openai_chat"
+            },
+            &derive_session_key(&headers, &client_addr, &parsed, ApiKind::Anthropic),
+            &request_id,
+        );
+    }
+
     // Book this turn through the same outcome funnel `forward_http` uses, so
     // routed spend shows up in /stats, /stats-history, and the dashboard
     // alongside Claude traffic.
@@ -306,6 +328,11 @@ pub async fn handle_messages(
 
     let openai_body_bytes = Bytes::from(openai_body_vec);
 
+    // J0 outbound leg on the routed translate path: pairs with the inbound
+    // capture above by request_id, so a routed turn diffs as translated
+    // against what actually went upstream (compression, redaction).
+    crate::cache_stabilization::capture::maybe_capture_outbound(&openai_body_bytes, &request_id);
+
     let mut upstream_headers = upstream_headers;
 
     // Session correlation headers and turn-state echo, mirroring the real
@@ -355,28 +382,29 @@ pub async fn handle_messages(
     // The buffered and fallback arms take none: a complete buffered body
     // has no truncation signature to read, and a fallback re-sends to a
     // different upstream on its own.
-    let early_retry = (state.config.retry_stream_hold_bytes > 0).then(|| {
-        let max_attempts = if state.config.retry_enabled {
-            state.config.retry_max_attempts.max(1)
-        } else {
-            1
-        };
-        crate::routed::early_stream_retry::EarlyRetryCtx {
-            state: state.clone(),
-            url: upstream_url.clone(),
-            headers: upstream_headers.clone(),
-            body: openai_body_bytes.clone(),
-            request_id: request_id.clone(),
-            session_key: session_key.clone(),
-            lane_key: Some(egress_lane_key.clone()),
-            is_chatgpt_auth,
-            is_zen,
-            hold_bytes: state.config.retry_stream_hold_bytes,
-            max_resends: max_attempts.saturating_sub(1),
-            base_delay_ms: state.config.retry_base_delay_ms,
-            max_delay_ms: state.config.retry_max_delay_ms,
-        }
-    });
+    // Gated on retries being enabled, not just on the hold: with no resends
+    // to spend, holding the opening bytes only delays the first tokens.
+    let early_retry = (state.config.retry_stream_hold_bytes > 0
+        && state.config.retry_enabled
+        && state.config.retry_max_attempts > 1)
+        .then(|| {
+            let max_attempts = state.config.retry_max_attempts;
+            crate::routed::early_stream_retry::EarlyRetryCtx {
+                state: state.clone(),
+                url: upstream_url.clone(),
+                headers: upstream_headers.clone(),
+                body: openai_body_bytes.clone(),
+                request_id: request_id.clone(),
+                session_key: session_key.clone(),
+                lane_key: Some(egress_lane_key.clone()),
+                is_chatgpt_auth,
+                is_zen,
+                hold_bytes: state.config.retry_stream_hold_bytes,
+                max_resends: max_attempts.saturating_sub(1),
+                base_delay_ms: state.config.retry_base_delay_ms,
+                max_delay_ms: state.config.retry_max_delay_ms,
+            }
+        });
 
     let ccr = RoutedCcr::assemble(
         &state,

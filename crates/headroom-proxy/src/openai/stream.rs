@@ -96,7 +96,13 @@ impl Drop for StreamTranslator {
             let usage = self.last_usage.clone();
             self.emit_outcome(usage.as_ref(), 200);
         }
-        if self.outcome.is_some() && !self.observation_completed && self.last_usage.is_some() {
+        // A translated turn is released even without usage: its entry exists
+        // only for the concurrency cap, and a dead one would count against
+        // the conversation until the horizon sweep.
+        if self.outcome.is_some()
+            && !self.observation_completed
+            && (self.last_usage.is_some() || self.translated_turn())
+        {
             // A stream that died mid-flight still billed whatever the provider
             // last reported. Booking it here is what keeps a dropped stream
             // from leaving its tokens out of the cache-health totals.
@@ -329,10 +335,10 @@ impl StreamTranslator {
         // Zen never sends quota (no headers, no rate_limits frames): warn
         // would fire on every routed turn. Debug keeps the signal for
         // troubleshooting without log noise. Matched on the client alias
-        // snapshot: self.model is the upstream name by now.
-        if self.client_model.starts_with("gpt-5")
-            || self.client_model.starts_with("claude-muse-spark")
-        {
+        // snapshot: self.model is the upstream name by now. Only the Spark
+        // aliases route to Zen; a `gpt-5` prefix here also silenced direct
+        // Codex models, where a missing quota is a real signal.
+        if self.client_model.starts_with("claude-muse-spark") {
             tracing::debug!(
                 event = "codex_rate_limits_missing",
                 request_id = %request_id,
@@ -421,6 +427,16 @@ impl StreamTranslator {
     /// The observer takes Anthropic-named counters. The Responses API reports
     /// cache reads but has no cache-creation counter, so zero goes in for
     /// writes — the same mapping used elsewhere on this path.
+    /// Spark or Codex, judged on every model name the turn carries.
+    fn translated_turn(&self) -> bool {
+        translated_route_model(&self.model)
+            || translated_route_model(&self.client_model)
+            || self
+                .outcome
+                .as_ref()
+                .is_some_and(|ctx| translated_route_model(&ctx.model))
+    }
+
     fn complete_usage_observation(&mut self, usage: Option<&Value>) {
         if self.observation_completed {
             return;
@@ -441,10 +457,13 @@ impl StreamTranslator {
         // (never a cache-creation counter, so every shortfall reads Recache):
         // same exclusion. Matched on the client-alias snapshot, since `model`
         // is the upstream name by now.
-        if translated_route_model(&self.model)
-            || translated_route_model(&self.client_model)
-            || translated_route_model(&ctx.model)
-        {
+        //
+        // The request side still parks these turns so the concurrency cap
+        // can count them; hand the entry back unscored.
+        if self.translated_turn() {
+            if let Some(observer) = ctx.usage_observer.as_ref() {
+                observer.end_unscored(&ctx.request_id);
+            }
             self.observation_completed = true;
             return;
         }
@@ -1095,7 +1114,9 @@ impl StreamTranslator {
         // entry so it never flags a later turn concurrent. The usage
         // observer's pending map is the only state touched — spend already
         // booked above through the outcome funnel.
-        if let Some(ctx) = self.outcome.as_ref()
+        if self.translated_turn() {
+            self.complete_usage_observation(None);
+        } else if let Some(ctx) = self.outcome.as_ref()
             && let Some(observer) = ctx.usage_observer.as_ref()
         {
             observer.note_stream_ended(&ctx.request_id);
@@ -1249,6 +1270,11 @@ struct TranslateState<S> {
     /// error yields the same error on every later poll, so without this the
     /// fold below would re-close the turn and re-log forever.
     finished: bool,
+    /// The upstream error, handed down on the poll after the abort events.
+    /// Ending cleanly instead left `stream_finisher` logging "body ended
+    /// early" with no cause, which hid a day of VPN-rotation resets
+    /// (2026-09-25) behind what read as the provider closing streams.
+    pending_err: Option<std::io::Error>,
 }
 
 impl<S> TranslateState<S>
@@ -1367,8 +1393,12 @@ fn translate_with_translator(
             current_event: None,
             current_data: Vec::new(),
             finished: false,
+            pending_err: None,
         },
         |mut state| async move {
+            if let Some(e) = state.pending_err.take() {
+                return Some((Err(e), state));
+            }
             if state.finished {
                 return None;
             }
@@ -1395,19 +1425,32 @@ fn translate_with_translator(
                         // back the same error for as long as it is polled.
                         tracing::warn!(
                             event = "routed_stream_aborted",
+                            request_id = %state
+                                .translator
+                                .outcome
+                                .as_ref()
+                                .map(|ctx| ctx.request_id.as_str())
+                                .unwrap_or("unknown"),
                             error = %e,
+                            cause = ?e,
                             "routed upstream stream failed after the client had events"
                         );
                         let terminal = state.translator.abort_terminal();
                         // Either way this turn is over: the upstream will hand
                         // back the same error for as long as it is polled.
                         state.finished = true;
+                        // Wrapped whole, not stringified: the source chain is
+                        // what names the reset, and the finisher logs it.
+                        let err = std::io::Error::other(e);
                         if terminal.is_empty() {
                             // Nothing started: no `message_start` went out, so
                             // there is no turn to close — propagate the
                             // transport error.
-                            return Some((Err(std::io::Error::other(e.to_string())), state));
+                            return Some((Err(err), state));
                         }
+                        // The finisher owns the close either way; the error
+                        // after the abort events only tells it why.
+                        state.pending_err = Some(err);
                         let mut output = Vec::new();
                         for event in terminal {
                             output.extend_from_slice(event.as_bytes());
@@ -1989,7 +2032,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         // Non-Zen model: the warn still fires (joinable single event).
-        let (translator, _logger, _cost) = translator_with_outcome("gpt-5.6-luna-direct", 0);
+        let (translator, _logger, _cost) = translator_with_outcome("gpt-5.6-luna", 0);
         let capture = EventCapture::default();
         let lines = capture.0.clone();
         let subscriber = tracing_subscriber::registry().with(capture);
@@ -2015,7 +2058,7 @@ mod tests {
 
         // Zen never sends quota: the event fires at debug so the log
         // stays clean on every routed turn.
-        let (translator, _logger, _cost) = translator_with_outcome("gpt-5.6-luna", 0);
+        let (translator, _logger, _cost) = translator_with_outcome("claude-muse-spark-1.3", 0);
         let capture = EventCapture::default();
         let lines = capture.0.clone();
         let subscriber = tracing_subscriber::registry().with(capture);
@@ -2503,10 +2546,21 @@ mod tests {
             None,
             None,
         );
-        let out: Vec<String> = translated
-            .map(|r| String::from_utf8(r.unwrap().to_vec()).unwrap())
-            .collect()
-            .await;
+        let items: Vec<Result<bytes::Bytes, std::io::Error>> = translated.collect().await;
+        // The upstream error follows the abort events, so the finisher can
+        // log why the turn died instead of "body ended early".
+        let (last, events) = items.split_last().expect("stream yielded nothing");
+        let err = last
+            .as_ref()
+            .expect_err("the upstream error must follow the abort");
+        assert!(
+            format!("{err:?}").contains("reqwest"),
+            "source chain lost: {err:?}"
+        );
+        let out: Vec<String> = events
+            .iter()
+            .map(|r| String::from_utf8(r.as_ref().unwrap().to_vec()).unwrap())
+            .collect();
         let joined = out.join("");
         assert!(joined.contains("hi"), "delta lost: {joined}");
         // The translator leaves the turn unstopped on purpose: the stop
@@ -2524,7 +2578,8 @@ mod tests {
         let closed: Vec<String> = crate::sse::stream_finisher::finish_on_drop(
             futures_util::stream::iter(
                 out.into_iter()
-                    .map(|s| Ok::<_, std::io::Error>(bytes::Bytes::from(s))),
+                    .map(|s| Ok::<_, std::io::Error>(bytes::Bytes::from(s)))
+                    .chain(std::iter::once(Err(std::io::Error::other("reset")))),
             ),
             "test".to_string(),
         )

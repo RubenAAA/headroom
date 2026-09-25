@@ -741,6 +741,14 @@ impl UsageObserver {
         }
     }
 
+    /// A translated-route turn (Spark, Codex) left its stream, however it
+    /// left. Those park only so the conversation-concurrency cap can count
+    /// them; they never reach `complete`, so this takes the entry back
+    /// without scoring it or counting it abandoned.
+    pub fn end_unscored(&self, request_id: &str) {
+        self.lock().pending.pop(request_id);
+    }
+
     /// Record the wire sizes and the arm this turn ran under.
     ///
     /// Deliberately taken from the bytes themselves rather than from any
@@ -4130,6 +4138,19 @@ mod tests {
             Some(false),
             "a leftover older than the horizon is not a turn in flight"
         );
+    }
+
+    /// A translated turn's entry exists only for the concurrency cap:
+    /// handing it back frees the slot and books nothing.
+    #[test]
+    fn an_unscored_turn_ends_without_counting() {
+        let obs = UsageObserver::new();
+        obs.begin_request("req-1", "conv".into(), None, None, None);
+        obs.end_unscored("req-1");
+        assert_eq!(obs.snapshot().abandoned_requests_total, 0);
+
+        obs.begin_request("req-2", "conv".into(), None, None, None);
+        assert_eq!(obs.pending_is_concurrent("req-2"), Some(false));
     }
 
     /// A terminally dead turn (client gone, stream unmatched, upstream failed)

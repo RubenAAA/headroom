@@ -7,13 +7,22 @@
 //! no equivalent — a stream that died early went straight to
 //! `stream_finisher`, which can only mark the turn truncated.
 //!
-//! Zen makes the gap hurt: it sheds load by closing streams cleanly
-//! mid-turn (measured 2026-09-24 on Spark — thirteen turns in one day,
-//! every one closed without a single output token, several dying in the
-//! same millisecond). A clean EOF carries no transport error, so there is
-//! nothing to match on except the shape of what arrived: an SSE stream
-//! that ends without its terminal event (`response.completed` / `failed` /
-//! `incomplete`, or chat `[DONE]`) was cut, not finished.
+//! This was first put down to Zen shedding load by closing streams cleanly
+//! mid-turn (2026-09-24: Spark turns dying with no output tokens, several
+//! in the same millisecond). That reading was wrong. Re-measured on
+//! 2026-09-25, the drops were `ConnectionReset`s, and Codex streams died
+//! with them. The zen-rotate watcher was rotating the device-wide VPN on
+//! every Zen 429, and the translator ended each aborted stream cleanly,
+//! so `stream_finisher` saw what looked like a clean EOF. Most deaths come
+//! after the hold has committed, so this wrapper cannot save them; the
+//! cure is the per-egress pool, where a 429 rotates one Zen lane and
+//! leaves the shared route alone.
+//!
+//! The clean-EOF check stays as cheap insurance. A clean EOF carries no
+//! transport error, so there is nothing to match on except the shape of
+//! what arrived: an SSE stream that ends without its terminal event
+//! (`response.completed` / `failed` / `incomplete`, or chat `[DONE]`) was
+//! cut, not finished.
 //!
 //! So this holds the opening bytes instead of forwarding them. While the
 //! held buffer is under `hold_bytes` the response is uncommitted: a
@@ -60,18 +69,26 @@ pub(crate) struct EarlyRetryCtx {
 /// Depth of the hand-off queue to the client. Matches `stream_retry`.
 const CLIENT_QUEUE_DEPTH: usize = 64;
 
-/// Terminal events of the two stream shapes this path translates. Scanned
-/// for as `event:` names (Responses) or the bare `[DONE]` sentinel (chat);
-/// a substring hit inside model text only loses a retry (the safe
-/// direction), never causes one.
+/// Terminal events of the two stream shapes this path translates. Matched
+/// as whole SSE lines: an `event:` name (Responses) or the `data: [DONE]`
+/// sentinel (chat). A substring match fired on model text: a delta saying
+/// `[DONE]` committed the hold early, and a drop after that was never
+/// retried. JSON escapes newlines, so no delta can start a line.
 fn has_terminal_event(held: &[Bytes]) -> bool {
     // Joined per check; the hold window is bytes, not megabytes.
     let joined: Vec<u8> = held.iter().flat_map(|b| b.iter().copied()).collect();
     let text = String::from_utf8_lossy(&joined);
-    text.contains("event: response.completed")
-        || text.contains("event: response.failed")
-        || text.contains("event: response.incomplete")
-        || text.contains("[DONE]")
+    text.lines().any(|line| {
+        let line = line.trim_end_matches('\r');
+        if let Some(name) = line.strip_prefix("event:") {
+            return matches!(
+                name.trim(),
+                "response.completed" | "response.failed" | "response.incomplete"
+            );
+        }
+        line.strip_prefix("data:")
+            .is_some_and(|data| data.trim() == "[DONE]")
+    })
 }
 
 /// Whether the held bytes look like an SSE stream at all. A complete JSON
@@ -179,9 +196,17 @@ pub(crate) fn wrap_streaming_body(
                 }
                 drop = Some(Drop::Truncated);
             }
-            let (kind, err_detail): (&str, String) = match drop {
-                Some(Drop::Transport(e)) => ("transport", e.to_string()),
-                Some(Drop::Truncated) => ("clean-eof", "body ended early".to_string()),
+            let (kind, err_detail, reason): (&str, String, &str) = match drop {
+                Some(Drop::Transport(e)) => (
+                    "transport",
+                    e.to_string(),
+                    crate::observability::retry_reason::TRANSPORT,
+                ),
+                Some(Drop::Truncated) => (
+                    "clean-eof",
+                    "body ended early".to_string(),
+                    crate::observability::retry_reason::TRUNCATED,
+                ),
                 None => unreachable!("drop is always set here"),
             };
 
@@ -190,7 +215,7 @@ pub(crate) fn wrap_streaming_body(
             resends += 1;
             let delay_ms = ctx
                 .base_delay_ms
-                .saturating_mul(1u64 << (resends - 1))
+                .saturating_mul(1u64.checked_shl(resends - 1).unwrap_or(u64::MAX))
                 .min(ctx.max_delay_ms);
             tracing::warn!(
                 event = "routed_stream_early_retry",
@@ -203,10 +228,7 @@ pub(crate) fn wrap_streaming_body(
                 held_bytes = held_len,
                 "routed stream dropped before the client was committed; re-sending"
             );
-            crate::observability::record_upstream_retry(
-                "routed",
-                crate::observability::retry_reason::TRANSPORT,
-            );
+            crate::observability::record_upstream_retry("routed", reason);
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
             // Same hygiene as every other repeat send: the real client
@@ -239,10 +261,7 @@ pub(crate) fn wrap_streaming_body(
                         status = next.resp.status().as_u16(),
                         "retry of a dropped routed stream came back non-success; giving up"
                     );
-                    crate::observability::record_upstream_retry_exhausted(
-                        "routed",
-                        crate::observability::retry_reason::TRANSPORT,
-                    );
+                    crate::observability::record_upstream_retry_exhausted("routed", reason);
                     for h in held.drain(..) {
                         if tx.send(Ok(h)).await.is_err() {
                             return;
@@ -257,10 +276,7 @@ pub(crate) fn wrap_streaming_body(
                         request_id = %ctx.request_id,
                         "retry of a dropped routed stream failed to send; giving up"
                     );
-                    crate::observability::record_upstream_retry_exhausted(
-                        "routed",
-                        crate::observability::retry_reason::TRANSPORT,
-                    );
+                    crate::observability::record_upstream_retry_exhausted("routed", reason);
                     for h in held.drain(..) {
                         if tx.send(Ok(h)).await.is_err() {
                             return;

@@ -782,9 +782,10 @@ fn excise_failed_memory_calls(response: &mut serde_json::Value, provider: &str) 
 }
 
 /// Whether the turn carries visible text (thinking does not count): picks
-/// the stranded-notice wording. Turn-local only — text already streamed
-/// past the resolver is invisible here, so streaming turns that spoke
-/// still read as empty. The marker below does the real work either way.
+/// the stranded-notice wording. On the stream path the first round is the
+/// rebuilt turn, streamed text included, so a turn that spoke is seen. A
+/// later round sees only that round's response. The marker does the real
+/// work either way.
 fn turn_has_visible_text(response: &serde_json::Value, provider: &str) -> bool {
     use serde_json::Value;
     fn anthropic_texts(response: &Value) -> Vec<String> {

@@ -69,6 +69,9 @@ pub mod retry_reason {
     /// A 200 response whose SSE body opened with an error event. The HTTP
     /// status says success; the body disagrees.
     pub const IN_BAND_SSE: &str = "in_band_sse";
+    /// An SSE body that ended cleanly without its terminal event. No
+    /// transport error was seen, so it is not counted as `transport`.
+    pub const TRUNCATED: &str = "truncated";
 
     /// Bucket an HTTP status into a reason. 529 is Anthropic's "overloaded"
     /// and gets its own bucket because it behaves differently from a generic

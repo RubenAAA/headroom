@@ -276,5 +276,11 @@ async fn routed_turn_sheds_with_429_past_the_cap() {
 
     assert_eq!(a.await.expect("turn A finished"), reqwest::StatusCode::OK);
     assert_eq!(b.await.expect("turn B finished"), reqwest::StatusCode::OK);
+
+    // Finished translated turns hand their slots back. If they lingered,
+    // A and B would still count and this lone turn would make three.
+    let after = post(&client, &url, &routed_turn("same opener")).await;
+    assert_eq!(after.status(), 200, "finished turns still held their slots");
+    drain(after).await;
     proxy.shutdown().await;
 }

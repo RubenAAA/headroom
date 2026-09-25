@@ -172,11 +172,10 @@ fn in_memory_get_refreshes_idle_ttl() {
     let store = InMemoryCcrStore::with_capacity_and_ttl(10, Duration::from_millis(120));
     let hash = compute_key(b"hot entry");
     store.put(&hash, "hot entry");
-    // Touch the entry every 30ms for ~1.5 idle windows' worth of wall
+    // Touch the entry every 30ms for ~4 idle windows' worth of wall
     // clock. Wall-clock expiry would kill it at 120ms; a sliding idle
     // window keeps it alive because every hit restarts the clock.
-    // (Six touches still cross several windows; eight was just slower.)
-    for _ in 0..6 {
+    for _ in 0..16 {
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(
             store.get(&hash).as_deref(),
