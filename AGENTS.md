@@ -57,11 +57,14 @@ for working on Headroom. The maintainer does.
   left alone, so tuning is never overwritten. Under `--link` it becomes a symlink
   to the checkout, and any existing real file is moved to `.bak` first.
 - `~/.headroom-paths.sh`, holding `HEADROOM_REPO`.
-- `~/.claude/statusline-with-cache.sh` and `statusline-usage-dump.sh`, wired into
-  `~/.claude/settings.json`. The first is always a symlink into the checkout,
-  in either mode, because it finds its helper scripts next to itself in
-  `contrib/`; a real file already there is moved to `.bak`. Move the checkout
-  and the statusline breaks until you rerun `install.sh`.
+- `~/.claude/statusline-with-cache.sh`, `statusline-usage-dump.sh`, and
+  `statusline-compose.sh`, wired into `~/.claude/settings.json`. The composer
+  keeps any previous statusline command in `statusline-user-command` and prints
+  its output before Headroom's; re-installing does not wrap it again. The cache
+  wrapper is always a symlink into the checkout because it finds helper scripts
+  in `contrib/`; move the checkout and rerun `install.sh` if it breaks.
+- Existing Claude settings, statusline files, hooks, and `CLAUDE.md` are backed
+  up to sibling `.bak` files before the installer changes them.
 
 It does not write `~/.headroom-zen-pool.env`, the Zen egress pool that
 `cclaude` and `restart-headroom.sh` source; the installer only reports whether

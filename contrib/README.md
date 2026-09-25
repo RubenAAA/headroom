@@ -233,16 +233,26 @@ default route.
 
 ## Status line
 
-One status line, six files. `settings.json` points at
-`statusline-with-cache.sh` alone; that script runs the others as subprocesses
-and joins what they print. The usage dump is installed beside it because the
-chain calls it by path; the remaining four it finds in the same directory.
-Every segment prints nothing when the proxy is down, so the line then reads
+`settings.json` points at `statusline-compose.sh`. Claude Code runs one command
+for its status line, so the composer runs the previous user command first and
+prints Headroom's status line after it. The installer saves that command in
+`~/.claude/statusline-user-command`; edit that file to customize the existing
+status line after installing. Re-running the installer recognizes the composer
+and does not chain it again. Settings retain their other fields, including
+padding and refresh interval. Existing files changed by the installer are
+copied to a sibling `.bak` before the change.
+
+The Headroom status line itself is a chain of six files. The usage dump is
+installed beside `statusline-with-cache.sh` because it calls it by path; the
+remaining four helpers live in the checkout's `contrib/` directory. Every
+segment prints nothing when the proxy is down, so Headroom's line then reads
 exactly like the usage dump on its own.
 
 | File | Role |
 | --- | --- |
-| `statusline-with-cache.sh` | The entry point. Chains the usage dump with the re-cache watchdog and the segments below. Folds `|`-separated segments onto new lines to fit the terminal width (tty, else COLUMNS, else 80), so nothing is cut. Always generated, never symlinked, since the checkout path is baked in. |
+| `statusline-compose.sh` | Entry point configured in `settings.json`. Runs `~/.claude/statusline-user-command`, then appends Headroom's line. |
+| `statusline-with-cache.sh` | Chains the usage dump with the re-cache watchdog and the segments below. Folds `|`-separated segments onto new lines to fit the terminal width (tty, else COLUMNS, else 80), so nothing is cut. Always symlinked so it can find its helpers in the checkout. |
+| `~/.claude/statusline-user-command` | Generated file containing the user's pre-existing statusline command. Edit it to customize that output; an empty file means Headroom only. |
 | `statusline-usage-dump.sh` | Produces the base line — model, context, plan usage — and caches what it was handed in `/tmp/claude-usage-latest.json`. The model shows short, without the `claude-` prefix. Works alone if you point `settings.json` straight at it. |
 | `statusline-cache-health.sh` | Re-cache watchdog: warns when the prompt cache is being thrown away. |
 | `statusline-cache-perf.sh` | Recent cache hit rate. |

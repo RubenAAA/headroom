@@ -5,9 +5,9 @@
 # Every segment prints nothing when headroom isn't running, so the statusline
 # then reads byte-identical to the usage dump alone.
 #
-# Install: ln -sf "$HEADROOM_REPO/contrib/statusline-with-cache.sh" ~/.claude/
-# and point settings.json statusLine.command at that path. Every helper lives
-# next to this file, so one symlink is enough.
+# The installer points statusline-compose.sh at this script after the user's
+# previous statusline command. It can also be used directly as a standalone
+# statusline. Every helper lives next to this file, so one symlink is enough.
 # Resolved through the symlink: HEADROOM_REPO is not in Claude Code's
 # environment, so a fallback to ~/headroom missed any other checkout.
 if self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) && [ -n "$self" ]; then
