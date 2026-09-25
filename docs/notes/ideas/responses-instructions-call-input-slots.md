@@ -1,6 +1,6 @@
 # Idea: compress `instructions` + call-input slots on the Responses live path
 
-- **Status:** open (needs measurement first)
+- **Status:** open (measured 2026-09-25, ready to build)
 - **Source:** upstream `be00a798` (gateway Responses shape, Sept 2026
   session) — skipped as a port because `/v1/compress` has no local
   contract, but its view design covers two slot classes our
@@ -51,10 +51,26 @@
       18KB resent every one of 1,134 turns ≈ 20MB cumulative —
       i.e. per-turn ~5% each, cumulative `instructions` dwarfs
       call-input. Both slots confirmed real on the wire path.
-- **Next:** size `instructions` on the wire — needs one captured
-  Responses body (`HEADROOM_CAPTURE_DIR` set + one Codex turn, or the
-  `responses_item_summary` telemetry at info). If fat, port the slot
-  classes (not the gateway endpoint) into the live-zone dispatcher;
-  keep the allowlist invariant (unknown item types still pass through
-  untouched). Call-input first (measured 5.3%), `instructions` second
-  (unmeasured but structurally static).
+- **Measurement (2026-09-25, wire bytes, 1,059 paired
+  inbound+outbound Responses turns from `~/headroom-capture-netvalue`,
+  89 Codex + 961 Spark + 9 mixed-model):**
+  - `instructions`: present on **89/89 Codex turns, 0/961 Spark
+    turns** — Codex-only slot. Codex per-turn: median 26KB, p90
+    65KB, max 65KB (~5% of per-turn wire, resent every turn).
+    Confirms the 2026-09-23 client-log estimate on wire bytes.
+  - call-input: **`function_call.arguments` only** — present in
+    1,021/1,050 non-empty bodies (median 16KB/turn Spark, 13KB
+    Codex; p90 ~78–128KB; max 137KB). Zero
+    `custom_tool_call.input` items anywhere on the wire: that
+    shape does not survive translation, so only the function_call
+    arm needs the JSON-safety guard.
+  - Wire check: 1,054/1,059 outbound bodies match inbound on
+    `instructions` + input-item count — both slots ride
+    byte-identical today, genuinely uncompressed. 5 differ (input
+    array emptied, `instructions` intact — likely redaction or an
+    error path); check those before building.
+- **Next:** port the slot classes (not the gateway endpoint) into
+  the live-zone dispatcher; keep the allowlist invariant (unknown
+  item types still pass through untouched). Call-input first
+  (measured), `instructions` second (Codex-only). Clear the 5
+  emptied-input turns first.
