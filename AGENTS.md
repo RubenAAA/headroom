@@ -55,7 +55,7 @@ for working on Headroom. The maintainer does.
 - `~/.headroom-flags.sh`, a bash array of proxy flags copied from
   `contrib/headroom-flags.sh` with paths written as `$HOME`. An existing file is
   left alone, so tuning is never overwritten. Under `--link` it becomes a symlink
-  to the checkout, and any existing real file is moved to `.bak` first.
+  to the checkout, and any existing file is backed up to `.bak` first.
 - `~/.headroom-paths.sh`, holding `HEADROOM_REPO`.
 - `~/.claude/statusline-with-cache.sh`, `statusline-usage-dump.sh`, and
   `statusline-compose.sh`, wired into `~/.claude/settings.json`. The composer

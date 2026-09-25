@@ -76,8 +76,16 @@ step() { printf '\n== %s\n' "$*"; }
 backup_file() {
     local target="$1"
     if [ -e "$target" ] || [ -L "$target" ]; then
-        cp -pP "$target" "$target.bak"
-        say "backed up $target to $target.bak"
+        local backup="$target.bak"
+        if [ -L "$backup" ] || { [ -e "$backup" ] && [ -d "$backup" ]; }; then
+            backup="$target.bak.$(date +%Y%m%d%H%M%S).$$"
+        fi
+        if [ -L "$target" ] && [ ! -e "$target" ]; then
+            cp -pP "$target" "$backup"
+        else
+            cp -p "$target" "$backup"
+        fi
+        say "backed up $target to $backup"
     fi
 }
 
@@ -472,6 +480,12 @@ if (typeof status !== "object" || Array.isArray(status)) {
   process.exit(0);
 }
 const currentCommand = typeof status.command === "string" ? status.command : "";
+function writeUserCommand(command) {
+  const tmp = userCommandFile + ".tmp-" + process.pid;
+  fs.writeFileSync(tmp, command, { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
+  fs.renameSync(tmp, userCommandFile);
+}
 if (currentCommand !== composeCommand) {
   let userCommand = currentCommand;
   if (currentCommand === headroomCommand || currentCommand.trim() === "") userCommand = "";
@@ -481,8 +495,7 @@ if (currentCommand !== composeCommand) {
   }
   const priorCommand = fs.existsSync(userCommandFile) ? fs.readFileSync(userCommandFile, "utf8") : null;
   if (priorCommand !== userCommand) {
-    fs.writeFileSync(userCommandFile, userCommand, { mode: 0o600 });
-    fs.chmodSync(userCommandFile, 0o600);
+    writeUserCommand(userCommand);
     console.log("  saved the previous statusline command in " + userCommandFile);
   }
   status.type = "command";
@@ -492,8 +505,7 @@ if (currentCommand !== composeCommand) {
   console.log("  statusline wired into " + file + " (existing output is chained first; edit " + userCommandFile + " to customize it)");
 } else {
   if (!fs.existsSync(userCommandFile)) {
-    fs.writeFileSync(userCommandFile, "", { mode: 0o600 });
-    fs.chmodSync(userCommandFile, 0o600);
+    writeUserCommand("");
   }
   console.log("  statusline already wired; keeping " + file + " unchanged (edit " + userCommandFile + " to customize the prior output)");
 }
