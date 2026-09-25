@@ -43,14 +43,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-it
 if command -v cargo-machete >/dev/null 2>&1; then
     echo "── hygiene: cargo machete (unused deps)"
     # False positives machete cannot see, each confirmed by grep:
-    #   bytes (core): no `use bytes`/`bytes::` in src, tests, benches
     #   cc (py): used in build.rs (`cc::Build`), which machete ignores
     #   proc-macro2 (itemspan): only `syn::spanned::Spanned` is used —
     #     no direct proc_macro2:: path, but syn re-exports it and the
     #     span-locations feature is load-bearing; keep, machete is wrong
-    #   md-5: used via `use md5` (plain `cargo machete` misses it;
-    #     --with-metadata finds it — always pass the flag)
-    cargo machete --with-metadata 2>/dev/null || cargo machete || {
+    #   md-5 (core, proxy): imported as `md5`; ignored in each Cargo.toml.
+    #     Plain mode on purpose: --with-metadata runs `cargo metadata`,
+    #     which can rewrite Cargo.lock in the middle of a push.
+    cargo machete || {
         echo "❌ hygiene: unused dependencies found." >&2
         fail=1
     }

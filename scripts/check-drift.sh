@@ -6,6 +6,7 @@
 #   2. shellcheck on contrib/*.sh + scripts/*.sh (skip if not installed).
 #   3. every HEADROOM_* var in config.rs appears in docs/flags.md or
 #      contrib/headroom-flags.sh (catches renamed-but-undocumented flags).
+#   4. review-gate.sh stands down on ticket-gate.sh's exact TICKET_INTENT.
 #
 # Usage: bash scripts/check-drift.sh [--build] (default reuses an existing
 # binary when present, else builds debug once).
@@ -117,6 +118,19 @@ for v in $OTHER; do
         echo "warn: $v in config.rs but undocumented (non-PROXY var, cleanup)"
     fi
 done
+
+# ── 4. ticket intent mirror ───────────────────────────────────────────
+# Where the copies differ, a prompt can stand review down without diverting
+# the ticket, and then nothing fires.
+HOOKS="$ROOT/contrib/claude/hooks"
+TICKET_A="$(grep -h "^ *TICKET_INTENT=" "$HOOKS/ticket-gate.sh" | sed 's/^ *//')"
+TICKET_B="$(grep -h "^ *TICKET_INTENT=" "$HOOKS/review-gate.sh" | sed 's/^ *//')"
+if [[ -n "$TICKET_A" && "$TICKET_A" == "$TICKET_B" ]]; then
+    echo "ok: review-gate mirrors ticket-gate's TICKET_INTENT"
+else
+    echo "FAIL: TICKET_INTENT differs between ticket-gate.sh and review-gate.sh (or is missing); copy ticket-gate's line into review-gate" >&2
+    FAIL=1
+fi
 
 if [[ "$FAIL" -ne 0 ]]; then
     echo "check-drift: FAILED" >&2

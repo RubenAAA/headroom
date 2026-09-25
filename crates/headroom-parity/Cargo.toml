@@ -8,22 +8,12 @@ license.workspace = true
 repository.workspace = true
 description = "Rust-vs-Python parity harness for the Headroom port."
 
-[lints]
-workspace = true
-
 [lib]
 path = "src/lib.rs"
 
 [[bin]]
 name = "parity-run"
 path = "src/bin/parity_run.rs"
-
-[dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-anyhow = { workspace = true }
-clap = { workspace = true }
-headroom-core = { path = "../headroom-core" }
 # NOTE: Phase 0 does not invoke Python from Rust. Phase 1 adds `pyo3` with
 # `auto-initialize` here so comparators can call into the installed
 # `headroom` package directly.
@@ -36,3 +26,13 @@ headroom-core = { path = "../headroom-core" }
 # CI's `test-ml` job runs the harness with `--features ml`.
 default = []
 ml = ["headroom-core/ml"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+headroom-core = { path = "../headroom-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

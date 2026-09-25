@@ -8,8 +8,13 @@ license.workspace = true
 repository.workspace = true
 description = "Headroom transparent reverse proxy (Rust, axum). Phase 1: drop-in passthrough in front of the Python proxy."
 
-[lints]
-workspace = true
+[package.metadata.cargo-machete]
+# Imported as `md5`; plain `cargo machete` matches on the package name.
+ignored = ["md-5"]
+
+[lib]
+name = "headroom_proxy"
+path = "src/lib.rs"
 
 [[bin]]
 name = "headroom-proxy"
@@ -23,57 +28,86 @@ path = "src/bin/headroom_cli.rs"
 name = "nord-socks-egress"
 path = "src/bin/nord_socks_egress.rs"
 
-[lib]
-name = "headroom_proxy"
-path = "src/lib.rs"
+[features]
+# Pass-through to headroom-core. `ml` is OFF by default, so a stock build is
+# the fast lexical one; turning it ON (`--features ml`) restores ONNX Runtime
+# and the models, and the proxy runs the full paths (Kompress instead of
+# TextCrusher, magika file typing, embedding relevance).
+default = []
+ml = ["headroom-core/ml"]
+# Shared Redis CCR store for multi-worker deployments. See headroom-core.
+redis = ["headroom-core/redis"]
 
 [dependencies]
-axum = { workspace = true, features = ["ws", "http2", "macros", "multipart"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time", "process"] }
-tower = { workspace = true }
-# Substring search for the sidecar gate: SIMD, and 24x cheaper than the
-# JSON parse it stands in front of. See `crate::sidecar`.
-memchr = "2"
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["json", "env-filter", "fmt"] }
-reqwest = { workspace = true, features = ["stream", "blocking", "http2", "socks"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-clap = { workspace = true, features = ["derive", "env"] }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-uuid = { workspace = true }
-hex = "0.4"
-chrono = { workspace = true, features = ["default"] }
-bytes = { workspace = true }
-futures = "0.3"
-futures-util = { workspace = true }
-pin-project-lite = "0.2"
-http = { workspace = true }
-http-body-util = { workspace = true }
-hyper = { workspace = true }
-url = "2"
-humantime = "2"
-bytesize = "2"
-tokio-stream = { workspace = true }
-tokio-util = { version = "0.7" }
-# `default-features = false` so the proxy's own `ml` feature is what decides
-# whether ONNX Runtime is linked; see `[features]` below.
-headroom-core = { path = "../headroom-core", default-features = false }
-base64 = "0.23"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+async-trait = "0.1"
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
 # Phase D PR-D1: native Bedrock InvokeModel route. SigV4 + AWS
 # default credential chain.
 aws-sigv4 = { workspace = true }
-aws-config = { workspace = true }
-aws-credential-types = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
+axum = { workspace = true, features = ["ws", "http2", "macros", "multipart"] }
+base64 = "0.23"
+brotli = "9"
+bytes = { workspace = true }
+bytesize = "2"
+chacha20poly1305 = { version = "0.11", features = ["getrandom"] }
+chrono = { workspace = true, features = ["default"] }
+clap = { workspace = true, features = ["derive", "env"] }
 # Phase D PR-D2: Bedrock binary EventStream parser. AWS frames each
 # message with a CRC32 over the prelude and over the entire message;
 # `crc32fast` is the standard IEEE 802.3 implementation already
 # transitively pulled in by `aws-smithy-*` (so this is not an
 # additional cold dep — promoting to a direct one for clarity).
 crc32fast = { workspace = true }
+# Phase 0 (body.rs): inbound request-body decompression for byte-faithful
+# forwarding. Ports Python `_read_request_body_bytes` which supports
+# gzip/deflate (flate2), zstd, and brotli (br) Content-Encodings.
+flate2 = { workspace = true }
+futures = "0.3"
+futures-util = { workspace = true }
+# PR-D4: GCP Application Default Credentials → bearer token for
+# Vertex `:rawPredict` / `:streamRawPredict`. See workspace
+# Cargo.toml for rationale.
+gcp_auth = { workspace = true }
+# `default-features = false` so the proxy's own `ml` feature is what decides
+# whether ONNX Runtime is linked; see `[features]` below.
+headroom-core = { path = "../headroom-core", default-features = false }
+hex = "0.4"
+# CTX-5: HTML→markdown conversion for ctx fetch (port of Turndown used by
+# the TS context-mode's ctx_fetch_and_index).
+htmd = "0.5"
+http = { workspace = true }
+http-body-util = { workspace = true }
+humantime = "2"
+hyper = { workspace = true }
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+] }
+libc = "0.2"
+# PR-E6: bounded session-scoped cache of structural hashes. The
+# detector evicts the oldest session at 1000 entries — we never want
+# unbounded memory growth from a flood of unique session keys. `lru`
+# is the de-facto Rust LRU crate; minimal surface, no dependencies of
+# our own beyond `hashbrown` (which we already pull transitively).
+lru = { workspace = true }
+# Phase E PR-E1: tool array deterministic sort uses MD5 of canonical
+# JSON as a fallback sort key for unnamed tools. MD5 is sufficient
+# because the value is opaque and only used for stable in-process
+# ordering — never persisted, never compared cross-host. Same crate
+# the core uses for the CCR cache_key, so no additional hash backend
+# enters the dep tree.
+md-5 = { workspace = true }
+# Substring search for the sidecar gate: SIMD, and 24x cheaper than the
+# JSON parse it stands in front of. See `crate::sidecar`.
+memchr = "2"
+# Global allocator for the proxy binary (wired in `src/main.rs`). The hot
+# path is allocation-heavy (JSON parse/strip/serialize per request plus
+# header-map churn); measured 1.6-1.7x on that workload vs the system
+# allocator with byte-identical output. See `src/main.rs`.
+mimalloc = "0.1"
+pin-project-lite = "0.2"
 # Phase D PR-D3: Prometheus metrics for Bedrock observability. The
 # `prometheus` crate's default-features pull in `protobuf`, which we
 # don't need (we serve text-format scrapes only), so we disable
@@ -89,6 +123,21 @@ crc32fast = { workspace = true }
 # bump cannot silently change the alarm contract; the bump must be
 # an explicit code review that re-validates the contract.
 prometheus = { version = "=0.14.0", default-features = false }
+# CTX-2: lightweight regex for env-command sanitization in extract.rs.
+regex-lite = "0.1"
+reqwest = { workspace = true, features = [
+  "stream",
+  "blocking",
+  "http2",
+  "socks",
+] }
+# CTX-5 fetch ladder (context-mode `next` P4): the lossless page/block sidecar
+# (`fetch-pages.db`) beside the FTS content DB. Same crate + version +
+# `bundled` feature as headroom-core's CtxStore, so no new SQLite backend
+# enters the dep tree.
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 # PR-E6: SHA-256 over canonical bytes of the cache hot zone (system,
 # tools, early messages) for cache-bust drift detection. Already in
 # the dev-dependencies (and pulled transitively by `aws-sigv4` via
@@ -96,72 +145,44 @@ prometheus = { version = "=0.14.0", default-features = false }
 # dependency so the drift detector compiles outside `cfg(test)`. Also
 # used by PR-E4 for `prompt_cache_key` derivation.
 sha2 = { workspace = true }
-libc = "0.2"
-# PR-E6: bounded session-scoped cache of structural hashes. The
-# detector evicts the oldest session at 1000 entries — we never want
-# unbounded memory growth from a flood of unique session keys. `lru`
-# is the de-facto Rust LRU crate; minimal surface, no dependencies of
-# our own beyond `hashbrown` (which we already pull transitively).
-lru = { workspace = true }
-# PR-D4: GCP Application Default Credentials → bearer token for
-# Vertex `:rawPredict` / `:streamRawPredict`. See workspace
-# Cargo.toml for rationale.
-gcp_auth = { workspace = true }
-async-trait = "0.1"
-# Phase E PR-E1: tool array deterministic sort uses MD5 of canonical
-# JSON as a fallback sort key for unnamed tools. MD5 is sufficient
-# because the value is opaque and only used for stable in-process
-# ordering — never persisted, never compared cross-host. Same crate
-# the core uses for the CCR cache_key, so no additional hash backend
-# enters the dep tree.
-md-5 = { workspace = true }
-# headroom CLI: URL-encoding for query params.
-urlencoding = "2"
-# CTX-5: HTML→markdown conversion for ctx fetch (port of Turndown used by
-# the TS context-mode's ctx_fetch_and_index).
-htmd = "0.5"
-# CTX-5 fetch ladder (context-mode `next` P4): the lossless page/block sidecar
-# (`fetch-pages.db`) beside the FTS content DB. Same crate + version +
-# `bundled` feature as headroom-core's CtxStore, so no new SQLite backend
-# enters the dep tree.
-rusqlite = { workspace = true }
-# CTX-2: lightweight regex for env-command sanitization in extract.rs.
-regex-lite = "0.1"
-# Phase 0 (body.rs): inbound request-body decompression for byte-faithful
-# forwarding. Ports Python `_read_request_body_bytes` which supports
-# gzip/deflate (flate2), zstd, and brotli (br) Content-Encodings.
-flate2 = { workspace = true }
-zstd = "0.14"
-brotli = "9"
+tar = "0.4"
 # Runtime ast-grep interceptor writes tool output to a temporary file before
 # invoking ast-grep. This is used outside tests, so tempfile must be a normal
 # dependency, not only a dev-dependency.
 tempfile = { workspace = true }
-tar = "0.4"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "net",
+  "io-util",
+  "time",
+  "process",
+] }
+tokio-stream = { workspace = true }
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+  "connect",
+  "rustls-tls-webpki-roots",
+] }
+tokio-util = { version = "0.7" }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = [
+  "json",
+  "env-filter",
+  "fmt",
+] }
+url = "2"
+# headroom CLI: URL-encoding for query params.
+urlencoding = "2"
+uuid = { workspace = true }
 zip = { version = "8", default-features = false, features = ["deflate"] }
-chacha20poly1305 = { version = "0.11", features = ["getrandom"] }
-# Global allocator for the proxy binary (wired in `src/main.rs`). The hot
-# path is allocation-heavy (JSON parse/strip/serialize per request plus
-# header-map churn); measured 1.6-1.7x on that workload vs the system
-# allocator with byte-identical output. See `src/main.rs`.
-mimalloc = "0.1"
-
-[features]
-# Pass-through to headroom-core. `ml` is OFF by default, so a stock build is
-# the fast lexical one; turning it ON (`--features ml`) restores ONNX Runtime
-# and the models, and the proxy runs the full paths (Kompress instead of
-# TextCrusher, magika file typing, embedding relevance).
-default = []
-ml = ["headroom-core/ml"]
-# Shared Redis CCR store for multi-worker deployments. See headroom-core.
-redis = ["headroom-core/redis"]
+zstd = "0.14"
 
 [dev-dependencies]
-# CTX-2: unit tests for the passive-capture observer open a throwaway
-# sessions DB in a temp dir.
-tower = { workspace = true, features = ["util"] }
-wiremock = "0.6"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time", "test-util", "process"] }
+filetime = "0.2"
+headroom-simulators = { path = "../headroom-simulators" }
 hyper = { workspace = true, features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 # PR-C1: property tests for the byte-level SSE parser. The parser
@@ -176,5 +197,20 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 # instead the case count is cut centrally (PROPTEST_CASES=32 in
 # .config/nextest.toml + CI env) — same invariant signal, ~8x less runtime.
 proptest = { workspace = true }
-headroom-simulators = { path = "../headroom-simulators" }
-filetime = "0.2"
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "net",
+  "io-util",
+  "time",
+  "test-util",
+  "process",
+] }
+# CTX-2: unit tests for the passive-capture observer open a throwaway
+# sessions DB in a temp dir.
+tower = { workspace = true, features = ["util"] }
+wiremock = "0.6"
+
+[lints]
+workspace = true

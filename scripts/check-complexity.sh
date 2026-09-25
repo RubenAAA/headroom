@@ -15,6 +15,11 @@
 
 set -euo pipefail
 
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "── complexity: python3 not installed; skipping"
+    exit 0
+fi
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BASELINE="$ROOT/scripts/complexity-baseline.txt"
 

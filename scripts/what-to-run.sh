@@ -69,6 +69,7 @@ if command -v cargo-nextest >/dev/null 2>&1; then
     UNIT_PROXY_CONFIG="cargo nextest run -p headroom-proxy --profile ci -E 'kind(lib) and test(config)'"
     UNIT_CORE_COST="cargo nextest run -p headroom-core --profile ci -E 'kind(lib) and (test(cost_tracker) or test(pricing) or test(savings))'"
     UNIT_CORE_XFORM="cargo nextest run -p headroom-core --profile ci -E 'kind(lib) and (test(transforms) or test(compression) or test(crusher))'"
+    INT_SUITE="cargo nextest run -p headroom-proxy --profile ci --test"
 else
     UNIT_PROXY_CACHE="cargo test -p headroom-proxy --lib cache_stabilization"
     INT_CACHE="cargo test -p headroom-proxy --test cache --test capture --test ccr"
@@ -76,6 +77,7 @@ else
     UNIT_PROXY_CONFIG="cargo test -p headroom-proxy --lib config"
     UNIT_CORE_COST="cargo test -p headroom-core --lib cost_tracker"
     UNIT_CORE_XFORM="cargo test -p headroom-core --lib transforms"
+    INT_SUITE="cargo test -p headroom-proxy --test"
 fi
 
 CMDS=()
@@ -85,13 +87,25 @@ add() { CMDS+=("$1"); NOTES+=("$2"); }
 if [[ ${#FILES_UNIQ[@]} -eq 0 ]]; then
     add "make test-unit" "no changes detected; sanity: test-unit"
 else
-    if hit "crates/headroom-proxy/src/cache_stabilization/*" || hit "crates/headroom-proxy/tests/cache_key_contract.rs"; then
+    if hit "crates/headroom-proxy/src/cache_stabilization/*" || hit "crates/headroom-proxy/tests/suites/cache/*"; then
         add "$UNIT_PROXY_CACHE" "cache unit"
         add "$INT_CACHE" "contract + prefix/roster/order suites"
     fi
     if hit "crates/headroom-proxy/src/routed/*" || hit "crates/headroom-proxy/src/handlers/*" || hit "crates/headroom-proxy/src/sidecar.rs" || hit "crates/headroom-proxy/src/sse/*" || hit "crates/headroom-proxy/src/output_shaper.rs" || hit "crates/headroom-proxy/src/model_router.rs"; then
         add "$INT_ROUTED" "routed + sidecar + sse suites"
     fi
+    if hit "crates/headroom-proxy/src/openai/*" || hit "crates/headroom-proxy/src/bedrock/*" || hit "crates/headroom-proxy/src/vertex/*" || hit "crates/headroom-proxy/src/foundry/*"; then
+        add "$INT_SUITE providers" "provider translation suites"
+    fi
+    if hit "crates/headroom-proxy/src/memory/*" || hit "crates/headroom-proxy/src/ctx/*" || hit "crates/headroom-proxy/src/proxy/memory_continuation.rs"; then
+        add "$INT_SUITE state" "memory + ctx store suites"
+    fi
+    # An edited suite file runs its own umbrella binary, whatever else matched.
+    for suite in flows providers state capture; do
+        if hit "crates/headroom-proxy/tests/suites/$suite/*"; then
+            add "$INT_SUITE $suite" "edited $suite suite"
+        fi
+    done
     if hit "crates/headroom-proxy/src/config.rs" || hit "docs/flags.md" || hit "contrib/headroom-flags.sh"; then
         add "bash scripts/check-drift.sh" "flags/docs drift"
         add "$UNIT_PROXY_CONFIG" "config unit"

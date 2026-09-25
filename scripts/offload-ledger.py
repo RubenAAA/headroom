@@ -87,7 +87,11 @@ def read_log(paths):
                         d = json.loads(line)
                     except ValueError:
                         continue
-                    f = d["fields"]
+                    # Non-tracing lines (restart-script notes, panics) share
+                    # the file; one of them must not end the run.
+                    f = d.get("fields") if isinstance(d, dict) else None
+                    if not isinstance(f, dict) or "timestamp" not in d or "request_id" not in f:
+                        continue
                     t = ts(d["timestamp"])
                     first = t if first is None else min(first, t)
                     ev = f.get("event")
@@ -190,7 +194,9 @@ def main():
     ap.add_argument("--store", default="~/.claude-work/context-mode/ccr.db")
     ap.add_argument("--transcripts", default="~/.claude*/projects/**/*.jsonl")
     ap.add_argument("--weights", choices=WEIGHTS, default="api")
-    ap.add_argument("--min-bytes", type=int, default=2000, help="the live --ctx-offload-min-bytes")
+    ap.add_argument("--min-bytes", type=int, default=20000,
+                    help="the --ctx-offload-min-bytes live during the log window "
+                         "(20000 since 29a91202; pass 2000 for logs before it)")
     ap.add_argument("--preview-bytes", type=int, default=700, help="digest plus preview left in place")
     ap.add_argument("--sweep", default="1000,2000,3000,4000,6000,8000,12000,16000,32000,64000")
     a = ap.parse_args()

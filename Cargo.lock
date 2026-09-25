@@ -2128,7 +2128,6 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "blake3",
- "bytes",
  "calamine",
  "chrono",
  "criterion",
