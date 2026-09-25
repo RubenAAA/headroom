@@ -10,6 +10,38 @@ use crate::handlers::reasoning_signature::{PendingReasoning, encode_reasoning_si
 use crate::routed::outcome::{RoutedOutcomeContext, book_routed_outcome};
 use serde_json::{Value, json};
 
+/// A client alias for a translated route (Spark, Codex) rather than a native
+/// Anthropic turn. Both bill from a different cache universe than the
+/// Anthropic footprint the usage observer scores — translated prefix, no
+/// write/TTL telemetry — so scoring them reads as a bust on nearly every
+/// turn. Case-insensitive, matching the guards this replaces.
+pub(crate) fn translated_route_model(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.contains("spark") || lower.contains("codex")
+}
+
+#[cfg(test)]
+mod translated_route_model_tests {
+    use super::translated_route_model;
+
+    /// The Codex alias must trip the same exclusion Spark has, or its
+    /// zero-creation turns keep filing as recache waste.
+    #[test]
+    fn codex_and_spark_aliases_are_translated_routes() {
+        for model in [
+            "claude-codex-6-luna",
+            "claude-codex-5.6",
+            "claude-muse-spark-1.3",
+            "gpt-5.6-codex",
+        ] {
+            assert!(translated_route_model(model), "{model} is translated");
+        }
+        for model in ["claude-opus-5-5", "claude-sonnet-5", "qwen-local"] {
+            assert!(!translated_route_model(model), "{model} is native");
+        }
+    }
+}
+
 /// First-round provider usage captured for a turn whose booking waits
 /// downstream. Written when usage arrives and at every outcome emission, so
 /// the completion guard books exactly what an immediate booking would have.
@@ -404,7 +436,14 @@ impl StreamTranslator {
         // side already skips parking it, and this guard covers any turn that
         // parked through another path. Spend is still booked through the
         // outcome funnel; only the cache-health signal skips it.
-        if self.model.to_lowercase().contains("spark") || ctx.model.to_lowercase().contains("spark")
+        //
+        // Codex rides the same translated Responses route with the same gap
+        // (never a cache-creation counter, so every shortfall reads Recache):
+        // same exclusion. Matched on the client-alias snapshot, since `model`
+        // is the upstream name by now.
+        if translated_route_model(&self.model)
+            || translated_route_model(&self.client_model)
+            || translated_route_model(&ctx.model)
         {
             self.observation_completed = true;
             return;
@@ -1052,6 +1091,15 @@ impl StreamTranslator {
         // `record_failed` — a failed turn must not feed the save-rate.
         let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
         self.emit_outcome(usage.as_ref(), 500);
+        // Terminally dead without ever reaching `complete`: pop the parked
+        // entry so it never flags a later turn concurrent. The usage
+        // observer's pending map is the only state touched — spend already
+        // booked above through the outcome funnel.
+        if let Some(ctx) = self.outcome.as_ref()
+            && let Some(observer) = ctx.usage_observer.as_ref()
+        {
+            observer.note_stream_ended(&ctx.request_id);
+        }
         // The turn still has to end on the wire: without terminal
         // events the client hangs, and the `[DONE]` fallback cannot
         // rescue it — the block above already closed `open`, which is

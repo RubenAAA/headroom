@@ -725,6 +725,22 @@ impl UsageObserver {
         }
     }
 
+    /// A parked turn ended without ever reaching `complete`: the client hung
+    /// up, the stream never matched, the upstream failed terminally. Its
+    /// entry would otherwise linger until the LRU evicts it, and every later
+    /// turn of that conversation flags `concurrent_with_in_flight` against a
+    /// turn that is long dead. Popping here is what makes the flag mean a
+    /// real overlap again. Counts into `abandoned_requests_total` like the
+    /// other unfinished exits. No-op when the id never parked or already
+    /// completed. Never call from a path that may still book the turn
+    /// (internal retries re-send; the turn is alive, not dead).
+    pub fn note_stream_ended(&self, request_id: &str) {
+        let mut inner = self.lock();
+        if inner.pending.pop(request_id).is_some() {
+            inner.abandoned_requests_total += 1;
+        }
+    }
+
     /// Record the wire sizes and the arm this turn ran under.
     ///
     /// Deliberately taken from the bytes themselves rather than from any
@@ -4114,6 +4130,34 @@ mod tests {
             Some(false),
             "a leftover older than the horizon is not a turn in flight"
         );
+    }
+
+    /// A terminally dead turn (client gone, stream unmatched, upstream failed)
+    /// pops its entry at stream end via `note_stream_ended`, so it stops
+    /// flagging later turns concurrent immediately — no waiting on the
+    /// 15-minute horizon sweep.
+    #[test]
+    fn a_terminally_ended_turn_stops_counting_as_in_flight() {
+        let obs = UsageObserver::new();
+        obs.begin_request("req-1", "conv".into(), None, None, None);
+        obs.note_stream_ended("req-1");
+        assert_eq!(
+            obs.snapshot().abandoned_requests_total,
+            1,
+            "a dead turn counts as abandoned, like the sweep"
+        );
+
+        obs.begin_request("req-2", "conv".into(), None, None, None);
+        assert_eq!(
+            obs.pending_is_concurrent("req-2"),
+            Some(false),
+            "the dead entry is gone, not a turn in flight"
+        );
+
+        // Unknown and already-completed ids are silent no-ops, never panics.
+        obs.note_stream_ended("never-parked");
+        obs.note_stream_ended("req-1");
+        assert_eq!(obs.snapshot().abandoned_requests_total, 1);
     }
 
     #[test]

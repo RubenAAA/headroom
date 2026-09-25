@@ -193,13 +193,17 @@ fn park_conversation_identity(
     // This is what feeds the re-cache watchdog that
     // `scripts/statusline-cache-health.sh` renders — without it the cache
     // segment simply has nothing to say about routed turns.
-    let body_model_is_spark = parsed
+    //
+    // Translated routes (Spark, Codex) stay out: different cache universe
+    // than the Anthropic footprint the watchdog scores, so parking them
+    // reads as a bust on nearly every turn. See `translated_route_model`.
+    let body_model_is_translated = parsed
         .get("model")
         .and_then(|v| v.as_str())
-        .is_some_and(|m| m.to_lowercase().contains("spark"));
+        .is_some_and(crate::openai::stream::translated_route_model);
     let conversation_key =
         crate::cache_stabilization::usage_observer::conversation_key(parsed, lane_key);
-    if !body_model_is_spark {
+    if !body_model_is_translated {
         state.usage_observer.begin_request(
             request_id,
             conversation_key.clone(),
