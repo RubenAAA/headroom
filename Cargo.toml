@@ -86,6 +86,7 @@ gcp_auth = "0.12"
 # `hex` for SHA-256 hash encoding in read_lifecycle/read_maturation.
 # Python's `hashlib.sha256().hexdigest()[:24]` → Rust `hex::encode(hash)[..24]`.
 hex = "0.4"
+hmac = "0.13"
 http = "1"
 http-body-util = "0.1"
 hyper = "1"

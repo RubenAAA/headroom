@@ -2,17 +2,22 @@
 //!
 //! A byte scan survives a token cut by a chunk edge but not one cut by SSE
 //! framing. A routed model streams a placeholder it echoes a few characters
-//! per delta, so on the wire the token's halves sit in two
-//! `content_block_delta` events with a frame's worth of JSON between them,
-//! and no byte scan can see it whole. The Codex translator emits one
-//! `input_json_delta` per upstream argument fragment, which is how a Skill
-//! call reached Claude Code still holding the token as its skill name.
+//! per delta, so on the wire the token's halves sit in two delta events with
+//! a frame's worth of JSON between them, and no byte scan can see it whole.
+//! The Codex translator emits one `input_json_delta` per upstream argument
+//! fragment, which is how a Skill call reached Claude Code still holding the
+//! token as its skill name.
 //!
-//! So the stream is framed first. When a delta's text ends inside a token (or
-//! on a partial `__HR_`), the tail is held and prepended to the next delta of
-//! the same block, so the token travels in one event. Any other event flushes
-//! the held tail first, so nothing is reordered and nothing outlives its
-//! block.
+//! So the stream is framed first, and each streamed text delta is read with
+//! the stream it belongs to: an Anthropic content block, an OpenAI Responses
+//! item, a Chat Completions choice or tool call, a Gemini candidate. A delta
+//! whose text ends inside a token (or on a partial `__HR_`) is held whole.
+//! When the next delta of the same stream arrives, the unfinished token moves
+//! out of the held event into it, so the token travels in one event. Events
+//! are never split or duplicated: each keeps its own metadata (a tool call's
+//! `id` and `name`, a `finishReason`), and only text moves between them.
+//! Keepalives pass a held delta; any other event flushes it first, so nothing
+//! is reordered and nothing outlives its block.
 //!
 //! Each event is then restored inside its decoded JSON, not in its bytes: a
 //! value holding `"` or `\` spliced raw into the wire would end its string
@@ -23,21 +28,60 @@
 
 use serde_json::Value;
 
-use crate::redact::{Escape, MAX_TOKEN_LEN, PREFIX, RestoreTable, hold_from};
+use crate::redact::{Escape, MAX_TOKEN_LEN, PREFIX, RestoreTable, hold_from, parse_token};
 use crate::sse::framing::SseFramer;
-use crate::sse::outbound::content_block_delta;
 
-/// A delta tail waiting for the rest of its token.
-struct Held {
-    index: usize,
-    delta_type: String,
-    field: &'static str,
+/// One step from an event's JSON root towards its streamed text.
+#[derive(Clone, Copy)]
+enum Seg {
+    Key(&'static str),
+    Index(usize),
+}
+
+/// A streamed text delta, as received and as it will go out.
+struct Delta {
+    /// Which stream the text belongs to; only deltas of one stream join.
+    stream: String,
+    block: String,
+    data: std::ops::Range<usize>,
+    value: Value,
+    path: Vec<Seg>,
+    original: String,
     text: String,
 }
 
-impl Held {
-    fn frame(&self) -> String {
-        content_block_delta(self.index, &self.delta_type, self.field, &self.text)
+impl Delta {
+    fn parse(block: &[u8]) -> Option<Self> {
+        let block = std::str::from_utf8(block).ok()?;
+        let (data, payload) = single_data_line(block)?;
+        let value: Value = serde_json::from_str(payload).ok()?;
+        let (stream, path) = stream_leaf(&value)?;
+        let text = leaf(&value, &path)?.as_str()?.to_string();
+        Some(Self {
+            stream,
+            block: block.to_string(),
+            data,
+            value,
+            path,
+            original: text.clone(),
+            text,
+        })
+    }
+
+    /// The event as it goes out: byte-identical unless its text changed.
+    fn render(mut self) -> Vec<u8> {
+        if self.text == self.original {
+            return self.block.into_bytes();
+        }
+        if let Some(slot) = leaf_mut(&mut self.value, &self.path) {
+            *slot = Value::String(self.text);
+        }
+        let mut out = String::with_capacity(self.block.len());
+        out.push_str(&self.block[..self.data.start]);
+        out.push_str("data: ");
+        out.push_str(&self.value.to_string());
+        out.push_str(&self.block[self.data.end..]);
+        out.into_bytes()
     }
 }
 
@@ -52,14 +96,17 @@ enum Shape {
 
 pub(crate) struct PlaceholderJoin {
     shape: Shape,
+    /// Opening bytes too short to tell the shape by (`ev` of `event:`).
+    undecided: Vec<u8>,
     framer: SseFramer,
-    held: Option<Held>,
+    held: Option<Delta>,
 }
 
 impl Default for PlaceholderJoin {
     fn default() -> Self {
         Self {
             shape: Shape::Unknown,
+            undecided: Vec::new(),
             framer: SseFramer::new(),
             held: None,
         }
@@ -78,29 +125,42 @@ impl PlaceholderJoin {
     }
 
     /// Feed a chunk. For SSE, returns whole restored events; for anything
-    /// else, the chunk untouched.
+    /// else, the chunk untouched. Opening bytes that could still be either
+    /// come back with the chunk that decides.
     pub(crate) fn push(
         &mut self,
         chunk: &[u8],
         table: &RestoreTable,
         misses: &mut usize,
     ) -> Vec<u8> {
-        if self.shape == Shape::Unknown {
-            let start = chunk.trim_ascii_start();
+        let decided;
+        let chunk = if self.shape == Shape::Unknown {
+            self.undecided.extend_from_slice(chunk);
+            let start = self.undecided.trim_ascii_start();
             if start.is_empty() {
-                return chunk.to_vec();
+                return std::mem::take(&mut self.undecided);
             }
-            self.shape = if [b"event:".as_slice(), b"data:", b":"]
+            let markers = [b"event:".as_slice(), b"data:", b":"];
+            // A first read can stop inside the marker; deciding on `ev`
+            // would send the whole stream past the join.
+            if markers
                 .iter()
-                .any(|p| start.starts_with(p))
+                .any(|p| start.len() < p.len() && p.starts_with(start))
             {
+                return Vec::new();
+            }
+            self.shape = if markers.iter().any(|p| start.starts_with(p)) {
                 Shape::Sse
             } else if start.starts_with(b"{") || start.starts_with(b"[") {
                 Shape::Json
             } else {
                 Shape::Other
             };
-        }
+            decided = std::mem::take(&mut self.undecided);
+            &decided[..]
+        } else {
+            chunk
+        };
         if self.shape != Shape::Sse {
             return chunk.to_vec();
         }
@@ -114,11 +174,15 @@ impl PlaceholderJoin {
         out
     }
 
-    /// End of stream, SSE only: the held tail, then any unframed bytes.
+    /// End of stream. SSE: the held tail, then any unframed bytes, restored.
+    /// Otherwise: opening bytes a shape was never decided for, unrestored.
     pub(crate) fn finish(&mut self, table: &RestoreTable, misses: &mut usize) -> Vec<u8> {
+        if self.shape != Shape::Sse {
+            return std::mem::take(&mut self.undecided);
+        }
         let mut out = Vec::new();
         if let Some(held) = self.held.take() {
-            out.extend(restore_event(table, held.frame().as_bytes(), misses));
+            out.extend(restore_event(table, &held.render(), misses));
         }
         let rest = self.framer.take_remaining();
         let (restored, m) = table.restore_bytes_as(&rest, Escape::Raw);
@@ -129,68 +193,182 @@ impl PlaceholderJoin {
 
     /// The events `block` becomes once split tokens are rejoined.
     fn join(&mut self, block: &[u8]) -> Vec<Vec<u8>> {
-        let mut out = Vec::new();
-        let Some((index, delta_type, field, text)) = text_delta(block) else {
-            if let Some(held) = self.held.take() {
-                out.push(held.frame().into_bytes());
+        let Some(mut next) = Delta::parse(block) else {
+            if is_keepalive(block) {
+                return vec![block.to_vec()];
             }
+            let mut out: Vec<Vec<u8>> = self.held.take().map(Delta::render).into_iter().collect();
             out.push(block.to_vec());
             return out;
         };
-        let (mut text, joined) = match self.held.take() {
-            Some(held) if held.index == index && held.delta_type == delta_type => {
-                (held.text + &text, true)
+        let mut out = Vec::new();
+        match self.held.take() {
+            Some(mut held) if held.stream == next.stream => {
+                let cut = safe_cut(&held.text, &next.text);
+                next.text.insert_str(0, &held.text[cut..]);
+                held.text.truncate(cut);
+                out.push(held.render());
             }
-            Some(held) => {
-                out.push(held.frame().into_bytes());
-                (text, false)
-            }
-            None => (text, false),
-        };
-        match hold_from(text.as_bytes(), MAX_TOKEN_LEN) {
-            // The cut lands on `_`, which is ASCII, so it is a char boundary.
-            Some(cut) => {
-                let tail = text.split_off(cut);
-                if !text.is_empty() {
-                    out.push(content_block_delta(index, &delta_type, field, &text).into_bytes());
-                }
-                self.held = Some(Held {
-                    index,
-                    delta_type,
-                    field,
-                    text: tail,
-                });
-            }
-            None if joined => {
-                out.push(content_block_delta(index, &delta_type, field, &text).into_bytes());
-            }
-            None => out.push(block.to_vec()),
+            Some(held) => out.push(held.render()),
+            None => {}
+        }
+        if hold_from(next.text.as_bytes(), MAX_TOKEN_LEN).is_some() {
+            self.held = Some(next);
+        } else {
+            out.push(next.render());
         }
         out
     }
 }
 
-/// `(index, delta type, field, text)` for a streamed text-bearing delta.
-fn text_delta(block: &[u8]) -> Option<(usize, String, &'static str, String)> {
-    let block = std::str::from_utf8(block).ok()?;
-    if !block.contains("content_block_delta") {
-        return None;
+/// Where the held text `head` may end once `tail` follows it: before any
+/// token the two would otherwise split, and before an unfinished one.
+/// Every cut lands on an ASCII `_` or on the join, so it is a char boundary.
+fn safe_cut(head: &str, tail: &str) -> usize {
+    let joined = format!("{head}{tail}");
+    let bytes = joined.as_bytes();
+    let mut cut = head.len();
+    let mut i = 0;
+    while i < cut {
+        match parse_token(bytes, i) {
+            Some((_, len)) if i + len > head.len() => cut = i,
+            Some((_, len)) => i += len,
+            None => i += 1,
+        }
     }
-    let v: Value = serde_json::from_str(single_data_line(block)?.1).ok()?;
+    match hold_from(bytes, MAX_TOKEN_LEN) {
+        Some(open) => cut.min(open),
+        None => cut,
+    }
+}
+
+/// A comment or `ping`: no text, and safe to send ahead of a held delta.
+fn is_keepalive(block: &[u8]) -> bool {
+    std::str::from_utf8(block).is_ok_and(|b| {
+        !b.lines().any(|l| l.starts_with("data:")) || b.lines().any(|l| l == "event: ping")
+    })
+}
+
+/// The stream a delta event belongs to, and the path to its text.
+fn stream_leaf(v: &Value) -> Option<(String, Vec<Seg>)> {
+    anthropic_leaf(v)
+        .or_else(|| responses_leaf(v))
+        .or_else(|| chat_leaf(v))
+        .or_else(|| gemini_leaf(v))
+}
+
+/// A field's JSON text, or empty when absent: part of a stream's name.
+fn field(v: &Value, key: &str) -> String {
+    v.get(key).map(Value::to_string).unwrap_or_default()
+}
+
+/// Anthropic: a `content_block_delta`, one stream per block `index`.
+fn anthropic_leaf(v: &Value) -> Option<(String, Vec<Seg>)> {
     if v.get("type")?.as_str()? != "content_block_delta" {
         return None;
     }
-    let index = usize::try_from(v.get("index")?.as_u64()?).ok()?;
-    let delta = v.get("delta")?;
-    let delta_type = delta.get("type")?.as_str()?;
-    let field = match delta_type {
+    let delta_type = v.get("delta")?.get("type")?.as_str()?;
+    let text = match delta_type {
         "text_delta" => "text",
         "input_json_delta" => "partial_json",
         "thinking_delta" => "thinking",
         _ => return None,
     };
-    let text = delta.get(field)?.as_str()?;
-    Some((index, delta_type.to_string(), field, text.to_string()))
+    let stream = format!("anthropic:{}:{delta_type}", field(v, "index"));
+    Some((stream, vec![Seg::Key("delta"), Seg::Key(text)]))
+}
+
+/// OpenAI Responses: every `response.*.delta` carries its text in `delta`.
+fn responses_leaf(v: &Value) -> Option<(String, Vec<Seg>)> {
+    let kind = v.get("type")?.as_str()?;
+    if !kind.starts_with("response.") || !kind.ends_with(".delta") || !v.get("delta")?.is_string() {
+        return None;
+    }
+    let stream = format!(
+        "responses:{kind}:{}:{}:{}:{}",
+        field(v, "item_id"),
+        field(v, "output_index"),
+        field(v, "content_index"),
+        field(v, "summary_index")
+    );
+    Some((stream, vec![Seg::Key("delta")]))
+}
+
+/// Chat Completions: one choice whose delta has exactly one text field.
+fn chat_leaf(v: &Value) -> Option<(String, Vec<Seg>)> {
+    let [choice] = v.get("choices")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let delta = choice.get("delta")?;
+    let mut found = Vec::new();
+    for text in ["content", "reasoning_content", "reasoning"] {
+        if delta.get(text).is_some_and(Value::is_string) {
+            found.push((text.to_string(), vec![Seg::Key(text)]));
+        }
+    }
+    let calls = delta.get("tool_calls").and_then(Value::as_array);
+    for (j, call) in calls.into_iter().flatten().enumerate() {
+        let arguments = call.get("function").and_then(|f| f.get("arguments"));
+        if arguments.is_some_and(Value::is_string) {
+            found.push((
+                format!("tool:{}", field(call, "index")),
+                vec![
+                    Seg::Key("tool_calls"),
+                    Seg::Index(j),
+                    Seg::Key("function"),
+                    Seg::Key("arguments"),
+                ],
+            ));
+        }
+    }
+    let [(name, tail)] = <[_; 1]>::try_from(found).ok()?;
+    let mut path = vec![Seg::Key("choices"), Seg::Index(0), Seg::Key("delta")];
+    path.extend(tail);
+    Some((format!("chat:{}:{name}", field(choice, "index")), path))
+}
+
+/// Gemini: one candidate with exactly one text part; thoughts stream apart.
+fn gemini_leaf(v: &Value) -> Option<(String, Vec<Seg>)> {
+    let [candidate] = v.get("candidates")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let parts = candidate.get("content")?.get("parts")?.as_array()?;
+    let mut texts = parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.get("text").is_some_and(Value::is_string));
+    let (k, part) = texts.next()?;
+    if texts.next().is_some() {
+        return None;
+    }
+    let thought = part
+        .get("thought")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let stream = format!("gemini:{}:{thought}", field(candidate, "index"));
+    let path = vec![
+        Seg::Key("candidates"),
+        Seg::Index(0),
+        Seg::Key("content"),
+        Seg::Key("parts"),
+        Seg::Index(k),
+        Seg::Key("text"),
+    ];
+    Some((stream, path))
+}
+
+fn leaf<'a>(v: &'a Value, path: &[Seg]) -> Option<&'a Value> {
+    path.iter().try_fold(v, |v, seg| match *seg {
+        Seg::Key(k) => v.get(k),
+        Seg::Index(i) => v.get(i),
+    })
+}
+
+fn leaf_mut<'a>(v: &'a mut Value, path: &[Seg]) -> Option<&'a mut Value> {
+    path.iter().try_fold(v, |v, seg| match *seg {
+        Seg::Key(k) => v.get_mut(k),
+        Seg::Index(i) => v.get_mut(i),
+    })
 }
 
 /// The one `data:` line's byte range and payload. `None` for zero or several.
@@ -368,12 +546,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            format!(
-                "{}{}{}",
-                text_delta(0, "see "),
-                text_delta(0, "__HR_SEC"),
-                content_block_stop(0)
-            )
+            format!("{}{}", text_delta(0, "see __HR_SEC"), content_block_stop(0))
         );
     }
 
@@ -399,5 +572,121 @@ mod tests {
             body.as_bytes()
         );
         assert!(matches!(join.byte_escape(), Some(Escape::Json)));
+    }
+
+    /// A first read that stops inside `event:` must still be read as SSE,
+    /// or a token split across deltas reaches the client unjoined.
+    #[test]
+    fn a_stream_read_a_byte_at_a_time_is_still_joined() {
+        let (table, token) = minted("abcdefghij1234567890");
+        let (a, b) = token.split_at(9);
+        let sse = [
+            input_json_delta(1, &format!("{{\"skill\":\"ta{a}")),
+            input_json_delta(1, &format!("{b}\"}}")),
+            content_block_stop(1),
+        ]
+        .concat();
+        let bytes: Vec<String> = sse.chars().map(String::from).collect();
+        assert_eq!(
+            tool_input(&run(&table, &bytes)),
+            json!({"skill": "taabcdefghij1234567890"})
+        );
+    }
+
+    fn frame(v: Value) -> String {
+        format!("data: {v}\n\n")
+    }
+
+    /// The string at `pointer` in every event of `sse`, concatenated.
+    fn joined(sse: &str, pointer: &str) -> String {
+        let mut framer = SseFramer::new();
+        framer.push(sse.as_bytes());
+        let mut out = String::new();
+        while let Some(Ok(event)) = framer.next_event() {
+            let v: Value = serde_json::from_slice(&event.data).unwrap();
+            out.push_str(v.pointer(pointer).and_then(Value::as_str).unwrap_or(""));
+        }
+        out
+    }
+
+    #[test]
+    fn a_ping_between_the_halves_does_not_break_the_join() {
+        let (table, token) = minted("abcdefghij1234567890");
+        let (a, b) = token.split_at(9);
+        let ping = "event: ping\ndata: {\"type\": \"ping\"}\n\n".to_string();
+        let out = run(
+            &table,
+            &[
+                text_delta(0, &format!("key {a}")),
+                ping.clone(),
+                text_delta(0, b),
+            ],
+        );
+        assert_eq!(joined(&out, "/delta/text"), "key abcdefghij1234567890");
+        assert!(out.starts_with(&ping), "the ping goes ahead: {out}");
+    }
+
+    #[test]
+    fn responses_argument_deltas_are_joined_without_repeating_an_event() {
+        let (table, token) = minted("abcdefghij1234567890");
+        let (a, b) = token.split_at(12);
+        let delta = |seq: u64, d: String| {
+            frame(json!({"type": "response.function_call_arguments.delta",
+                "sequence_number": seq, "item_id": "fc_1", "output_index": 0, "delta": d}))
+        };
+        let out = run(
+            &table,
+            &[
+                delta(1, format!("{{\"skill\":\"ta{a}")),
+                delta(2, format!("{b}\"}}")),
+            ],
+        );
+        let args: Value = serde_json::from_str(&joined(&out, "/delta")).unwrap();
+        assert_eq!(args, json!({"skill": "taabcdefghij1234567890"}));
+        assert_eq!(out.matches("sequence_number").count(), 2);
+    }
+
+    #[test]
+    fn a_chat_tool_call_keeps_its_id_and_name_in_the_first_chunk() {
+        let (table, token) = minted("abcdefghij1234567890");
+        let (a, b) = token.split_at(7);
+        let first = frame(json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": "call_1", "type": "function",
+             "function": {"name": "Skill", "arguments": format!("{{\"skill\":\"{a}")}}]}}]}));
+        let rest = frame(json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": format!("{b}\"}}")}}]}}]}));
+        let out = run(&table, &[first, rest]);
+        let args = joined(&out, "/choices/0/delta/tool_calls/0/function/arguments");
+        assert_eq!(
+            serde_json::from_str::<Value>(&args).unwrap(),
+            json!({"skill": "abcdefghij1234567890"})
+        );
+        assert_eq!(out.matches("call_1").count(), 1);
+        assert_eq!(out.matches("\"name\"").count(), 1);
+    }
+
+    #[test]
+    fn gemini_text_parts_are_joined() {
+        let (table, token) = minted("abcdefghij1234567890");
+        let (a, b) = token.split_at(3);
+        let part = |t: String, done: bool| {
+            let mut c = json!({"index": 0, "content": {"role": "model", "parts": [{"text": t}]}});
+            if done {
+                c["finishReason"] = json!("STOP");
+            }
+            frame(json!({"candidates": [c]}))
+        };
+        let out = run(
+            &table,
+            &[
+                part(format!("it is {a}"), false),
+                part(format!("{b}."), true),
+            ],
+        );
+        assert_eq!(
+            joined(&out, "/candidates/0/content/parts/0/text"),
+            "it is abcdefghij1234567890."
+        );
+        assert_eq!(out.matches("STOP").count(), 1);
     }
 }

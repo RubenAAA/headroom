@@ -47,6 +47,14 @@
 //! no future chunk can still complete. Placeholders are self-delimiting, so
 //! the scan is a single pass with no backtracking.
 
+mod key;
+
+// Globs cap each item at its own visibility: `pub` items stay public
+// API, the rest stay in-crate. Modules with no `pub` item would
+// otherwise warn that they re-export nothing.
+#[allow(unused_imports)]
+pub use self::key::*;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -143,151 +151,6 @@ const TOKEN_OVERHEAD: usize = NONCE_LEN + 16;
 /// The most value one token can carry and still parse on the way back.
 const MAX_VALUE_BYTES: usize = MAX_TOKEN_HEX / 2 - TOKEN_OVERHEAD;
 
-/// Where the restore key lives. `HEADROOM_REDACT_KEY_FILE` overrides it, which
-/// is what the tests use so a run never touches the real one.
-fn key_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("HEADROOM_REDACT_KEY_FILE") {
-        return std::path::PathBuf::from(p);
-    }
-    let state = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|s| s.starts_with('/'))
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            format!("{home}/.local/state")
-        });
-    std::path::PathBuf::from(state)
-        .join("headroom")
-        .join("redact.key")
-}
-
-/// Read the key, or create one on first use. `0600`, and `create_new` so two
-/// proxies racing to start cannot write over each other — the loser re-reads
-/// the winner's key rather than minting tokens the winner cannot restore.
-///
-/// A key that cannot be read or written is not fatal: the process falls back
-/// to a random in-memory key, which restores everything it minted itself and
-/// nothing from before it, exactly as the old map-only design did.
-fn load_or_create_key() -> ([u8; 32], bool) {
-    let path = key_path();
-    let mut key = [0u8; 32];
-
-    if let Some(result) = read_existing_key(&path, &mut key) {
-        return result;
-    }
-
-    getrandom_key(&mut key);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    persist_key(&path, key)
-}
-
-/// A readable 32-byte key file wins immediately; a malformed one warns and
-/// falls through to minting. `None` means no usable file — keep going.
-/// Extracted from `load_or_create_key` without behavior change.
-fn read_existing_key(path: &std::path::Path, key: &mut [u8; 32]) -> Option<([u8; 32], bool)> {
-    if let Ok(bytes) = std::fs::read(path) {
-        if bytes.len() == 32 {
-            key.copy_from_slice(&bytes);
-            return Some((*key, true));
-        }
-        tracing::warn!(
-            event = "redact_key_malformed",
-            path = %path.display(),
-            len = bytes.len(),
-            "restore key is not 32 bytes; placeholders minted before now will not restore"
-        );
-    }
-    None
-}
-
-/// Persist a minted key with `0600` and `create_new`, so two proxies racing
-/// to start cannot write over each other — the loser re-reads the winner's
-/// key rather than minting tokens the winner cannot restore.
-/// Extracted from `load_or_create_key` without behavior change.
-fn persist_key(path: &std::path::Path, key: [u8; 32]) -> ([u8; 32], bool) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-    {
-        Ok(f) => finish_key_write(f, path, key),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => adopt_race_winner_key(path, key),
-        Err(e) => report_unavailable_key(path, key, e),
-    }
-}
-
-/// Write a freshly minted key to a newly created file.
-/// Extracted from `persist_key` without behavior change.
-fn finish_key_write(
-    mut f: std::fs::File,
-    path: &std::path::Path,
-    key: [u8; 32],
-) -> ([u8; 32], bool) {
-    use std::io::Write;
-
-    if let Err(e) = f.write_all(&key) {
-        tracing::warn!(event = "redact_key_write_failed", error = %e);
-        return (key, false);
-    }
-    tracing::info!(
-        event = "redact_key_created",
-        path = %path.display(),
-        "wrote a new restore key"
-    );
-    (key, true)
-}
-
-/// Lost the creation race: re-read the winner's key, which is the one that
-/// counts. Anything else leaves this process on its in-memory key.
-/// Extracted from `persist_key` without behavior change.
-fn adopt_race_winner_key(path: &std::path::Path, key: [u8; 32]) -> ([u8; 32], bool) {
-    // Lost the race. The winner's key is the one that counts.
-    match std::fs::read(path) {
-        Ok(bytes) if bytes.len() == 32 => {
-            let mut key = key;
-            key.copy_from_slice(&bytes);
-            (key, true)
-        }
-        _ => (key, false),
-    }
-}
-
-/// No key file can be read or written: fall back to the in-memory key, which
-/// restores everything this process mints itself and nothing from before it.
-/// Extracted from `persist_key` without behavior change.
-fn report_unavailable_key(
-    path: &std::path::Path,
-    key: [u8; 32],
-    e: std::io::Error,
-) -> ([u8; 32], bool) {
-    tracing::warn!(
-        event = "redact_key_unavailable",
-        path = %path.display(),
-        error = %e,
-        "no restore key on disk; placeholders will not survive this process"
-    );
-    (key, false)
-}
-
-/// 32 bytes from the OS. `/dev/urandom` directly rather than through an RNG
-/// crate: one read, no generic plumbing, and the same source either way.
-fn getrandom_key(out: &mut [u8; 32]) {
-    use std::io::Read;
-    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(out)) {
-        Ok(()) => {}
-        Err(e) => {
-            // Never mint tokens from a predictable key: without randomness the
-            // placeholder is guessable, which is the one thing it must not be.
-            panic!("cannot read /dev/urandom for the redaction key: {e}");
-        }
-    }
-}
-
 /// One session's two-way map. `forward` restores, `reverse` keeps a value on
 /// one placeholder for the whole session, `order` bounds memory.
 ///
@@ -314,6 +177,7 @@ impl SessionMap {
     fn placeholder(
         &mut self,
         cipher: &ChaCha20Poly1305,
+        nonce_key: &[u8; 32],
         kind: &'static str,
         original: &str,
         session: &str,
@@ -326,7 +190,7 @@ impl SessionMap {
         // in an attempt counter rather than aliasing.
         let mut attempt = 0u32;
         let token = loop {
-            let candidate = token_for(cipher, session, kind, original, attempt);
+            let candidate = token_for(cipher, nonce_key, session, kind, original, attempt);
             match self.forward.get(&candidate) {
                 None => break candidate,
                 Some(owner) if owner == original => break candidate,
@@ -381,6 +245,9 @@ pub struct RedactStore {
     /// The key behind every counted token. A token carries its own ciphertext,
     /// so restore is decryption rather than a lookup — see [`token_for`].
     cipher: Arc<ChaCha20Poly1305>,
+    /// Keys the nonce, which rides in every token in the clear. See
+    /// [`token_for`].
+    nonce_key: [u8; 32],
     /// Whether that key came from disk. False means this process invented one
     /// and nothing it mints will outlive it.
     key_is_durable: bool,
@@ -408,6 +275,7 @@ impl RedactStore {
             inner: Arc::new(Mutex::new(LruCache::new(capacity))),
             global: Arc::new(Mutex::new(LruCache::new(global))),
             cipher: Arc::new(ChaCha20Poly1305::new(&Key::from(key))),
+            nonce_key: nonce_key(&key),
             key_is_durable: durable,
         }
     }
@@ -423,6 +291,7 @@ impl RedactStore {
             inner: Arc::new(Mutex::new(LruCache::new(capacity))),
             global: Arc::new(Mutex::new(LruCache::new(global))),
             cipher: Arc::new(ChaCha20Poly1305::new(&Key::from(key))),
+            nonce_key: nonce_key(&key),
             key_is_durable: true,
         }
     }
@@ -696,8 +565,9 @@ impl<'a> BodyRedactor<'a> {
         let mut token = String::new();
         let session = self.session_key.clone();
         let cipher = Arc::clone(&self.store.cipher);
+        let nonce_key = self.store.nonce_key;
         self.store.with_session(&session, |map| {
-            token = map.placeholder(&cipher, kind, original, &session);
+            token = map.placeholder(&cipher, &nonce_key, kind, original, &session);
         });
         self.store.remember(&token, original);
         token
@@ -780,83 +650,6 @@ impl<'a> BodyRedactor<'a> {
         }
         match_relative_path(bytes, i, rest)
     }
-}
-
-/// Mint a placeholder deterministically: SHA-256 over the session, kind and
-/// value, NUL-separated the way `conversation_discriminator` separates its
-/// fields, truncated to 64 bits (16 hex chars). The session key is the salt
-/// and never goes upstream, so the token is opaque without it.
-fn token_for(
-    cipher: &ChaCha20Poly1305,
-    session: &str,
-    kind: &str,
-    original: &str,
-    attempt: u32,
-) -> String {
-    use sha2::{Digest, Sha256};
-    // The nonce is derived from the value, so the same value in the same
-    // session always mints the same token — the property the provider's cached
-    // prefix depends on. Deriving it from the plaintext also means a nonce is
-    // only ever paired with the plaintext that produced it, which is the rule
-    // that makes reuse safe. The session is salted in so two sessions holding
-    // the same secret still send different bytes upstream.
-    let mut hasher = Sha256::new();
-    hasher.update(b"headroom-redact-nonce");
-    hasher.update(session.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(kind.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(original.as_bytes());
-    if attempt > 0 {
-        hasher.update([0u8]);
-        hasher.update(attempt.to_le_bytes());
-    }
-    let digest = hasher.finalize();
-    let nonce_bytes: [u8; NONCE_LEN] = digest[..NONCE_LEN]
-        .try_into()
-        .expect("digest is longer than the nonce");
-    let nonce = Nonce::from(nonce_bytes);
-
-    // The kind is authenticated but not encrypted: it is already in the token,
-    // and binding it stops a token being read back as another kind.
-    let sealed = cipher
-        .encrypt(
-            &nonce,
-            Payload {
-                msg: original.as_bytes(),
-                aad: kind.as_bytes(),
-            },
-        )
-        .expect("ChaCha20-Poly1305 seals any plaintext this scanner can produce");
-
-    let mut body = Vec::with_capacity(NONCE_LEN + sealed.len());
-    body.extend_from_slice(&digest[..NONCE_LEN]);
-    body.extend_from_slice(&sealed);
-    format!("{PREFIX}{kind}_{}__", hex::encode(body))
-}
-
-/// Recover what a counted token carries. `None` when the token was not minted
-/// by this key — an older process's, a shorter legacy token, or an invention.
-fn value_of(cipher: &ChaCha20Poly1305, token: &str) -> Option<String> {
-    let rest = token.strip_prefix(PREFIX)?.strip_suffix("__")?;
-    let (kind, hex_body) = rest.split_once('_')?;
-    let body = hex::decode(hex_body).ok()?;
-    if body.len() <= TOKEN_OVERHEAD {
-        return None;
-    }
-    let (nonce, sealed) = body.split_at(NONCE_LEN);
-    let opened = cipher
-        .decrypt(
-            &Nonce::from(
-                <[u8; NONCE_LEN]>::try_from(nonce).expect("split_at gave NONCE_LEN bytes"),
-            ),
-            Payload {
-                msg: sealed,
-                aad: kind.as_bytes(),
-            },
-        )
-        .ok()?;
-    String::from_utf8(opened).ok()
 }
 
 fn store_size(store: &RedactStore, session_key: &str) -> usize {
@@ -1078,7 +871,7 @@ fn redacted_label(token: &str) -> String {
 /// counter suffix: after a restart the old token has no map entry and stays
 /// as-is (counted as a miss) rather than corrupting text. Anything else is
 /// bytes — including a `__HR_` the model invented.
-fn parse_token(bytes: &[u8], i: usize) -> Option<(&str, usize)> {
+pub(crate) fn parse_token(bytes: &[u8], i: usize) -> Option<(&str, usize)> {
     let rest = bytes.get(i..)?;
     if !rest.starts_with(PREFIX.as_bytes()) {
         return None;
@@ -1188,6 +981,7 @@ where
                 let out = match join.byte_escape() {
                     None => join.finish(&table, &mut misses),
                     Some(escape) => {
+                        pending.extend(join.finish(&table, &mut misses));
                         let (out, m) = table.restore_bytes_as(&pending, escape);
                         pending.clear();
                         misses += m;
@@ -1644,7 +1438,69 @@ fn match_compound_key(bytes: &[u8], i: usize, rest: &[u8]) -> Option<(usize, usi
     if prev != b'_' && prev != b'-' && !(prev.is_ascii_lowercase() && rest[0] == b'K') {
         return None;
     }
+    if !names_credential_key(&bytes[..i]) {
+        return None;
+    }
     match_named_value(rest, 3, false).map(|(start, len)| (start, len, SECRET_KIND))
+}
+
+/// Whether the word before `key` makes the name a credential. Code is full of
+/// `session_key`, `cache_key` and `partition_key`, whose values the model has
+/// to read; hiding them cost it the value and handed it a long token to copy
+/// back. A random value after any name still goes, through the entropy rule.
+fn names_credential_key(before: &[u8]) -> bool {
+    let name = before
+        .strip_suffix(b"_")
+        .or_else(|| before.strip_suffix(b"-"))
+        .unwrap_or(before);
+    let run = name.len()
+        - name
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_alphanumeric())
+            .count();
+    let run = &name[run..];
+    // `secretAccess` → `Access`; `SECRET_ACCESS` and `api` are whole already.
+    let mixed = run.iter().any(u8::is_ascii_uppercase) && run.iter().any(u8::is_ascii_lowercase);
+    let word = match run.iter().rposition(u8::is_ascii_uppercase) {
+        Some(k) if mixed => &run[k..],
+        _ => run,
+    };
+    const CREDENTIAL_WORDS: [&str; 30] = [
+        "access",
+        "account",
+        "admin",
+        "api",
+        "app",
+        "auth",
+        "bot",
+        "client",
+        "consumer",
+        "decryption",
+        "deploy",
+        "encryption",
+        "gpg",
+        "hmac",
+        "jwt",
+        "license",
+        "licence",
+        "master",
+        "mfa",
+        "otp",
+        "pgp",
+        "private",
+        "recovery",
+        "root",
+        "secret",
+        "shared",
+        "signing",
+        "ssh",
+        "storage",
+        "subscription",
+    ];
+    CREDENTIAL_WORDS
+        .iter()
+        .any(|w| word.eq_ignore_ascii_case(w.as_bytes()))
 }
 
 /// pgpass line at a line start: only the password goes.
@@ -2261,14 +2117,14 @@ mod tests {
         );
     }
 
-    /// Compound credential names (`private_key`, `api-key`, `myKey`) redact
+    /// Compound credential names (`private_key`, `api-key`, `signingKey`) redact
     /// short values that no prefix and no entropy rule can see.
     #[test]
     fn compound_key_names_redact() {
         for content in [
             "private_key = hunter2hunter",
             "api-key: hunter2hunter",
-            "myKey=hunter2hunter",
+            "signingKey=hunter2hunter",
             "encryption_key = hunter2hunter",
         ] {
             let s = store();
@@ -2993,6 +2849,54 @@ mod tests {
                 assert_eq!(restored, original.as_bytes());
             }
             None => assert_eq!(redacted.as_ref(), original.as_bytes()),
+        }
+    }
+
+    /// The nonce travels in the clear, so it must depend on the key: under a
+    /// plain hash of the value, anyone with the session key could confirm a
+    /// guessed password by recomputing it.
+    #[test]
+    fn the_nonce_depends_on_the_key() {
+        let nonce = |key: u8| {
+            let s = RedactStore::with_key([key; 32]);
+            let mut body = json!({"messages": [
+                {"role": "user", "content": "password=hunter2hunter2"}
+            ]});
+            redact_body(&s, "sess", &mut body);
+            let text = body["messages"][0]["content"].as_str().unwrap();
+            let token = &text[text.find(PREFIX).expect("the password was redacted")..];
+            let hex = token[PREFIX.len()..].split_once('_').unwrap().1;
+            hex[..NONCE_LEN * 2].to_string()
+        };
+        assert_eq!(nonce(1), nonce(1), "one key, one value: one token");
+        assert_ne!(nonce(1), nonce(2));
+    }
+
+    /// A `*_key` name is a credential only when the word before `key` says so;
+    /// cache and session keys are values the model has to read.
+    #[test]
+    fn only_credential_key_names_hide_their_value() {
+        let s = store();
+        for clear in [
+            "session_key: \"stale-margin-session\"",
+            "cache_key = \"report_month_v2\"",
+            "partition_key: 'report_month'",
+            "lookupKey = \"employee-invites\"",
+        ] {
+            let mut body = json!({"messages": [{"role": "user", "content": clear}]});
+            redact_body(&s, "sess", &mut body);
+            assert_eq!(body["messages"][0]["content"], clear, "{clear}");
+        }
+        for hidden in [
+            "private_key = \"hunter2hunter2\"",
+            "AWS_SECRET_ACCESS_KEY=minioadmin123",
+            "apiKey: \"correct-horse-battery\"",
+            "x-api-key: letmein-please",
+        ] {
+            let mut body = json!({"messages": [{"role": "user", "content": hidden}]});
+            redact_body(&s, "sess", &mut body);
+            let text = body["messages"][0]["content"].as_str().unwrap();
+            assert!(text.contains(PREFIX), "{hidden} went out as {text}");
         }
     }
 }

@@ -156,6 +156,10 @@ pub(crate) async fn read_routed_body(
         if let Some(ctx) = outcome {
             book_routed_outcome(ctx, None, 0, 0.0, status.as_u16() as i64);
         }
+        // Restored like the explicit error arm's: an error body can echo the
+        // redacted request.
+        let body_text = String::from_utf8_lossy(&restore_buffered(outcome, body_text.into_bytes()))
+            .into_owned();
         // Same measured 413 as the explicit error arm above: the buffered
         // fold reaches non-OK statuses through here, not through
         // `handle_routed_error_response`.

@@ -74,6 +74,7 @@ gcp_auth = { workspace = true }
 # whether ONNX Runtime is linked; see `[features]` below.
 headroom-core = { path = "../headroom-core", default-features = false }
 hex = "0.4"
+hmac = { workspace = true }
 # CTX-5: HTML→markdown conversion for ctx fetch (port of Turndown used by
 # the TS context-mode's ctx_fetch_and_index).
 htmd = "0.5"
