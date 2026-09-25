@@ -10,6 +10,9 @@ number to its window; do not quote across windows.
 - [`offload-loses-at-2000-bytes.md`](offload-loses-at-2000-bytes.md): at a
   2,000-byte floor, retrievals and re-reads cost more than offload saves;
   two thirds of retrievals repeat one from an earlier turn.
+- [`device-wide-rotation-resets-routed-streams.md`](device-wide-rotation-resets-routed-streams.md):
+  Spark/Codex "dropped mid-response" turns were VPN rotations resetting a
+  pool-less proxy's streams, not provider load shedding.
 - [`zen-retry-after-guidance.md`](zen-retry-after-guidance.md): use bounded
   provider guidance, but preserve the measured guard against Zen's stale,
   oversized Retry-After value.

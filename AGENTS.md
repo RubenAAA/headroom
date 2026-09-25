@@ -58,12 +58,29 @@ for working on Headroom. The maintainer does.
   to the checkout, and any existing real file is moved to `.bak` first.
 - `~/.headroom-paths.sh`, holding `HEADROOM_REPO`.
 - `~/.claude/statusline-with-cache.sh` and `statusline-usage-dump.sh`, wired into
-  `~/.claude/settings.json`. The first is always generated, never symlinked,
-  since the checkout path is baked into it.
+  `~/.claude/settings.json`. The first is always a symlink into the checkout,
+  in either mode, because it finds its helper scripts next to itself in
+  `contrib/`; a real file already there is moved to `.bak`. Move the checkout
+  and the statusline breaks until you rerun `install.sh`.
+
+It does not write `~/.headroom-zen-pool.env`, the Zen egress pool that
+`cclaude` and `restart-headroom.sh` source; the installer only reports whether
+it exists. Without it, each Zen 429 rotates the device-wide VPN and resets every
+Codex and Spark stream in flight. With Nord SOCKS credentials, create it once
+and again after every reboot:
+
+```bash
+(umask 077; ~/.local/bin/nord-socks-egress env > ~/.headroom-zen-pool.env)
+restart-headroom.sh
+```
+
+For other relays, start from `contrib/headroom-zen-pool.env.example`. Both
+sourcing scripts ignore the file unless it is yours with mode `0600`. Setup and
+rotation details: "Nord SOCKS5 relay pool" in `contrib/README.md`.
 
 Under `--link`, the contrib scripts, hooks, flag file and usage dump are
-symlinked into the checkout. Binaries are always copied and the main statusline
-is always generated, so those still need reinstalling after relevant changes.
+symlinked into the checkout. Binaries are always copied, so those still need
+reinstalling after relevant changes.
 In copy mode a `git pull` leaves every installed copy stale. `update-headroom.sh`
 (installed in `~/.local/bin`) pulls, infers link mode from the flags-file symlink
 unless overridden with `--link`/`--copy`, reinstalls, and restarts the proxy. The
@@ -103,6 +120,15 @@ change with no restart means you are still measuring the old setting.
 
 All 138 options (140 with `-h`/`-V`): `headroom-proxy --help`, or [`docs/flags.md`](docs/flags.md),
 generated from that output. Regenerate it when you add a flag.
+
+The flags file ships with `--redact-sensitive true`: on routed paths (Spark,
+Codex) secrets and emails go upstream as opaque placeholders and are restored
+at the client edge. The restore key is created on first use at
+`$XDG_STATE_HOME/headroom/redact.key` (0600; `~/.local/state/headroom/redact.key`
+by default, overridable with `HEADROOM_REDACT_KEY_FILE`). Back it up with the
+machine — deleting it orphans every placeholder minted before then, and they
+stop resolving. Local artifacts (logs, sessions DB) still see real text; the
+redaction guards the wire, not the disk.
 
 ## Layout for editing
 

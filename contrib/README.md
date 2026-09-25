@@ -16,6 +16,7 @@ nothing here is on the request path.
 | `update-headroom.sh` | `~/.local/bin/` | Pulls the checkout, reinstalls in the last install's mode, restarts the proxy. Run after `git pull`, or instead of it. |
 | `concurrency-report.sh` | `~/.local/bin/` | Verdict on the 2026-09-15 concurrency fixes from the proxy log: sidecar 404 fallbacks, Zen slot timeouts, proxy-side stalls, and whether `--cache-stampede-gate` held any follower that then read cache. Run after a day of use; it says when to drop the gate flag. |
 | `headroom-flags.sh` | `~/.headroom-flags.sh` | The flag array both starters read. An existing file is never overwritten, so tuning survives a re-install. |
+| `headroom-zen-pool.env.example` | not installed | Shape of `~/.headroom-zen-pool.env`, the Zen egress pool both starters source. Generate the real file with `nord-socks-egress env`; see [Nord SOCKS5 relay pool](#nord-socks5-relay-pool). |
 | `zen-rotate-watch.sh` | `~/.local/bin/` | Watches Zen/Spark rate limits; rotates a device-wide VPN in legacy mode or configured egresses individually in pool mode. Not started by the installer. |
 | `nord-socks-egress` | `~/.local/bin/` | Rust helper binary for the optional local SOCKS5 relay pool over Nord; exposes eight verified loopback lanes, or ten when all preferred exits pass, and rotates a lane to an unused endpoint when a spare is available. |
 | `headroom-rss-sample` | `~/.local/bin/` | Samples the proxy's RSS once a minute into `~/headroom-rss.log`, so a leak over a long session is visible. |
@@ -120,13 +121,18 @@ A Tor SOCKS5 endpoint is protocol-compatible, but this only establishes
 transport support—not that OpenCode Zen accepts Tor exits. Tor is not selected
 automatically.
 
-For example, store one SOCKS URL per line in a local file with mode `0600`,
-then load it without putting the credentials in shell history:
+Put both variables in `~/.headroom-zen-pool.env` (mode `0600`) rather than
+exporting them from a shell: `claude-launcher` and `restart-headroom.sh` source
+that file themselves, so a proxy started from a shell without the exports
+still gets the pool. `headroom-zen-pool.env.example` shows the shape. With
+`nord-socks-egress`, generate the file instead (next section). For another
+relay, write it by hand and keep the credentials out of shell history:
 
 ```bash
-export HEADROOM_ZEN_HTTP_PROXY_POOL="$(<"$HOME/.config/headroom/muse-egress-pool")"
-export HEADROOM_ZEN_EGRESS_ROTATE_COMMAND="$HOME/.local/bin/rotate-muse-egress"
-cclaude --context
+cp contrib/headroom-zen-pool.env.example ~/.headroom-zen-pool.env
+chmod 600 ~/.headroom-zen-pool.env
+$EDITOR ~/.headroom-zen-pool.env    # your URLs and rotate command
+restart-headroom.sh
 ```
 
 The executable receives one opaque ID and a reason per invocation;
@@ -154,19 +160,30 @@ Headroom's per-egress rotation hook. It reads `USERNAME=...` and `PASSWORD=...` 
 directory `0700`. Credentials are not placed in the process command line,
 exported Headroom pool, or relay logs.
 
-After installing this branch, wait until existing proxy requests have drained
-and stop any old device-wide watcher. In the shell that will restart Headroom
-and start Claude Code, run:
+Once, from any shell, after existing proxy requests have drained:
 
 ```bash
-eval "$(~/.local/bin/nord-socks-egress env)"
-restart-headroom.sh
-claude-work --context
+(umask 077; ~/.local/bin/nord-socks-egress env > ~/.headroom-zen-pool.env)
+restart-headroom.sh    # replaces a device-wide watcher with a per-egress one
+cclaude --context
 ```
 
-The `env` command starts the local relay daemon and exports one loopback SOCKS
-URL for each verified lane (eight, or ten when all preferred exits pass) plus
-the per-egress rotator path.
+Nothing starts the relay at boot. After a reboot the file still names its
+loopback ports, but nothing listens on them and every Zen request fails until
+you run the first two commands again. Do the same after `nord-socks-egress
+stop`: the relay can come back with eight lanes or ten, and the file must
+match.
+
+The `env` command starts the local relay daemon and prints exports for one
+loopback SOCKS URL per verified lane (eight, or ten when all preferred exits
+pass) plus the per-egress rotator path. `claude-launcher` and
+`restart-headroom.sh` both source `~/.headroom-zen-pool.env`
+(`HEADROOM_ZEN_POOL_ENV` overrides the path). The file takes precedence over
+whatever the shell exports, and they skip it unless it belongs to you with
+mode `0600`. With the pool loaded, `restart-headroom.sh` swaps a device-wide
+watcher for a per-egress one. Without the pool and with the relay up, it
+prints a warning: Zen then shares the device-wide route, and each Zen 429
+rotates the VPN under every Codex and Spark stream.
 The relay uses exact server IDs from
 Nord's [live SOCKS server catalog](https://api.nordvpn.com/v1/servers?filters%5Bservers_technologies%5D%5Bidentifier%5D=socks&limit=0)
 (not region-level aliases), pins each lane to
@@ -245,7 +262,7 @@ session.
 | `review-gate.sh` | UserPromptSubmit, PreToolUse (Bash, writes), Stop | Only a review articulation it diverts to a worker |
 | `ticket-gate.sh` | UserPromptSubmit, PreToolUse (Bash) | Only a YouTrack filing it diverts to a worker |
 | `scrub-secrets.sh` | PreToolUse (Bash) | Yes — commands that would print credentials into the transcript |
-| `scrub-placeholders.sh` | PreToolUse (writes, Bash) | Yes — redaction tokens that would land literally in code or docs, or wedge a session when pasted into commands; `HEADROOM_SCRUB_BASH=0` skips the Bash leg |
+| `scrub-placeholders.sh` | PreToolUse (writes, Bash, Skill) | Yes — redaction tokens that would land literally in code or docs, or wedge a session when pasted into commands; `HEADROOM_SCRUB_BASH=0` skips the Bash leg |
 | `shared-worktree-guard.sh` | PreToolUse (Bash) | Yes — the destructive git commands banned by `.agents/SHARED-WORKTREE-PROTOCOL.md`, but only while another agent is live in the same toplevel |
 | `peer-awareness.sh` | SessionStart, UserPromptSubmit | No — reports other sessions sharing the checkout |
 | `stale-branch.sh` | SessionStart | No — one-time notice when the branch trails its origin |

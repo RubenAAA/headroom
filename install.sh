@@ -357,6 +357,26 @@ else
 fi
 unset _vpn_provider
 
+# The per-egress pool keeps a Zen 429 from rotating the device-wide route under
+# every routed stream. Never generated here: `nord-socks-egress env` starts a
+# relay daemon and probes live exits, which an installer should not do quietly.
+ZEN_POOL_FILE="${HEADROOM_ZEN_POOL_ENV:-$HOME/.headroom-zen-pool.env}"
+if [ -f "$ZEN_POOL_FILE" ]; then
+    _pool_perm=$(stat -c '%u %a' "$ZEN_POOL_FILE" 2>/dev/null || stat -f '%u %Lp' "$ZEN_POOL_FILE" 2>/dev/null || true)
+    if [[ "$_pool_perm" =~ ^$(id -u)\ [0-7]*00$ ]]; then
+        say "Zen egress pool: $ZEN_POOL_FILE (sourced by cclaude and restart-headroom.sh)"
+    else
+        say "WARNING: $ZEN_POOL_FILE is ignored until it is yours with mode 0600: chmod 600 $ZEN_POOL_FILE"
+    fi
+    unset _pool_perm
+elif [ -x "$BIN_DIR/nord-socks-egress" ]; then
+    say "no Zen egress pool. Without one, the watcher rotates the whole VPN on each"
+    say "  Zen 429 and resets every Codex and Spark stream in flight. To set it up:"
+    say "  (umask 077; $BIN_DIR/nord-socks-egress env > $ZEN_POOL_FILE) && restart-headroom.sh"
+    say "  Needs Nord SOCKS credentials; see 'Nord SOCKS5 relay pool' in contrib/README.md"
+fi
+
+
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) say "WARNING: $BIN_DIR is not on your PATH — add it to your shell profile" ;;
@@ -451,7 +471,15 @@ for src in "$CONTRIB"/claude/hooks/*.sh; do
     # --link symlinks it directly (rotation-notice.sh shipped 644 and failed
     # with "Permission denied" on every prompt until chmodded).
     chmod +x "$src"
-    if [ "$LINK" = 1 ]; then
+    # The two gates are linked in either mode: each runs a worker from the
+    # checkout's spark-poster/ and shares state files with it, and
+    # review-gate carries a copy of ticket-gate's trigger. A copied gate
+    # drifts out of step with all of that (as the statusline did, 2026-09-24).
+    case "$(basename "$src")" in
+        ticket-gate.sh|review-gate.sh) always_link=1 ;;
+        *) always_link=0 ;;
+    esac
+    if [ "$LINK" = 1 ] || [ "$always_link" = 1 ]; then
         [ -e "$dst" ] && [ ! -L "$dst" ] && mv "$dst" "$dst.bak" \
             && say "moved the old $dst to $dst.bak"
         ln -sfn "$src" "$dst"

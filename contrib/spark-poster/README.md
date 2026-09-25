@@ -91,6 +91,10 @@ export SPARK_GITLAB_PROJECT=group/project
 export YOUTRACK_TOKEN=...
 export YOUTRACK_URL=https://youtrack.example.com
 export YOUTRACK_PROJECT_ID=0-00
+# Multi-project alternative: leave YOUTRACK_PROJECT_ID unset and map session
+# cwd prefixes to ids instead -- longest prefix wins, global still wins when
+# set. Example (operator-local paths, not repo content):
+# export YOUTRACK_PROJECT_MAP="$HOME/work/alpha=0-21,$HOME/work/beta=0-22"
 # AI_YOUTRACK_BIN defaults to the ai-first-workspace checkout; set only to override.
 EOF
 chmod 600 ~/.config/spark-poster/env
@@ -122,7 +126,8 @@ need no extra setup.
 | `GITLAB_TOKEN` | credential (or `~/.config/spark-poster/token`) |
 | `YOUTRACK_TOKEN` | ticket credential (hook env via the sourced env file) |
 | `YOUTRACK_URL` | YouTrack base URL (required, no default) |
-| `YOUTRACK_PROJECT_ID` | numeric project id (required, no default) |
+| `YOUTRACK_PROJECT_ID` | numeric project id (required, unless per-cwd ids cover the session) |
+| `YOUTRACK_PROJECT_MAP` | `prefix=id,...` table routing session cwd to project (longest prefix wins); global still wins when set. Find your numeric ids with `ai-youtrack list-projects` (the `id` field, e.g. `0-42`), then map each checkout root: `export YOUTRACK_PROJECT_MAP="$HOME/work/alpha=0-21,$HOME/work/beta=0-22"` |
 | `AI_YOUTRACK_BIN` | ai-youtrack CLI override (optional) |
 | `SPARK_DRAFT_MODEL` / `SPARK_DRAFT_TIMEOUT` / `SPARK_DRAFT_BATCH` / `SPARK_DRAFT_BATCH_TIMEOUT` / `SPARK_DRAFT_BASE_URL` | drafter tuning, see `spark_draft.py` |
 

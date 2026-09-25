@@ -213,6 +213,25 @@ print("\n".join(item["egress_id"] for item in data.get("egresses", [])))
 }
 
 if [ "$use_context" -eq 1 ]; then
+    # The Zen egress pool comes from a private file, not from whatever this
+    # shell happens to export: a proxy started pool-less shares the
+    # device-wide route with Zen, and each Zen 429 then rotates the VPN under
+    # every Codex and Spark stream (2026-09-25). restart-headroom.sh reads the
+    # same file. Write it with:
+    #   (umask 077; nord-socks-egress env > ~/.headroom-zen-pool.env)
+    ZEN_POOL_ENV="${HEADROOM_ZEN_POOL_ENV:-$HOME/.headroom-zen-pool.env}"
+    if [ -e "$ZEN_POOL_ENV" ]; then
+        zen_pool_perm=$(stat -c '%u %a' "$ZEN_POOL_ENV" 2>/dev/null || stat -f '%u %Lp' "$ZEN_POOL_ENV" 2>/dev/null || true)
+        if [[ "$zen_pool_perm" =~ ^$(id -u)\ [0-7]*00$ ]]; then
+            unset HEADROOM_ZEN_HTTP_PROXY_POOL HEADROOM_ZEN_EGRESS_ROTATE_COMMAND
+            set -a
+            # shellcheck source=/dev/null
+            source "$ZEN_POOL_ENV"
+            set +a
+        else
+            echo "headroom: ignoring $ZEN_POOL_ENV — it must be yours and mode 0600 (is: ${zen_pool_perm:-unreadable})" >&2
+        fi
+    fi
     if curl -fsS --max-time 1 "$PROXY_URL/cache-health" >/dev/null 2>&1; then
         echo "headroom: reusing running proxy at $PROXY_URL"
         if [ "${#proxy_flags[@]}" -gt 0 ]; then

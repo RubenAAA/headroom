@@ -223,8 +223,10 @@ if [ -z "$MSG" ]; then
   # writes the tag, a newline, the content, a newline and the closing tag,
   # which JSONL stores as a literal \n on each side. A reply or a Bash command
   # that merely names the tag is an assistant line too, and matching it re-armed
-  # the hook on turns that had already answered (2026-09-24).
-  SPLICE_OPEN='<retrieved_context>\n'
+  # the hook on turns that had already answered (2026-09-24). The splice is
+  # always a text block that starts with the tag (112 of 112 checked, 2026-09-25),
+  # so a reply quoting a whole splice mid-prose does not match either.
+  SPLICE_OPEN='"type":"text","text":"<retrieved_context>\n'
   SPLICE_CLOSE='\n</retrieved_context>'
   SPLICE_LINE=$(printf '%s\n' "$WIDE" | grep -nF "$SPLICE_OPEN" | grep -F "$SPLICE_CLOSE" |
     tail -1 | cut -d: -f1)
@@ -237,9 +239,14 @@ if [ -z "$MSG" ]; then
       # use (2026-09-24). If this exact splice was already continued, let the
       # stop through. New content still fires. Fail-open: any hashing error
       # falls through to firing as before.
-      SPLICE_HASH=$(printf '%s\n' "$WIDE" | sed -n "${SPLICE_LINE}p" | sha256sum 2>/dev/null | cut -d' ' -f1)
+      # Hashes the message content only: the whole line carries its own uuid,
+      # parentUuid, timestamp and requestId, so no two lines ever hashed equal
+      # and the dedup never fired. Every continued hash is kept, so a model
+      # alternating two retrievals (A, B, A) is caught too; a clean stop
+      # clears the list below.
+      SPLICE_HASH=$(printf '%s\n' "$WIDE" | sed -n "${SPLICE_LINE}p" | jq -c '.message.content' 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)
       if [ -n "$SPLICE_HASH" ] && [ -f "$STATE_DIR/$SESSION.splice" ] &&
-         [ "$SPLICE_HASH" = "$(cat "$STATE_DIR/$SESSION.splice" 2>/dev/null)" ]; then
+         grep -qxF "$SPLICE_HASH" "$STATE_DIR/$SESSION.splice" 2>/dev/null; then
         echo "ts=$(date -u +%FT%TZ) session=$SESSION subagent=$ISSUBAGENT decision=splice-dedup-skip branch=splice" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
         rm -f "$STATE_DIR/$SESSION"
         exit 0
@@ -248,7 +255,7 @@ if [ -z "$MSG" ]; then
       TAIL_INSTR="Continue the original task now using the retrieved context above — reference it directly instead of calling headroom_retrieve for it again, and do not repeat tool calls that already ran; do not ask, do not narrate."
       BRANCH="splice"
       mkdir -p "$STATE_DIR" 2>/dev/null
-      [ -n "$SPLICE_HASH" ] && printf '%s' "$SPLICE_HASH" >"$STATE_DIR/$SESSION.splice" 2>/dev/null || true
+      [ -n "$SPLICE_HASH" ] && printf '%s\n' "$SPLICE_HASH" >>"$STATE_DIR/$SESSION.splice" 2>/dev/null || true
     fi
 fi
 if [ -z "$MSG" ]; then
@@ -292,6 +299,10 @@ fi
 DECISION="no-match"
 if [ -z "$MSG" ]; then
   rm -f "$STATE_DIR/$SESSION"
+  # A clean stop ends the ping-pong the splice dedup guards against. Keeping
+  # its hashes past this point would let a later turn that retrieves the same
+  # content, and genuinely stalls on it, slip through unrescued.
+  rm -f "$STATE_DIR/$SESSION.splice"
   echo "ts=$(date -u +%FT%TZ) session=$SESSION subagent=$ISSUBAGENT decision=$DECISION branch=$BRANCH" >>"$STATE_DIR/stop-debug.log" 2>/dev/null || true
   exit 0
 fi

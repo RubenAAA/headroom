@@ -9,6 +9,7 @@ INPUT=$(cat)
 EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null)
 TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
 [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ] && exit 0
 OUTDIR="$HOME/.local/state/spark-review"
 TICKET_WORKER="${HEADROOM_REPO:-$HOME/headroom}/contrib/spark-poster/ticket_file.py"
@@ -61,7 +62,7 @@ spawn_ticket_worker() {
   if [ -f "$OUTDIR/$SESSION_ID.ticket.done" ]; then
     if [ ! -f "$OUTDIR/$SESSION_ID.ticket.proof.json" ]; then
       rm -f "$OUTDIR/$SESSION_ID.ticket.diverted" "$OUTDIR/$SESSION_ID.ticket.done" \
-        "$OUTDIR/$SESSION_ID.ticket.started"
+        "$OUTDIR/$SESSION_ID.ticket.started" "$OUTDIR/$SESSION_ID.ticket.project"
     else
       return 0
     fi
@@ -94,11 +95,51 @@ spawn_ticket_worker() {
     echo "ticket filing is not configured: set YOUTRACK_URL in ~/.config/spark-poster/env (exported into the hook/worker environment alongside YOUTRACK_TOKEN)" >"$OUTDIR/$SESSION_ID.ticket.failed"
     return 1
   fi
+  # Resolve the project for this session cwd against the operator's
+  # project map (YOUTRACK_PROJECT_MAP="prefix=id,...", longest prefix wins;
+  # pairs with an empty side are skipped). The worker never routes: it reads
+  # the `.ticket.project` this writes. A set YOUTRACK_PROJECT_ID
+  # still wins (single-project setups keep working); the map covers the
+  # multi-project case with no global default. No personal paths live here --
+  # the table is operator config in ~/.config/spark-poster/env.
+  route_project() {
+    local cwd="$1" map="$2" best="" best_len=-1 pair prefix pid
+    local old_ifs="$IFS"
+    IFS=','
+    # shellcheck disable=SC2162
+    for pair in $map; do
+      case "$pair" in *=*) : ;; *) continue ;; esac
+      prefix="${pair%%=*}"; pid="${pair#*=}"
+      # trim spaces without spawning: parameter expansion only
+      prefix="${prefix#"${prefix%%[! ]*}"}"; prefix="${prefix%"${prefix##*[! ]}"}"
+      pid="${pid#"${pid%%[! ]*}"}"; pid="${pid%"${pid##*[! ]}"}"
+      # An empty prefix would match every cwd.
+      if [ -z "$prefix" ] || [ -z "$pid" ]; then continue; fi
+      case "$cwd" in
+        "$prefix"*)
+          if [ "${#prefix}" -gt "$best_len" ]; then
+            best="$pid"; best_len="${#prefix}"
+          fi
+          ;;
+      esac
+    done
+    IFS="$old_ifs"
+    echo "$best"
+  }
+  if [ -z "$YOUTRACK_PROJECT_ID" ] && [ -n "$YOUTRACK_PROJECT_MAP" ] && [ -n "$CWD" ]; then
+    YOUTRACK_PROJECT_ID="$(route_project "$CWD" "$YOUTRACK_PROJECT_MAP")"
+  fi
   if [ -z "$YOUTRACK_PROJECT_ID" ]; then
-    echo "ticket filing is not configured: set YOUTRACK_PROJECT_ID in ~/.config/spark-poster/env (exported into the hook/worker environment alongside YOUTRACK_TOKEN)" >"$OUTDIR/$SESSION_ID.ticket.failed"
+    echo "ticket filing is not configured: set YOUTRACK_PROJECT_ID (or YOUTRACK_PROJECT_MAP=\"prefix=id,...\" for cwd-based routing) in ~/.config/spark-poster/env (exported into the hook/worker environment alongside YOUTRACK_TOKEN)" >"$OUTDIR/$SESSION_ID.ticket.failed"
     return 1
   fi
   touch "$OUTDIR/$SESSION_ID.ticket.diverted"
+  # The cwd routing above runs inside spawn too (UserPromptSubmit and
+  # PreToolUse both pass .cwd), so persist the resolved project next to the
+  # divert marker: the second watcher (UserPromptSubmit relay on the next
+  # prompt) reads this file to say which project the ticket lands in, without
+  # re-deriving it from a cwd it may no longer see.
+  echo "$YOUTRACK_PROJECT_ID" >"$OUTDIR/$SESSION_ID.ticket.project"
   # Stale state from a previous run must not leak into this one.
   rm -f "$OUTDIR/$SESSION_ID.ticket.failed" "$OUTDIR/$SESSION_ID.ticket.reported"
 
@@ -115,7 +156,11 @@ spawn_ticket_worker() {
       else
         rc=$?
         {
-          echo "ticket worker failed (rc=$rc); last lines:"
+          if [ $rc -eq 124 ]; then
+            echo "ticket worker timed out after 600s (still running or hung); last lines:"
+          else
+            echo "ticket worker failed (rc=$rc); last lines:"
+          fi
           tail -8 "$SESSLOG"
         } >"$OUTDIR/$SESSION_ID.ticket.failed"
         touch "$OUTDIR/$SESSION_ID.ticket.done"
@@ -135,6 +180,14 @@ unreported_ticket_proof() {
   [ -f "$OUTDIR/$SESSION_ID.ticket.reported" ] && return 1
   [ -f "$OUTDIR/$SESSION_ID.ticket.proof.json" ] || return 1
   echo "$OUTDIR/$SESSION_ID.ticket.proof.json"
+}
+
+# A configuration gap is said once per session: it does not change between
+# prompts, and repeating it turns every later matching prompt into noise.
+warn_unconfigured() {
+  [ -f "$OUTDIR/$SESSION_ID.ticket.unconfigured-warned" ] && return 0
+  touch "$OUTDIR/$SESSION_ID.ticket.unconfigured-warned"
+  echo "$1"
 }
 
 ticket_summary() {
@@ -159,12 +212,20 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   # Said outright: "file the ticket", "file the ticket in youtrack",
   # "file the youtrack ticket", "create a youtrack issue".
   #
-  # A verb and an object, matched separately -- the same shape as the review
-  # gate's intent check. Literals only, no bracket ranges: a range over
-  # multibyte characters does not survive the locale this hook runs under.
+  # A verb, then its object within two words of the same clause, on one
+  # line, both whole words. Matched anywhere as bare substrings, a code
+  # review that named `ticket_file.py` was a filing request ("file" +
+  # "ticket"), and with YouTrack configured it would have filed a real
+  # ticket. The words between carry no clause punctuation, so "post the
+  # threads; ticket MVP-12 ..." is not a filing. No bracket ranges over
+  # letters: a range over multibyte characters does not survive the locale
+  # this hook runs under. Classes and ASCII punctuation do.
+  #
+  # review-gate.sh stands down on this exact pattern; check-drift.sh fails
+  # if the two copies differ.
   INTENT=""
-  if echo "$PROMPT" | grep -qE 'file|create|open|submit|raise|post|заведи|завести|создай|открыть|открой' &&
-     echo "$PROMPT" | grep -qE 'ticket|issue|youtrack|mvp-|тикет|задач'; then
+  TICKET_INTENT='(^|[^[:alnum:]_./-])(file|create|open|submit|raise|post|заведи|завести|создай|открыть|открой)( +[^ .;:!?,]+){0,2} +((tickets?|issues?|youtrack|mvp-[0-9]+)([^[:alnum:]_./-]|[.]([^[:alnum:]]|$)|$)|тикет|задач)'
+  if echo "$PROMPT" | grep -qE "$TICKET_INTENT"; then
     INTENT=1
   fi
 
@@ -189,24 +250,34 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
         else
           echo "TICKET DONE, NO PROOF: inconsistent state; say 'file the ticket' again to retry."
           rm -f "$OUTDIR/$SESSION_ID.ticket.diverted" "$OUTDIR/$SESSION_ID.ticket.done" \
-            "$OUTDIR/$SESSION_ID.ticket.started"
+            "$OUTDIR/$SESSION_ID.ticket.started" "$OUTDIR/$SESSION_ID.ticket.project"
         fi
         ;;
       failed)
-        echo "TICKET WORKER FAILED. Reason: $(head -3 "$OUTDIR/$SESSION_ID.ticket.failed"). Say 'file the ticket' again to retry."
+        FAILED_MSG=$(head -3 "$OUTDIR/$SESSION_ID.ticket.failed")
+        case "$FAILED_MSG" in
+          *"timed out"*) KIND="TICKET WORKER TIMED OUT" ;;
+          *) KIND="TICKET WORKER FAILED" ;;
+        esac
+        echo "$KIND. Reason: $FAILED_MSG. Say 'file the ticket' again to retry."
         rm -f "$OUTDIR/$SESSION_ID.ticket.diverted" "$OUTDIR/$SESSION_ID.ticket.done" \
-          "$OUTDIR/$SESSION_ID.ticket.failed" "$OUTDIR/$SESSION_ID.ticket.started"
+          "$OUTDIR/$SESSION_ID.ticket.failed" "$OUTDIR/$SESSION_ID.ticket.started" \
+          "$OUTDIR/$SESSION_ID.ticket.project"
         ;;
       running)
-        echo "TICKET WORKER ALREADY RUNNING. It files the ticket by itself, then pings this session with the ticket id; do not call the YouTrack API yourself."
+        PROJ_MSG=""
+        [ -f "$OUTDIR/$SESSION_ID.ticket.project" ] && PROJ_MSG=" (project $(cat "$OUTDIR/$SESSION_ID.ticket.project" 2>/dev/null))."
+        echo "TICKET WORKER ALREADY RUNNING.$PROJ_MSG It files the ticket by itself, then pings this session with the ticket id; do not call the YouTrack API yourself."
         ;;
       idle)
         if [ -z "$YOUTRACK_TOKEN" ]; then
-          echo "TICKET DIVERT NOT STARTED: YOUTRACK_TOKEN is not set in this session's environment. Export it and say 'file the ticket' again. The worker reads the bearer from that variable at runtime and never writes it anywhere."
+          warn_unconfigured "TICKET DIVERT NOT STARTED: YOUTRACK_TOKEN is not set in this session's environment. Export it and say 'file the ticket' again. The worker reads the bearer from that variable at runtime and never writes it anywhere."
         elif spawn_ticket_worker; then
-          echo "TICKET DIVERTED. Worker started: it files the YouTrack ticket from the last 10 turns of this session, then pings with the ticket id. Do not call the YouTrack API yourself; do not compose the summary."
+          PROJ_MSG=""
+          [ -f "$OUTDIR/$SESSION_ID.ticket.project" ] && PROJ_MSG=" Project: $(cat "$OUTDIR/$SESSION_ID.ticket.project" 2>/dev/null)."
+          echo "TICKET DIVERTED. Worker started: it files the YouTrack ticket from the last 10 turns of this session, then pings with the ticket id.$PROJ_MSG Do not call the YouTrack API yourself; do not compose the summary."
         else
-          echo "TICKET DIVERT NOT STARTED: $(head -3 "$OUTDIR/$SESSION_ID.ticket.failed"). Fix it and say 'file the ticket' again."
+          warn_unconfigured "TICKET DIVERT NOT STARTED: $(head -3 "$OUTDIR/$SESSION_ID.ticket.failed"). Fix it and say 'file the ticket' again."
         fi
         ;;
     esac

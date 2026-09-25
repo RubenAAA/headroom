@@ -8,7 +8,13 @@
 # Install: ln -sf "$HEADROOM_REPO/contrib/statusline-with-cache.sh" ~/.claude/
 # and point settings.json statusLine.command at that path. Every helper lives
 # next to this file, so one symlink is enough.
-here="${HEADROOM_REPO:-$HOME/headroom}/contrib"
+# Resolved through the symlink: HEADROOM_REPO is not in Claude Code's
+# environment, so a fallback to ~/headroom missed any other checkout.
+if self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) && [ -n "$self" ]; then
+  here=$(dirname "$self")
+else
+  here="${HEADROOM_REPO:-$HOME/headroom}/contrib"
+fi
 input=$(cat)
 base=$(printf '%s' "$input" | "$here/statusline-usage-dump.sh")
 cache=$("$here/statusline-cache-health.sh" --segment)

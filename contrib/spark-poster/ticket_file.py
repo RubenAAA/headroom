@@ -19,7 +19,14 @@ never run it to completion outside a real diverted session.
 Configuration (all in ~/.config/spark-poster/env, mode 600, next to the
 token file -- the same file the review chain uses):
   YOUTRACK_URL        YouTrack base URL (required, no default)
-  YOUTRACK_PROJECT_ID numeric project id (required, no default)
+  YOUTRACK_PROJECT_ID numeric project id (required, no default --
+                        unless per-project ids cover the session cwd)
+  YOUTRACK_PROJECT_MAP  comma-separated `path-prefix=id` pairs routing a
+                      session cwd to its project (longest prefix wins), e.g.
+                      "/home/you/work/alpha=0-21,/home/you/work/beta=0-22".
+                      The gate resolves and persists the choice, the worker
+                      reads it. A set YOUTRACK_PROJECT_ID still wins over the
+                      map (single-project setups keep working).
   AI_YOUTRACK_BIN     ai-youtrack CLI (optional; defaults to the
                       ai-first-workspace checkout path below)
 """
@@ -46,7 +53,27 @@ def youtrack_url():
     return _req_env("YOUTRACK_URL")
 
 
-def project_id():
+def project_id(outdir=None, session=None):
+    """Resolved YouTrack project id: explicit default wins, else cwd routing.
+
+    The gate resolves the session cwd against YOUTRACK_PROJECT_MAP and
+    persists the choice in `<session>.ticket.project` next to the divert
+    marker; the worker only sees the transcript path, so it reads the
+    gate's resolution. A global YOUTRACK_PROJECT_ID still wins when set
+    (single-project setups keep working); the map covers the multi-project
+    case with no global default.
+    """
+    val = os.environ.get("YOUTRACK_PROJECT_ID", "").strip()
+    if val:
+        return val
+    if outdir and session:
+        try:
+            with open(os.path.join(outdir, session + ".ticket.project")) as f:
+                routed = f.read().strip()
+            if routed:
+                return routed
+        except OSError:
+            pass
     return _req_env("YOUTRACK_PROJECT_ID")
 
 
@@ -202,7 +229,7 @@ def main():
         return fail(outdir, session,
                     "YOUTRACK_TOKEN is not set in the worker environment")
     try:
-        cfg_url, cfg_project, cfg_bin = youtrack_url(), project_id(), ai_youtrack()
+        cfg_url, cfg_project, cfg_bin = youtrack_url(), project_id(outdir, session), ai_youtrack()
     except RuntimeError as e:
         return fail(outdir, session, str(e))
     log("extracting last %d turns" % TURNS)

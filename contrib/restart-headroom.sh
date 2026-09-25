@@ -70,6 +70,43 @@ source "$FLAGS_FILE"
 
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"; }
 
+# The Zen egress pool comes from a private file, not from whatever the calling
+# shell exports. On 2026-09-25 the proxy ran pool-less because the shell that
+# restarted it never ran `nord-socks-egress env`. Zen then shared the
+# device-wide route, each Zen 429 made the watcher rotate the VPN, and every
+# rotation reset the Codex and Spark streams in flight. Nothing reported it.
+# Write the file with:
+#   (umask 077; nord-socks-egress env > ~/.headroom-zen-pool.env)
+ZEN_POOL_ENV="${HEADROOM_ZEN_POOL_ENV:-$HOME/.headroom-zen-pool.env}"
+if [ -e "$ZEN_POOL_ENV" ]; then
+  zen_pool_perm=$(stat -c '%u %a' "$ZEN_POOL_ENV" 2>/dev/null || stat -f '%u %Lp' "$ZEN_POOL_ENV" 2>/dev/null)
+  if [[ "$zen_pool_perm" =~ ^$(id -u)\ [0-7]*00$ ]]; then
+    unset HEADROOM_ZEN_HTTP_PROXY_POOL HEADROOM_ZEN_EGRESS_ROTATE_COMMAND
+    # `set -a`: the proxy only sees the pool if it is exported, and the file
+    # may hold bare assignments.
+    set -a
+    # shellcheck source=/dev/null
+    source "$ZEN_POOL_ENV"
+    set +a
+  else
+    echo "restart-headroom: WARNING: ignoring $ZEN_POOL_ENV — it must be yours and mode 0600 (is: ${zen_pool_perm:-unreadable})" >&2
+    log "WARNING: ignoring $ZEN_POOL_ENV — it must be yours and mode 0600 (is: ${zen_pool_perm:-unreadable})"
+  fi
+fi
+
+# Starting without a pool is legitimate on a machine with no relay. With a
+# healthy relay up it means Zen goes back on the shared route, so say so on
+# the terminal and in the log.
+if [ -z "${HEADROOM_ZEN_HTTP_PROXY_POOL:-}" ] && [ -x "$HOME/.local/bin/nord-socks-egress" ]; then
+  zen_lanes=$("$HOME/.local/bin/nord-socks-egress" status 2>/dev/null |
+    python3 -c 'import json,sys; j=json.load(sys.stdin); print(j.get("lane_count", 0) if j.get("ok") else 0)' 2>/dev/null) || zen_lanes=0
+  if [[ "${zen_lanes:-0}" =~ ^[1-9][0-9]*$ ]]; then
+    zen_msg="WARNING: starting WITHOUT the Zen egress pool while nord-socks-egress has $zen_lanes lanes up. Zen will share the device-wide route and every Zen 429 will rotate the VPN, resetting Codex and Spark streams. Fix: (umask 077; nord-socks-egress env > $ZEN_POOL_ENV)"
+    printf '\n!!! restart-headroom: %s\n\n' "$zen_msg" >&2
+    log "$zen_msg"
+  fi
+fi
+
 # `lsof` first: it reports the owning pid on both Linux and macOS. The macOS
 # `ss` comes from iproute2mac, which wraps netstat and emits neither the
 # `sport = :N` filter nor the `pid=N` column the Linux one does — installing it
@@ -109,7 +146,33 @@ ensure_watcher() {
   [ -x "$watch" ] || return 0
   # Bracket trick: pgrep -f would otherwise match this script's own command
   # line, which quotes the pattern.
-  if pgrep -f "[z]en-rotate-watch\.sh" >/dev/null 2>&1; then
+  local pids pid stale=0
+  pids=$(pgrep -f "[z]en-rotate-watch\.sh" 2>/dev/null)
+  if [ -n "${HEADROOM_ZEN_HTTP_PROXY_POOL:-}" ]; then
+    # A device-wide watcher left over from before the pool rotates the
+    # shared route on every Zen 429, which is the failure the pool exists
+    # to end. Swap it for a per-egress one.
+    for pid in $pids; do
+      # No /proc (macOS): cannot tell the mode, so leave it be.
+      [ -r "/proc/$pid/environ" ] || continue
+      tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx 'HEADROOM_ZEN_EGRESS_MODE=1' || stale=1
+    done
+    if [ "$stale" = "1" ]; then
+      log "replacing the device-wide watcher (pids: ${pids//$'\n'/ }) with a per-egress one"
+      pkill -f "[z]en-rotate-watch\.sh" 2>/dev/null
+      sleep 1
+      pids=""
+    fi
+  fi
+  [ -z "$pids" ] || return 0
+  if [ -n "${HEADROOM_ZEN_HTTP_PROXY_POOL:-}" ]; then
+    setsid nohup env -u HEADROOM_HTTP_PROXY -u HEADROOM_ZEN_HTTP_PROXY_POOL \
+      HEADROOM_PROXY_URL="http://127.0.0.1:$PORT" HEADROOM_PROXY_LOG="$LOG" \
+      HEADROOM_ZEN_EGRESS_MODE=1 \
+      HEADROOM_ZEN_EGRESS_ROTATE_COMMAND="$HEADROOM_ZEN_EGRESS_ROTATE_COMMAND" \
+      "$watch" >>"$HOME/zen-rotate-watch.log" 2>&1 </dev/null &
+    disown
+    log "per-egress watcher (re)started"
     return 0
   fi
   setsid nohup env -u HEADROOM_HTTP_PROXY -u HEADROOM_ZEN_HTTP_PROXY_POOL \
@@ -126,7 +189,8 @@ start_proxy() {
   cd "$WORKDIR" || { log "start_proxy: cd $WORKDIR failed; not starting"; exit 1; }
   # Capture writes whole request bodies to disk — a debugging tool, armed by
   # HEADROOM_CAPTURE_DIR. The proxy inherits that variable from whoever ran this
-  # script, so removing an assignment here would not turn it off; `env -u` does.
+  # script, so start it with the var set to keep a live capture going, e.g.
+  #   env HEADROOM_CAPTURE_DIR=$HOME/headroom-capture-<question> restart-headroom.sh
   #
   # DISARMED 2026-08-11 after two runs that earned their keep: it named the drift
   # source (Claude Code deletes a <system-reminder> block from an old user
@@ -151,7 +215,7 @@ start_proxy() {
   # system markers forwarded): 51.99 billed-fresh-equivalents per client KB over
   # 178 turns, hit 90.4%, drift 71% of cache creation. Compare with
   # ~/headroom-savings.py, which buckets by proxy start.
-  setsid nohup env -u HEADROOM_CAPTURE_DIR "$LIVE_BIN" \
+  setsid nohup "$LIVE_BIN" \
     --listen "127.0.0.1:$PORT" \
     --upstream https://api.anthropic.com \
     --ctx-capture=true \

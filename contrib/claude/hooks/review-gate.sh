@@ -384,37 +384,26 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   PROMPT=$(echo "$PROMPT" | sed -E 's/<command-message>.*<\/command-message>//g; s/<command-name>.*<\/command-name>//g; s/<command-args>.*<\/command-args>//g; s#/(gitlab-review|fix-mr-comments)##g')
 
   # Said outright: "post the threads", "answer the comments", "запости ответы".
-  # Length is not a filter here -- an instruction that names the action is an
-  # instruction however it is phrased.
   #
-  # A verb and an object, matched separately. One combined pattern needed a
-  # Cyrillic bracket range to skip the words between them, and a range over
-  # multibyte characters does not survive the locale this hook runs under -- it
-  # silently matched nothing, so every Russian instruction and "post the
-  # threads" itself went through. Two greps need no ranges at all.
+  # An instruction, not a mention: the verb opens a clause (start of a line,
+  # after punctuation, or after "please", "then", "can you" and the like), and
+  # its object follows within three words of the same clause. Matching the
+  # verb and the object anywhere in the prompt fired on ordinary review talk
+  # -- "why did you close that thread?", "the answer in that thread is
+  # wrong", "resolve the merge conflict, then re-read the comments" -- and
+  # every divert starts a worker that posts replies by itself. Something
+  # phrased longer than this misses; the model or a rephrase covers it, and
+  # a miss posts nothing.
   #
-  # English halves use word boundaries: bare substrings diverted on ordinary
-  # work -- "replicate the issue" matched repl|repl, "resolve the MR
-  # pipeline failure" matched resolve|mr, and "note that the app doesn't
-  # respond" matched respond|note, each posting replies nobody asked for.
-  # Bare `review`/`mr` as the object meant any MR mention plus any nearby
-  # verb ("answer my question about the MR") fired, so they are out: every
-  # realistic instruction also names threads, comments or discussions.
-  # `note` is out for the same reason ("note that ..." is an observation,
-  # not an object), and `reply` sits on one side only -- on both, any
-  # prompt containing the word ("how do I reply to emails") matched
-  # verb+object against itself. "post the replies" still fires via the
-  # phrase rule below. Russian stays substring: Cyrillic bytes are
-  # non-word bytes under the C locale, so \b around them never matches.
+  # English uses base forms only: "posted the replies" reports, it does not
+  # ask. Russian lists imperative and infinitive forms, so the noun "ответ"
+  # ("какой ответ?") is no longer a verb and an object at once. No bracket
+  # ranges over letters: a range over multibyte characters does not survive
+  # the locale this hook runs under.
   INTENT=""
-  if echo "$PROMPT" | grep -qE '\b(post|posts|posted|posting|reply|replies|replied|replying|answer|answers|answered|answering|respond|responds|responded|responding|resolve|resolves|resolved|resolving|close|closes|closed|closing)\b|запост|ответ|отвеч|закр' &&
-     echo "$PROMPT" | grep -qE '\b(thread|threads|comment|comments|discussion|discussions)\b|тред|коммент|ветк|замечан|ответ'; then
-    INTENT=1
-  fi
-  # "post the replies / responses" names the object with a word that lives
-  # on the verb side, so the split match above cannot see it.
-  if [ -z "$INTENT" ] &&
-     echo "$PROMPT" | grep -qE '\bpost\b.*\b(replies|responses)\b'; then
+  EN_INTENT='(^|[.;:!?,] *|\b(please|pls|now|then|and|so|just|go ahead and|can you|could you|would you) +)(post|reply|answer|respond|resolve|close)( +[^ .;:!?,]+){0,3} +(threads?|comments?|discussions?|replies|responses)\b'
+  RU_INTENT='(^|[^[:alnum:]])(запости|запостить|ответь|ответьте|отвечай|ответить|закрой|закройте|закрыть|закрывай)( +[^ .;:!?,]+){0,3} +(тред|коммент|ветк|замечан|ответ)'
+  if echo "$PROMPT" | grep -qE "$EN_INTENT" || echo "$PROMPT" | grep -qE "$RU_INTENT"; then
     INTENT=1
   fi
 
@@ -442,19 +431,14 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
     fi
   fi
 
-  # Ticket territory belongs to ticket-gate.sh: when the prompt names ticket
-  # filing with a filing verb, the ticket worker owns it and review stands
-  # down — both would otherwise spawn (disjoint state dirs, no mutual
-  # exclusion). Mirrors ticket-gate's trigger so the split stays aligned: if
-  # ticket-gate would fire, review-gate must not. FINDING-046: the mirrors
-  # are intentionally not identical — review excludes `issue` (ordinary
-  # review prose says "this issue" without filing anything) and the Russian
-  # verbs (review diverts on Russian post/answer words, ticket on Russian
-  # file/create words), so "создай тикет" fires ticket only and "запости
-  # ответы" fires review only; "post the ticket" matches both and ticket
-  # wins by this stand-down.
-  if echo "$PROMPT" | grep -qE 'file|create|open|submit|raise|post' &&
-     echo "$PROMPT" | grep -qE 'ticket|youtrack'; then
+  # Ticket territory belongs to ticket-gate.sh: when that gate would divert,
+  # the ticket worker owns the prompt and review stands down -- both would
+  # otherwise spawn (disjoint state dirs, no mutual exclusion). So this is
+  # ticket-gate's own pattern, copied exactly: a looser copy stood review
+  # down on prompts ticket-gate ignores ("post the threads; ticket MVP-12
+  # ...") and nothing fired at all. check-drift.sh fails if they differ.
+  TICKET_INTENT='(^|[^[:alnum:]_./-])(file|create|open|submit|raise|post|заведи|завести|создай|открыть|открой)( +[^ .;:!?,]+){0,2} +((tickets?|issues?|youtrack|mvp-[0-9]+)([^[:alnum:]_./-]|[.]([^[:alnum:]]|$)|$)|тикет|задач)'
+  if echo "$PROMPT" | grep -qE "$TICKET_INTENT"; then
     INTENT=""
   fi
 
@@ -569,8 +553,15 @@ if [ "$TOOL" = "Bash" ]; then
   # (SUBJECT on api/v4) and `<sanctioned-script> > file; python3 -c
   # "...json.load(open(...))"` (SUBJECT on the project's own script path).
   # A load cannot articulate a review no matter what it reads.
+  #
+  # Nor can any heredoc: a read-only script fetching the discussions, or a
+  # commit message naming merge_requests/NNN, diverted too, and each divert
+  # starts a worker that posts. A heredoc composes a reply when it sets a
+  # note body -- a `"body":` key or a `body=` field. Reading one
+  # (`note["body"]`) does neither.
   case "$LOW" in
-    *'<<'*) COMPOSES=1 ;;
+    *'<<'*)
+      echo "$LOW" | grep -qE "[\"']body[\"'] *:|(^|[^[:alnum:]_])body=" && COMPOSES=1 ;;
   esac
 
   ARTICULATE=""
