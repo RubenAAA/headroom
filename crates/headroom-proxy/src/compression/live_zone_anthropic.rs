@@ -272,6 +272,7 @@ pub fn compress_anthropic_request(
     // this path, so `None` here matches what the 4-arg shim passed.
     let dispatch_config = DispatchConfig {
         exclude_tools: exclude_tools.to_vec(),
+        disable_kompress: headroom_core::transforms::kompress_disabled_for_anthropic(),
         ..DispatchConfig::default()
     };
     // `AllMessages` compresses every eligible block in every user

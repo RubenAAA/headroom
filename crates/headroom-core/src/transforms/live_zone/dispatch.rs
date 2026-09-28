@@ -53,6 +53,10 @@ pub struct DispatchConfig {
     pub disable_kompress_per_provider: std::collections::HashMap<String, bool>,
     /// When Kompress is disabled, route to passthrough instead of fallback.
     pub disable_kompress_fallback: bool,
+    /// Kompress is off for this request's provider
+    /// (`--disable-kompress-anthropic` / `--disable-kompress-openai`), so
+    /// `PlainText` passes through even when Kompress is enabled.
+    pub disable_kompress: bool,
     /// Compress user-role messages (overrides skip_user_messages when Some(true)).
     pub compress_user_messages: Option<bool>,
     /// Compress system-role messages.
@@ -147,7 +151,9 @@ pub(super) fn intern_dispatch_strategy(strategy: &str) -> Option<&'static str> {
 ///
 /// This is a pure function of `(text, content_type, config.target_ratio)`, which
 /// is what makes the process-global memo safe: identical inputs always produce
-/// identical output, so a hit cannot be stale.
+/// identical output, so a hit cannot be stale. The one exception,
+/// `config.disable_kompress` on `PlainText`, bypasses the memo in both
+/// directions: it never reads an entry Kompress wrote, and never writes one.
 ///
 /// The memo deliberately sits *below* the accept/reject decision in
 /// [`compress_one_block`], not above it. Python caches a compressed result
@@ -170,6 +176,10 @@ pub(super) fn dispatch_compressor_with_config(
             content_type: content_type.as_str(),
             declined_by: None,
         };
+    }
+
+    if config.disable_kompress && content_type == ContentType::PlainText {
+        return dispatch_compressor_uncached(text, content_type, config);
     }
 
     let cache = dispatch_cache();
@@ -214,8 +224,6 @@ pub(super) fn dispatch_compressor_with_config(
     result
 }
 
-// `config` carries the target ratio, which only the Kompress arm reads.
-#[cfg_attr(not(feature = "ml"), allow(unused_variables))]
 pub(super) fn dispatch_compressor_uncached(
     text: &str,
     content_type: ContentType,
@@ -326,6 +334,10 @@ pub(super) fn dispatch_compressor_uncached(
                 compressed,
             }
         }
+        ContentType::PlainText if config.disable_kompress => DispatchResult::NoOp {
+            content_type: content_type.as_str(),
+            declined_by: Some("kompress_disabled"),
+        },
         ContentType::PlainText
             if crate::transforms::content_router::kompress_size_gate_exceeded(text) =>
         {
@@ -621,6 +633,32 @@ mod dispatch_cache_kompress_flag_tests {
         set_kompress_enabled_for_test(before);
 
         assert_ne!(key_disabled, key_enabled);
+    }
+
+    /// A provider with Kompress switched off gets passthrough, says why, and
+    /// never sees an entry an enabled call left in the memo.
+    #[test]
+    fn a_provider_with_kompress_off_passes_plain_text_through() {
+        let text = "plain prose for a provider that has kompress switched off";
+        let off = DispatchConfig {
+            disable_kompress: true,
+            ..DispatchConfig::default()
+        };
+        let _ = dispatch_compressor_with_config(
+            text,
+            ContentType::PlainText,
+            &DispatchConfig::default(),
+        );
+
+        let result = dispatch_compressor_with_config(text, ContentType::PlainText, &off);
+
+        assert!(matches!(
+            result,
+            DispatchResult::NoOp {
+                declined_by: Some("kompress_disabled"),
+                ..
+            }
+        ));
     }
 
     /// Sets the flag and returns its previous value, so a test can restore it.

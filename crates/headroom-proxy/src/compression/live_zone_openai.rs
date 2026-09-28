@@ -125,6 +125,7 @@ pub fn compress_openai_chat_request(
     // the rationale — same wiring on the OpenAI chat path.
     let dispatch_config = headroom_core::transforms::live_zone::DispatchConfig {
         exclude_tools: exclude_tools.to_vec(),
+        disable_kompress: headroom_core::transforms::kompress_disabled_for_openai(),
         ..Default::default()
     };
     match compress_openai_chat_live_zone_with_config(

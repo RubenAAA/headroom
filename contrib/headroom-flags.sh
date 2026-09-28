@@ -629,7 +629,9 @@ HEADROOM_FLAGS=(
   --compress-user-messages true
   --compression-max-workers 4
   --smart-crusher-compaction true
+  # No-op: SmartCrusher has no token floor; kept so the file keeps parsing.
   --min-tokens-to-crush 200
+  # Wired 2026-09-28 (was a no-op); 15 is the crusher's own default.
   --max-items-after-crush 15
   # 0 = no ratio target; the transforms decide
   --target-ratio 0
@@ -649,6 +651,9 @@ HEADROOM_FLAGS=(
   # (~/.cache/huggingface/.../kompress-int8-wo.onnx) so this is available,
   # not theoretical. Untried: lossy compression sits close to instructions,
   # and the live zone is the least valuable place to compress
+  # Wired 2026-09-28: --disable-kompress overrides --enable-kompress, so the
+  # kompress A/B has to flip both. The per-provider switches only turn it off.
+  # --disable-kompress-fallback and --force-kompress-all are still no-ops.
   --enable-kompress false
   --disable-kompress true
   --disable-kompress-fallback true

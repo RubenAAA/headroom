@@ -1,6 +1,13 @@
 # Idea: wire or remove the dead crush flags
 
-- **Status:** open
+- **Status:** done 2026-09-28, split verdict. `--max-items-after-crush` is
+  wired: `set_smart_crusher_max_items` (`live_zone/compressors.rs`), set in
+  `main.rs` before the first dispatch builds the crusher. E2E
+  (`scripts/e2e-crush-max-items.py`, 60 rows in): new binary forwards
+  15 / 3 / 27 rows for default / `3` / `30`; the old binary forwarded 15 for
+  all three. `--min-tokens-to-crush` stays a documented no-op: SmartCrusher
+  has no such setting, and mapping 200 tokens onto the live zone's 512-byte
+  thresholds would stop compressing blocks that compress today.
 - **Source:** `docs/notes/recache-classification.md` (2026-08-23)
 - **Summary:** `--min-tokens-to-crush` (default 200) and `--max-items-after-crush` (default 15) are declared, copied into runtime `Config`, and never read — changing them does nothing to forwarded requests.
 - **Next:** wire `SmartCrusher` construction to the CLI values, or delete the flags.

@@ -233,9 +233,20 @@ fn init_live_zone_compressors(config: &Config) {
     // here from `--code-aware` so the off-arm exists for operators that want
     // it. Our deployment pins it on (flags.sh) — the 2026-09-18 ladder
     // measured 261k tokens saved live with no invalid-syntax signal.
+    //
+    // `--disable-kompress` overrides `--enable-kompress`; the per-provider
+    // switches can only turn Kompress off for one provider's requests.
+    // `--max-items-after-crush` must land before the first dispatch builds
+    // the SmartCrusher singleton, which is why it is set here.
     headroom_core::transforms::set_code_aware_enabled(config.code_aware_enabled);
-    headroom_core::transforms::set_kompress_enabled(config.enable_kompress);
-    if config.enable_kompress {
+    let kompress_on = config.enable_kompress && !config.disable_kompress;
+    headroom_core::transforms::set_kompress_enabled(kompress_on);
+    headroom_core::transforms::set_kompress_disabled_per_provider(
+        config.disable_kompress_anthropic,
+        config.disable_kompress_openai,
+    );
+    headroom_core::transforms::set_smart_crusher_max_items(config.max_items_after_crush);
+    if kompress_on {
         tokio::task::spawn_blocking(|| {
             let ready = headroom_core::transforms::warm_live_zone_compressors();
             tracing::info!(

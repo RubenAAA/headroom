@@ -17,7 +17,25 @@ use super::*;
 
 pub(super) fn smart_crusher() -> &'static SmartCrusher {
     static INSTANCE: OnceLock<SmartCrusher> = OnceLock::new();
-    INSTANCE.get_or_init(|| SmartCrusher::new(SmartCrusherConfig::default()))
+    INSTANCE.get_or_init(|| {
+        let mut config = SmartCrusherConfig::default();
+        if let Some(&max_items) = SMART_CRUSHER_MAX_ITEMS.get() {
+            config.max_items_after_crush = max_items;
+        }
+        SmartCrusher::new(config)
+    })
+}
+
+// `--max-items-after-crush`. Read once, when the first dispatch builds the
+// crusher above, so the proxy must set it at startup before serving. Unset
+// keeps `SmartCrusherConfig::default()`.
+static SMART_CRUSHER_MAX_ITEMS: OnceLock<usize> = OnceLock::new();
+
+/// Set how many items SmartCrusher keeps from a crushed array. Call once at
+/// startup, before the first request. Returns `false` if a value was already
+/// set, in which case the first one stands.
+pub fn set_smart_crusher_max_items(max_items: usize) -> bool {
+    SMART_CRUSHER_MAX_ITEMS.set(max_items).is_ok()
 }
 
 pub(super) fn log_compressor() -> &'static LogCompressor {
@@ -73,6 +91,31 @@ pub(super) static KOMPRESS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// blocks pass through and the model is never loaded.
 pub fn set_kompress_enabled(enabled: bool) {
     KOMPRESS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+// Per-provider Kompress off switches (`--disable-kompress-anthropic`,
+// `--disable-kompress-openai`). They only ever turn Kompress off: a provider
+// never gets it while `KOMPRESS_ENABLED` is false. The proxy sets them once at
+// startup and copies the matching one into each request's
+// `DispatchConfig::disable_kompress`.
+static KOMPRESS_DISABLED_ANTHROPIC: AtomicBool = AtomicBool::new(false);
+static KOMPRESS_DISABLED_OPENAI: AtomicBool = AtomicBool::new(false);
+
+/// Turn Kompress off for Anthropic or OpenAI requests only. Call once at
+/// startup from config.
+pub fn set_kompress_disabled_per_provider(anthropic: bool, openai: bool) {
+    KOMPRESS_DISABLED_ANTHROPIC.store(anthropic, Ordering::Relaxed);
+    KOMPRESS_DISABLED_OPENAI.store(openai, Ordering::Relaxed);
+}
+
+/// Whether Kompress is off for Anthropic requests (default `false`).
+pub fn kompress_disabled_for_anthropic() -> bool {
+    KOMPRESS_DISABLED_ANTHROPIC.load(Ordering::Relaxed)
+}
+
+/// Whether Kompress is off for OpenAI requests (default `false`).
+pub fn kompress_disabled_for_openai() -> bool {
+    KOMPRESS_DISABLED_OPENAI.load(Ordering::Relaxed)
 }
 
 /// Kompress readiness for health reporting.

@@ -9,6 +9,11 @@
   (`~/.cache/huggingface/.../kompress-int8-wo.onnx`), so this is available,
   not theoretical. Only remaining lossy family never measured on live
   traffic — everything else lossy has numbers.
+- **Since 2026-09-28:** `--disable-kompress` is live and overrides
+  `--enable-kompress`, and the flags file sets it `true`, so the on-arm must
+  flip both. `--force-kompress-all` is still a no-op in Rust; the forced arm
+  needs it built first (route every non-excluded type to Kompress in
+  `live_zone/dispatch.rs`, size gate kept).
 - **Next:** enable on a canary (NOT `--force-compress-all` yet — that
   bypasses guards; test guarded first, forced second if guarded wins).
   Track: per-turn savings on `PlainText` blocks; answer-retention quality

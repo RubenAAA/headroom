@@ -1664,10 +1664,11 @@ pub struct CliArgs {
     // ─── Compression tuning ──────────────────────────────────────────────
     /// Minimum token count before a message is eligible for compression.
     ///
-    /// NO-OP (2026-09-11): the live SmartCrusher path uses its own defaults
-    /// (200) and never reads this value — see ideas/dead-crush-flags.md.
-    /// Kept as a declared flag so existing flag files keep parsing; setting
-    /// it changes nothing until it is wired or removed.
+    /// NO-OP: SmartCrusher has no such setting, and the live zone gates on
+    /// per-type byte thresholds (512) instead. Mapping 200 tokens onto them
+    /// would stop compressing blocks that compress today — see
+    /// ideas/implemented/dead-crush-flags.md. Kept so existing flag files
+    /// keep parsing.
     #[arg(
         long = "min-tokens-to-crush",
         env = "HEADROOM_MIN_TOKENS_TO_CRUSH",
@@ -1677,8 +1678,7 @@ pub struct CliArgs {
 
     /// Max items to retain after SmartCrusher processing.
     ///
-    /// NO-OP (2026-09-11): same as above — the live path uses its own
-    /// default (15). See ideas/dead-crush-flags.md.
+    /// Read once at startup, before the first request builds the crusher.
     #[arg(
         long = "max-items-after-crush",
         env = "HEADROOM_MAX_ITEMS_AFTER_CRUSH",
@@ -1712,23 +1712,33 @@ pub struct CliArgs {
     #[arg(long = "code-aware", env = "HEADROOM_CODE_AWARE_ENABLED", default_value_t = false, action = clap::ArgAction::Set)]
     pub code_aware_enabled: bool,
 
-    /// Disable the Kompress ML compressor entirely.
-    #[arg(long = "disable-kompress", env = "HEADROOM_DISABLE_KOMPRESS", default_value_t = true, action = clap::ArgAction::Set)]
+    /// Disable the Kompress ML compressor entirely. Overrides
+    /// `--enable-kompress`.
+    #[arg(long = "disable-kompress", env = "HEADROOM_DISABLE_KOMPRESS", default_value_t = false, action = clap::ArgAction::Set)]
     pub disable_kompress: bool,
 
     /// When Kompress is disabled, route fall-through to passthrough.
+    ///
+    /// NO-OP: the live-zone dispatcher has no Kompress fallback. With
+    /// Kompress off, plain text always passes through, which is what `true`
+    /// selects in Python.
     #[arg(long = "disable-kompress-fallback", env = "HEADROOM_DISABLE_KOMPRESS_FALLBACK", default_value_t = true, action = clap::ArgAction::Set)]
     pub disable_kompress_fallback: bool,
 
-    /// Disable Kompress for Anthropic provider only.
+    /// Disable Kompress for Anthropic provider only. Can only turn Kompress
+    /// off; it never enables Kompress on its own.
     #[arg(long = "disable-kompress-anthropic", env = "HEADROOM_DISABLE_KOMPRESS_ANTHROPIC", default_value_t = false, action = clap::ArgAction::Set)]
     pub disable_kompress_anthropic: bool,
 
-    /// Disable Kompress for OpenAI provider only.
+    /// Disable Kompress for OpenAI provider only (Chat Completions and
+    /// Responses). Can only turn Kompress off.
     #[arg(long = "disable-kompress-openai", env = "HEADROOM_DISABLE_KOMPRESS_OPENAI", default_value_t = false, action = clap::ArgAction::Set)]
     pub disable_kompress_openai: bool,
 
     /// Force all compressible content through Kompress.
+    ///
+    /// NO-OP: not implemented on the Rust side. See
+    /// ideas/kompress-enable-ab.md, where it is the forced arm.
     #[arg(long = "force-kompress-all", env = "HEADROOM_FORCE_KOMPRESS_ALL", default_value_t = false, action = clap::ArgAction::Set)]
     pub force_kompress_all: bool,
 
@@ -3116,7 +3126,7 @@ impl Config {
             savings_profile: "balanced".to_string(),
             target_ratio: 0.0,
             code_aware_enabled: false,
-            disable_kompress: true,
+            disable_kompress: false,
             disable_kompress_fallback: true,
             disable_kompress_anthropic: false,
             disable_kompress_openai: false,

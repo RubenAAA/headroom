@@ -36,7 +36,7 @@
 
 ## Older threads, closed — 2026-08-23
 
-> **Moved to [`ideas/dead-crush-flags.md`](ideas/dead-crush-flags.md)** — dead CLI flags (`--min-tokens-to-crush`, `--max-items-after-crush` never read; SmartCrusher built from `::default()`).
+> **Moved to [`ideas/implemented/dead-crush-flags.md`](ideas/implemented/dead-crush-flags.md)** — dead CLI flags (`--min-tokens-to-crush`, `--max-items-after-crush` never read; SmartCrusher built from `::default()`).
 
 > **Moved to [`learnings/recache-counting-rules.md`](learnings/recache-counting-rules.md)** — denominator-mismatch lesson (subset vs corpus).
 

@@ -843,7 +843,7 @@ Options:
       --min-tokens-to-crush <MIN_TOKENS_TO_CRUSH>
           Minimum token count before a message is eligible for compression.
           
-          NO-OP (2026-09-11): the live SmartCrusher path uses its own defaults (200) and never reads this value — see ideas/dead-crush-flags.md. Kept as a declared flag so existing flag files keep parsing; setting it changes nothing until it is wired or removed.
+          NO-OP: SmartCrusher has no such setting, and the live zone gates on per-type byte thresholds (512) instead. Mapping 200 tokens onto them would stop compressing blocks that compress today — see ideas/implemented/dead-crush-flags.md. Kept so existing flag files keep parsing.
           
           [env: HEADROOM_MIN_TOKENS_TO_CRUSH=]
           [default: 200]
@@ -851,7 +851,7 @@ Options:
       --max-items-after-crush <MAX_ITEMS_AFTER_CRUSH>
           Max items to retain after SmartCrusher processing.
           
-          NO-OP (2026-09-11): same as above — the live path uses its own default (15). See ideas/dead-crush-flags.md.
+          Read once at startup, before the first request builds the crusher.
           
           [env: HEADROOM_MAX_ITEMS_AFTER_CRUSH=]
           [default: 15]
@@ -878,35 +878,39 @@ Options:
           [possible values: true, false]
 
       --disable-kompress <DISABLE_KOMPRESS>
-          Disable the Kompress ML compressor entirely
+          Disable the Kompress ML compressor entirely. Overrides `--enable-kompress`
           
           [env: HEADROOM_DISABLE_KOMPRESS=]
-          [default: true]
+          [default: false]
           [possible values: true, false]
 
       --disable-kompress-fallback <DISABLE_KOMPRESS_FALLBACK>
-          When Kompress is disabled, route fall-through to passthrough
+          When Kompress is disabled, route fall-through to passthrough.
+          
+          NO-OP: the live-zone dispatcher has no Kompress fallback. With Kompress off, plain text always passes through, which is what `true` selects in Python.
           
           [env: HEADROOM_DISABLE_KOMPRESS_FALLBACK=]
           [default: true]
           [possible values: true, false]
 
       --disable-kompress-anthropic <DISABLE_KOMPRESS_ANTHROPIC>
-          Disable Kompress for Anthropic provider only
+          Disable Kompress for Anthropic provider only. Can only turn Kompress off; it never enables Kompress on its own
           
           [env: HEADROOM_DISABLE_KOMPRESS_ANTHROPIC=]
           [default: false]
           [possible values: true, false]
 
       --disable-kompress-openai <DISABLE_KOMPRESS_OPENAI>
-          Disable Kompress for OpenAI provider only
+          Disable Kompress for OpenAI provider only (Chat Completions and Responses). Can only turn Kompress off
           
           [env: HEADROOM_DISABLE_KOMPRESS_OPENAI=]
           [default: false]
           [possible values: true, false]
 
       --force-kompress-all <FORCE_KOMPRESS_ALL>
-          Force all compressible content through Kompress
+          Force all compressible content through Kompress.
+          
+          NO-OP: not implemented on the Rust side. See ideas/kompress-enable-ab.md, where it is the forced arm.
           
           [env: HEADROOM_FORCE_KOMPRESS_ALL=]
           [default: false]
