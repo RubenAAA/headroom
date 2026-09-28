@@ -1,6 +1,8 @@
 # Idea: intelligent task-aware model routing with cost x cache x limits
 
-- **Status:** open
+- **Status:** open, but phase A is dead — measured 2026-09-28, its recipe
+  matches 2 of ~4,500 Claude requests in a month (see Findings). Phase B
+  waits on `harness-whole-tree-cost.md`.
 - **Source:** investigation 2026-09-22 (proxy routing, cost model, task signals)
 - **Value:** user never chooses a model; proxy dispatches each task to the
   cheapest model that can solve it, aware of model prices, recache costs, and
@@ -53,3 +55,33 @@ No hot-path I/O, LLM call, content regex, or real tokenizer.
 - **C (only if A/B wins after write costs):** full optimizer + escalation fed by
   live hit stats (`observability/cache_hit_rate.rs`), `/codex-limits`,
   `ModelCooldowns`.
+
+## Findings 2026-09-28 — phase A has nothing to route
+
+Every Claude request body in `~/headroom-capture-netvalue` (2026-08-23 to
+09-25), bucketed on the signals phase A would see:
+
+| model | tools | messages | size | effort | requests |
+|---|---|---|---|---|---|
+| opus | yes | >3 | >20k | medium | 2,140 |
+| opus | yes | >3 | >20k | high | 1,154 |
+| sonnet | yes | >3 | >20k | medium | 935 |
+| opus | yes | >3 | >20k | max | 149 |
+| sonnet | no | 2–3 | ~47k | none | 98 |
+| everything else | | | | | 52 |
+
+- The phase A recipe (no tools, small, effort low or medium) matched 2
+  requests, about 1.2k tokens. No request sent `effort: low`.
+- The 98 toolless sonnet calls are Claude Code's own permission classifier
+  (`<transcript>` prompt, `max_tokens` 64 or 8192). Claude Code chose sonnet
+  for them on purpose, and a weaker safety check is not a saving worth having.
+- The spend sits in long tool-using opus conversations. A `NewUserAsk` inside
+  one of them cannot move without a full rewrite of its prefix, which is the
+  loss `rejected/per-turn-model-routing.md` measured. First turns, the only
+  place a pin is free, are under 1% of requests.
+
+So the only form of this that could pay is phase B: pick the model once, on
+the first turn, and pin it. That picks the model for a whole agentic session
+from one prompt, and needs the per-tree cost from
+`harness-whole-tree-cost.md` to show it did not just move the cost into
+retries. Do not build phase A.
