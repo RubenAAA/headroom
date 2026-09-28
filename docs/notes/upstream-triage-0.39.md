@@ -66,6 +66,12 @@ Landed as one gate, `src/admission.rs`, a middleware in front of every generatio
 
 Each changes bytes sent upstream. Read `docs/notes/learnings/` and the matching `cache_stabilization/` module first, and check the cache-health numbers after deploy.
 
+Landed: `d971f7c3` (b634a16a; its digit-integrity test now runs through the log compressor, a2d0d34a), `9263b420` (cc331837), `6c9aef1d` (3ecfed3f), `c7ebaedd` (15c8e9e7), `a2bf5ed1` (feb0cad6), `c0292984` (6cb19b93), `bf290ba9` (5ed85d98), `665b73df` (2dc43047, without the hourly orphaned-deferral warning), `f12e3fbe` (8a4bbb9d), `12c15796` in part (049f2cb1), `deca575c` (e5fb063e).
+
+`12c15796` gap: the header and log halves landed. The opaque-frame envelope for CCR re-synthesis did not. Rust streams a turn's own unknown SSE events (`safeguard_results`) to the client live, so only the unknown events of a CCR continuation round are still folded away, and only when `headroom_retrieve` fires mid auto-mode turn. Carrying them needs a side channel out of `continuation_turn_from_body` through the round loop (`CcrRoundUsage` is `Copy`). No capture in `~/headroom-capture*` carries `safeguards` or a `dangerous-tool-use-*` beta.
+
+`deca575c` note: the chat live zone skips the output of a tool named `read` (read protection), and keeps the newest tool message live until a newer one arrives, so the replay only matters from the second tool result on.
+
 | sha | kind | cache | behavior | Rust target | note |
 |---|---|---|---|---|---|
 | `f12e3fbe` | PORT | yes | Repair client-side tool_result blocks whose content lists tool_reference entries for tools no longer in `tools` (drop them; placeholder text if none left) | crates/headroom-proxy/src/tool_search_deferral.rs:571 (strip_unsupported_blocks only inspects server result types via server_result_family; plain tool_result is skipped) | Agrees with old doc. Rewrites history bytes, so keep the placeholder constant for byte stability. S-M |
