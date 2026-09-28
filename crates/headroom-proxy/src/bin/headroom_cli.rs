@@ -1105,6 +1105,14 @@ fn cmd_savings(as_json: bool, days: u32, reset: bool) -> Result<(), Box<dyn std:
             &report.windows["last_30_days"]
         )
     );
+    if ["today", "last_7_days", "last_30_days"]
+        .iter()
+        .any(|w| has_new_input(&report.windows[*w]))
+    {
+        println!(
+            "  % is of the selected input; 'of new input' is of tokens that newly entered context."
+        );
+    }
 
     if !report.by_model.is_empty() {
         println!();
@@ -1163,7 +1171,7 @@ fn window_line(label: &str, window: &serde_json::Value) -> String {
         .get("cost_usd")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
-    format!(
+    let mut line = format!(
         "{:<11} {} {:>5.1}%  saved {} / {} selected tokens  {}",
         label,
         bar(pct),
@@ -1171,7 +1179,27 @@ fn window_line(label: &str, window: &serde_json::Value) -> String {
         commafy(saved),
         commafy(before),
         fmt_money(cost, 4)
-    )
+    );
+    // Second basis, only when the window has provider cache data: the share of
+    // what newly entered context. The first counts a session's cached history
+    // on every turn, so a long session reads near 0% there while compression
+    // is working.
+    if has_new_input(window) {
+        let new_pct = window
+            .get("new_input_savings_percent")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        line.push_str(&format!("  · of new input {new_pct:.1}%"));
+    }
+    line
+}
+
+fn has_new_input(window: &serde_json::Value) -> bool {
+    window
+        .get("new_input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        > 0
 }
 
 fn bar(percent: f64) -> String {
@@ -1358,6 +1386,15 @@ mod tests {
         assert!(line.contains(" 50.0%"));
         assert!(line.contains("saved 500 / 1,000 selected tokens"));
         assert!(line.contains("$0.0018"));
+        assert!(
+            !line.contains("new input"),
+            "no cache data, no second basis"
+        );
+
+        let mut w = w;
+        w["new_input_tokens"] = json!(3500);
+        w["new_input_savings_percent"] = json!(12.5);
+        assert!(window_line("Today", &w).ends_with("  · of new input 12.5%"));
     }
 
     #[test]

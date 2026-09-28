@@ -469,6 +469,12 @@ pub struct TokensState {
     pub attempted_input: i64,
     /// Input tokens compression removed.
     pub saved: i64,
+    /// Uncached plus cache-write input on requests that reported either:
+    /// what newly entered context, as the provider billed it.
+    pub new_input: i64,
+    /// Compression savings on those same requests, so the new-input rate
+    /// never lends a saving to a denominator it did not come from.
+    pub new_input_saved: i64,
 }
 
 /// What the proxy itself adds to a request.
@@ -1170,6 +1176,15 @@ impl PersistentMetricsState {
         tokens.output += output_delta;
         tokens.attempted_input += attempted_delta;
         tokens.saved += headline_delta;
+        // Same predicate the savings ledger writes its `new_input` field on,
+        // so `/stats` and `headroom savings` measure one cohort. Compression
+        // only: deferred tool schemas ride the cached prefix, never new input.
+        let new_input_delta = clamp_int(request.uncached_input_tokens)
+            .saturating_add(clamp_int(request.cache_write_tokens));
+        if new_input_delta > 0 {
+            tokens.new_input += new_input_delta;
+            tokens.new_input_saved += saved_delta;
+        }
 
         let cache = &mut self.state.prefix_cache;
         cache.requests += 1;
@@ -1398,6 +1413,23 @@ impl PersistentMetricsState {
             "token_savings_percent".to_string(),
             to_value(&Self::percent(tokens.saved, tokens.input)),
         );
+        // Savings as a share of what newly entered context: saved / (new
+        // input + saved), since removed tokens never reached the provider.
+        // `token_savings_percent` recounts a session's cached history every
+        // turn, so a long session reads near 0% there however well
+        // compression does on new content. Null without cache data, rather
+        // than savings divided by themselves.
+        tokens_out.insert(
+            "new_input_savings_percent".to_string(),
+            to_value(&if tokens.new_input > 0 {
+                Self::percent(
+                    tokens.new_input_saved,
+                    tokens.new_input + tokens.new_input_saved,
+                )
+            } else {
+                None
+            }),
+        );
 
         let mut cache_out = object_of(&cache);
         cache_out.insert(
@@ -1609,6 +1641,8 @@ fn normalize(raw: Option<&Value>) -> MetricsSnapshotState {
         output: coerce_int(get(raw_tokens, "output")),
         attempted_input: coerce_int(get(raw_tokens, "attempted_input")),
         saved: coerce_int(get(raw_tokens, "saved")),
+        new_input: coerce_int(get(raw_tokens, "new_input")),
+        new_input_saved: coerce_int(get(raw_tokens, "new_input_saved")),
     };
 
     let raw_cache = dict_or_empty(get(source, "prefix_cache"));
@@ -1773,7 +1807,7 @@ mod tests {
         let state = PersistentMetricsState::new(None);
         assert_eq!(
             compact(&state.to_dict()),
-            r#"{"started_at":null,"last_activity_at":null,"full_fidelity_started_at":null,"requests":{"total":0,"cached":0,"failed":0,"rate_limited":0,"by_provider":{},"failed_by_provider":{},"rate_limited_by_provider":{},"rate_limited_by_source":{},"by_stack":{}},"tokens":{"input":0,"output":0,"attempted_input":0,"saved":0},"prefix_cache":{"requests":0,"hit_requests":0,"cache_read_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":0,"cache_write_1h_tokens":0,"uncached_input_tokens":0,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{}},"cost":{"input_usd":0.0,"compression_savings_usd":0.0,"cache_savings_usd":0.0},"waste_signals":{},"models":{"tracked":{},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"last_saved_at":null}}"#
+            r#"{"started_at":null,"last_activity_at":null,"full_fidelity_started_at":null,"requests":{"total":0,"cached":0,"failed":0,"rate_limited":0,"by_provider":{},"failed_by_provider":{},"rate_limited_by_provider":{},"rate_limited_by_source":{},"by_stack":{}},"tokens":{"input":0,"output":0,"attempted_input":0,"saved":0,"new_input":0,"new_input_saved":0},"prefix_cache":{"requests":0,"hit_requests":0,"cache_read_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":0,"cache_write_1h_tokens":0,"uncached_input_tokens":0,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{}},"cost":{"input_usd":0.0,"compression_savings_usd":0.0,"cache_savings_usd":0.0},"waste_signals":{},"models":{"tracked":{},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"last_saved_at":null}}"#
         );
     }
 
@@ -1862,7 +1896,7 @@ mod tests {
         });
         assert_eq!(
             compact(&state.to_dict()),
-            r#"{"started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"openai":1},"failed_by_provider":{},"rate_limited_by_provider":{},"rate_limited_by_source":{},"by_stack":{"codex":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":40,"cache_write_tokens":10,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":60,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"openai":1}},"cost":{"input_usd":0.001235,"compression_savings_usd":0.5,"cache_savings_usd":0.25},"waste_signals":{"json_bloat":12,"other":3},"models":{"tracked":{"gpt-5":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"}},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"last_saved_at":null}}"#
+            r#"{"started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"openai":1},"failed_by_provider":{},"rate_limited_by_provider":{},"rate_limited_by_source":{},"by_stack":{"codex":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50,"new_input":70,"new_input_saved":50},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":40,"cache_write_tokens":10,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":60,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"openai":1}},"cost":{"input_usd":0.001235,"compression_savings_usd":0.5,"cache_savings_usd":0.25},"waste_signals":{"json_bloat":12,"other":3},"models":{"tracked":{"gpt-5":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"}},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"last_saved_at":null}}"#
         );
     }
 
@@ -1886,7 +1920,7 @@ mod tests {
         let snapshot = state.snapshot(&json!({"path": "/tmp/x.json", "enabled": true}));
         assert_eq!(
             compact(&snapshot),
-            r#"{"scope":"lifetime","schema_version":5,"generated_at":"2026-07-27T12:00:00Z","started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"anthropic":1},"failed_by_provider":{},"rate_limited_by_provider":{},"rate_limited_by_source":{},"by_stack":{"claude-code":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50,"token_savings_percent":50.0},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":0,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"anthropic":1},"cache_hit_rate":100.0,"ttl_1h_percent":40.0,"ttl_5m_percent":60.0},"cost":{"input_usd":0.0,"compression_savings_usd":0.0,"cache_savings_usd":0.0},"waste_signals":{},"by_model":{"sonnet":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"path":"/tmp/x.json","enabled":true,"last_saved_at":"2026-07-27T12:00:05Z"}}"#
+            r#"{"scope":"lifetime","schema_version":5,"generated_at":"2026-07-27T12:00:00Z","started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"anthropic":1},"failed_by_provider":{},"rate_limited_by_provider":{},"rate_limited_by_source":{},"by_stack":{"claude-code":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50,"new_input":0,"new_input_saved":0,"token_savings_percent":50.0,"new_input_savings_percent":null},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":0,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"anthropic":1},"cache_hit_rate":100.0,"ttl_1h_percent":40.0,"ttl_5m_percent":60.0},"cost":{"input_usd":0.0,"compression_savings_usd":0.0,"cache_savings_usd":0.0},"waste_signals":{},"by_model":{"sonnet":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"path":"/tmp/x.json","enabled":true,"last_saved_at":"2026-07-27T12:00:05Z"}}"#
         );
     }
 

@@ -825,6 +825,7 @@ impl OutcomeSink for CodexWsOutcomeSink {
         let client = outcome.client.clone();
         let priced_cost = outcome.compression_savings_cost_usd();
         let priced_basis = outcome.compression_savings_cost_basis().to_string();
+        let new_input = outcome.new_input_tokens();
         tokio::task::spawn_blocking(move || {
             headroom_core::savings_ledger::record_from_forwarded_with_cost(
                 forwarded,
@@ -833,6 +834,8 @@ impl OutcomeSink for CodexWsOutcomeSink {
                 client.as_deref(),
                 Some(priced_cost),
                 Some(&priced_basis),
+                new_input,
+                0,
             );
         });
     }

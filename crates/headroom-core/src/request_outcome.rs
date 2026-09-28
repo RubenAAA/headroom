@@ -165,6 +165,15 @@ impl RequestOutcome {
         self.tokens_saved as f64 / self.original_tokens as f64 * 100.0
     }
 
+    /// Input that newly entered context, as the provider billed it: uncached
+    /// plus cache write. `None` when the usage block reported neither, so a
+    /// provider with no cache breakdown never supplies a denominator.
+    pub fn new_input_tokens(&self) -> Option<i64> {
+        let uncached = self.uncached_input_tokens.max(0);
+        let write = self.cache_write_tokens.max(0);
+        (uncached > 0 || write > 0).then(|| uncached.saturating_add(write))
+    }
+
     /// Rate class the removed input would have occupied on this request.
     ///
     /// Prompt caches are prefixes. `optimized_tokens` is the selected span
@@ -669,8 +678,11 @@ pub fn emit_request_outcome<S: OutcomeSink + ?Sized>(sink: &S, outcome: &Request
     // saved is the bill it never sent to the client's model, and that is worth
     // more than any compression delta. The ledger helper still ignores a
     // zero-token compression saving, so the disk write stays gated as before.
+    // A turn that newly billed input books too, as a denominator-only line for
+    // the ledger's new-input rate (see `savings_ledger::record_savings_event`).
     if crate::tool_schema_savings::headline_tokens_saved(outcome.tokens_saved, &outcome.tags) > 0
         || outcome.routed_from_model.is_some()
+        || outcome.new_input_tokens().is_some()
     {
         sink.record_savings_ledger(outcome);
     }

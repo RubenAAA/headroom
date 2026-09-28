@@ -248,6 +248,7 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         // nothing, not because nothing was saved — do not read them
         // against priced rows.
         let priced_basis = outcome.compression_savings_cost_basis().to_string();
+        let new_input = outcome.new_input_tokens();
         let pricing = headroom_core::pricing::lookup(&model);
         let fresh_rate = pricing
             .map(|p| p.input_cost_per_token)
@@ -257,7 +258,9 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             .unwrap_or(fresh_rate);
         let fresh_counterfactual = saved.max(0) as f64 * fresh_rate;
         let cache_counterfactual = saved.max(0) as f64 * cache_read_rate;
-        tracing::info!(
+        // A denominator-only turn has no saving to price.
+        if saved > 0 {
+            tracing::info!(
             event = "savings_pricing_counterfactual",
             request_id = %outcome.request_id,
             model = %model,
@@ -269,9 +272,10 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             fresh_input_usd = fresh_counterfactual,
             cache_read_usd = cache_counterfactual,
             priced_cost_basis = %priced_basis,
-            priced_cost_usd = priced_cost,
-            "savings ledger pricing counterfactuals"
-        );
+                priced_cost_usd = priced_cost,
+                "savings ledger pricing counterfactuals"
+            );
+        }
         let offload = offload_savings(outcome);
         // Widening the gate above brought turns here that never reached this
         // line before, including ones booked outside a runtime. `spawn_blocking`
@@ -286,6 +290,8 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
                 client.as_deref(),
                 priced_cost,
                 &priced_basis,
+                new_input,
+                tool_schema_saved,
                 offload,
             );
             return;
@@ -298,6 +304,8 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
                 client.as_deref(),
                 priced_cost,
                 &priced_basis,
+                new_input,
+                tool_schema_saved,
                 offload,
             );
         });
@@ -315,6 +323,8 @@ pub(super) fn write_savings_ledger(
     client: Option<&str>,
     priced_cost: f64,
     priced_basis: &str,
+    new_input: Option<i64>,
+    deferred: i64,
     offload: Option<OffloadSavings>,
 ) {
     headroom_core::savings_ledger::record_from_forwarded_with_cost(
@@ -324,6 +334,8 @@ pub(super) fn write_savings_ledger(
         client,
         Some(priced_cost),
         Some(priced_basis),
+        new_input,
+        deferred,
     );
     if let Some(offload) = offload {
         headroom_core::savings_ledger::record_savings_event(
@@ -338,6 +350,7 @@ pub(super) fn write_savings_ledger(
                 cost_basis: Some("model_offload"),
                 fallback_rate: None,
                 path: None,
+                ..Default::default()
             },
         );
     }

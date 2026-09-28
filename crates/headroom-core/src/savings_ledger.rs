@@ -183,6 +183,15 @@ pub struct SavingsEvent<'a> {
     pub cost_basis: Option<&'a str>,
     pub fallback_rate: Option<f64>,
     pub path: Option<&'a Path>,
+    /// Provider-billed input that newly entered context this request
+    /// (uncached + cache write): the denominator of `new_input_savings_percent`.
+    /// `None` when the provider gave no cache breakdown, so the ledger never
+    /// divides savings by themselves.
+    pub new_input_tokens: Option<i64>,
+    /// The share of the saving that is tool-schema deferral. It rides the
+    /// cached prefix and never was new input, so the new-input rate leaves it
+    /// out of its numerator.
+    pub deferred_tokens: i64,
 }
 
 /// Record a savings event from a completed request, given the count that was
@@ -204,12 +213,23 @@ pub fn record_from_forwarded(
     model: Option<&str>,
     client: Option<&str>,
 ) -> bool {
-    record_from_forwarded_with_cost(forwarded_tokens, tokens_saved, model, client, None, None)
+    record_from_forwarded_with_cost(
+        forwarded_tokens,
+        tokens_saved,
+        model,
+        client,
+        None,
+        None,
+        None,
+        0,
+    )
 }
 
 /// As [`record_from_forwarded`], with a request-scoped price derived from the
-/// provider's cache usage. New proxy paths use this; the legacy helper remains
-/// for callers that genuinely have no placement measurement.
+/// provider's cache usage and the new-input basis described on
+/// [`SavingsEvent`]. New proxy paths use this; the legacy helper remains for
+/// callers that genuinely have no placement measurement.
+#[allow(clippy::too_many_arguments)]
 pub fn record_from_forwarded_with_cost(
     forwarded_tokens: i64,
     tokens_saved: i64,
@@ -217,12 +237,14 @@ pub fn record_from_forwarded_with_cost(
     client: Option<&str>,
     cost_usd: Option<f64>,
     cost_basis: Option<&str>,
+    new_input_tokens: Option<i64>,
+    deferred_tokens: i64,
 ) -> bool {
-    if tokens_saved <= 0 {
+    if tokens_saved <= 0 && new_input_tokens.is_none() {
         return false;
     }
     record_savings_event(SavingsEvent {
-        tokens_before: forwarded_tokens + tokens_saved,
+        tokens_before: forwarded_tokens + tokens_saved.max(0),
         tokens_after: forwarded_tokens,
         model,
         client: Some(client.unwrap_or("proxy")),
@@ -232,16 +254,24 @@ pub fn record_from_forwarded_with_cost(
         cost_basis,
         fallback_rate: None,
         path: None,
+        new_input_tokens,
+        deferred_tokens,
     })
 }
 
 /// Append one savings event to the durable ledger. Never panics; returns `true`
 /// when a line was written.
+///
+/// A request that saved nothing but carries `new_input_tokens` is still
+/// written, as a denominator-only line: the new-input rate must see every
+/// request that newly billed input, not only the ones compression touched, or
+/// a 100-saved/100-new turn followed by a 0-saved/10,000-new turn reads as 50%
+/// instead of under 1%. Without `new_input_tokens` a zero saving is skipped.
 pub fn record_savings_event(event: SavingsEvent) -> bool {
     let before = event.tokens_before.max(0);
     let after = event.tokens_after.max(0);
     let saved = (before - after).max(0);
-    if saved <= 0 {
+    if saved <= 0 && event.new_input_tokens.is_none() {
         return false;
     }
 
@@ -275,6 +305,13 @@ pub fn record_savings_event(event: SavingsEvent) -> bool {
     obj.insert("client".into(), json!(label(event.client)));
     obj.insert("source".into(), json!(event.source.unwrap_or(UNKNOWN)));
     obj.insert("pid".into(), json!(std::process::id()));
+    if let Some(new_input) = event.new_input_tokens {
+        obj.insert("new_input".into(), json!(new_input.max(0)));
+        obj.insert(
+            "deferred".into(),
+            json!(event.deferred_tokens.clamp(0, saved)),
+        );
+    }
 
     let target = resolve_path(event.path);
     if write_locked_line(&target, &Value::Object(obj)).is_err() {
@@ -354,14 +391,45 @@ struct Bucket {
     tokens_before: i64,
     cost_usd: f64,
     calls: i64,
+    new_input_tokens: i64,
+    new_input_saved: i64,
 }
 
 impl Bucket {
-    fn add(&mut self, saved: i64, before: i64, cost: f64) {
+    fn add(&mut self, saved: i64, before: i64, cost: f64, new_input: Option<(i64, i64)>) {
+        if saved <= 0
+            && let Some((tokens, _)) = new_input
+        {
+            // Denominator-only line (see `record_savings_event`): it belongs
+            // to the new-input basis and nowhere else, so calls, before/saved
+            // and cost keep meaning saving turns.
+            self.new_input_tokens += tokens;
+            return;
+        }
         self.tokens_saved += saved;
         self.tokens_before += before;
         self.cost_usd += cost;
         self.calls += 1;
+        if let Some((tokens, deferred)) = new_input {
+            self.new_input_tokens += tokens;
+            self.new_input_saved += (saved - deferred).max(0);
+        }
+    }
+
+    /// Compression-only savings as a share of what newly entered context:
+    /// saved / (new input + saved), since removed tokens never reached the
+    /// provider. `savings_percent` recounts a session's cached history every
+    /// turn, so a long session reads near 0% there however well compression
+    /// does on new content.
+    fn new_input_savings_percent(&self) -> f64 {
+        if self.new_input_tokens <= 0 {
+            return 0.0;
+        }
+        round_half_even(
+            self.new_input_saved as f64 / (self.new_input_tokens + self.new_input_saved) as f64
+                * 100.0,
+            1,
+        )
     }
 
     fn savings_percent(&self) -> f64 {
@@ -381,6 +449,8 @@ impl Bucket {
             "cost_usd": round_half_even(self.cost_usd, 6),
             "calls": self.calls,
             "savings_percent": self.savings_percent(),
+            "new_input_tokens": self.new_input_tokens,
+            "new_input_savings_percent": self.new_input_savings_percent(),
         })
     }
 }
@@ -507,13 +577,19 @@ pub fn aggregate_savings(
         let saved = coerce_i64(obj.get("saved")).max(0);
         let before = coerce_i64(obj.get("before")).max(0);
         let cost = coerce_f64(obj.get("cost_usd")).max(0.0);
+        let new_input = obj.get("new_input").filter(|v| !v.is_null()).map(|v| {
+            (
+                coerce_i64(Some(v)).max(0),
+                coerce_i64(obj.get("deferred")).max(0),
+            )
+        });
 
-        windowed.add(saved, before, cost);
+        windowed.add(saved, before, cost, new_input);
         if event.ts >= today_cutoff {
-            today.add(saved, before, cost);
+            today.add(saved, before, cost, new_input);
         }
         if event.ts >= week_cutoff {
-            last_7.add(saved, before, cost);
+            last_7.add(saved, before, cost, new_input);
         }
 
         let model = obj
@@ -522,7 +598,7 @@ pub fn aggregate_savings(
             .filter(|s| !s.is_empty())
             .unwrap_or(UNKNOWN)
             .to_string();
-        by_model.entry(model).add(saved, before, cost);
+        by_model.entry(model).add(saved, before, cost, new_input);
 
         let client = obj
             .get("client")
@@ -530,7 +606,7 @@ pub fn aggregate_savings(
             .filter(|s| !s.is_empty())
             .unwrap_or(UNKNOWN)
             .to_string();
-        by_client.entry(client).add(saved, before, cost);
+        by_client.entry(client).add(saved, before, cost, new_input);
     }
 
     let model_rows = ranked(&by_model.into_ordered(), "model");
@@ -735,6 +811,49 @@ mod tests {
     fn record_from_forwarded_ignores_a_non_saving_request() {
         assert!(!record_from_forwarded(600, 0, Some("m"), None));
         assert!(!record_from_forwarded(600, -5, Some("m"), None));
+    }
+
+    /// The new-input rate pairs compression savings with the input that newly
+    /// entered context, and hears from every turn that billed new input — a
+    /// 0-saved turn included — while `calls` and `savings_percent` still count
+    /// saving turns only. Deferral stays out of the numerator.
+    #[test]
+    fn new_input_rate_counts_turns_that_saved_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("savings_events.jsonl");
+        // 100 saved (20 of it deferral) against 80 new input…
+        assert!(record_savings_event(SavingsEvent {
+            new_input_tokens: Some(80),
+            deferred_tokens: 20,
+            ..ev(1_000, 900, "c", &path)
+        }));
+        // …then a turn that saved nothing but billed 9,840 new tokens.
+        assert!(record_savings_event(SavingsEvent {
+            new_input_tokens: Some(9_840),
+            ..ev(5_000, 5_000, "c", &path)
+        }));
+        // No cache breakdown: no new-input fields, so a zero saving is skipped.
+        assert!(!record_savings_event(ev(5_000, 5_000, "c", &path)));
+
+        let lines: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            (&lines[0]["new_input"], &lines[0]["deferred"]),
+            (&json!(80), &json!(20))
+        );
+        assert_eq!(lines[1]["saved"], json!(0));
+
+        let report = aggregate_savings(Some(&path), None, DEFAULT_RETENTION_DAYS);
+        let life = &report.lifetime;
+        assert_eq!(life["calls"], json!(1));
+        assert_eq!(life["tokens_before"], json!(1_000));
+        assert_eq!(life["new_input_tokens"], json!(9_920));
+        // 80 compression-saved / (9,920 + 80) = 0.8%.
+        assert_eq!(life["new_input_savings_percent"], json!(0.8));
     }
 
     #[test]
