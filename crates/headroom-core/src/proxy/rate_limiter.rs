@@ -2,18 +2,24 @@
 //!
 //! Rate limits requests and token usage per API key or IP address.
 //! Uses a classic token bucket algorithm with time-based refill.
+//!
+//! A limit of 0 means unlimited for that dimension. A request larger than
+//! the whole bucket is admitted once the bucket is full and charged in full,
+//! so the balance goes negative and later requests wait it off (upstream
+//! `79681226`): otherwise its wait could never come true and the caller
+//! would be refused forever.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+use lru::LruCache;
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
-/// Maximum rate limiter buckets (prevents DoS via spoofed API keys).
+/// Maximum rate limiter keys (prevents DoS via spoofed API keys). At the cap
+/// the least recently used key is evicted when a new one arrives.
 pub const MAX_RATE_LIMITER_BUCKETS: usize = 1000;
-
-/// Stale bucket cleanup threshold (10 minutes).
-const STALE_THRESHOLD: Duration = Duration::from_secs(600);
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -33,12 +39,18 @@ impl BucketState {
     }
 }
 
+/// Both buckets of one key, so they share one LRU lifecycle.
+#[derive(Default)]
+struct KeyBuckets {
+    requests: Option<BucketState>,
+    tokens: Option<BucketState>,
+}
+
 /// Rate limiter configuration and state.
 pub struct TokenBucketRateLimiter {
     requests_per_minute: f64,
     tokens_per_minute: f64,
-    request_buckets: Mutex<HashMap<String, BucketState>>,
-    token_buckets: Mutex<HashMap<String, BucketState>>,
+    buckets: Mutex<LruCache<String, KeyBuckets>>,
 }
 
 /// Result of a rate limit check.
@@ -56,114 +68,74 @@ pub struct RateLimiterStats {
     pub active_keys: usize,
 }
 
+const ALLOWED: RateLimitResult = RateLimitResult {
+    allowed: true,
+    wait_seconds: 0.0,
+};
+
 impl TokenBucketRateLimiter {
-    /// Create a new rate limiter with the given limits.
+    /// Create a new rate limiter with the given limits (0 = unlimited).
     pub fn new(requests_per_minute: u32, tokens_per_minute: u32) -> Self {
         Self {
             requests_per_minute: requests_per_minute as f64,
             tokens_per_minute: tokens_per_minute as f64,
-            request_buckets: Mutex::new(HashMap::new()),
-            token_buckets: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MAX_RATE_LIMITER_BUCKETS).expect("nonzero cap"),
+            )),
         }
     }
 
-    /// Refill bucket based on elapsed time.
-    fn refill(state: &mut BucketState, rate_per_minute: f64) -> f64 {
+    /// Whether a token count is ever checked (a TPM limit is set).
+    pub fn limits_tokens(&self) -> bool {
+        self.tokens_per_minute > 0.0
+    }
+
+    /// Refill the bucket for elapsed time, then take `requested` from it.
+    fn consume(state: &mut BucketState, requested: f64, rate_per_minute: f64) -> RateLimitResult {
         let now = Instant::now();
         let elapsed = now.duration_since(state.last_update).as_secs_f64();
-        let refill = elapsed * (rate_per_minute / 60.0);
-        state.tokens = rate_per_minute.min(state.tokens + refill);
+        state.tokens = rate_per_minute.min(state.tokens + elapsed * (rate_per_minute / 60.0));
         state.last_update = now;
-        state.tokens
-    }
 
-    /// Clean up stale buckets that haven't been used in the last 10 minutes.
-    /// Cleans both request and token buckets for the same stale keys.
-    fn cleanup_stale_buckets(
-        request_buckets: &mut HashMap<String, BucketState>,
-        token_buckets: &mut HashMap<String, BucketState>,
-    ) {
-        let now = Instant::now();
-        let stale_keys: Vec<String> = request_buckets
-            .iter()
-            .filter(|(_, state)| now.duration_since(state.last_update) > STALE_THRESHOLD)
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        for key in &stale_keys {
-            request_buckets.remove(key);
-            token_buckets.remove(key);
-        }
-
-        if !stale_keys.is_empty() {
-            tracing::debug!(
-                event = "rate_limiter_cleanup",
-                count = stale_keys.len(),
-                "Cleaned up stale rate limiter buckets"
-            );
+        let required = requested.min(rate_per_minute);
+        if state.tokens >= required {
+            state.tokens -= requested;
+            ALLOWED
+        } else {
+            RateLimitResult {
+                allowed: false,
+                wait_seconds: (required - state.tokens) * (60.0 / rate_per_minute),
+            }
         }
     }
 
     /// Check if a request is allowed.
     pub fn check_request(&self, key: &str) -> RateLimitResult {
-        let mut buckets = self.request_buckets.lock().unwrap();
-
-        // Prevent unbounded bucket growth from spoofed keys
-        if buckets.len() > MAX_RATE_LIMITER_BUCKETS {
-            let mut token_buckets = self.token_buckets.lock().unwrap();
-            Self::cleanup_stale_buckets(&mut buckets, &mut token_buckets);
+        let rate = self.requests_per_minute;
+        if rate <= 0.0 {
+            return ALLOWED;
         }
-
-        let state = buckets
-            .entry(key.to_string())
-            .or_insert_with(|| BucketState::new(self.requests_per_minute));
-
-        let available = Self::refill(state, self.requests_per_minute);
-
-        if available >= 1.0 {
-            state.tokens -= 1.0;
-            RateLimitResult {
-                allowed: true,
-                wait_seconds: 0.0,
-            }
-        } else {
-            let wait_seconds = (1.0 - available) * (60.0 / self.requests_per_minute);
-            RateLimitResult {
-                allowed: false,
-                wait_seconds,
-            }
-        }
+        let mut buckets = self.buckets.lock().unwrap();
+        let entry = buckets.get_or_insert_mut(key.to_string(), KeyBuckets::default);
+        let state = entry.requests.get_or_insert_with(|| BucketState::new(rate));
+        Self::consume(state, 1.0, rate)
     }
 
     /// Check if token usage is allowed.
     pub fn check_tokens(&self, key: &str, token_count: u32) -> RateLimitResult {
-        let mut buckets = self.token_buckets.lock().unwrap();
-
-        let state = buckets
-            .entry(key.to_string())
-            .or_insert_with(|| BucketState::new(self.tokens_per_minute));
-
-        let available = Self::refill(state, self.tokens_per_minute);
-        let token_count_f64 = token_count as f64;
-
-        if available >= token_count_f64 {
-            state.tokens -= token_count_f64;
-            RateLimitResult {
-                allowed: true,
-                wait_seconds: 0.0,
-            }
-        } else {
-            let wait_seconds = (token_count_f64 - available) * (60.0 / self.tokens_per_minute);
-            RateLimitResult {
-                allowed: false,
-                wait_seconds,
-            }
+        let rate = self.tokens_per_minute;
+        if rate <= 0.0 {
+            return ALLOWED;
         }
+        let mut buckets = self.buckets.lock().unwrap();
+        let entry = buckets.get_or_insert_mut(key.to_string(), KeyBuckets::default);
+        let state = entry.tokens.get_or_insert_with(|| BucketState::new(rate));
+        Self::consume(state, token_count as f64, rate)
     }
 
     /// Get rate limiter statistics.
     pub fn stats(&self) -> RateLimiterStats {
-        let buckets = self.request_buckets.lock().unwrap();
+        let buckets = self.buckets.lock().unwrap();
         RateLimiterStats {
             requests_per_minute: self.requests_per_minute,
             tokens_per_minute: self.tokens_per_minute,
@@ -226,11 +198,53 @@ mod tests {
     }
 
     #[test]
-    fn check_tokens_denies_over_limit() {
+    fn oversized_request_is_admitted_on_a_full_bucket_then_waits_it_off() {
         let limiter = TokenBucketRateLimiter::new(60, 100);
-        let result = limiter.check_tokens("test_key", 200);
-        assert!(!result.allowed);
-        assert!(result.wait_seconds > 0.0);
+        // Larger than the whole bucket: refusing it would be forever.
+        assert!(limiter.check_tokens("test_key", 200).allowed);
+        // Charged in full, so the balance is -100 and the next small request
+        // waits for the bucket to climb back to 1.
+        let next = limiter.check_tokens("test_key", 1);
+        assert!(!next.allowed);
+        assert!(next.wait_seconds > 60.0, "{}", next.wait_seconds);
+    }
+
+    #[test]
+    fn oversized_request_waits_for_a_full_bucket_not_forever() {
+        let limiter = TokenBucketRateLimiter::new(60, 100);
+        assert!(limiter.check_tokens("test_key", 50).allowed);
+        let r = limiter.check_tokens("test_key", 500);
+        assert!(!r.allowed);
+        // Needs the bucket full (100), has ~50: about 30s at 100/min.
+        assert!(
+            r.wait_seconds > 29.0 && r.wait_seconds <= 30.0,
+            "{}",
+            r.wait_seconds
+        );
+    }
+
+    #[test]
+    fn zero_limits_are_unlimited() {
+        let limiter = TokenBucketRateLimiter::new(0, 0);
+        for _ in 0..1000 {
+            assert!(limiter.check_request("k").allowed);
+            assert!(limiter.check_tokens("k", u32::MAX).allowed);
+        }
+        assert!(!limiter.limits_tokens());
+        assert_eq!(limiter.stats().active_keys, 0);
+    }
+
+    #[test]
+    fn keys_are_bounded_and_the_least_recent_is_evicted() {
+        let limiter = TokenBucketRateLimiter::new(1, 0);
+        assert!(limiter.check_request("oldest").allowed);
+        assert!(!limiter.check_request("oldest").allowed);
+        for i in 0..MAX_RATE_LIMITER_BUCKETS {
+            limiter.check_request(&format!("key_{i}"));
+        }
+        assert_eq!(limiter.stats().active_keys, MAX_RATE_LIMITER_BUCKETS);
+        // "oldest" was evicted, so it comes back with a fresh bucket.
+        assert!(limiter.check_request("oldest").allowed);
     }
 
     #[test]

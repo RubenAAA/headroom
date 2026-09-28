@@ -25,8 +25,6 @@ pub use crate::request_outcome::summarize_transforms;
 
 /// Hard cap on retained cost entries (memory bound).
 pub const MAX_COST_ENTRIES: usize = 100_000;
-/// Time-based retention: must be ≥ the longest budget period (monthly ≈ 31d).
-pub const COST_RETENTION_HOURS: i64 = 744;
 
 /// Provider cache discount multipliers: `(read_multiplier, write_multiplier,
 /// label)` — the fraction of the input price a cache read/write costs.
@@ -219,8 +217,10 @@ struct PerModel {
 }
 
 struct Inner {
+    /// Costs inside the current budget period, oldest first.
     costs: VecDeque<(DateTime<Local>, f64)>,
-    last_prune: DateTime<Local>,
+    /// Running sum of `costs`, so a budget check never scans them.
+    period_cost: f64,
     m: PerModel,
 }
 
@@ -240,7 +240,7 @@ impl CostTracker {
             budget_period: budget_period.to_string(),
             inner: Mutex::new(Inner {
                 costs: VecDeque::new(),
-                last_prune: Local::now(),
+                period_cost: 0.0,
                 m: PerModel::default(),
             }),
         }
@@ -414,35 +414,21 @@ impl CostTracker {
         }
 
         if let Some(cost) = cost {
-            inner.costs.push_back((Local::now(), cost));
+            let now = Local::now();
+            self.expire(&mut inner, now);
+            inner.costs.push_back((now, cost));
+            inner.period_cost += cost;
             while inner.costs.len() > MAX_COST_ENTRIES {
-                inner.costs.pop_front();
-            }
-            Self::prune_old(&mut inner);
-        }
-    }
-
-    /// Remove entries older than the retention window, throttled to every 5 min.
-    fn prune_old(inner: &mut Inner) {
-        let now = Local::now();
-        if (now - inner.last_prune).num_seconds() < 300 {
-            return;
-        }
-        inner.last_prune = now;
-        let cutoff = now - Duration::hours(COST_RETENTION_HOURS);
-        while let Some(&(ts, _)) = inner.costs.front() {
-            if ts < cutoff {
-                inner.costs.pop_front();
-            } else {
-                break;
+                if let Some((_, c)) = inner.costs.pop_front() {
+                    inner.period_cost -= c;
+                }
             }
         }
     }
 
-    /// Cost accumulated in the current budget period.
-    pub fn get_period_cost(&self) -> f64 {
-        let now = Local::now();
-        let cutoff = match self.budget_period.as_str() {
+    /// Start of the budget period containing `now`.
+    fn period_start(&self, now: DateTime<Local>) -> DateTime<Local> {
+        match self.budget_period.as_str() {
             "hourly" => now - Duration::hours(1),
             "monthly" => now
                 .with_day(1)
@@ -459,14 +445,31 @@ impl CostTracker {
                 .and_then(|d| d.with_second(0))
                 .and_then(|d| d.with_nanosecond(0))
                 .unwrap_or(now),
-        };
-        let inner = self.inner.lock().unwrap();
-        inner
-            .costs
-            .iter()
-            .filter(|(ts, _)| *ts >= cutoff)
-            .map(|(_, c)| c)
-            .sum()
+        }
+    }
+
+    /// Drop costs from before the current period. Each entry leaves once, so
+    /// upkeep is amortized O(1) per recorded cost (upstream `ed08069b`).
+    fn expire(&self, inner: &mut Inner, now: DateTime<Local>) {
+        let cutoff = self.period_start(now);
+        while let Some(&(ts, c)) = inner.costs.front() {
+            if ts >= cutoff {
+                break;
+            }
+            inner.costs.pop_front();
+            inner.period_cost -= c;
+        }
+        // Float subtraction drifts; an empty window is exactly zero.
+        if inner.costs.is_empty() {
+            inner.period_cost = 0.0;
+        }
+    }
+
+    /// Cost accumulated in the current budget period.
+    pub fn get_period_cost(&self) -> f64 {
+        let mut inner = self.inner.lock().unwrap();
+        self.expire(&mut inner, Local::now());
+        inner.period_cost.max(0.0)
     }
 
     /// `(allowed, remaining)`. Unlimited budget → `(true, +inf)`.
@@ -607,7 +610,7 @@ impl CostTracker {
     pub fn reset_runtime(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.costs.clear();
-        inner.last_prune = Local::now();
+        inner.period_cost = 0.0;
         inner.m = PerModel::default();
     }
 }
@@ -1661,6 +1664,37 @@ mod tests {
         let t = CostTracker::new(Some(1000.0), "daily");
         let (allowed, _remaining) = t.check_budget();
         assert!(allowed); // no cost recorded yet
+    }
+
+    #[test]
+    fn budget_window_sums_recorded_costs_and_expires_old_ones() {
+        let rec = TokenRecord {
+            tokens_sent: 1_000_000,
+            uncached_tokens: 1_000_000,
+            output_tokens: 0,
+            ..Default::default()
+        };
+        let t = CostTracker::new(Some(0.5), "daily");
+        t.record_tokens("claude-sonnet-4", &rec);
+        let one = t.get_period_cost();
+        assert!(one > 0.5, "1M sonnet input tokens cost {one}");
+        t.record_tokens("claude-sonnet-4", &rec);
+        assert!((t.get_period_cost() - 2.0 * one).abs() < 1e-9);
+        assert!(!t.check_budget().0);
+
+        // Backdate the window to yesterday: it expires on the next read.
+        {
+            let mut inner = t.inner.lock().unwrap();
+            for entry in inner.costs.iter_mut() {
+                entry.0 -= Duration::days(1);
+            }
+        }
+        assert_eq!(t.get_period_cost(), 0.0);
+        assert!(t.check_budget().0);
+
+        t.record_tokens("claude-sonnet-4", &rec);
+        t.reset_runtime();
+        assert_eq!(t.get_period_cost(), 0.0);
     }
 
     #[test]
