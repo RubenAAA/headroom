@@ -26,7 +26,7 @@ CI surrogate (must stay green and excludes this file)::
 
     python -m pytest -m "not live" --tb=short -q
 
-Per-realignment-plan: ``docs/notes/realignment/04-phase-B-live-zone.md``.
+Per-realignment-plan: ``REALIGNMENT/04-phase-B-live-zone.md``.
 """
 
 from __future__ import annotations

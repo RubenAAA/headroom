@@ -4,27 +4,32 @@ This directory contains examples demonstrating Headroom's capabilities.
 
 ## Quick Start Examples
 
-### context_compression_demo.py
+### basic_usage.py
 
-Headroom compression on realistic retriever tool outputs. No mocks, no API key
-needed — compression runs locally:
-
-```bash
-PYTHONPATH=. python examples/context_compression_demo.py
-```
-
-### test_ccr.py
-
-Checks CCR markers and content preservation in compressed output (no API key):
+Basic integration with OpenAI client:
 
 ```bash
-PYTHONPATH=. python examples/test_ccr.py
+export OPENAI_API_KEY='your-key'
+python examples/basic_usage.py
 ```
 
-### 07-context-compression.ipynb
+### anthropic_example.py
 
-Notebook walkthrough of the same compression path, with the numbers shown
-step by step.
+Integration with Anthropic Claude:
+
+```bash
+export ANTHROPIC_API_KEY='your-key'
+python examples/anthropic_example.py
+```
+
+### streaming_example.py
+
+Streaming responses with optimization:
+
+```bash
+export OPENAI_API_KEY='your-key'
+python examples/streaming_example.py
+```
 
 ### tabular_compression_demo.py
 
@@ -39,8 +44,32 @@ python examples/tabular_compression_demo.py --write DIR # also save the sample f
 
 ## Evaluation Examples
 
-The agent evaluations live in the demo directories below —
-`langchain_demo/run_comparison.py` and `mcp_demo/run_agent_eval.py`.
+### smart_vs_naive_eval.py
+
+Compare SmartCrusher against naive truncation:
+
+```bash
+export OPENAI_API_KEY='your-key'
+python examples/smart_vs_naive_eval.py
+```
+
+### real_world_eval.py
+
+Comprehensive evaluation with Anthropic models:
+
+```bash
+export ANTHROPIC_API_KEY='your-key'
+python examples/real_world_eval.py
+```
+
+### real_world_openai_eval.py
+
+Comprehensive evaluation with OpenAI models:
+
+```bash
+export OPENAI_API_KEY='your-key'
+python examples/real_world_openai_eval.py
+```
 
 ## Demo Directories
 
@@ -137,10 +166,11 @@ python examples/<example_name>.py
 
 | Example | Token Savings | Notes |
 |---------|---------------|-------|
-| context_compression_demo | 50-70% | Retriever tool output compression |
+| basic_usage | 50-70% | Simple tool output compression |
 | langchain_demo | 70-85% | Real agent with multiple tools |
 | mcp_demo | 60-80% | MCP tool outputs |
 | strands_bedrock_demo | 60-85% | Strands + Bedrock with verbose tools |
+| real_world_eval | 50-90% | Varies by scenario |
 
 ## Troubleshooting
 
@@ -149,7 +179,7 @@ python examples/<example_name>.py
 Run from the repository root with PYTHONPATH:
 
 ```bash
-PYTHONPATH=. python examples/context_compression_demo.py
+PYTHONPATH=. python examples/basic_usage.py
 ```
 
 Or install in development mode:

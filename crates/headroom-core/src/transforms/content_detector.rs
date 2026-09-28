@@ -326,6 +326,13 @@ static LOG_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(r"^npm ERR!|^yarn error|^cargo error").unwrap(),
         Regex::new(r"Traceback \(most recent call last\)").unwrap(),
         Regex::new(r"^\s*at\s+[\w.$]+\(").unwrap(),
+        // CMTrace record opener — the log format SCCM, MDT and Intune Win32
+        // app/script deployments write on Windows. Every record is
+        // `<![LOG[message]LOG]!><time="..." date="..." ...>`, which matches
+        // none of the patterns above: the timestamp sits in an attribute
+        // *after* the message, so the anchored date/time/separator patterns
+        // cannot fire, and a record need not contain ERROR/WARN/INFO.
+        Regex::new(r"^<!\[LOG\[").unwrap(),
     ]
 });
 
@@ -1861,5 +1868,91 @@ pairs with BYTE-IDENTICAL full names: 704
         // Quoting the value makes it valid TOML, and TOML is tried first.
         assert_eq!(parse_config_flavor("[a]\nk = \"v\"\n"), Some("toml"));
         assert!(parse_config_flavor(&"x".repeat(1_000_001)).is_none());
+    }
+
+    /// One CMTrace record: `<![LOG[msg]LOG]!><time="..." date="..." ...>`.
+    fn cmtrace_record(message: &str, sec: usize) -> String {
+        format!(
+            "<![LOG[{message}]LOG]!><time=\"10:00:{sec:02}.000-0\" date=\"01-15-2026\" \
+             component=\"ExampleCorp_SampleApp_1.0.0_x64_B1\" context=\"SYSTEM\" type=\"1\" \
+             thread=\"4242\" file=\"install.ps1\">"
+        )
+    }
+
+    /// Dividers alternating with messages — the dividers are what used to make
+    /// this content look like grep output.
+    fn cmtrace_records() -> Vec<String> {
+        let messages = [
+            "Starting deployment of SampleApp 1.0.0",
+            "Detection rule evaluated, not installed",
+            "Downloading package from content source",
+            "Extracting files to target directory",
+            "Registering application components",
+            "Starting service SampleAppSvc",
+            "Writing uninstall registry entries",
+            "Deployment completed with exit code 0",
+        ];
+        let mut records = Vec::new();
+        for (i, message) in messages.iter().enumerate() {
+            records.push(cmtrace_record(&"=".repeat(75), i * 2));
+            records.push(cmtrace_record(message, i * 2 + 1));
+        }
+        records
+    }
+
+    #[test]
+    fn multiline_cmtrace_detects_as_build_output() {
+        let r = detect_content_type(&cmtrace_records().join("\n"));
+        assert_eq!(r.content_type, ContentType::BuildOutput);
+        assert!(r.confidence >= 0.5);
+    }
+
+    #[test]
+    fn single_line_cmtrace_detects_as_build_output() {
+        // How Intune actually writes them: records run together with no
+        // separators. This form never reaches the search detector, so it failed
+        // purely on the missing LOG_PATTERNS signal.
+        let r = detect_content_type(&cmtrace_records().concat());
+        assert_eq!(r.content_type, ContentType::BuildOutput);
+    }
+
+    #[test]
+    fn cmtrace_divider_is_rejected_by_the_path_shape_guard() {
+        // The bare pattern *does* match a CMTrace divider - that is the whole
+        // problem. What rejects it is `prefix_looks_like_path`, ported here
+        // from Python, which this implementation previously lacked.
+        let divider = cmtrace_record(&"=".repeat(75), 0);
+        assert!(SEARCH_RESULT_PATTERN.is_match(&divider));
+        assert!(!prefix_looks_like_path(
+            divider.split(':').next().unwrap_or("")
+        ));
+    }
+
+    #[test]
+    fn path_shape_guard_matches_python_rules() {
+        // Mirrors Python's `_prefix_looks_like_path`: no `<`, `>` or `=`.
+        assert!(prefix_looks_like_path("src/main.py"));
+        assert!(prefix_looks_like_path("Makefile"));
+        assert!(!prefix_looks_like_path("<current_datetime"));
+        assert!(!prefix_looks_like_path("key=value"));
+    }
+
+    #[test]
+    fn grep_output_still_detects_as_search_results() {
+        let content = "src/main.py:42:def process():\n\
+                       src/util.py:13:    return None\n\
+                       lib/x.py:7:class X:\n\
+                       tests/test_a.py:3:    assert True";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SearchResults);
+    }
+
+    #[test]
+    fn extensionless_grep_paths_still_detected() {
+        let content = "Makefile:12:\tpytest -q\n\
+                       Dockerfile:3:RUN apt-get update\n\
+                       Jenkinsfile:88:    sh 'make test'";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SearchResults);
     }
 }

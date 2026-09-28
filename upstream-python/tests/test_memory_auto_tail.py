@@ -17,7 +17,7 @@ These tests verify three guarantees of the AutoTail memory mode:
    (system / instructions / tool definitions) is sacrosanct.
 
 These cover the three test names called out in
-``docs/notes/realignment/04-phase-B-live-zone.md`` PR-B6:
+``REALIGNMENT/04-phase-B-live-zone.md`` PR-B6:
 
 - ``test_memory_appears_in_latest_user_message_tail``
 - ``test_memory_does_not_modify_system_or_tools``

@@ -291,3 +291,7 @@ harness = false
 [[bench]]
 name = "memory_search"
 harness = false
+
+[[bench]]
+name = "bm25_scoring"
+harness = false

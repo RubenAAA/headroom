@@ -65,7 +65,7 @@ class CompressionObserver(Protocol):
     handle that internally — bubbling exceptions out of an observer
     would break the compression that just succeeded, which is the
     opposite of what observability should do. (See the audit
-    in `docs/notes/rust-dev.md`: any silent regression is bad, but a noisy
+    in `RUST_DEV.md`: any silent regression is bad, but a noisy
     observer that breaks compression is worse.)
     """
 

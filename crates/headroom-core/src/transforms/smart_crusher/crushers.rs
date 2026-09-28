@@ -1,4 +1,4 @@
-//! Three universal crushers for non-dict-array JSON shapes.
+//! Two universal crushers for non-dict-array JSON shapes.
 //!
 //! Object fields are independent properties, not sampled records.
 //! `crush_object` preserves every key; nested arrays are compacted
@@ -8,7 +8,6 @@
 //!
 //! - `crush_string_array`  ← `_crush_string_array`  (line 2727)
 //! - `crush_number_array`  ← `_crush_number_array`  (line 2810) — has BUG #1
-//! - `crush_object`        ← `_crush_object`        (line 3015)
 //!
 //! Each takes a `&SmartCrusherConfig`, a `bias` multiplier, and returns
 //! `(crushed_items, strategy_string)`. Schema-preserving: the output
@@ -34,7 +33,7 @@
 //! the bug-doc test below flips to pin the corrected behavior and the
 //! fixtures are regenerated.
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 
 use super::config::SmartCrusherConfig;
@@ -383,29 +382,6 @@ pub fn crush_number_array(
     (kept_values, strategy)
 }
 
-/// Preserve every property of a JSON object.
-///
-/// Object fields are independent properties, not sampled records: dropping
-/// a key deletes a named fact the model may need, while dropping array
-/// element 7 of 50 loses one interchangeable sample. Nested arrays were
-/// already compacted by the recursive `process_value` pass before this
-/// runs, so large-array compaction and CCR row offload still fire without
-/// deleting their enclosing keys.
-///
-/// `SmartCrusher::process_value_with_hook` stays unchanged.
-pub fn crush_object(
-    obj: &Map<String, Value>,
-    _config: &SmartCrusherConfig,
-    _bias: f64,
-) -> (Map<String, Value>, String) {
-    // Cheap keys ride free in every other crusher; the n<=8 / token-floor
-    // gates below this comment used to live here and now live there.
-    // Keeping the keys is what lets a later pass stay honest about what
-    // changed: `crusher.rs` keeps original bytes when an object and its
-    // descendants are untouched.
-    (obj.clone(), "object:passthrough".to_string())
-}
-
 // ---------- helpers ----------
 
 /// Linear-interpolation percentile (numpy "linear" method).
@@ -637,129 +613,6 @@ mod tests {
         assert!(strat.contains("p75="));
     }
 
-    // ---------- crush_object ----------
-
-    #[test]
-    fn object_passthrough_when_few_keys() {
-        let mut obj = Map::new();
-        for i in 0..5 {
-            obj.insert(format!("k{}", i), json!(i));
-        }
-        let (out, strat) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(out.len(), 5);
-        assert_eq!(strat, "object:passthrough");
-    }
-
-    #[test]
-    fn object_passthrough_when_total_tokens_below_min() {
-        // Many tiny keys/values: total_tokens stays below
-        // min_tokens_to_crush=200.
-        let mut obj = Map::new();
-        for i in 0..30 {
-            obj.insert(format!("k{}", i), json!(i));
-        }
-        let (_out, strat) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(strat, "object:passthrough");
-    }
-
-    #[test]
-    fn object_preserves_every_key_above_token_floor() {
-        // 30 keys, each with a long string value. Above the old n>8 /
-        // token-floor gate — and every key still comes back.
-        let mut obj = Map::new();
-        for i in 0..30 {
-            obj.insert(
-                format!("k{:02}", i),
-                json!(format!(
-                    "this is a relatively long value string for entry number {} with content",
-                    i
-                )),
-            );
-        }
-        let (out, strat) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(strat, "object:passthrough");
-        assert_eq!(out.len(), 30);
-        assert_eq!(out, obj);
-    }
-
-    #[test]
-    fn object_preserves_mixed_value_shapes() {
-        // Mixed shapes — small ints, long strings, nulls, booleans, a
-        // nested dict. Every key survives regardless of value size.
-        let mut obj = Map::new();
-        obj.insert("tiny".to_string(), json!(1));
-        obj.insert("flag".to_string(), json!(true));
-        obj.insert("nothing".to_string(), json!(null));
-        for i in 0..12 {
-            obj.insert(
-                format!("big{:02}", i),
-                json!(format!(
-                    "this is a long string with content for entry number {} that exceeds the small threshold",
-                    i
-                )),
-            );
-        }
-        obj.insert(
-            "nested".to_string(),
-            json!({"inner": [1, 2, 3], "name": "deep"}),
-        );
-        let (out, strat) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(strat, "object:passthrough");
-        assert_eq!(out, obj);
-    }
-
-    #[test]
-    fn object_preserves_wide_object_with_nested_dict() {
-        // Wide object above the old n>8 / token-floor gate: arbitrary
-        // names, long strings, a nested dict, nulls, booleans, empty
-        // arrays. The nested dict position must not matter.
-        for expensive_index in [0, 7, 14] {
-            let n = 15;
-            let mut obj = Map::new();
-            for k in 0..n {
-                if k == expensive_index {
-                    obj.insert(
-                        format!("expensive_{k}"),
-                        json!({"inner": (0..50).map(|x| json!(x)).collect::<Vec<_>>()}),
-                    );
-                } else {
-                    obj.insert(
-                        format!("k{k:02}"),
-                        json!(format!(
-                            "a moderately long value string for entry {k} with padding"
-                        )),
-                    );
-                }
-            }
-            obj.insert("nothing".to_string(), json!(null));
-            obj.insert("flag".to_string(), json!(false));
-            obj.insert("empty".to_string(), json!([]));
-            let (out, strat) = crush_object(&obj, &cfg(), 1.0);
-            assert_eq!(strat, "object:passthrough", "index {expensive_index}");
-            assert_eq!(out, obj, "index {expensive_index}");
-        }
-    }
-
-    #[test]
-    fn object_keeps_error_keywords() {
-        let mut obj = Map::new();
-        obj.insert(
-            "msg1".to_string(),
-            json!(format!("FATAL: {}", "x".repeat(200))),
-        );
-        for i in 0..30 {
-            obj.insert(
-                format!("k{:02}", i),
-                json!(format!("padding content for entry {} with text", i)),
-            );
-        }
-        let (out, _) = crush_object(&obj, &cfg(), 1.0);
-        assert!(
-            out.contains_key("msg1"),
-            "key with error-keyword value must survive"
-        );
-    }
-
     // ---------- lossless_only (#3625) ----------
     //
     // These crushers drop items with no CCR marker at all, so strict
@@ -797,30 +650,6 @@ mod tests {
         let (out, strat) = crush_number_array(&items, &lossless_only_cfg(), 1.0);
         assert_eq!(out, items, "lossless_only must keep every number");
         assert_eq!(strat, "number:lossless_only");
-    }
-
-    #[test]
-    fn object_lossless_only_keeps_every_key() {
-        let mut obj = Map::new();
-        for i in 0..40 {
-            obj.insert(
-                format!("k{i:02}"),
-                json!(format!(
-                    "long description for entry {i}, above the small-value floor"
-                )),
-            );
-        }
-
-        // Default mode preserves every key too: object fields are
-        // independent properties, not sampled records. The lossless_only
-        // distinction is gone for objects — both return the keys whole.
-        let (lossy, lossy_strat) = crush_object(&obj, &cfg(), 1.0);
-        assert_eq!(lossy, obj, "default config must keep every key");
-        assert_eq!(lossy_strat, "object:passthrough");
-
-        let (out, strat) = crush_object(&obj, &lossless_only_cfg(), 1.0);
-        assert_eq!(out, obj, "lossless_only must keep every key");
-        assert_eq!(strat, "object:passthrough");
     }
 
     // ---------- BUG #1 documentation test ----------
