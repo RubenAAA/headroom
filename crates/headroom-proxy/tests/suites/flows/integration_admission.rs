@@ -182,3 +182,59 @@ async fn unconfigured_limits_refuse_nothing() {
     }
     proxy.shutdown().await;
 }
+
+/// The ledger tells the proxy's own 429 from the provider's (upstream
+/// `5ff4ea1e`): one is fixed by raising the cap, the other by backing off.
+#[tokio::test]
+async fn ledger_splits_rate_limits_by_who_refused() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(
+            json!({"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}),
+        ))
+        .mount(&upstream)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let tracker = std::sync::Arc::new(headroom_core::savings_tracker::SavingsTracker::new(
+        Some(dir.path().join("savings.json")),
+        false,
+    ));
+    let probe = tracker.clone();
+    let proxy = start_proxy_with_state(
+        &upstream.uri(),
+        |c| {
+            // Interception builds the outcome that books the upstream 429.
+            c.compression = true;
+            c.compression_mode = headroom_proxy::config::CompressionMode::Off;
+            c.rate_limit_enabled = true;
+            c.rate_limit_rpm = 1;
+            c.retry_enabled = false;
+        },
+        move |mut s| {
+            s.savings_tracker = tracker;
+            s
+        },
+    )
+    .await;
+    let url = format!("{}/v1/messages", proxy.url());
+
+    // The first request reaches the provider, which refuses it; the second
+    // is over our own rate and never leaves.
+    for _ in 0..2 {
+        assert_eq!(post(&url, "k", &messages_body("hi")).await.status(), 429);
+    }
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+
+    let snapshot = probe.metrics_snapshot(&json!({}));
+    let requests = &snapshot["requests"];
+    assert_eq!(requests["rate_limited"], 2, "{snapshot}");
+    assert_eq!(
+        requests["rate_limited_by_source"],
+        json!({"headroom": 1, "upstream": 1})
+    );
+    assert_eq!(
+        requests["rate_limited_by_provider"],
+        json!({"anthropic": 2})
+    );
+    proxy.shutdown().await;
+}

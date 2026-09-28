@@ -111,8 +111,24 @@ pub(crate) fn budget_refusal(state: &AppState) -> Option<Response> {
     ))
 }
 
-fn rate_limited(what: &str, wait_seconds: f64) -> Response {
+/// The provider label a generation path's outcomes carry, so the ledger files
+/// our own 429 beside the provider's (`rate_limited_by_provider`).
+fn provider_label(path: &str) -> &'static str {
+    use crate::compression::{CompressibleEndpoint, classify_compressible_path};
+    match classify_compressible_path(path) {
+        Some(CompressibleEndpoint::AnthropicMessages) => "anthropic",
+        Some(CompressibleEndpoint::OpenAiChatCompletions) => "openai_chat",
+        Some(CompressibleEndpoint::OpenAiResponses) => "openai_responses",
+        _ if path == "/anthropic/v1/messages" => "anthropic",
+        _ => "gemini",
+    }
+}
+
+fn rate_limited(state: &AppState, path: &str, what: &str, wait_seconds: f64) -> Response {
     crate::observability::proxy_counters::record_rate_limited("headroom");
+    state
+        .savings_tracker
+        .record_rate_limited(Some(provider_label(path)), "headroom");
     too_many_requests(
         format!("{what} rate limited. Retry after {wait_seconds:.1}s"),
         Some(wait_seconds),
@@ -155,7 +171,7 @@ pub(crate) async fn admission_gate(
     if let Some(limiter) = &limiter {
         let r = limiter.check_request(&key);
         if !r.allowed {
-            return rate_limited("Request", r.wait_seconds);
+            return rate_limited(&state, req.uri().path(), "Request", r.wait_seconds);
         }
     }
     if let Some(refusal) = budget_refusal(&state) {
@@ -179,7 +195,7 @@ pub(crate) async fn admission_gate(
     let tokens = estimate_request_tokens(parts.uri.path(), &bytes);
     let r = limiter.check_tokens(&key, u32::try_from(tokens).unwrap_or(u32::MAX));
     if !r.allowed {
-        return rate_limited("Token", r.wait_seconds);
+        return rate_limited(&state, parts.uri.path(), "Token", r.wait_seconds);
     }
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await

@@ -206,7 +206,7 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         // and records source="headroom" from its own call site.
         crate::observability::proxy_counters::record_rate_limited("upstream");
         self.savings_tracker
-            .record_rate_limited(Some(outcome.provider.as_str()));
+            .record_rate_limited(Some(outcome.provider.as_str()), "upstream");
         // A 429 is failed work too: it reached the failure bucket, not the
         // success funnel, and the ledger must see the wasted tokens.
         self.record_failed(outcome);

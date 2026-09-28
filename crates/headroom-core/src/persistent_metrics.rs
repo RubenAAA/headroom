@@ -49,6 +49,11 @@ pub const MAX_LABEL_LENGTH: usize = 128;
 /// Cache-miss reasons that keep their own bucket; anything else is `unknown`.
 pub const KNOWN_MISS_REASONS: [&str; 3] = ["ttl_expiry", "prefix_change", "unknown"];
 
+/// Who refused a rate-limited request: `headroom` is the proxy's own limiter,
+/// `upstream` the provider's 429. Mirrors the Prometheus
+/// `headroom_requests_rate_limited_total{source}` label (upstream `5ff4ea1e`).
+pub const RATE_LIMIT_SOURCES: [&str; 2] = ["headroom", "upstream"];
+
 /// Waste signals that keep their own bucket; anything else is `other`.
 ///
 /// Names must match `WasteSignals.to_dict()` — the parser emits `json_bloat`;
@@ -447,6 +452,8 @@ pub struct RequestsState {
     pub failed_by_provider: CountMap,
     /// Rate-limited requests per provider label.
     pub rate_limited_by_provider: CountMap,
+    /// Rate-limited requests per [`RATE_LIMIT_SOURCES`] entry.
+    pub rate_limited_by_source: CountMap,
     /// Requests per calling stack label.
     pub by_stack: CountMap,
 }
@@ -1256,9 +1263,15 @@ impl PersistentMetricsState {
     }
 
     /// Record a rate-limited request without redefining total request
-    /// semantics. Provider breakdown mirrors the Prometheus
-    /// `headroom_requests_rate_limited_total{source}` split.
-    pub fn record_rate_limited(&mut self, provider: Option<&str>, _model: Option<&str>) {
+    /// semantics, broken down by provider and by `source`, the same split as
+    /// the Prometheus `headroom_requests_rate_limited_total{source}` label. A
+    /// source outside [`RATE_LIMIT_SOURCES`] counts as `headroom`.
+    pub fn record_rate_limited(
+        &mut self,
+        provider: Option<&str>,
+        _model: Option<&str>,
+        source: &str,
+    ) {
         self.record_activity();
         self.state.requests.rate_limited += 1;
         increment_count(
@@ -1266,6 +1279,12 @@ impl PersistentMetricsState {
             &label(provider),
             MAX_PROVIDER_VALUES,
         );
+        let source = if RATE_LIMIT_SOURCES.contains(&source) {
+            source
+        } else {
+            "headroom"
+        };
+        self.state.requests.rate_limited_by_source.add(source, 1);
     }
 
     /// Record one prefix-cache bust and the tokens it cost.
@@ -1574,6 +1593,13 @@ fn normalize(raw: Option<&Value>) -> MetricsSnapshotState {
             get(raw_requests, "rate_limited_by_provider"),
             MAX_PROVIDER_VALUES,
         ),
+        // A file written before the split loads empty rather than back-filling
+        // the `rate_limited` total into one bucket, which would invent history.
+        rate_limited_by_source: normalize_enum_map(
+            get(raw_requests, "rate_limited_by_source"),
+            &RATE_LIMIT_SOURCES,
+            "headroom",
+        ),
         by_stack: normalize_count_map(get(raw_requests, "by_stack"), MAX_STACK_VALUES),
     };
 
@@ -1747,7 +1773,7 @@ mod tests {
         let state = PersistentMetricsState::new(None);
         assert_eq!(
             compact(&state.to_dict()),
-            r#"{"started_at":null,"last_activity_at":null,"full_fidelity_started_at":null,"requests":{"total":0,"cached":0,"failed":0,"rate_limited":0,"by_provider":{},"failed_by_provider":{},"rate_limited_by_provider":{},"by_stack":{}},"tokens":{"input":0,"output":0,"attempted_input":0,"saved":0},"prefix_cache":{"requests":0,"hit_requests":0,"cache_read_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":0,"cache_write_1h_tokens":0,"uncached_input_tokens":0,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{}},"cost":{"input_usd":0.0,"compression_savings_usd":0.0,"cache_savings_usd":0.0},"waste_signals":{},"models":{"tracked":{},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"last_saved_at":null}}"#
+            r#"{"started_at":null,"last_activity_at":null,"full_fidelity_started_at":null,"requests":{"total":0,"cached":0,"failed":0,"rate_limited":0,"by_provider":{},"failed_by_provider":{},"rate_limited_by_provider":{},"rate_limited_by_source":{},"by_stack":{}},"tokens":{"input":0,"output":0,"attempted_input":0,"saved":0},"prefix_cache":{"requests":0,"hit_requests":0,"cache_read_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":0,"cache_write_1h_tokens":0,"uncached_input_tokens":0,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{}},"cost":{"input_usd":0.0,"compression_savings_usd":0.0,"cache_savings_usd":0.0},"waste_signals":{},"models":{"tracked":{},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"last_saved_at":null}}"#
         );
     }
 
@@ -1836,7 +1862,7 @@ mod tests {
         });
         assert_eq!(
             compact(&state.to_dict()),
-            r#"{"started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"openai":1},"failed_by_provider":{},"rate_limited_by_provider":{},"by_stack":{"codex":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":40,"cache_write_tokens":10,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":60,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"openai":1}},"cost":{"input_usd":0.001235,"compression_savings_usd":0.5,"cache_savings_usd":0.25},"waste_signals":{"json_bloat":12,"other":3},"models":{"tracked":{"gpt-5":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"}},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"last_saved_at":null}}"#
+            r#"{"started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"openai":1},"failed_by_provider":{},"rate_limited_by_provider":{},"rate_limited_by_source":{},"by_stack":{"codex":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":40,"cache_write_tokens":10,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":60,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"openai":1}},"cost":{"input_usd":0.001235,"compression_savings_usd":0.5,"cache_savings_usd":0.25},"waste_signals":{"json_bloat":12,"other":3},"models":{"tracked":{"gpt-5":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"}},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"last_saved_at":null}}"#
         );
     }
 
@@ -1860,7 +1886,7 @@ mod tests {
         let snapshot = state.snapshot(&json!({"path": "/tmp/x.json", "enabled": true}));
         assert_eq!(
             compact(&snapshot),
-            r#"{"scope":"lifetime","schema_version":5,"generated_at":"2026-07-27T12:00:00Z","started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"anthropic":1},"failed_by_provider":{},"rate_limited_by_provider":{},"by_stack":{"claude-code":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50,"token_savings_percent":50.0},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":0,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"anthropic":1},"cache_hit_rate":100.0,"ttl_1h_percent":40.0,"ttl_5m_percent":60.0},"cost":{"input_usd":0.0,"compression_savings_usd":0.0,"cache_savings_usd":0.0},"waste_signals":{},"by_model":{"sonnet":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"path":"/tmp/x.json","enabled":true,"last_saved_at":"2026-07-27T12:00:05Z"}}"#
+            r#"{"scope":"lifetime","schema_version":5,"generated_at":"2026-07-27T12:00:00Z","started_at":"2026-07-27T12:00:00Z","last_activity_at":"2026-07-27T12:00:00Z","full_fidelity_started_at":"2026-07-27T12:00:00Z","requests":{"total":1,"cached":1,"failed":0,"rate_limited":0,"by_provider":{"anthropic":1},"failed_by_provider":{},"rate_limited_by_provider":{},"rate_limited_by_source":{},"by_stack":{"claude-code":1}},"tokens":{"input":100,"output":20,"attempted_input":150,"saved":50,"token_savings_percent":50.0},"prefix_cache":{"requests":1,"hit_requests":1,"cache_read_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":6,"cache_write_1h_tokens":4,"uncached_input_tokens":0,"bust_count":0,"bust_tokens":0,"misses_by_reason":{},"by_provider":{"anthropic":1},"cache_hit_rate":100.0,"ttl_1h_percent":40.0,"ttl_5m_percent":60.0},"cost":{"input_usd":0.0,"compression_savings_usd":0.0,"cache_savings_usd":0.0},"waste_signals":{},"by_model":{"sonnet":{"requests":1,"input_tokens":100,"output_tokens":20,"attempted_input_tokens":150,"tokens_saved":50,"last_activity_at":"2026-07-27T12:00:00Z"},"other":{"requests":0,"input_tokens":0,"output_tokens":0,"attempted_input_tokens":0,"tokens_saved":0,"last_activity_at":null}},"persistence":{"path":"/tmp/x.json","enabled":true,"last_saved_at":"2026-07-27T12:00:05Z"}}"#
         );
     }
 
@@ -2023,7 +2049,8 @@ mod tests {
 
         state.record_stack(Some("  codex  "));
         state.record_failed(Some("openai"), Some("gpt-5"));
-        state.record_rate_limited(None, None);
+        state.record_rate_limited(None, None, "upstream");
+        state.record_rate_limited(None, None, "bogus");
         state.record_cache_bust(1200);
         state.record_cache_miss(Some("openai"), Some("ttl_expiry"));
         state.record_cache_miss(None, Some("bogus"));
@@ -2035,11 +2062,15 @@ mod tests {
         assert_eq!(state.state().requests.by_stack.get("codex"), 1);
         assert_eq!(state.state().requests.total, 0);
         assert_eq!(state.state().requests.failed, 1);
-        assert_eq!(state.state().requests.rate_limited, 1);
+        assert_eq!(state.state().requests.rate_limited, 2);
         assert_eq!(state.state().requests.failed_by_provider.get("openai"), 1);
         assert_eq!(
             state.state().requests.rate_limited_by_provider.get("other"),
-            1
+            2
+        );
+        assert_eq!(
+            compact(&state.to_dict()["requests"]["rate_limited_by_source"]),
+            r#"{"upstream":1,"headroom":1}"#
         );
         assert_eq!(state.state().prefix_cache.bust_count, 1);
         assert_eq!(state.state().prefix_cache.bust_tokens, 1200);

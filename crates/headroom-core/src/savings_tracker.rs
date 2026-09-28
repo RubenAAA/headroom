@@ -531,6 +531,10 @@ pub struct SavingsTracker {
     handed_off: AtomicBool,
 }
 
+fn upstream_rate_limit_source() -> String {
+    "upstream".to_string()
+}
+
 /// One `record_*` call made after [`SavingsTracker::begin_handoff`], with
 /// owned copies of its arguments. Timestamps are fixed when the call is made,
 /// so a replayed turn lands in the display session and history where it
@@ -576,6 +580,10 @@ enum HandoffOp {
     },
     RateLimited {
         provider: Option<String>,
+        /// Absent in ops written before the source split, when only upstream
+        /// 429s reached this path.
+        #[serde(default = "upstream_rate_limit_source")]
+        source: String,
     },
     FailedWork {
         provider: Option<String>,
@@ -1020,14 +1028,15 @@ impl SavingsTracker {
     /// Book a rate-limited request in the persistent ledger, broken down
     /// by provider (mirrors the Prometheus
     /// `headroom_requests_rate_limited_total{source}` split).
-    pub fn record_rate_limited(&self, provider: Option<&str>) {
+    pub fn record_rate_limited(&self, provider: Option<&str>, source: &str) {
         let mut st = self.state.lock().unwrap();
         if self.divert(|| HandoffOp::RateLimited {
             provider: provider.map(str::to_string),
+            source: source.to_string(),
         }) {
             return;
         }
-        st.metrics.record_rate_limited(provider, None);
+        st.metrics.record_rate_limited(provider, None, source);
     }
 
     pub fn record_failed_work(&self, rec: &FailedWorkRecord) {
@@ -1967,7 +1976,9 @@ impl SavingsTracker {
                     offload_savings_usd,
                 });
             }
-            HandoffOp::RateLimited { provider } => self.record_rate_limited(provider.as_deref()),
+            HandoffOp::RateLimited { provider, source } => {
+                self.record_rate_limited(provider.as_deref(), &source)
+            }
             HandoffOp::FailedWork {
                 provider,
                 status_code,
@@ -3356,7 +3367,11 @@ mod tests {
             .unwrap();
         old.record_request(&turn(1000));
 
-        assert_eq!(old.absorb_handoff(), 0, "a draining proxy leaves the journal");
+        assert_eq!(
+            old.absorb_handoff(),
+            0,
+            "a draining proxy leaves the journal"
+        );
         assert_eq!(new.absorb_handoff(), 3);
         assert_eq!(new.absorb_handoff(), 0, "an absorbed line is gone");
 
