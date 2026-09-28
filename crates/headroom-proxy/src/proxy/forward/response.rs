@@ -741,8 +741,11 @@ pub(crate) fn build_outcome_context(
         };
         let num_messages = message_array_length(buffered, endpoint).unwrap_or(0);
 
-        // Resolve project from headers + system prompt.
-        let system_prompt = crate::memory::router::extract_system_prompt(&parsed_body);
+        // Resolve project from headers + the working directory the client
+        // stated last (upstream `3f3cf19e`). Claude Code states it in a user
+        // message, not `system`, so a system-only read labelled every turn
+        // with the fallback project.
+        let system_prompt = crate::memory::router::extract_project_prompt(&parsed_body);
         let hdrs = headers_snapshot
             .as_ref()
             .map(|h| {

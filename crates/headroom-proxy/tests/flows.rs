@@ -47,3 +47,6 @@ mod tls_client_wiring;
 
 #[path = "suites/flows/integration_ws.rs"]
 mod integration_ws;
+
+#[path = "suites/flows/integration_project_label.rs"]
+mod integration_project_label;
