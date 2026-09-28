@@ -2558,11 +2558,15 @@ pub struct Config {
     pub memory_min_similarity: f64,
     /// Enable per-key rate limiting. Defaults to `true` in `from_args`
     /// (matching Python's `rate_limit_enabled: bool = True`); disable with
-    /// `HEADROOM_RATE_LIMIT_ENABLED=0`.
+    /// `HEADROOM_RATE_LIMIT_ENABLED=0`. Limits nothing until `HEADROOM_RPM`
+    /// or `HEADROOM_TPM` sets a limit.
     pub rate_limit_enabled: bool,
-    /// Requests per minute per API key (0 = unlimited).
+    /// Requests per minute per API key (0 = unlimited, the default). Upstream
+    /// defaults to 60; a Claude Code session with subagents passes that, so
+    /// the fork leaves it opt-in.
     pub rate_limit_rpm: u32,
-    /// Tokens per minute per API key (0 = unlimited).
+    /// Input tokens per minute per API key (0 = unlimited, the default, as in
+    /// upstream `79681226`).
     pub rate_limit_tpm: u32,
     /// Enable semantic response caching. When `true`, identical
     /// non-streaming requests are served from an in-memory LRU.
@@ -2875,11 +2879,11 @@ impl Config {
             rate_limit_rpm: std::env::var("HEADROOM_RPM")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
+                .unwrap_or(0),
             rate_limit_tpm: std::env::var("HEADROOM_TPM")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(100000),
+                .unwrap_or(0),
             cache_enabled: args.cache_enabled,
             cache_ttl_seconds: args.cache_ttl_seconds,
             cache_max_entries: args.cache_max_entries,

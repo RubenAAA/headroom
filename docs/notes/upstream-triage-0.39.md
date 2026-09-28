@@ -37,6 +37,8 @@ The Python reference for every row is `upstream-python/` at `v0.39.1`
 
 Small, no forwarded bytes change.
 
+Landed: `20c126f7` and the copilot token save (9b8cae84), `406187e3` (5cb87bc3), `efa50379` (26a2c493), `5cbdcc8e` (000fefce).
+
 | sha | kind | cache | behavior | Rust target | note |
 |---|---|---|---|---|---|
 | `9b8cae84` | PORT | no | Create credential/CCR files private (0600, O_EXCL/O_NOFOLLOW or temp+rename) instead of writing then narrowing | core ccr/backends/sqlite.rs:59 Connection::open creates ccr.db at umask mode (live via proxy ctx/offload_store.rs:104, dir from create_dir_all at :101); bin/headroom_cli/copilot_auth.rs:229-237 truncates and writes an existing token file before set_permissions | S. Codex-recovery part N/A (no Rust counterpart). Same gap likely on ctx-offload-index.db and project stores (not checked) |
@@ -47,6 +49,8 @@ Small, no forwarded bytes change.
 ### 2. Rate limiting and budget (adopted)
 
 Land 79681226 with or before 138736c9. The limiter ships on with a 100k TPM default and refuses any request larger than the bucket forever, so enforcing TPM alone would 429 every Claude Code turn over 100k tokens. `0` is documented as unlimited but denies everything; fix that in the same change. Today only chat completions and responses check RPM; `/v1/messages` and Gemini check nothing, and `check_budget` has no caller. Tests from 00896a7c state the budget contract.
+
+Landed as one gate, `src/admission.rs`, a middleware in front of every generation route (Anthropic plain and Foundry, chat completions, responses, Gemini `generateContent`), plus budget checks on the Codex WebSocket before the upgrade and on each `response.create` (1008 close). RPM and TPM default to 0, meaning unlimited; users opt in with `HEADROOM_RPM` / `HEADROOM_TPM`. Upstream keeps RPM 60 on, but a Claude Code session with subagents passes 60 (measured p99 71 rpm, max 269). 79681226, 138736c9, a8bd9bec, b9e8462a, f734c573 and ed08069b are done. The Rust tracker still has no measured/estimated cost split, so the budget message cannot name estimated spend. 5ff4ea1e is half done: Prometheus has `source="headroom"` from the gate, but `rate_limited_by_source` in persistent metrics and `/stats` is left for phase 5.
 
 | sha | kind | cache | behavior | Rust target | note |
 |---|---|---|---|---|---|

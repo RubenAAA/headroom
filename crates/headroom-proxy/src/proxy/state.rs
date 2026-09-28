@@ -161,7 +161,7 @@ pub struct AppState {
     /// and tool call execution. `Some` only when `config.memory_enabled`.
     pub memory_handler: Option<Arc<crate::memory::handler::MemoryHandler>>,
     /// Per-key token-bucket rate limiter. `Some` only when
-    /// `config.rate_limit_enabled` is set.
+    /// `config.rate_limit_enabled` is set and an RPM or TPM limit is nonzero.
     pub rate_limiter: Option<Arc<headroom_core::proxy::rate_limiter::TokenBucketRateLimiter>>,
     /// Semantic response cache. `Some` only when `config.cache_enabled`.
     /// Serves identical non-streaming requests from an in-memory LRU
@@ -763,7 +763,7 @@ impl AppState {
         let budget_limit_usd = config.budget_limit_usd;
         let budget_period = config.budget_period.clone();
 
-        let rate_limiter = if rate_limit_enabled {
+        let rate_limiter = if rate_limit_enabled && (rate_limit_rpm > 0 || rate_limit_tpm > 0) {
             Some(Arc::new(
                 headroom_core::proxy::rate_limiter::TokenBucketRateLimiter::new(
                     rate_limit_rpm,

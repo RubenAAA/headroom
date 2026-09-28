@@ -513,6 +513,14 @@ pub fn build_app(state: AppState) -> Router {
     // routed transforms) sit behind the catch-all.
     let router = router.layer(axum::middleware::from_fn(strip_untrusted_identity));
 
+    // Request rate, token rate and spend budget for every generation route,
+    // including `/v1/messages`, which reaches the catch-all above rather than
+    // a handler. See `crate::admission`.
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::admission::admission_gate,
+    ));
+
     // Count every inbound request, including ones that fall through to the
     // catch-all.
     let router = router.layer(axum::middleware::from_fn(track_inbound_request));

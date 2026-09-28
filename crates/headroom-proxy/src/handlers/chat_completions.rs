@@ -141,34 +141,6 @@ pub(crate) fn compact_chat_tool_descriptions(body: Bytes) -> Bytes {
     }
 }
 
-/// Rate-limit check: extracts the API key from `Authorization` header
-/// and checks against the per-key token bucket. Returns 429 when denied.
-pub(crate) fn check_rate_limit(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let limiter = state.rate_limiter.as_ref()?;
-    let key = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("anonymous")
-        .to_string();
-    let result = limiter.check_request(&key);
-    if result.allowed {
-        None
-    } else {
-        crate::observability::proxy_counters::record_rate_limited("headroom");
-        let wait = std::time::Duration::from_secs_f64(result.wait_seconds);
-        Some(
-            Response::builder()
-                .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
-                .header("retry-after", format!("{:.0}", wait.as_secs()))
-                .body(Body::from(format!(
-                    "rate limit exceeded; retry after {:.1}s",
-                    result.wait_seconds
-                )))
-                .expect("static response"),
-        )
-    }
-}
-
 /// Axum POST handler for `/v1/chat/completions`. Buffers the body,
 /// stitches a fresh `Request<Body>` together, and forwards via
 /// [`forward_http`]. Compression dispatch + SSE telemetry is handled
@@ -181,11 +153,6 @@ pub async fn handle_chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Rate-limit gate: check before buffering the body.
-    if let Some(rejected) = check_rate_limit(&state, &headers) {
-        return rejected;
-    }
-
     // Compatibility shim: GPT-5 / o-series chat models reject the legacy
     // `max_tokens`; translate it to `max_completion_tokens` before
     // forwarding. Runs on the always-buffered chat body regardless of

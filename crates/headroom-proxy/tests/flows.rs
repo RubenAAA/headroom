@@ -9,6 +9,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
+#[path = "suites/flows/integration_admission.rs"]
+mod integration_admission;
+
 #[path = "suites/flows/integration_health.rs"]
 mod integration_health;
 

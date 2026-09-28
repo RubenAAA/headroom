@@ -448,11 +448,6 @@ pub async fn handle_responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Rate-limit gate: check before buffering the body.
-    if let Some(rejected) = super::chat_completions::check_rate_limit(&state, &headers) {
-        return rejected;
-    }
-
     note_streaming_pipeline(&state, &headers, &method, &uri);
 
     note_request_service_tier(&body, &headers, &uri);

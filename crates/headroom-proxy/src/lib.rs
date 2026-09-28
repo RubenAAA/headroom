@@ -5,6 +5,7 @@
 // to set up config; non-test code stays free of unsafe.
 #![cfg_attr(test, allow(unsafe_code, clippy::undocumented_unsafe_blocks))]
 
+pub mod admission;
 pub mod audit;
 pub mod background_compression;
 pub mod bedrock;

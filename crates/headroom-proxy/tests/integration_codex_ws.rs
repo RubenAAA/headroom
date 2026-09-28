@@ -626,3 +626,76 @@ async fn loopback_origin_allowed() {
     let _ = ws.close(None).await;
     proxy.shutdown().await;
 }
+
+/// A spent budget refuses the upgrade outright, and a budget spent while a
+/// socket is open stops the next `response.create`: the client gets a 1008
+/// close and the frame never reaches the upstream (upstream `f734c573`).
+#[tokio::test]
+async fn spent_budget_refuses_the_upgrade_and_closes_an_open_socket() {
+    let upstream = spawn_mock_upstream(vec![], false, vec![]).await;
+    let tracker = Arc::new(Mutex::new(None));
+    let slot = tracker.clone();
+    let proxy = common::start_proxy_with_state(
+        &format!("http://{}", upstream.addr),
+        |c| {
+            live_zone_config(c);
+            c.budget_limit_usd = Some(0.01);
+        },
+        move |state| {
+            *slot.lock().unwrap() = Some(state.cost_tracker.clone());
+            state
+        },
+    )
+    .await;
+    let tracker = tracker.lock().unwrap().clone().unwrap();
+    let connect = || async {
+        let mut req = format!("{}/v1/responses", proxy.ws_url())
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            "authorization",
+            http::HeaderValue::from_static("Bearer sk-test-payg"),
+        );
+        tokio_tungstenite::connect_async(req).await
+    };
+
+    let (mut ws, _resp) = connect().await.unwrap();
+    ws.send(Message::Text(big_response_create_frame().into()))
+        .await
+        .unwrap();
+    wait_for_frames(&upstream.frames, 1).await;
+
+    // The first turn's usage lands and spends the budget.
+    tracker.record_tokens(
+        "gpt-5.4-codex",
+        &headroom_core::cost_tracker::TokenRecord {
+            tokens_sent: 10_000_000,
+            uncached_tokens: 10_000_000,
+            ..Default::default()
+        },
+    );
+    ws.send(Message::Text(big_response_create_frame().into()))
+        .await
+        .unwrap();
+    let close = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(msg) = ws.next().await {
+            if let Ok(Message::Close(frame)) = msg {
+                return frame;
+            }
+        }
+        None
+    })
+    .await
+    .expect("client was never closed");
+    let frame = close.expect("close carries a code");
+    assert_eq!(u16::from(frame.code), 1008);
+    assert_eq!(upstream.frames.lock().unwrap().len(), 1);
+
+    match connect().await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), 429);
+        }
+        other => panic!("upgrade should be refused with 429, got {other:?}"),
+    }
+    proxy.shutdown().await;
+}

@@ -601,6 +601,9 @@ where
 /// per-turn outcome emission (openai.py 4302-4339, 5273-5416).
 #[derive(Debug, Default)]
 struct SessionTotals {
+    /// The client asked for a generation past the spend budget; the relay
+    /// closes the client with 1008 instead of forwarding it.
+    budget_refused: bool,
     tokens_saved: i64,
     attempted_input_tokens: i64,
     transforms_applied: Vec<String>,
@@ -1195,6 +1198,12 @@ pub async fn ws_codex_handler(
         return refusal;
     }
 
+    // ── Spend budget: refuse pre-upgrade, like the origin check. Later
+    // `response.create` frames are checked again in the relay. ──
+    if let Some(refusal) = crate::admission::budget_refusal(&state) {
+        return refusal;
+    }
+
     // ── Client classification + codex stamping (auth_mode.py:267-282) ──
     let stamped = should_stamp_codex_client(&path, &headers);
     let client = if stamped {
@@ -1651,6 +1660,19 @@ async fn run_codex_session_inner(
                                 if let Ok(mut reg) = ctx_state.ws_sessions.lock() {
                                     reg.mark_activity(&session_id);
                                 }
+                                // A long-lived socket must not keep buying
+                                // generations once the budget is spent
+                                // (upstream `f734c573`).
+                                if is_create && !ctx_state.cost_tracker.check_budget().0 {
+                                    tracing::warn!(
+                                        event = "websocket_budget_exceeded",
+                                        request_id = %request_id,
+                                        session_id = %session_id,
+                                        "codex ws response.create refused: spend budget used up"
+                                    );
+                                    totals.lock().expect("totals lock").budget_refused = true;
+                                    break;
+                                }
                                 let out = if is_create && !bypass {
                                     let comp_started = Instant::now();
                                     let exclude_tools = exclude_tools.clone();
@@ -1814,6 +1836,14 @@ async fn run_codex_session_inner(
                         }
                     }
                 }
+            }
+            if totals.lock().expect("totals lock").budget_refused {
+                let _ = client_sink
+                    .send(AxMsg::Close(Some(CloseFrame {
+                        code: 1008,
+                        reason: "budget exceeded".into(),
+                    })))
+                    .await;
             }
             let _ = client_sink.close().await;
             cancel.cancel();
