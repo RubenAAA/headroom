@@ -47,8 +47,18 @@ fn block_hash(b: &Value) -> u64 {
     hash_bytes(&serde_json::to_vec(b).unwrap_or_default())
 }
 
+/// Mirrors `proxy/reasoning.rs::is_unsigned_reasoning`: a block cut short by a
+/// dropped stream. The proxy drops these on purpose because Anthropic refuses
+/// them, so they are not continuity losses.
+fn is_unsigned(b: &Value) -> bool {
+    b.get("signature")
+        .and_then(|s| s.as_str())
+        .is_none_or(|s| s.is_empty())
+        && b.get("data").is_none()
+}
+
 /// Thinking-block hashes per assistant message, in order. `None` content
-/// (string messages) contributes no entry.
+/// (string messages) contributes no entry, and unsigned blocks are skipped.
 fn thinking_per_message(body: &Value) -> Vec<Vec<(u64, Value)>> {
     let empty = vec![];
     let msgs = body
@@ -63,7 +73,7 @@ fn thinking_per_message(body: &Value) -> Vec<Vec<(u64, Value)>> {
         let mut blocks = Vec::new();
         if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
             for b in arr {
-                if is_thinking(b) {
+                if is_thinking(b) && !is_unsigned(b) {
                     blocks.push((block_hash(b), b.clone()));
                 }
             }

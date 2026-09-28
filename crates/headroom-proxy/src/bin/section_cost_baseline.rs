@@ -25,7 +25,7 @@
 //! lines is the follow-up, not this file.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use headroom_core::pricing;
@@ -278,8 +278,11 @@ fn segmentize(
 struct ToolStats {
     turns_with_call: usize,
     result_tokens: usize,
-    result_blocks: usize,
-    error_blocks: usize,
+    /// Distinct `tool_use_id`s, not blocks: a result is re-sent in every
+    /// later turn, so counting blocks weights an error by how long its
+    /// conversation ran after it.
+    result_ids: HashSet<String>,
+    error_ids: HashSet<String>,
 }
 
 fn is_error_result(block: &Value) -> bool {
@@ -554,11 +557,16 @@ fn main() {
                                 .cloned()
                                 .unwrap_or_else(|| "unknown".to_string());
                             let st = tools.entry(parent.clone()).or_default();
-                            st.result_blocks += 1;
                             st.result_tokens += segs.get(si).map(|s| s.tokens).unwrap_or(0);
+                            let id = b
+                                .get("tool_use_id")
+                                .and_then(|i| i.as_str())
+                                .unwrap_or_default()
+                                .to_string();
                             if is_error_result(b) {
-                                st.error_blocks += 1;
+                                st.error_ids.insert(id.clone());
                             }
+                            st.result_ids.insert(id);
                         }
                         if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
                             && let Some(name) = b.get("name").and_then(|n| n.as_str())
@@ -707,8 +715,8 @@ fn main() {
     trows.sort_by_key(|a| std::cmp::Reverse(a.1.result_tokens));
     for (name, st) in trows.iter().take(40) {
         let sess = tool_sessions.get(*name).map(|s| s.len()).unwrap_or(0);
-        let err = if st.result_blocks > 0 {
-            st.error_blocks as f64 / st.result_blocks as f64 * 100.0
+        let err = if !st.result_ids.is_empty() {
+            st.error_ids.len() as f64 / st.result_ids.len() as f64 * 100.0
         } else {
             0.0
         };

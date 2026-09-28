@@ -1,22 +1,13 @@
 # Idea: re-enable code-aware compression and measure
 
-- **Status:** open, ladder partially run 2026-09-18 (rungs 1–4a green; 4b
-  staged, live runs pending). **Honoring patch LANDED 2026-09-18
-  (uncommitted):** `CODE_AWARE_ENABLED` static + `set_code_aware_enabled`
-  (`live_zone.rs`, mirroring `KOMPRESS_ENABLED`), SourceCode-arm gate,
-  startup wiring from `--code-aware` (`main.rs`), `flags.sh` flipped to
-  `--code-aware true` (pins measured behavior; upstream default stays
-  false). Off-arm proven by `tests/code_aware_off_arm.rs` (own process —
-  the gate is process-wide). Drive-by fix in the same patch: the flag joins
-  the dispatch-memo key, else a runtime flip serves 30-min-stale results.
-  Full core suite green (2,188 lib pass), proxy compression tests green
-  (217 pass), fmt clean, clippy shows only 3 pre-existing warnings in
-  untouched files. LIVE since 2026-09-17T23:15:39Z restart (PID 16674, new
-  binary, `--code-aware true` in cmdline) — gate wired, behavior pinned on.
-  Open confirmation (2026-09-18): only ~1 min of traffic at the restart
-  check, zero `code_aware_compressor` hits yet — spot-check the next hour's
-  log for `live_zone_strategies: ["code_aware_compressor"]` to close the
-  loop, then delete this line.
+- **Status:** implemented 2026-09-28 — on in production since the
+  2026-09-17 restart (`--code-aware true`), and it has not hurt edits. Rung 4b
+  was never run; live traffic answered its question instead (Findings below).
+- **Shipped in:** `edeb2cca`. `CODE_AWARE_ENABLED` plus
+  `set_code_aware_enabled` gate the SourceCode arm from `--code-aware`
+  (`main.rs`); the flag is part of the dispatch-memo key; the off arm is
+  proven by `tests/code_aware_off_arm.rs`. `contrib/headroom-flags.sh` sets
+  `--code-aware true`; the upstream default stays false.
 - **Original blocking finding (now resolved by the patch):** `--code-aware
   false` was not honored on the Rust live-zone path — `code_aware_enabled`
   is parsed (`config.rs:1677`) but never read; `live_zone.rs:2264` routes
@@ -69,3 +60,24 @@
 - **Exit:** enable (possibly exploration-only, keeping `ByteExact` for edit
   targets) if ladder passes with no edit-regression; reject with the killing
   number otherwise.
+
+## Findings 2026-09-28 — live edits say keep it on
+
+`code_aware_compressor` fired on every day from 09-18 to 09-28 (27,966 log
+lines: 9,320 dispatch decisions, 5,385 applied). No capture has an off arm,
+because before 09-17 the flag was ignored and code-aware ran anyway. So the
+test is the edit failure it was feared to cause: an `Edit` whose
+`old_string` no longer matches, because the model copied it from a skeleton.
+
+| capture | distinct Edit calls | old_string not found |
+|---|---|---|
+| blindguard (08-17→18) | 1,027 | 9 |
+| vkreview | 205 | 2 |
+| netvalue (08-23→09-25) | 185 | 0 |
+| baseline-202609 | 18 | 0 |
+| **all** | **1,435** | **11 (0.77%)** |
+
+An off arm cannot beat 0.77% by enough to matter, so 4b's `claude -p` spend
+would buy nothing. The upstream verdict in
+`rejected/code-aware-40-pct-invalid-syntax.md` is overturned for this code:
+the re-parse gate serves the original whenever the skeleton does not parse.

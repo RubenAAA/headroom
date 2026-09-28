@@ -1,6 +1,8 @@
 # Idea: per-section cost share baseline (§1)
 
-- **Status:** open — precondition for every other harness-derived idea
+- **Status:** implemented 2026-09-28 — the tool exists, the tables are
+  below, and two proposals cite them (`harness-mcp-on-demand-schemas.md`,
+  `rejected/harness-sparse-line-numbers.md`). Re-run it; do not rebuild it.
 - **Source:** `LOOK_AT_THIS_WHEN_YOU_HAVE_TIME.md` §1 + §8. Proxy counterparts: `docs/measurement.md` (savings_verdict vs wire_verdict; billed = creation + uncached input, reads free on subscription), `cache_stabilization/usage_observer.rs:1-51` (turn classifier, conversation-keyed, observer-only).
 - **Gap, verified:** totals exist (saved vs lost-to-busts, billed tokens, hit %) but no source split (system/tools/reads/search/commands/history). Ledger rows carry `cost_basis` (fresh/read/free) without source, so "share × removable ÷ risk" ranking is guesswork.
 - **Value:** stops work on a 2% leg. Denominator for §8 validation (cost per completed task, turns/task, errors, hit rate).
@@ -33,3 +35,24 @@ Both: static ~19–21k tokens/req, stable-prefix share ~96.5% (excl. first turns
 - **Thinking shares above are overstated:** `rejected/prior-thinking-billing-question.md` (67/67 invariant) says prior thinking moves billed reads ~0. Wire tokens ≠ billed cost for that leg; discount it to ~zero when ranking.
 - **Error-rate outliers (taxonomy seeds):** blindguard WebSearch 37.4%, `search_code` 23.9%, TaskOutput 13.3%, TaskStop 12.5% vs Read 0.4%, Write 0.0%. Netvalue Agent 21.6%, `search_code` 33.7%.
 - **Method limits:** simulated prefix economics, not `usage` truth (no ledger join — follow-up); August windows, client has moved since; fresh capture `~/headroom-capture-baseline-202609` armed 2026-09-24 to re-run on current traffic.
+
+## Findings 2026-09-28 — netvalue extended to 09-25
+
+Same tool over the netvalue capture, which kept recording until 09-25
+(4,528 Claude turns, 75 sessions; baseline-202609 holds only 3 sessions,
+too few to rank on):
+
+| leg (billed-equiv share) | netvalue 08-23→09-25 |
+|---|---|
+| result:command | 27.2% |
+| msg:user_text | 18.4% |
+| msg:thinking | 16.5% (discount to ~0, as above) |
+| msg:tool_use | 10.7% |
+| result:file | 9.7% |
+| tools:builtin | 9.1% |
+| system | 2.6% |
+| tools:mcp | 2.1% |
+
+Static 17.6k tokens/req, stable prefix 96.8% of non-first-turn tokens, first
+turns 18.7% of writes. The August shape holds. The err% column in table 3
+now counts distinct `tool_use_id`s; it used to count every re-sent copy.
