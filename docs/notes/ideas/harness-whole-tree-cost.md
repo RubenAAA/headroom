@@ -10,7 +10,7 @@
   - `recache-rekey-floor.md`: include re-key/arrived-with-history floor or trees undercount.
   - `ccr-fragmentation-across-workers.md`: per-worker state fragments under round-robin — tree join must be worker-aware.
   - `sidecar-poisons-main-cache.md` (fixed via strip-long-context-beta): label/exclude sidecar turns or one spinner answer poisons the tree.
-  - `ccr-round-cap-forced-answer.md` (open: retrieval loops run ~220 calls vs 30–70): attribute retrieval rounds to the tree or loops hide.
+  - `rejected/ccr-round-cap-forced-answer.md` (rejected: retrieval loops ran ~220 calls vs 30–70 until 2026-09-25, none since): attribute retrieval rounds to the tree or loops hide.
 - **Next:** lane-respecting planner+worker trees via identity/ctx-capture; cost/tree by billing type, turns/tree, hit rate. Gate routing proposals on it: ship only when tree cost drops with guardrails flat.
 - **Exit:** close when tree cost is queryable; later routing ideas cite it instead of per-request math.
 - **Tool:** `crates/headroom-proxy/src/bin/whole_tree_cost.rs` (offline; groups captures by envelope session key across models, planner = first-turn model as stated assumption, per-model shares per tree. Written 2026-09-24, unverified — tree was mid-refactor; run on netvalue/blindguard once green. Re-keyed continuations file as separate trees — ledger `session_key_hash` join remains the follow-up).

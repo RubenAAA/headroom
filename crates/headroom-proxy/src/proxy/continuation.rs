@@ -568,13 +568,16 @@ pub(crate) async fn handle_ccr_response(
     let mut last_fetched: Vec<headroom_core::ccr::response_handler::CcrToolResult> = Vec::new();
 
     loop {
-        if !ccr_response::check_ccr_round_budget(rounds, max_rounds, request_id) {
-            break;
-        }
-
         let (ccr_calls, other_calls) = handler.parse_ccr_tool_calls(&current_response, provider);
 
         if ccr_calls.is_empty() {
+            break;
+        }
+
+        // After the parse, so the cap only fires when the model asked for
+        // another retrieve: checked first, it also fired on a final round
+        // that had already answered (121 of 216 hits, 2026-09-22..27).
+        if !ccr_response::check_ccr_round_budget(rounds, max_rounds, request_id) {
             break;
         }
 

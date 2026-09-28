@@ -438,7 +438,8 @@ pub(super) fn parse_ccr_request(
     }
 }
 
-/// Round-budget gate: warn and stop when the retrieval rounds are spent.
+/// Round-budget gate: warn and stop when the retrieval rounds are spent and
+/// the model still wants another retrieve.
 /// Returns false when the loop ends here.
 /// Extracted from `handle_ccr_response` without behavior change.
 pub(super) fn check_ccr_round_budget(rounds: usize, max_rounds: usize, request_id: &str) -> bool {
