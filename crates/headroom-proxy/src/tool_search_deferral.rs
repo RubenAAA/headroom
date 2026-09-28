@@ -170,6 +170,10 @@ pub fn is_custom_anthropic_base_url(value: Option<&str>) -> bool {
 /// name, Copilot CLI `tool_search_tool` (which does not start with
 /// [`TOOL_SEARCH_TYPE_PREFIX`]), VS Code Copilot and Kiro `tool_search`, and
 /// Codebuff `composio_search_tools`. Upstream `665b73df`.
+///
+/// Upstream also reads extra names from `HEADROOM_CLIENT_TOOL_SEARCH_NAMES`,
+/// empty by default, for a harness it has not seen. Not ported: every client
+/// this proxy serves is listed here, and a new one belongs in this list.
 const TOOL_SEARCH_META_TOOL_NAMES: &[&str] = &[
     "tool_search",
     "tool_search_tool",

@@ -120,6 +120,11 @@ const KEY_EXTRA_FIELDS: &[&str] = &[
 /// (upstream `dfdc7251`). Taking it here makes the lookup and the store key on
 /// it alike.
 ///
+/// Upstream keys the base URL alone; the query string is keyed here on
+/// purpose. It can change the answer (Azure's `?api-version=`, Anthropic's
+/// `?beta=true`), and a client sends the same one every turn, so the only
+/// hits it costs are between requests that were not the same request.
+///
 /// Borrows: the old form cloned the whole turn array plus every extra
 /// field (measured 481x on a 100-tool body) just to hand them to
 /// `compute_key`, which only reads them. Both callers use the result

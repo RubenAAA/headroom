@@ -115,6 +115,9 @@ fn too_many_requests(message: String, retry_after_seconds: Option<f64>) -> Respo
 }
 
 /// `Some(429)` when the spend budget for the current period is used up.
+///
+/// Not booked as `rate_limited`, on purpose and as upstream does: a spent
+/// budget is not a rate, and the `budget_exceeded` event below records it.
 pub(crate) fn budget_refusal(state: &AppState) -> Option<Response> {
     let tracker = &state.cost_tracker;
     let (allowed, _) = tracker.check_budget();
