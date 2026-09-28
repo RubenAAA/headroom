@@ -57,7 +57,7 @@
 //! just without a live rewriter.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -111,22 +111,104 @@ const FOLDED_EVENTS: [&str; 8] = [
     "error",
 ];
 
+/// Message fields this proxy reads or rewrites. Anything else on an Anthropic
+/// message is an attachment it passes on (upstream `12c15796`).
+const KNOWN_MESSAGE_FIELDS: [&str; 9] = [
+    "id",
+    "type",
+    "role",
+    "model",
+    "content",
+    "stop_reason",
+    "stop_sequence",
+    "stop_details",
+    "usage",
+];
+
+/// Give `replacement` the unknown fields of `original` it has none of its own
+/// for. A CCR round swaps the message the client was answered with for a
+/// continuation's; attachments such as `safeguard_results` belong to the
+/// exchange, not to the content the proxy rewrote. Returns whether it added
+/// any.
+pub(crate) fn keep_unknown_message_fields(original: &Value, replacement: &mut Value) -> bool {
+    let (Some(original), Some(replacement)) = (original.as_object(), replacement.as_object_mut())
+    else {
+        return false;
+    };
+    let mut added = false;
+    for (key, value) in original {
+        if !KNOWN_MESSAGE_FIELDS.contains(&key.as_str()) && !replacement.contains_key(key) {
+            replacement.insert(key.clone(), value.clone());
+            added = true;
+        }
+    }
+    added
+}
+
+/// `known` with the fields of `extras` it does not set itself added after
+/// them, so an unknown field rides along and can never overwrite a known one.
+fn with_extras(known: Value, extras: Option<&serde_json::Map<String, Value>>) -> Value {
+    let (Value::Object(mut out), Some(extras)) = (known.clone(), extras) else {
+        return known;
+    };
+    for (key, value) in extras {
+        out.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    Value::Object(out)
+}
+
 /// What a folded continuation stream carried that its turn JSON cannot
 /// (upstream `12c15796`): events this proxy does not know, verbatim, and the
-/// `message_delta` fields it does not read. Claude Code's auto mode sends a
-/// `safeguard_results` event after a tool call; a continuation that makes one
-/// has to hand it on with the call, or the client never hears the verdict.
+/// fields it does not read on the events it does. Claude Code's auto mode
+/// sends a `safeguard_results` event after a tool call; a continuation that
+/// makes one has to hand it on with the call, or the client never hears the
+/// verdict.
 #[derive(Debug, Default)]
 pub(crate) struct ContinuationExtras {
     /// The continuation's own message id, so the extras are only replayed
     /// with the turn they came from.
     message_id: String,
+    /// The `message` of the continuation's `message_start`, whose unknown
+    /// fields the folded turn keeps.
+    message: Value,
     frames: Vec<Bytes>,
     /// `message_delta` fields other than `type`, `delta` and `usage`.
     message_delta: serde_json::Map<String, Value>,
     /// `message_delta.delta` fields other than `stop_reason` and
     /// `stop_sequence`.
     delta: serde_json::Map<String, Value>,
+    /// Per upstream block index; in index order that is the order
+    /// [`rebuild_message`] lays the turn's content out in.
+    blocks: BTreeMap<usize, BlockExtras>,
+}
+
+/// The unread fields of one continuation block's events.
+#[derive(Debug, Default)]
+pub(crate) struct BlockExtras {
+    block_type: String,
+    /// `content_block_start` fields other than `type`, `index` and
+    /// `content_block`.
+    start: serde_json::Map<String, Value>,
+    /// `content_block_delta` fields other than `type`, `index` and `delta`.
+    delta_event: serde_json::Map<String, Value>,
+    /// Delta fields other than `type` and the payload the delta carries.
+    delta: serde_json::Map<String, Value>,
+    /// `content_block_stop` fields other than `type` and `index`.
+    stop: serde_json::Map<String, Value>,
+}
+
+impl ContinuationExtras {
+    /// The extras of the block at `position` in the continuation's content,
+    /// when that content is still the one they were collected from.
+    fn block(&self, position: usize, block: &Value, content_len: usize) -> Option<&BlockExtras> {
+        if self.blocks.len() != content_len {
+            return None;
+        }
+        self.blocks
+            .values()
+            .nth(position)
+            .filter(|e| block.get("type").and_then(Value::as_str) == Some(e.block_type.as_str()))
+    }
 }
 
 tokio::task_local! {
@@ -466,7 +548,8 @@ pub(crate) fn anthropic_stream_to_turn(body: &[u8]) -> Option<Value> {
     if matches!(state.status, StreamStatus::Errored) {
         return None;
     }
-    let turn = rebuild_message(&state);
+    let mut turn = rebuild_message(&state);
+    let _ = keep_unknown_message_fields(&extras.message, &mut turn);
     let complete = turn
         .get("content")
         .and_then(Value::as_array)
@@ -484,23 +567,55 @@ fn collect_extras(extras: &mut ContinuationExtras, event: &SseEvent) {
     let Ok(Value::Object(mut data)) = serde_json::from_slice::<Value>(&event.data) else {
         return;
     };
-    let kind = data.get("type").and_then(Value::as_str).unwrap_or("");
-    if !FOLDED_EVENTS.contains(&kind) {
+    let kind = data
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if !FOLDED_EVENTS.contains(&kind.as_str()) {
         extras.frames.push(reframe(event));
         return;
     }
-    if kind != "message_delta" {
-        return;
+    data.remove("type");
+    let index = data.remove("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+    match kind.as_str() {
+        "message_start" => extras.message = data.remove("message").unwrap_or(Value::Null),
+        "message_delta" => {
+            if let Some(Value::Object(mut delta)) = data.remove("delta") {
+                delta.remove("stop_reason");
+                delta.remove("stop_sequence");
+                extras.delta.extend(delta);
+            }
+            data.remove("usage");
+            extras.message_delta.extend(data);
+        }
+        "content_block_start" => {
+            let block = extras.blocks.entry(index).or_default();
+            block.block_type = data
+                .remove("content_block")
+                .and_then(|b| b.get("type").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default();
+            block.start.extend(data);
+        }
+        "content_block_delta" => {
+            let block = extras.blocks.entry(index).or_default();
+            if let Some(Value::Object(mut delta)) = data.remove("delta") {
+                let payload = match delta.remove("type").as_ref().and_then(Value::as_str) {
+                    Some("text_delta") => "text",
+                    Some("input_json_delta") => "partial_json",
+                    Some("thinking_delta") => "thinking",
+                    Some("signature_delta") => "signature",
+                    Some("citations_delta") => "citation",
+                    _ => "",
+                };
+                delta.remove(payload);
+                block.delta.extend(delta);
+            }
+            block.delta_event.extend(data);
+        }
+        "content_block_stop" => extras.blocks.entry(index).or_default().stop.extend(data),
+        _ => {}
     }
-    if let Some(Value::Object(mut delta)) = data.remove("delta") {
-        delta.remove("stop_reason");
-        delta.remove("stop_sequence");
-        extras.delta.extend(delta);
-    }
-    for known in ["type", "usage"] {
-        data.remove(known);
-    }
-    extras.message_delta.extend(data);
 }
 
 /// Every tool this proxy injects and therefore has to answer itself.
@@ -714,21 +829,30 @@ fn drop_reason(block: &Value, memory_enabled: bool, live: &[Value]) -> Option<Dr
 /// Blocks are opened empty and filled by a delta, which is the shape the wire
 /// format specifies and the shape clients are built to parse. Emitting a
 /// populated `content_block_start` would be shorter and is not worth the bet.
-pub(crate) fn synthesize_blocks(content: &[Value], start_index: usize) -> Vec<Bytes> {
+///
+/// `extras[i]`, when present, holds the fields the continuation sent on block
+/// `i`'s events that this proxy does not read; they go back out on the same
+/// events.
+pub(crate) fn synthesize_blocks(
+    content: &[Value],
+    start_index: usize,
+    extras: &[Option<&BlockExtras>],
+) -> Vec<Bytes> {
     let mut out = Vec::new();
     for (offset, block) in content.iter().enumerate() {
         let index = start_index + offset;
+        let extras = extras.get(offset).copied().flatten();
         let block_type = block.get("type").and_then(Value::as_str).unwrap_or("text");
         let (shell, delta) = match block_type {
             "text" => (
-                json!({"type": "text", "text": ""}),
+                with_empty(block, "text", &["citations"]),
                 Some(json!({
                     "type": "text_delta",
                     "text": block.get("text").and_then(Value::as_str).unwrap_or(""),
                 })),
             ),
             "thinking" => (
-                json!({"type": "thinking", "thinking": ""}),
+                with_empty(block, "thinking", &["signature"]),
                 Some(json!({
                     "type": "thinking_delta",
                     "thinking": block.get("thinking").and_then(Value::as_str).unwrap_or(""),
@@ -757,21 +881,27 @@ pub(crate) fn synthesize_blocks(content: &[Value], start_index: usize) -> Vec<By
 
         out.push(event_bytes(
             "content_block_start",
-            &serde_json::to_vec(&json!({
-                "type": "content_block_start",
-                "index": index,
-                "content_block": shell,
-            }))
+            &serde_json::to_vec(&with_extras(
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": shell,
+                }),
+                extras.map(|e| &e.start),
+            ))
             .unwrap_or_default(),
         ));
         if let Some(delta) = delta {
             out.push(event_bytes(
                 "content_block_delta",
-                &serde_json::to_vec(&json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": delta,
-                }))
+                &serde_json::to_vec(&with_extras(
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": with_extras(delta, extras.map(|e| &e.delta)),
+                    }),
+                    extras.map(|e| &e.delta_event),
+                ))
                 .unwrap_or_default(),
             ));
         }
@@ -792,14 +922,32 @@ pub(crate) fn synthesize_blocks(content: &[Value], start_index: usize) -> Vec<By
         }
         out.push(event_bytes(
             "content_block_stop",
-            &serde_json::to_vec(&json!({
-                "type": "content_block_stop",
-                "index": index,
-            }))
+            &serde_json::to_vec(&with_extras(
+                json!({
+                    "type": "content_block_stop",
+                    "index": index,
+                }),
+                extras.map(|e| &e.stop),
+            ))
             .unwrap_or_default(),
         ));
     }
     out
+}
+
+/// The start shell of a streamed block: `block` with its streamed field
+/// emptied and the fields its deltas carry removed. Starting from the block
+/// rather than a bare `{type, <field>: ""}` keeps fields this proxy has never
+/// heard of.
+fn with_empty(block: &Value, streamed: &str, delta_borne: &[&str]) -> Value {
+    let mut shell = block.clone();
+    if let Some(obj) = shell.as_object_mut() {
+        obj.insert(streamed.into(), json!(""));
+        for key in delta_borne {
+            obj.remove(*key);
+        }
+    }
+    shell
 }
 
 /// Whether the terminal `stop_reason` still claims a tool call the client
@@ -1089,7 +1237,9 @@ where
         // The first one is enough to name in the message; a turn dropping two
         // different proxy tools has the same cause as one dropping either.
         let mut unresolved_tool: Option<String> = None;
-        for block in content {
+        let content_len = content.len();
+        let mut emit_extras: Vec<Option<&BlockExtras>> = Vec::with_capacity(content_len);
+        for (position, block) in content.into_iter().enumerate() {
             match drop_reason(&block, memory_enabled, &live_blocks) {
                 Some(reason) => {
                     dropped[reason as usize] += 1;
@@ -1102,7 +1252,14 @@ where
                             .map(str::to_string);
                     }
                 }
-                None => emit.push(block),
+                None => {
+                    emit_extras.push(
+                        extras
+                            .as_ref()
+                            .and_then(|e| e.block(position, &block, content_len)),
+                    );
+                    emit.push(block);
+                }
             }
         }
         if dropped.iter().any(|&n| n > 0) {
@@ -1251,9 +1408,10 @@ where
                     "text": empty_turn_text(unresolved_tool.as_deref()),
                 })],
                 rw.next_client_index,
+                &[],
             )
         } else {
-            synthesize_blocks(&emit, rw.next_client_index)
+            synthesize_blocks(&emit, rw.next_client_index, &emit_extras)
         };
         // After the blocks they report on, before the turn closes: where the
         // continuation itself sent them.
@@ -1887,7 +2045,7 @@ mod tests {
     #[test]
     fn synthesized_blocks_continue_the_client_numbering() {
         let content = vec![json!({"type": "text", "text": "the answer"})];
-        let out = synthesize_blocks(&content, 3);
+        let out = synthesize_blocks(&content, 3, &[]);
         let text = joined(&out);
         assert!(text.contains("event: content_block_start"));
         assert!(text.contains("\"index\":3"));
@@ -2015,7 +2173,7 @@ mod tests {
         let content = vec![json!({
             "type": "tool_use", "id": "t9", "name": "Read", "input": {"file_path": "/x"}
         })];
-        let text = joined(&synthesize_blocks(&content, 0));
+        let text = joined(&synthesize_blocks(&content, 0, &[]));
         assert!(text.contains("input_json_delta"));
         assert!(text.contains("file_path"));
     }

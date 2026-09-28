@@ -26,3 +26,6 @@ mod memory_continuation;
 
 #[path = "suites/ccr/continuation_cache_prefix.rs"]
 mod continuation_cache_prefix;
+
+#[path = "suites/ccr/integration_ccr_attachments.rs"]
+mod integration_ccr_attachments;

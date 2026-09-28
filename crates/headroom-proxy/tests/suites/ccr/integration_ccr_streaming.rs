@@ -86,11 +86,11 @@ async fn ccr_upstream(rounds: Arc<AtomicUsize>) -> (SocketAddr, tokio::task::Joi
                                         "event: message_start\n",
                                         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude\",\"usage\":{\"input_tokens\":900,\"output_tokens\":0}}}\n\n",
                                         "event: content_block_start\n",
-                                        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                                        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\",\"x_block\":\"BLOCK_EXTRA\"},\"x_block_start\":\"START_EXTRA\"}\n\n",
                                         "event: content_block_delta\n",
-                                        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ANSWER_AFTER_RETRIEVAL\"}}\n\n",
+                                        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ANSWER_AFTER_RETRIEVAL\",\"x_text_delta\":\"TEXT_DELTA_EXTRA\"},\"x_delta_event\":\"DELTA_EVENT_EXTRA\"}\n\n",
                                         "event: content_block_stop\n",
-                                        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                                        "data: {\"type\":\"content_block_stop\",\"index\":0,\"x_block_stop\":\"STOP_EXTRA\"}\n\n",
                                         // Claude Code auto mode: an event and
                                         // fields this proxy does not know.
                                         "event: safeguard_results\n",
@@ -533,4 +533,22 @@ async fn the_splice_keeps_what_the_continuation_sent_that_the_proxy_does_not_kno
             && message_delta.contains("end_turn"),
         "message_delta keeps the continuation's extra fields: {message_delta}"
     );
+    // And each block event keeps its own, on the block the client is given.
+    let frame = |kind: &str| {
+        sse.split("\n\n")
+            .find(|f| f.starts_with(&format!("event: {kind}")) && f.contains(r#""index":1"#))
+            .unwrap_or_else(|| panic!("no {kind} for block 1:\n{sse}"))
+            .to_string()
+    };
+    let start = frame("content_block_start");
+    assert!(
+        start.contains("START_EXTRA") && start.contains("BLOCK_EXTRA"),
+        "{start}"
+    );
+    let delta = frame("content_block_delta");
+    assert!(
+        delta.contains("DELTA_EVENT_EXTRA") && delta.contains("TEXT_DELTA_EXTRA"),
+        "{delta}"
+    );
+    assert!(frame("content_block_stop").contains("STOP_EXTRA"));
 }

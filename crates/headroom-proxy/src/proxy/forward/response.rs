@@ -39,6 +39,7 @@ pub(crate) async fn resolve_ccr_memory_rounds(
         provider: memory_provider,
     } = memory;
     let mut ccr_round_usage = CcrRoundUsage::default();
+    let answered = body_bytes.clone();
     for _ in 0..MAX_RESOLVER_ALTERNATIONS {
         let before = body_bytes.clone();
 
@@ -107,6 +108,21 @@ pub(crate) async fn resolve_ccr_memory_rounds(
         if body_bytes == before {
             break;
         }
+    }
+    // A resolved turn is the last continuation's message, not the one
+    // upstream first answered with. Fields this proxy does not model (Claude
+    // Code auto mode's `safeguard_results`) belong to the exchange, so the
+    // client keeps them (upstream `12c15796`).
+    if body_bytes != answered
+        && path_for_log.contains("/v1/messages")
+        && let (Ok(original), Ok(mut resolved)) = (
+            serde_json::from_slice::<serde_json::Value>(&answered),
+            serde_json::from_slice::<serde_json::Value>(&body_bytes),
+        )
+        && crate::sse::ccr_stream::keep_unknown_message_fields(&original, &mut resolved)
+        && let Ok(merged) = serde_json::to_vec(&resolved)
+    {
+        body_bytes = merged.into();
     }
     (body_bytes, ccr_round_usage)
 }
@@ -468,6 +484,10 @@ pub(crate) fn wrap_buffered_success_body(
             }
         }
     } else {
+        // Upstream's length describes the body it sent. Retrieval, memory
+        // and turn hooks can each replace that body, and a stale length cuts
+        // the client's read short or leaves it waiting; the body knows its own.
+        resp_headers.remove(http::header::CONTENT_LENGTH);
         Body::from(body_bytes)
     }
 }
