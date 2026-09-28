@@ -68,6 +68,11 @@ fi
 # shellcheck disable=SC1091
 source "$FLAGS_FILE"
 
+# The log carries request metadata and upstream error bodies, so it and its
+# older generations are owner-only (upstream 5cb87bc3).
+(umask 077; : >>"$LOG")
+chmod 600 "$LOG" "$LOG".[1-4] 2>/dev/null || true
+
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"; }
 
 # The Zen egress pool comes from a private file, not from whatever the calling

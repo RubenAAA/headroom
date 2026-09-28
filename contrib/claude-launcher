@@ -272,6 +272,10 @@ if [ "$use_context" -eq 1 ]; then
             # than spend a generation on it.
             : > "$PROXY_LOG"
         fi
+        # The log carries request metadata and upstream error bodies, so it
+        # and its older generations are owner-only (upstream 5cb87bc3).
+        (umask 077; : >>"$PROXY_LOG")
+        chmod 600 "$PROXY_LOG" "$PROXY_LOG".[1-4] 2>/dev/null || true
         # The measured settings, shared with restart-headroom.sh. This branch is
         # what runs after a reboot, when nothing holds 8787 — so a proxy started
         # here without them would quietly serve every session on defaults.
