@@ -703,6 +703,12 @@ Options:
           
           [env: HEADROOM_OUTPUT_SHAPER=]
 
+      --output-holdout <OUTPUT_HOLDOUT>
+          Share of conversations, 0-1, the output shaper leaves unsteered as the A/B control for the output-savings ledger. Assignment is per conversation, so no conversation's system prompt changes mid-session. 0 steers every conversation
+          
+          [env: HEADROOM_OUTPUT_HOLDOUT=]
+          [default: 0]
+
       --verbosity-level <VERBOSITY_LEVEL>
           Verbosity steering level 0-4. 0 = off, 1 = skip preamble, 2 = default, 3 = conclusions only, 4 = minimum tokens
           

@@ -75,15 +75,18 @@ fn inject_ccr_retrieve_tool(parsed: &mut Value) -> bool {
 /// (`output_shaper_enabled`), same extend of the report labels, same debug
 /// event. Returns nothing — the label extend is the only report effect.
 fn apply_output_shaper(state: &AppState, parsed: &mut Value, labels: &mut Vec<String>) {
-    let shaped = crate::output_shaper::shape_request(parsed, true, state.config.verbosity_level);
-    if shaped.changed {
-        labels.extend(shaped.labels.clone());
-        tracing::debug!(
-            event = "codex_output_shaper",
-            labels = ?shaped.labels,
-            "shaped routed-model request"
-        );
-    }
+    let shaped = crate::output_shaper::shape_with_holdout(
+        parsed,
+        state.config.verbosity_level,
+        state.config.output_holdout,
+    );
+    tracing::debug!(
+        event = "codex_output_shaper",
+        steered = shaped.changed,
+        labels = ?shaped.labels,
+        "shaped routed-model request"
+    );
+    labels.extend(shaped.labels);
 }
 
 /// Search memory and append recalled context to the latest user message

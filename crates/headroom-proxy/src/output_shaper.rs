@@ -102,6 +102,18 @@ pub enum TurnKind {
     Unknown,
 }
 
+impl TurnKind {
+    /// The name the savings strata use (Python `TurnKind.value`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnKind::NewUserAsk => "new_user_ask",
+            TurnKind::MechanicalContinuation => "mechanical_continuation",
+            TurnKind::ErrorContinuation => "error_continuation",
+            TurnKind::Unknown => "unknown",
+        }
+    }
+}
+
 /// Classify the latest turn from message structure alone.
 pub fn classify_turn(messages: &[Value]) -> TurnKind {
     let last = match messages.last() {
@@ -216,6 +228,73 @@ pub fn apply_verbosity_steering(body: &mut Value, level: i32) -> bool {
 pub struct ShapeResult {
     pub changed: bool,
     pub labels: Vec<String>,
+}
+
+/// The conversation a request belongs to, as a hex digest, for holdout
+/// assignment.
+///
+/// Claude Code's session id comes first. Upstream's key hashes the model and
+/// the first user text block, which on Claude Code is a `<system-reminder>`
+/// that repeats across sessions, so most sessions would share one key and one
+/// arm. Subagents share their parent's session id, so a whole tree lands in
+/// one arm; bodies without a session id fall back to upstream's key.
+pub fn holdout_conversation_key(body: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    match crate::cache_stabilization::capture::client_session_id(body) {
+        Some(id) => hex::encode(Sha256::digest(format!("session:{id}").as_bytes())),
+        None => headroom_core::output_savings::conversation_key_from_body(body),
+    }
+}
+
+/// Input size for the savings stratum: characters of every string in the
+/// body over four. The strata buckets are a factor of four apart, and both
+/// arms are sized the same way, which is all the holdout comparison needs.
+fn approx_input_tokens(v: &Value) -> i64 {
+    fn chars(v: &Value) -> usize {
+        match v {
+            Value::String(s) => s.len(),
+            Value::Array(a) => a.iter().map(chars).sum(),
+            Value::Object(o) => o.values().map(chars).sum(),
+            _ => 0,
+        }
+    }
+    (chars(v) / 4) as i64
+}
+
+/// [`shape_request`] behind the output-savings holdout.
+///
+/// Assigns the request's conversation an arm (`holdout` is the control
+/// share), labels it with the arm, stratum and conversation for the savings
+/// ledger, and steers only the treatment arm. The arm is fixed per
+/// conversation, so a conversation's system prompt never flips between turns.
+/// Labels are returned even when nothing was steered; `changed` says whether
+/// the body was.
+pub fn shape_with_holdout(body: &mut Value, verbosity_level: i32, holdout: f64) -> ShapeResult {
+    use headroom_core::output_savings::{
+        assign_arm, conversation_label, stratum_key, stratum_label,
+    };
+    let conversation = holdout_conversation_key(body);
+    let arm = assign_arm(&conversation, holdout);
+    let turn_kind = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(TurnKind::Unknown, |m| classify_turn(m));
+    let stratum = stratum_key(
+        turn_kind.as_str(),
+        approx_input_tokens(body),
+        body.get("model").and_then(Value::as_str).unwrap_or(""),
+        body.get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|t| !t.is_empty()),
+    );
+    let mut result = if arm == "treatment" {
+        shape_request(body, true, verbosity_level)
+    } else {
+        ShapeResult::default()
+    };
+    result.labels.push(stratum_label(arm, &stratum));
+    result.labels.push(conversation_label(&conversation));
+    result
 }
 
 /// Apply verbosity steering to an Anthropic request body in place.

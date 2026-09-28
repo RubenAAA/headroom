@@ -1286,7 +1286,7 @@ mod tests {
             ledger.baseline.observe("k", 100);
         }
         for _ in 0..30 {
-            ledger.record("treatment", "k", 70);
+            ledger.record("treatment", "k", 70, None);
         }
         let out = format_output_savings(&ledger);
         assert!(out.contains("Method:    ESTIMATED (synthetic control)"));
@@ -1301,9 +1301,10 @@ mod tests {
     fn output_savings_measured_report_has_no_note() {
         use headroom_core::output_savings::SavingsLedger;
         let mut ledger = SavingsLedger::default();
-        for _ in 0..10 {
-            ledger.record("control", "k", 100);
-            ledger.record("treatment", "k", 70);
+        for i in 0..10 {
+            let conv = format!("c{i}");
+            ledger.record("control", "k", 100, Some(&conv));
+            ledger.record("treatment", "k", 70, Some(&conv));
         }
         let out = format_output_savings(&ledger);
         assert!(out.contains("Method:    MEASURED (A/B holdout)"));
@@ -1319,7 +1320,7 @@ mod tests {
         register_modelled_factors(3, 0.20, 0.40).unwrap();
         let mut ledger = SavingsLedger::default();
         for _ in 0..8 {
-            ledger.record("treatment", "k", 100);
+            ledger.record("treatment", "k", 100, None);
         }
         let out = format_output_savings_with_level(&ledger, Some(3));
         assert!(out.contains("Method:    MODELLED (benchmark factor)"));
@@ -1337,7 +1338,7 @@ mod tests {
         // estimated tier — the honest rendering of "not measured".
         let mut ledger = SavingsLedger::default();
         for _ in 0..8 {
-            ledger.record("treatment", "k", 100);
+            ledger.record("treatment", "k", 100, None);
         }
         let out = format_output_savings_with_level(&ledger, Some(2));
         assert!(out.contains("No shaped requests recorded yet."));

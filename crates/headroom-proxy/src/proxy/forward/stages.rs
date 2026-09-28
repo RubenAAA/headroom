@@ -550,6 +550,7 @@ pub(crate) fn run_output_shaper(
     state: &AppState,
     request_id: &str,
     changed: &mut bool,
+    labels: &mut Vec<String>,
 ) {
     // Output shaping: verbosity steering on Anthropic-shaped
     // request bodies. Only runs when the output shaper is
@@ -559,17 +560,25 @@ pub(crate) fn run_output_shaper(
     // Runs in cache mode too: the level is fixed at startup, so
     // the steering block is byte-stable and joins the cached
     // prefix on turn 1 (upstream `c0292984`).
+    // The holdout arm is fixed per conversation, so it keeps that
+    // stability; its labels feed the output-savings ledger.
     if state.config.output_shaper_enabled {
-        let shape_result =
-            crate::output_shaper::shape_request(value, true, state.config.verbosity_level);
+        let shape_result = crate::output_shaper::shape_with_holdout(
+            value,
+            state.config.verbosity_level,
+            state.config.output_holdout,
+        );
         if shape_result.changed {
             *changed = true;
-            tracing::debug!(
-                request_id = %request_id,
-                labels = ?shape_result.labels,
-                "output_shaper applied"
-            );
         }
+        tracing::info!(
+            request_id = %request_id,
+            event = "output_shaper_arm",
+            steered = shape_result.changed,
+            labels = ?shape_result.labels,
+            "output_shaper applied"
+        );
+        labels.extend(shape_result.labels);
     }
 }
 

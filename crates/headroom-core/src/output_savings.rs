@@ -11,12 +11,20 @@
 //! global; Rust checks only the `HEADROOM_STATELESS` env var for the flush
 //! guard (the proxy sets that env for stateless deploys).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// Distinct conversations each arm of a stratum needs before the holdout
+/// difference counts as measured (upstream `53631adb`).
+pub const MEASURED_MIN_CLUSTERS: usize = 5;
+
+/// Cluster tracking saturates here: the count is only compared against
+/// [`MEASURED_MIN_CLUSTERS`], and the ledger is rewritten every 25 requests.
+const CLUSTER_CAP: usize = 32;
 
 /// Coarse input-token bucket boundaries (tokens).
 const INPUT_BUCKETS: [i64; 4] = [2_000, 8_000, 32_000, 128_000];
@@ -132,13 +140,66 @@ pub struct Accum {
     pub sum: f64,
     #[serde(default)]
     pub sumsq: f64,
+    /// Distinct conversations behind the qualified observations, saturating
+    /// at [`CLUSTER_CAP`]. Empty on a ledger written before they were tracked.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub clusters: BTreeSet<String>,
+    /// Count / sum / sum-of-squares over observations that carried a
+    /// conversation. The holdout reads only these, so legacy requests with no
+    /// provenance never ride into a measurement on five fresh conversations.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub qn: i64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub qsum: f64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub qsumsq: f64,
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
 }
 
 impl Accum {
     pub fn add(&mut self, x: f64) {
+        self.add_in(x, None);
+    }
+
+    /// [`Self::add`], also counting `cluster` (the conversation) when known.
+    pub fn add_in(&mut self, x: f64, cluster: Option<&str>) {
         self.n += 1;
         self.sum += x;
         self.sumsq += x * x;
+        let Some(cluster) = cluster else {
+            return;
+        };
+        self.qn += 1;
+        self.qsum += x;
+        self.qsumsq += x * x;
+        if self.clusters.len() < CLUSTER_CAP {
+            self.clusters.insert(cluster.to_string());
+        }
+    }
+
+    /// Mean over the conversation-qualified observations only.
+    pub fn qmean(&self) -> f64 {
+        if self.qn != 0 {
+            self.qsum / self.qn as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Sample variance over the conversation-qualified observations only.
+    pub fn qvar(&self) -> f64 {
+        if self.qn < 2 {
+            return 0.0;
+        }
+        let n = self.qn as f64;
+        ((self.qsumsq - self.qsum * self.qsum / n) / (n - 1.0)).max(0.0)
     }
 
     pub fn mean(&self) -> f64 {
@@ -163,6 +224,15 @@ impl Accum {
         self.n += other.n;
         self.sum += other.sum;
         self.sumsq += other.sumsq;
+        self.qn += other.qn;
+        self.qsum += other.qsum;
+        self.qsumsq += other.qsumsq;
+        for c in &other.clusters {
+            if self.clusters.len() >= CLUSTER_CAP {
+                break;
+            }
+            self.clusters.insert(c.clone());
+        }
     }
 }
 
@@ -307,7 +377,7 @@ pub struct SavingsLedger {
 }
 
 impl SavingsLedger {
-    pub fn record(&mut self, arm: &str, key: &str, output_tokens: i64) {
+    pub fn record(&mut self, arm: &str, key: &str, output_tokens: i64, conversation: Option<&str>) {
         let target = if arm == "treatment" {
             &mut self.treatment
         } else {
@@ -316,7 +386,7 @@ impl SavingsLedger {
         target
             .entry(key.to_string())
             .or_default()
-            .add(output_tokens as f64);
+            .add_in(output_tokens as f64, conversation);
     }
 
     /// Synthetic-control estimate: treatment output vs. offline baseline.
@@ -344,7 +414,13 @@ impl SavingsLedger {
     }
 
     /// A/B measurement: per-stratum control mean minus treatment mean. `None`
-    /// when no stratum has data in both arms.
+    /// when no stratum has conversation-labelled data in both arms from at
+    /// least [`MEASURED_MIN_CLUSTERS`] distinct conversations each.
+    ///
+    /// Assignment is per conversation, so one conversation's requests are one
+    /// draw; the variance below divides by the request count and would read a
+    /// single 2,500-request session as a precise measurement. Thin strata are
+    /// excluded rather than down-weighted (upstream `53631adb`).
     pub fn estimate_from_holdout(&self) -> Option<SavingsEstimate> {
         let mut total_saved = 0.0;
         let mut total_baseline = 0.0;
@@ -355,16 +431,20 @@ impl SavingsLedger {
             let Some(c) = self.control.get(key) else {
                 continue;
             };
-            if c.n == 0 || t.n == 0 {
+            if c.qn == 0 || t.qn == 0 {
+                continue;
+            }
+            if c.clusters.len() < MEASURED_MIN_CLUSTERS || t.clusters.len() < MEASURED_MIN_CLUSTERS
+            {
                 continue;
             }
             contributing += 1;
-            let n = t.n;
+            let n = t.qn;
             n_requests += n;
-            let delta = c.mean() - t.mean();
+            let delta = c.qmean() - t.qmean();
             total_saved += n as f64 * delta;
-            total_baseline += n as f64 * c.mean();
-            var += (n as f64 * n as f64) * (c.var() / c.n as f64 + t.var() / t.n as f64);
+            total_baseline += n as f64 * c.qmean();
+            var += (n as f64 * n as f64) * (c.qvar() / c.qn as f64 + t.qvar() / t.qn as f64);
         }
         if contributing == 0 {
             return None;
@@ -551,6 +631,8 @@ impl SavingsLedger {
 
 const STRATUM_LABEL: &str = "output_shaper:stratum:";
 const CONTROL_LABEL: &str = "output_shaper:control:";
+const CONVERSATION_LABEL: &str = "output_shaper:conv:";
+const CONVERSATION_LABEL_CHARS: usize = 12;
 
 /// Encode (arm, stratum) as a transforms_applied label.
 pub fn stratum_label(arm: &str, key: &str) -> String {
@@ -571,6 +653,22 @@ pub fn parse_stratum_label(label: &str) -> Option<(&'static str, String)> {
         return Some(("control", rest.to_string()));
     }
     None
+}
+
+/// Encode the conversation a request belongs to as a label, so the ledger can
+/// count distinct conversations per arm. `conversation_key` is already a
+/// digest; this only truncates it, so no request content reaches the ledger.
+pub fn conversation_label(conversation_key: &str) -> String {
+    let short: String = conversation_key
+        .chars()
+        .take(CONVERSATION_LABEL_CHARS)
+        .collect();
+    format!("{CONVERSATION_LABEL}{short}")
+}
+
+/// Decode a conversation label, or `None` if not one of ours.
+pub fn parse_conversation_label(label: &str) -> Option<&str> {
+    label.strip_prefix(CONVERSATION_LABEL)
 }
 
 fn process_is_stateless() -> bool {
@@ -606,20 +704,22 @@ impl SavingsRecorder {
 
     /// Record one outcome given its transforms_applied labels. Returns `true` if
     /// a shaping label was found and recorded.
+    ///
+    /// The conversation label may sit either side of the stratum label. A
+    /// request without one still records its output tokens; it just does not
+    /// advance the stratum's cluster count.
     pub fn record_from_labels(&self, labels: &[String], output_tokens: i64) -> bool {
-        for label in labels {
-            let Some((arm, key)) = parse_stratum_label(label) else {
-                continue;
-            };
-            let mut st = self.state.lock().unwrap();
-            st.ledger.record(arm, &key, output_tokens);
-            st.since_flush += 1;
-            if st.since_flush >= self.flush_every {
-                self.flush_locked(&mut st);
-            }
-            return true;
+        let Some((arm, key)) = labels.iter().find_map(|l| parse_stratum_label(l)) else {
+            return false;
+        };
+        let conversation = labels.iter().find_map(|l| parse_conversation_label(l));
+        let mut st = self.state.lock().unwrap();
+        st.ledger.record(arm, &key, output_tokens, conversation);
+        st.since_flush += 1;
+        if st.since_flush >= self.flush_every {
+            self.flush_locked(&mut st);
         }
-        false
+        true
     }
 
     /// Per-request output tokens saved, for the savings rollup.
@@ -869,9 +969,10 @@ mod tests {
     fn holdout_estimate_measured() {
         let mut l = SavingsLedger::default();
         // Same stratum in both arms: control ~100, treatment ~70.
-        for _ in 0..10 {
-            l.record("control", "s|c|s|tools", 100);
-            l.record("treatment", "s|c|s|tools", 70);
+        for i in 0..10 {
+            let conv = format!("c{i}");
+            l.record("control", "s|c|s|tools", 100, Some(&conv));
+            l.record("treatment", "s|c|s|tools", 70, Some(&conv));
         }
         let est = l.estimate_from_holdout().unwrap();
         assert_eq!(est.kind, "measured");
@@ -880,9 +981,88 @@ mod tests {
     }
 
     #[test]
+    fn one_conversation_per_arm_does_not_qualify() {
+        let mut l = SavingsLedger::default();
+        for _ in 0..2_500 {
+            l.record("control", "k", 100, Some("one"));
+            l.record("treatment", "k", 70, Some("two"));
+        }
+        assert!(l.estimate_from_holdout().is_none());
+        assert_eq!(l.best_estimate().kind, "estimated");
+    }
+
+    #[test]
+    fn thin_control_arm_does_not_ride_on_a_thick_treatment_one() {
+        let mut l = SavingsLedger::default();
+        for i in 0..50 {
+            l.record("treatment", "k", 70, Some(&format!("t{i}")));
+        }
+        for i in 0..4 {
+            l.record("control", "k", 100, Some(&format!("c{i}")));
+        }
+        assert!(l.estimate_from_holdout().is_none());
+        l.record("control", "k", 100, Some("c4"));
+        assert!(l.estimate_from_holdout().is_some());
+    }
+
+    #[test]
+    fn legacy_requests_stay_out_of_the_measurement() {
+        let mut l = SavingsLedger::default();
+        // Thousands of unattributed requests, then five conversations an arm.
+        for _ in 0..1_000 {
+            l.record("control", "k", 500, None);
+            l.record("treatment", "k", 10, None);
+        }
+        for i in 0..5 {
+            let conv = format!("c{i}");
+            l.record("control", "k", 100, Some(&conv));
+            l.record("treatment", "k", 70, Some(&conv));
+        }
+        let est = l.estimate_from_holdout().unwrap();
+        assert_eq!(est.n_requests, 5);
+        assert!((est.pct - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cluster_tracking_saturates() {
+        let mut a = Accum::default();
+        for i in 0..100 {
+            a.add_in(1.0, Some(&format!("c{i}")));
+        }
+        assert_eq!(a.clusters.len(), CLUSTER_CAP);
+        assert_eq!(a.qn, 100);
+    }
+
+    #[test]
+    fn accum_without_clusters_serializes_as_before() {
+        let mut a = Accum::default();
+        a.add(3.0);
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            r#"{"n":1,"sum":3.0,"sumsq":9.0}"#
+        );
+    }
+
+    #[test]
+    fn recorder_reads_the_conversation_off_the_label_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = SavingsRecorder::new(dir.path().join("os.json"), 1_000);
+        let labels = vec![
+            conversation_label("abcdef0123456789"),
+            stratum_label("control", "k"),
+        ];
+        assert!(rec.record_from_labels(&labels, 100));
+        assert!(rec.record_from_labels(&[stratum_label("control", "k")], 100));
+        let st = rec.state.lock().unwrap();
+        let c = st.ledger.control.get("k").unwrap();
+        assert_eq!((c.n, c.qn), (2, 1));
+        assert!(c.clusters.contains("abcdef012345"));
+    }
+
+    #[test]
     fn holdout_none_without_both_arms() {
         let mut l = SavingsLedger::default();
-        l.record("treatment", "k", 50);
+        l.record("treatment", "k", 50, None);
         assert!(l.estimate_from_holdout().is_none());
         // best_estimate falls back to baseline path (empty → 0 pct).
         assert_eq!(l.best_estimate().kind, "estimated");
@@ -893,8 +1073,8 @@ mod tests {
         let mut l = SavingsLedger::default();
         l.baseline.observe("k", 100);
         l.baseline.observe("k", 100);
-        l.record("treatment", "k", 60);
-        l.record("treatment", "k", 80);
+        l.record("treatment", "k", 60, None);
+        l.record("treatment", "k", 80, None);
         let est = l.estimate_from_baseline();
         assert_eq!(est.kind, "estimated");
         // baseline mean 100, treatment mean 70, n=2 → saved 60, baseline 200 → 30%.
@@ -907,7 +1087,7 @@ mod tests {
         let path = dir.path().join("os.json");
         let mut l = SavingsLedger::default();
         l.baseline.observe("k", 100);
-        l.record("treatment", "k", 70);
+        l.record("treatment", "k", 70, None);
         l.save(&path).unwrap();
         let loaded = SavingsLedger::load(&path);
         assert_eq!(loaded.baseline.total_samples(), 1);
@@ -1086,7 +1266,7 @@ mod tests {
         clear_modelled_factors();
         let mut l = SavingsLedger::default();
         for _ in 0..10 {
-            l.record("treatment", "k", 70);
+            l.record("treatment", "k", 70, None);
         }
         assert!(l.estimate_from_model(3).is_none());
         // And the level-less default never invents a modelled number either.
@@ -1102,7 +1282,7 @@ mod tests {
         // Observed 800 post-shaping tokens at r=0.20: unshaped would have been
         // 1000, so saved = 200 (not the naive 800*0.20 = 160).
         for _ in 0..8 {
-            l.record("treatment", "k", 100);
+            l.record("treatment", "k", 100, None);
         }
         let est = l.estimate_from_model(3).unwrap();
         assert_eq!(est.kind, "modelled");
@@ -1124,20 +1304,21 @@ mod tests {
         register_modelled_factors(3, 0.20, 0.40).unwrap();
         // Holdout data outranks the factor table.
         let mut l = SavingsLedger::default();
-        for _ in 0..10 {
-            l.record("control", "k", 100);
-            l.record("treatment", "k", 70);
+        for i in 0..10 {
+            let conv = format!("c{i}");
+            l.record("control", "k", 100, Some(&conv));
+            l.record("treatment", "k", 70, Some(&conv));
         }
         assert_eq!(l.best_estimate_with_level(Some(3)).kind, "measured");
         // So does a learned baseline.
         let mut l = SavingsLedger::default();
         l.baseline.observe("k", 100);
         l.baseline.observe("k", 100);
-        l.record("treatment", "k", 70);
+        l.record("treatment", "k", 70, None);
         assert_eq!(l.best_estimate_with_level(Some(3)).kind, "estimated");
         // With neither, the level unlocks the modelled fallback.
         let mut l = SavingsLedger::default();
-        l.record("treatment", "k", 70);
+        l.record("treatment", "k", 70, None);
         assert_eq!(l.best_estimate_with_level(Some(3)).kind, "modelled");
         assert_eq!(l.best_estimate_with_level(None).kind, "estimated");
         clear_modelled_factors();

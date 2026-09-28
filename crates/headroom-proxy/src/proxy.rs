@@ -606,6 +606,9 @@ pub(crate) async fn forward_http(
             rebuild_boundary,
             pre_boundary_agreement,
         );
+        // Output-shaper holdout labels; they join `transforms_applied` once the
+        // outcome context exists, which is how the savings ledger sees them.
+        let mut shaper_labels = Vec::new();
         let buffered = forward::run_ctx_transform_gate(
             buffered,
             endpoint,
@@ -622,6 +625,7 @@ pub(crate) async fn forward_http(
             &mut stage_timer,
             &mut ctx_transform_tokens_saved,
             &mut proactive_expansion_applied,
+            &mut shaper_labels,
         )
         .await;
 
@@ -690,6 +694,9 @@ pub(crate) async fn forward_http(
             },
             _tags.clone(),
         ));
+        if let Some(ctx) = outcome_ctx.as_mut() {
+            ctx.transforms_applied.extend(shaper_labels);
+        }
         forward::record_compression_observations(
             &state,
             &request_id,

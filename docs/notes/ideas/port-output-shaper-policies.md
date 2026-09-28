@@ -1,7 +1,7 @@
 # Idea: port the upstream output-shaper policy split
 
 - **Status:** open, narrowed 2026-09-28 — 9 of 20 commits are pure file
-  splits; 2 behaviour items left, 1 blocked.
+  splits; 1 behaviour item left.
 - **Source:** `docs/notes/upstream-port-backlog.md` group A (range
   `42ebbc6c..904bc675`)
 - **Summary:** upstream split output-shaping into single-purpose policy modules
@@ -44,8 +44,18 @@ Left:
    prompt, and so costs a recache, with or without the fix. The shaper is
    also off live (`--output-shaper` defaults false and the flag file does
    not set it; 0 of 1,600 outbound bodies carry the block).
-4. Blocked: `53631adb` (holdout counts conversations). `assign_arm` has no
-   production caller, so there is no holdout to fix.
+4. Done 2026-09-28: `53631adb` (holdout counts conversations) plus the
+   wiring it lacked. `--output-holdout` / `HEADROOM_OUTPUT_HOLDOUT` sets
+   the control share; `shape_with_holdout` (`output_shaper.rs`) assigns
+   the arm per conversation, steers only treatment, and labels every
+   request with arm, stratum and conversation for the savings ledger, on
+   both the Claude and routed paths. The conversation is Claude Code's
+   session id, not upstream's first-text-block key: that block is a
+   shared `<system-reminder>`, and with upstream's key all ten sessions
+   in `integration_output_holdout.rs` land in one arm. Idle until
+   `--output-shaper` is on; the trial is to run it with
+   `--output-holdout 0.5` and read `headroom` output savings plus
+   `text_chars` per `end_turn` by arm (`output_shaper_arm` log event).
 
 Also belongs here from the server re-diff: `/stats output_reduction`
 (`074f0ae9`), which needs a shaper ledger first.

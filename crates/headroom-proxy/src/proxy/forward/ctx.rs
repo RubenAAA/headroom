@@ -605,6 +605,7 @@ pub(crate) async fn run_ctx_transform_gate(
     stage_timer: &mut crate::stage_timer::StageTimer,
     ctx_transform_tokens_saved: &mut i64,
     proactive_expansion_applied: &mut bool,
+    shaper_labels: &mut Vec<String>,
 ) -> bytes::Bytes {
     let CtxGateInputs {
         state,
@@ -665,7 +666,13 @@ pub(crate) async fn run_ctx_transform_gate(
                     &mut changed,
                 );
 
-                forward::run_output_shaper(&mut value, state, request_id, &mut changed);
+                forward::run_output_shaper(
+                    &mut value,
+                    state,
+                    request_id,
+                    &mut changed,
+                    shaper_labels,
+                );
 
                 forward::restore_deferred_memory_answer(&mut value, request_id, &mut changed);
 

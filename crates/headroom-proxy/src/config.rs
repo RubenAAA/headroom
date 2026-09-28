@@ -1438,6 +1438,17 @@ pub struct CliArgs {
     )]
     pub output_shaper_enabled: bool,
 
+    /// Share of conversations, 0-1, the output shaper leaves unsteered as
+    /// the A/B control for the output-savings ledger. Assignment is per
+    /// conversation, so no conversation's system prompt changes mid-session.
+    /// 0 steers every conversation.
+    #[arg(
+        long = "output-holdout",
+        env = "HEADROOM_OUTPUT_HOLDOUT",
+        default_value_t = 0.0
+    )]
+    pub output_holdout: f64,
+
     /// Verbosity steering level 0-4. 0 = off, 1 = skip preamble,
     /// 2 = default, 3 = conclusions only, 4 = minimum tokens.
     #[arg(
@@ -2533,6 +2544,8 @@ pub struct Config {
     /// Master switch for output-token shaping (verbosity steering).
     /// Env-driven via HEADROOM_OUTPUT_SHAPER.
     pub output_shaper_enabled: bool,
+    /// Control share of the output-shaper holdout, 0-1.
+    pub output_holdout: f64,
     /// Verbosity steering level 0-4 (0 = off, 4 = minimum tokens).
     pub verbosity_level: i32,
     /// Shared ceiling on bytes one request may gain across all injection
@@ -2846,6 +2859,7 @@ impl Config {
             ),
             provider_name: args.provider_name.clone(),
             output_shaper_enabled: args.output_shaper_enabled,
+            output_holdout: args.output_holdout.clamp(0.0, 1.0),
             verbosity_level: args.verbosity_level.clamp(0, 4),
             max_injection_bytes: args.max_injection_bytes,
             memory_enabled: args.memory_enabled,
@@ -3093,6 +3107,7 @@ impl Config {
             // actively overrode the good server default).
             mode: crate::modes::PROXY_MODE_CACHE.to_string(),
             output_shaper_enabled: false,
+            output_holdout: 0.0,
             verbosity_level: 2,
             max_injection_bytes: crate::injection_budget::DEFAULT_MAX_INJECTION_BYTES,
             memory_enabled: false,
