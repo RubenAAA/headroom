@@ -1525,7 +1525,10 @@ pub fn strategy_from_detection(
         ContentType::BuildOutput => CompressionStrategy::Log,
         ContentType::GitDiff => CompressionStrategy::Diff,
         ContentType::Html => CompressionStrategy::Html,
-        ContentType::Tabular => CompressionStrategy::Kompress,
+        // Never Kompress: it drops words inside rows, so some rows would lose
+        // a field and others not, with nothing marking which (upstream
+        // `6c9aef1d`). No tabular compressor runs here, so tables pass through.
+        ContentType::Tabular => CompressionStrategy::Tabular,
         ContentType::StructuredConfig => CompressionStrategy::Config,
         ContentType::PlainText => CompressionStrategy::Kompress,
     }

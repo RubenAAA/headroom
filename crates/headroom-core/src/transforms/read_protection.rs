@@ -261,11 +261,32 @@ pub fn read_output_should_be_protected(text: &str) -> bool {
     if text.is_empty() {
         return false;
     }
-    !RELEASABLE_READ_TYPES.contains(&detect_content_type(text).content_type)
+    let detection = detect_content_type(text);
+    // Space-aligned columns are also what hand-aligned files look like
+    // (/etc/fstab, a block of C #defines), so a READ of one stays byte-exact.
+    // Only delimited and markdown tables are released (upstream `6c9aef1d`).
+    if detection.metadata.get("format").and_then(|v| v.as_str()) == Some("fixed_width") {
+        return true;
+    }
+    !RELEASABLE_READ_TYPES.contains(&detection.content_type)
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_fixed_width_read_stays_protected_but_a_csv_is_released() {
+        let ls = crate::transforms::content_detector::tests::ls_issue_payload();
+        assert!(read_output_should_be_protected(&ls));
+        let csv = format!(
+            "id,name,city\n{}",
+            (0..30)
+                .map(|i| format!("{i},user_{i},city_{}", i % 5))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(!read_output_should_be_protected(&csv));
+    }
     use super::*;
 
     #[test]

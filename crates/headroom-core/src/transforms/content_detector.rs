@@ -414,6 +414,11 @@ pub fn detect_content_type(content: &str) -> DetectionResult {
     {
         return r;
     }
+    // Space-aligned command output (`ls -l`, `ps aux`, `docker ps`). Last, so
+    // it only claims content that would otherwise be plain text.
+    if let Some(r) = try_detect_fixed_width(content) {
+        return r;
+    }
     DetectionResult::plain_text(0.5)
 }
 
@@ -1164,6 +1169,94 @@ fn try_detect_tabular(content: &str) -> Option<DetectionResult> {
     try_detect_delimited(&lines)
 }
 
+// Fixed-width (space-aligned) command output: `ls -l`, `ps aux`, `df -h`,
+// `docker ps`, `kubectl get`. These rows have no delimiter, so without this
+// check they fall through to plain text and the prose compressor drops fields
+// out of individual rows with nothing marking which row lost what (upstream
+// #3652, ported from `6c9aef1d`).
+static FIXED_WIDTH_LIST_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s").expect("valid"));
+static FIXED_WIDTH_PROSE_END_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[A-Za-z][.!?]["')\]]?$"#).expect("valid"));
+const FIXED_WIDTH_CODE_ENDS: &[char] = &['{', '}', ';', '(', ')', ',', ':', '\\'];
+const FIXED_WIDTH_CODE_STARTS: &[&str] = &["#", "//", "/*", "--"];
+const FIXED_WIDTH_MAX_COLS: usize = 400;
+
+/// Count the column gaps shared by at least 90% of `lines`.
+///
+/// A gutter is a character position that holds a space strictly inside the
+/// text (after the first non-space character; lines are right-trimmed) on
+/// nearly every line. Adjacent gutter positions count as one gap, so a table
+/// with N columns has N - 1 gaps. Prose and code line up by accident on one
+/// position at most, not on several.
+fn fixed_width_gutters(lines: &[&str]) -> usize {
+    let need = (9 * lines.len()).div_ceil(10);
+    let mut hits = [0usize; FIXED_WIDTH_MAX_COLS];
+    for ln in lines {
+        let chars: Vec<char> = ln.chars().take(FIXED_WIDTH_MAX_COLS).collect();
+        let start = chars.iter().take_while(|c| **c == ' ').count();
+        for (i, c) in chars.iter().enumerate().skip(start) {
+            if *c == ' ' {
+                hits[i] += 1;
+            }
+        }
+    }
+    let mut gaps = 0;
+    let mut in_gap = false;
+    for count in hits {
+        let is_gutter = count >= need;
+        if is_gutter && !in_gap {
+            gaps += 1;
+        }
+        in_gap = is_gutter;
+    }
+    gaps
+}
+
+/// Detect space-aligned columns (at least 3 of them) in command output.
+///
+/// Runs last, only for content that would otherwise be plain text, so it
+/// never takes content away from another detector. A false positive costs
+/// savings, not correctness: tabular content is never sent to Kompress.
+fn try_detect_fixed_width(content: &str) -> Option<DetectionResult> {
+    let lines: Vec<&str> = content
+        .split('\n')
+        .filter(|ln| !ln.trim().is_empty())
+        .map(str::trim_end)
+        .take(50)
+        .collect();
+    if lines.len() < 4 || lines.iter().any(|ln| ln.contains('\t')) {
+        return None;
+    }
+    let n = lines.len() as f64;
+    let share = |pred: &dyn Fn(&str) -> bool| lines.iter().filter(|ln| pred(ln)).count() as f64 / n;
+    if share(&|ln| FIXED_WIDTH_LIST_RE.is_match(ln)) >= 0.5
+        || share(&|ln| FIXED_WIDTH_PROSE_END_RE.is_match(ln)) >= 0.3
+        || share(&|ln| {
+            ln.ends_with(FIXED_WIDTH_CODE_ENDS)
+                || FIXED_WIDTH_CODE_STARTS
+                    .iter()
+                    .any(|p| ln.trim_start().starts_with(p))
+        }) >= 0.3
+    {
+        return None;
+    }
+
+    let mut gaps = fixed_width_gutters(&lines);
+    if gaps < 2 && lines.len() >= 5 {
+        // A one-line preamble (`total 480` above `ls -l` rows) has no gaps of
+        // its own; measure the rows without it.
+        gaps = fixed_width_gutters(&lines[1..]);
+    }
+    if gaps < 2 {
+        return None;
+    }
+    let mut meta = Map::new();
+    meta.insert("format".into(), json!("fixed_width"));
+    meta.insert("columns".into(), json!(gaps + 1));
+    Some(DetectionResult::new(ContentType::Tabular, 0.7, meta))
+}
+
 fn try_detect_code(content: &str) -> Option<DetectionResult> {
     let lines: Vec<&str> = content.split('\n').take(100).collect();
     if lines.is_empty() {
@@ -1240,7 +1333,70 @@ fn try_detect_code(content: &str) -> Option<DetectionResult> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+
+    /// `ls -l` as in upstream issue #3652: single-space separators, sizes
+    /// of varying width, and a `total` preamble.
+    pub(crate) fn ls_issue_payload() -> String {
+        let rows: Vec<String> = (1..60)
+            .map(|d| {
+                format!(
+                    "-rw-r--r--  1 tejas staff {} Sep {d} 09:{d:02} file_{d}.py",
+                    1000 + (d * 7919) % 98000
+                )
+            })
+            .collect();
+        format!("total 480\n{}", rows.join("\n"))
+    }
+
+    #[test]
+    fn fixed_width_command_output_is_tabular() {
+        let ls_macos = "total 64\ndrwxr-xr-x  12 tejas  staff    384 Sep 18 09:01 .\ndrwxr-xr-x   5 tejas  staff    160 Sep 17 11:20 ..\n-rw-r--r--   1 tejas  staff   1834 Sep 18 09:01 README.md\n-rw-r--r--   1 tejas  staff  18611 Sep 18 09:01 setup.py\ndrwxr-xr-x   8 tejas  staff    256 Sep 18 09:01 src";
+        let kubectl = "NAME                     READY   STATUS    RESTARTS   AGE\napi-7d9f8b6c4-2xkqp      1/1     Running   0          3d\napi-7d9f8b6c4-9wz7m      1/1     Running   0          3d\nworker-5c8d7f9b8-lq2vx   1/1     Running   2          5h\nredis-0                  1/1     Running   0          12d";
+        let ps_aux = "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot         1  0.0  0.1 168100 11520 ?        Ss   Sep17   0:04 /sbin/init\nroot         2  0.0  0.0      0     0 ?        S    Sep17   0:00 [kthreadd]\ntejas     4121  1.2  2.3 912344 190220 pts/0  Sl+  09:01   0:12 python app.py\ntejas     4188  0.0  0.0  10072  3300 pts/1    R+   09:05   0:00 ps aux";
+        let df_h = "Filesystem      Size  Used Avail Use% Mounted on\n/dev/nvme0n1p2  468G  201G  244G  46% /\ntmpfs            16G  1.2M   16G   1% /dev/shm\n/dev/nvme0n1p1  511M  6.1M  505M   2% /boot/efi\ntmpfs           3.2G  2.4M  3.2G   1% /run/user/1000";
+        let ls = ls_issue_payload();
+        for (name, content) in [
+            ("ls_issue", ls.as_str()),
+            ("ls_macos", ls_macos),
+            ("kubectl", kubectl),
+            ("ps_aux", ps_aux),
+            ("df_h", df_h),
+        ] {
+            let r = detect_content_type(content);
+            assert_eq!(r.content_type, ContentType::Tabular, "{name}");
+            assert_eq!(r.metadata["format"], "fixed_width", "{name}");
+            assert!(r.metadata["columns"].as_u64().unwrap() >= 3, "{name}");
+        }
+    }
+
+    #[test]
+    fn fixed_width_does_not_claim_non_tables() {
+        let git_status = format!(
+            "On branch main\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n{}",
+            (0..10)
+                .map(|i| format!("\tmodified:   src/m_{i}.py"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        for (name, content) in [
+            ("bullets", "- first item in the list\n- second item in the list\n- third item in the list\n- fourth item in the list".to_string()),
+            ("numbered", "1. install the package\n2. run the proxy\n3. wrap the agent\n4. check the stats".to_string()),
+            ("sql", "SELECT id, name\nFROM users\nWHERE active = 1\nORDER BY name;\n-- comment\nLIMIT 10;".to_string()),
+            ("c_defines", "#define FOO 1\n#define BAR 2\n#define BAZ 3\n#define QUX 4".to_string()),
+            ("git_status", git_status),
+            ("git_log", "3aa5012 perf(memory/budget): precompute word sets once\nc81378c fix(grok): preserve xAI model context metadata\nb0c19a2 fix(security): reject unauthenticated public proxy binds\n871bbde fix(proxy): reject Anthropic batch operations on Copilot\na29162b fix(dashboard): separate rolling cache economics by owner".to_string()),
+            ("wrapped_prose", "Headroom compresses tool output before it reaches the model, which saves\ntokens on long agent sessions. The router picks a compressor per content\ntype, and plain prose goes to Kompress, an ML model that drops words it\npredicts the reader can do without. That is fine for prose and wrong for\nrecords, where every field matters to whatever command runs next, so the\ndetector has to tell the two apart before anything is dropped at all.".to_string()),
+        ] {
+            // What each is otherwise (SQL reads as code here) is not the
+            // point; none of them is a table.
+            assert_ne!(
+                detect_content_type(&content).content_type,
+                ContentType::Tabular,
+                "{name}"
+            );
+        }
+    }
 
     fn timestamped_log(sep: char) -> String {
         (0..120)

@@ -206,11 +206,30 @@ pub fn parse_tabular(content: &str) -> Option<(Vec<String>, Vec<Vec<String>>, St
     if rows.iter().any(|row| row.len() != width) {
         return None;
     }
+    // The detector finds fixed-width columns by single-space gutters, but the
+    // parser splits on 2+ spaces, so a table like GNU `ls -l` can come back as
+    // one cell per line. That is not a table; leave it verbatim.
+    if fmt == "fixed_width" && width < 2 {
+        return None;
+    }
     Some((headers, rows, fmt.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn single_column_fixed_width_is_not_a_table() {
+        // Single-space separators: the detector sees aligned columns, but the
+        // 2+-space splitter returns one cell per line.
+        let ls = (1..=5)
+            .map(|i| format!("-rw-r--r-- 1 a b {i} f{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detection = detect_content_type(&ls);
+        assert_eq!(detection.metadata["format"], "fixed_width");
+        assert!(parse_tabular(&ls).is_none());
+    }
     use super::*;
 
     const CSV: &str = "name,age,city\nAlice,30,NYC\nBob,25,LA\nCara,40,SF";
