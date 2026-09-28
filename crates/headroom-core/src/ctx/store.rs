@@ -341,7 +341,7 @@ impl CtxStore {
         // applies are process-wide and have to precede the first connection.
         crate::sqlite_tuning::apply();
         let path = db_path.as_ref().to_path_buf();
-        let conn = Connection::open(&path)?;
+        let conn = crate::private_db::open(&path)?;
 
         // WAL + NORMAL: readers don't block writers, and a power-loss-truncated
         // row costs at most one search miss (same rationale as ccr/sqlite.rs).

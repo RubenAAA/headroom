@@ -85,7 +85,7 @@ impl SqliteCcrStore {
         max_lifetime_seconds: u64,
     ) -> rusqlite::Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
-        let conn = Connection::open(&path_buf)?;
+        let conn = crate::private_db::open(&path_buf)?;
 
         // WAL gives us readers-don't-block-writers. `synchronous=NORMAL`
         // is the WAL-recommended setting (FULL is overkill for a CCR

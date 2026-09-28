@@ -207,7 +207,7 @@ impl PageStore {
 
     /// Open (creating) the sidecar at `db_path`.
     pub fn open(db_path: &Path) -> rusqlite::Result<Self> {
-        let conn = Connection::open(db_path)?;
+        let conn = headroom_core::private_db::open(db_path)?;
         Self::init(&conn)?;
         Ok(Self { conn })
     }

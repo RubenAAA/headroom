@@ -277,7 +277,7 @@ impl OffloadStore {
 
 impl IndexOutbox {
     fn open(path: &Path) -> std::io::Result<Self> {
-        let conn = Connection::open(path).map_err(std::io::Error::other)?;
+        let conn = headroom_core::private_db::open(path).map_err(std::io::Error::other)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(std::io::Error::other)?;
         // The queue is the only retained copy after a CCR TTL or restart, so

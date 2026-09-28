@@ -52,7 +52,7 @@ impl MemoryRecordStore {
     /// Open (or create) the store at `db_path`. Pass `":memory:"` for a
     /// per-connection ephemeral store.
     pub fn open(db_path: impl AsRef<Path>) -> rusqlite::Result<Self> {
-        let conn = Connection::open(db_path)?;
+        let conn = crate::private_db::open(db_path)?;
 
         // One store is shared by every session and every account, so writes
         // arrive concurrently. WAL lets readers run through a write, and the

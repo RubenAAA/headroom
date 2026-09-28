@@ -220,21 +220,24 @@ pub fn save_oauth_token(token: &str, domain: &str) -> Result<PathBuf, Error> {
         "refresh": token,
         "type": "oauth",
     });
-    // FINDING-032 (TOCTOU): create with 0600 atomically — write-then-chmod
-    // leaves the token world-readable under a standard 022 umask until the
-    // chmod lands. OpenOptions with `.create_new()` also avoids clobbering
-    // an existing token file's permissions on re-save.
+    // FINDING-032 (TOCTOU): write-then-chmod leaves the token world-readable
+    // under a standard 022 umask until the chmod lands, and re-saving into an
+    // existing 0644 file has the same gap (upstream 9b8cae84). So write a
+    // fresh 0600 file beside it and rename it over the old one.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        opts.mode(0o600);
-        opts.open(&path)?
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?
             .write_all(format!("{}\n", serde_json::to_string_pretty(&body)?).as_bytes())?;
-        // Re-saving must tighten, not just create: an existing file keeps
-        // its old mode through open().
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        std::fs::rename(&tmp, &path)?;
     }
     #[cfg(not(unix))]
     {
@@ -340,6 +343,18 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&file).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+        }
+        // Re-saving over a file an older build left 0644 replaces it with a
+        // fresh 0600 one instead of writing the token into the open file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            save_oauth_token("gho_second", "github.com").unwrap();
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            assert_eq!(read_oauth_token().as_deref(), Some("gho_second"));
+            assert!(!dir.path().join("auth.json.tmp").exists());
         }
         // Wrong type → None.
         std::fs::write(&file, r#"{"type":"pat","refresh":"x"}"#).unwrap();

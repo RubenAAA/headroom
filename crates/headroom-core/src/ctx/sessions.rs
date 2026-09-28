@@ -201,7 +201,7 @@ impl SessionsStore {
     /// and adds the `conv_prefix_chain` table if absent.
     pub fn open(db_path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let path = db_path.as_ref().to_path_buf();
-        let conn = Connection::open(&path)?;
+        let conn = crate::private_db::open(&path)?;
         // A background `CREATE INDEX` holds the write lock for as long as it
         // takes to build. Without a timeout every concurrent insert would fail
         // instantly with SQLITE_BUSY instead of waiting the build out. Reads
