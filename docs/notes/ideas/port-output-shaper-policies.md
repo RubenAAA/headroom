@@ -1,7 +1,7 @@
 # Idea: port the upstream output-shaper policy split
 
 - **Status:** open, narrowed 2026-09-28 — 9 of 20 commits are pure file
-  splits; 3 behaviour items left, 1 blocked.
+  splits; 2 behaviour items left, 1 blocked.
 - **Source:** `docs/notes/upstream-port-backlog.md` group A (range
   `42ebbc6c..904bc675`)
 - **Summary:** upstream split output-shaping into single-purpose policy modules
@@ -36,11 +36,14 @@ Left:
    message). The shaper runs on Anthropic bodies only
    (`forward/ctx.rs:619-622`). New bytes in cached prefixes, so ship with
    byte-stability tests.
-3. Not from the range: `apply_verbosity_steering` appends a second block
-   when the level changes (`output_shaper.rs:197-206`) where Python
-   replaces in place. The level is fixed at startup, so it bites only after
-   a restart with a new level, and then rewrites every open conversation's
-   system prefix. Verified.
+3. Dropped 2026-09-28: `apply_verbosity_steering` appends a second block
+   on a level change (`output_shaper.rs`) where Python replaces in place.
+   The branch never runs: the proxy adds the block to the forwarded body
+   and the client never sends it back (0 of 1,600 captured inbound bodies
+   carry `<headroom_output_shaping>`). A level change rewrites the system
+   prompt, and so costs a recache, with or without the fix. The shaper is
+   also off live (`--output-shaper` defaults false and the flag file does
+   not set it; 0 of 1,600 outbound bodies carry the block).
 4. Blocked: `53631adb` (holdout counts conversations). `assign_arm` has no
    production caller, so there is no holdout to fix.
 
