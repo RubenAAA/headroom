@@ -360,6 +360,11 @@ struct Lifetime {
     output_tokens_saved: i64,
     #[serde(default)]
     output_savings_usd: f64,
+    /// Emitted output priced at the output rate (upstream `c766bdb2`): the
+    /// output half of the bill, so a share-of-bill rate whose numerator holds
+    /// output savings has a denominator that holds output spend.
+    #[serde(default)]
+    total_output_cost_usd: f64,
     /// Bill the requested model never saw because the router served the turn
     /// on a cheaper one (`would_have_cost − did_cost`, clamped ≥ 0).
     /// `#[serde(default)]` so older state files still load.
@@ -383,6 +388,7 @@ impl Default for Lifetime {
             total_input_cost_usd: 0.0,
             output_tokens_saved: 0,
             output_savings_usd: 0.0,
+            total_output_cost_usd: 0.0,
             offload_savings_usd: 0.0,
             cache_read_tokens: 0,
             cache_savings_usd: 0.0,
@@ -462,6 +468,8 @@ struct HistoryEntry {
     output_tokens_saved: i64,
     #[serde(default)]
     output_savings_usd: f64,
+    #[serde(default)]
+    total_output_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -806,6 +814,7 @@ impl SavingsTracker {
             total_input_cost_usd: st.lifetime.total_input_cost_usd,
             output_tokens_saved: st.lifetime.output_tokens_saved,
             output_savings_usd: st.lifetime.output_savings_usd,
+            total_output_cost_usd: st.lifetime.total_output_cost_usd,
         };
         Self::push_history(&mut st, entry);
         self.trim_history(&mut st, ts);
@@ -840,6 +849,10 @@ impl SavingsTracker {
         let delta_output_tokens_saved = coerce_int(rec.output_tokens_saved).max(0);
         let delta_output_savings_usd =
             estimate_output_savings_usd(rec.model, delta_output_tokens_saved);
+        // Emitted output, disjoint from `output_tokens_saved`, priced from the
+        // same table so spend and savings agree even for an unpriced model.
+        let delta_output_cost_usd =
+            estimate_output_savings_usd(rec.model, coerce_int(rec.output_tokens).max(0));
         let delta_input_cost_usd = estimate_input_cost_usd(
             rec.model,
             delta_input_tokens,
@@ -913,6 +926,8 @@ impl SavingsTracker {
         st.lifetime.output_tokens_saved += delta_output_tokens_saved;
         st.lifetime.output_savings_usd =
             round_n(st.lifetime.output_savings_usd + delta_output_savings_usd, 6);
+        st.lifetime.total_output_cost_usd =
+            round_n(st.lifetime.total_output_cost_usd + delta_output_cost_usd, 6);
         st.lifetime.offload_savings_usd = round_n(
             st.lifetime.offload_savings_usd + delta_offload_savings_usd,
             6,
@@ -991,6 +1006,7 @@ impl SavingsTracker {
                 total_input_cost_usd: st.lifetime.total_input_cost_usd,
                 output_tokens_saved: st.lifetime.output_tokens_saved,
                 output_savings_usd: st.lifetime.output_savings_usd,
+                total_output_cost_usd: st.lifetime.total_output_cost_usd,
             };
             Self::push_history(&mut st, entry);
             self.trim_history(&mut st, ts);
@@ -1595,6 +1611,7 @@ impl SavingsTracker {
         let mut prev_input_cost = 0.0f64;
         let mut prev_output_tokens = 0i64;
         let mut prev_output_usd = 0.0f64;
+        let mut prev_output_cost = 0.0f64;
 
         for point in history {
             let Some(ts) = parse_timestamp(&point.timestamp) else {
@@ -1608,12 +1625,14 @@ impl SavingsTracker {
             let total_input_cost = coerce_float(point.total_input_cost_usd);
             let total_output_tokens = coerce_int(point.output_tokens_saved);
             let total_output_usd = coerce_float(point.output_savings_usd);
+            let total_output_cost = coerce_float(point.total_output_cost_usd);
             let delta_tokens = (total_tokens - prev_tokens).max(0);
             let delta_usd = (total_usd - prev_usd).max(0.0);
             let delta_input_tokens = (total_input_tokens - prev_input_tokens).max(0);
             let delta_input_cost = (total_input_cost - prev_input_cost).max(0.0);
             let delta_output_tokens = (total_output_tokens - prev_output_tokens).max(0);
             let delta_output_usd = (total_output_usd - prev_output_usd).max(0.0);
+            let delta_output_cost = (total_output_cost - prev_output_cost).max(0.0);
 
             prev_tokens = total_tokens;
             prev_usd = total_usd;
@@ -1621,6 +1640,7 @@ impl SavingsTracker {
             prev_input_cost = total_input_cost;
             prev_output_tokens = total_output_tokens;
             prev_output_usd = total_output_usd;
+            prev_output_cost = total_output_cost;
 
             let entry = agg.entry(key.clone()).or_insert_with(|| {
                 order.push(key.clone());
@@ -1645,6 +1665,9 @@ impl SavingsTracker {
             entry.output_tokens_saved_delta += delta_output_tokens;
             entry.output_savings_usd_delta =
                 round_n(entry.output_savings_usd_delta + delta_output_usd, 6);
+            entry.total_output_cost_usd_delta =
+                round_n(entry.total_output_cost_usd_delta + delta_output_cost, 6);
+            entry.total_output_cost_usd = round_n(total_output_cost, 6);
 
             if delta_tokens != 0
                 || delta_usd != 0.0
@@ -1736,6 +1759,11 @@ impl SavingsTracker {
                 .and_then(Value::as_f64)
                 .map(coerce_float)
                 .unwrap_or(0.0),
+            total_output_cost_usd: lr
+                .and_then(|l| l.get("total_output_cost_usd"))
+                .and_then(Value::as_f64)
+                .map(coerce_float)
+                .unwrap_or(0.0),
             // Absent from state files written before router-offload
             // accounting; default to zero rather than rejecting the file.
             offload_savings_usd: lr
@@ -1767,9 +1795,22 @@ impl SavingsTracker {
             lifetime.total_input_cost_usd = lifetime
                 .total_input_cost_usd
                 .max(coerce_float(last.total_input_cost_usd));
+            // The output side checkpoints the same way, so it recovers the
+            // same way; otherwise a restart zeroed it while history kept the
+            // old totals, and the rollup's clamped delta swallowed the gap.
+            lifetime.output_tokens_saved =
+                lifetime.output_tokens_saved.max(last.output_tokens_saved);
+            lifetime.output_savings_usd = lifetime
+                .output_savings_usd
+                .max(coerce_float(last.output_savings_usd));
+            lifetime.total_output_cost_usd = lifetime
+                .total_output_cost_usd
+                .max(coerce_float(last.total_output_cost_usd));
         }
         lifetime.compression_savings_usd = round_n(lifetime.compression_savings_usd, 6);
         lifetime.total_input_cost_usd = round_n(lifetime.total_input_cost_usd, 6);
+        lifetime.output_savings_usd = round_n(lifetime.output_savings_usd, 6);
+        lifetime.total_output_cost_usd = round_n(lifetime.total_output_cost_usd, 6);
 
         let mut st = State {
             lifetime,
@@ -2148,6 +2189,7 @@ fn lifetime_value(l: &Lifetime) -> Value {
         "total_input_cost_usd": l.total_input_cost_usd,
         "output_tokens_saved": l.output_tokens_saved,
         "output_savings_usd": l.output_savings_usd,
+        "total_output_cost_usd": l.total_output_cost_usd,
         "offload_savings_usd": l.offload_savings_usd,
         "cache_read_tokens": l.cache_read_tokens,
         "cache_savings_usd": l.cache_savings_usd,
@@ -2234,6 +2276,7 @@ fn history_entry_value(e: &HistoryEntry) -> Value {
         "total_input_cost_usd": e.total_input_cost_usd,
         "output_tokens_saved": e.output_tokens_saved,
         "output_savings_usd": e.output_savings_usd,
+        "total_output_cost_usd": e.total_output_cost_usd,
     })
 }
 
@@ -2256,7 +2299,7 @@ fn projects_persist_value(projects: &BTreeMap<String, ProjectEntry>) -> Value {
 }
 
 fn normalize_history_entry(entry: &Value) -> Option<HistoryEntry> {
-    let (timestamp, provider, model, tts, csu, crt, crs, tit, tic, ots, osu) =
+    let (timestamp, provider, model, tts, csu, crt, crs, tit, tic, ots, osu, toc) =
         if let Some(obj) = entry.as_object() {
             (
                 parse_timestamp(obj.get("timestamp").and_then(Value::as_str).unwrap_or(""))?,
@@ -2297,6 +2340,10 @@ fn normalize_history_entry(entry: &Value) -> Option<HistoryEntry> {
                     .and_then(Value::as_f64)
                     .map(coerce_float)
                     .unwrap_or(0.0),
+                obj.get("total_output_cost_usd")
+                    .and_then(Value::as_f64)
+                    .map(coerce_float)
+                    .unwrap_or(0.0),
             )
         } else if let Some(arr) = entry.as_array() {
             if arr.len() < 2 {
@@ -2326,6 +2373,7 @@ fn normalize_history_entry(entry: &Value) -> Option<HistoryEntry> {
                     .unwrap_or(0.0),
                 0,
                 0.0,
+                0.0,
             )
         } else {
             return None;
@@ -2342,6 +2390,7 @@ fn normalize_history_entry(entry: &Value) -> Option<HistoryEntry> {
         total_input_cost_usd: round_n(tic, 6),
         output_tokens_saved: ots,
         output_savings_usd: round_n(osu, 6),
+        total_output_cost_usd: round_n(toc, 6),
     })
 }
 
@@ -2567,6 +2616,9 @@ struct RollupEntry {
     /// input-side, also matching Python.
     output_tokens_saved_delta: i64,
     output_savings_usd_delta: f64,
+    /// Output spend per bucket and cumulative (upstream `c766bdb2`).
+    total_output_cost_usd_delta: f64,
+    total_output_cost_usd: f64,
     by_provider: BTreeMap<String, RollupDelta>,
     by_model: BTreeMap<String, RollupDelta>,
 }
@@ -2591,6 +2643,8 @@ impl RollupEntry {
             total_input_cost_usd: total_input_cost,
             output_tokens_saved_delta: 0,
             output_savings_usd_delta: 0.0,
+            total_output_cost_usd_delta: 0.0,
+            total_output_cost_usd: 0.0,
             by_provider: BTreeMap::new(),
             by_model: BTreeMap::new(),
         }
@@ -2624,6 +2678,8 @@ impl RollupEntry {
             "total_input_cost_usd": self.total_input_cost_usd,
             "output_tokens_saved_delta": self.output_tokens_saved_delta,
             "output_savings_usd_delta": self.output_savings_usd_delta,
+            "total_output_cost_usd_delta": self.total_output_cost_usd_delta,
+            "total_output_cost_usd": self.total_output_cost_usd,
             "by_provider": map_deltas(&self.by_provider),
             "by_model": map_deltas(&self.by_model),
         })
@@ -2674,6 +2730,46 @@ mod tests {
         // verdict has to say so rather than reporting the 400 alone.
         assert_eq!(v["net_tokens_saved"], -2_100);
         assert_eq!(v["verdict"], "costing more than it saves");
+    }
+
+    /// Emitted output is priced into lifetime spend, checkpointed in history,
+    /// and recovered from it when the lifetime block lost it.
+    #[test]
+    fn output_spend_accumulates_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        let expected = estimate_output_savings_usd("claude-sonnet-4", 1_000);
+        assert!(expected > 0.0);
+        {
+            let t = tracker(&path);
+            t.record_request(&RequestRecord {
+                model: "claude-sonnet-4",
+                input_tokens: 1_000,
+                tokens_saved: 400,
+                output_tokens: 1_000,
+                ..Default::default()
+            });
+            let snap = t.snapshot();
+            assert_eq!(
+                snap["lifetime"]["total_output_cost_usd"],
+                json!(round_n(expected, 6))
+            );
+        }
+
+        // A lifetime block written before the field existed.
+        let mut raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["lifetime"]
+            .as_object_mut()
+            .unwrap()
+            .remove("total_output_cost_usd");
+        std::fs::write(&path, raw.to_string()).unwrap();
+
+        let snap = tracker(&path).snapshot();
+        assert_eq!(
+            snap["lifetime"]["total_output_cost_usd"],
+            json!(round_n(expected, 6))
+        );
     }
 
     /// The cost of lossy compression that per-request token counts miss: the
@@ -3667,6 +3763,8 @@ mod tests {
                     "total_input_cost_usd",
                     "output_tokens_saved_delta",
                     "output_savings_usd_delta",
+                    "total_output_cost_usd_delta",
+                    "total_output_cost_usd",
                     "by_provider",
                     "by_model",
                 ] {
