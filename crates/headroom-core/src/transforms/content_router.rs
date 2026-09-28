@@ -1846,12 +1846,15 @@ pub fn apply_strategy(
 /// run on top of them. SmartCrusher, tabular, config, and diff emit their own
 /// structured (and CCR-marked) forms; Kompress is lossy with its own marker.
 /// Eliding inside those would corrupt output another compressor owns.
+/// CodeAware is here so a partial win on minified JS still loses its bundle
+/// lines (upstream `9263b420`).
 fn dense_elide_after(strategy: CompressionStrategy) -> bool {
     matches!(
         strategy,
         CompressionStrategy::Html
             | CompressionStrategy::Log
             | CompressionStrategy::Text
+            | CompressionStrategy::CodeAware
             | CompressionStrategy::Search
     )
 }
@@ -2082,7 +2085,10 @@ pub fn apply_strategy_with_registry(
             let result = extractor.extract(content, None);
             let compressed = result.extracted;
             let tokens = compressed.split_whitespace().count();
-            if !compressed.is_empty() && tokens < original_tokens {
+            // A page that is all <script>/<style> extracts to whitespace:
+            // nothing extracted, so it falls through to passthrough (and
+            // dense-line elision below), not a compression to zero tokens.
+            if !compressed.trim().is_empty() && tokens < original_tokens {
                 return (compressed, tokens, vec!["html_extractor".to_string()]);
             }
             (
@@ -2147,13 +2153,17 @@ pub fn apply_strategy_with_registry(
     // back plain text — SmartCrusher, tabular, config, and diff emit their
     // own structured (and CCR-marked) forms; Kompress is lossy with its own
     // marker. Eliding inside those would corrupt output another owns.
-    // Runs only when the strategy actually ran (chain names it), matching
-    // the Python `_DENSE_ELIDE_AFTER` gate.
+    // Runs only when the strategy itself produced the result (the chain
+    // ends with it), matching the Python `_DENSE_ELIDE_AFTER` gate: CodeAware
+    // that fell back to Kompress hands back Kompress output. An HTML page
+    // that extracted nothing hands back the original, which Python sends
+    // down its passthrough path, dense elision included.
     let (compressed_out, tokens_out, mut chain_out) = strategy_result;
-    if config.enable_dense_line_elision
-        && dense_elide_after(strategy)
-        && chain_out.iter().any(|c| c == strategy.as_str())
-    {
+    let produced_by = chain_out.last().map(String::as_str);
+    let strategy_produced = produced_by == Some(strategy.as_str())
+        || (strategy == CompressionStrategy::Html
+            && matches!(produced_by, Some("html_extractor" | "passthrough")));
+    if config.enable_dense_line_elision && dense_elide_after(strategy) && strategy_produced {
         // elide_dense char-gates internally; Some means shorter.
         if let Some((elided, elided_tokens)) =
             elide_dense(&compressed_out, context, config, store_recoverable)
@@ -4800,6 +4810,41 @@ mod kompress_size_gate_tests {
         assert!(chain.contains(&"dense_elide".to_string()), "{chain:?}");
         assert!(tokens < dump.len() / 4);
         assert!(out.contains("chars of dense machine-generated content elided"));
+    }
+
+    #[test]
+    fn dense_elide_runs_after_code_aware_and_on_a_script_only_page() {
+        let config = config_with(|c| {
+            c.enable_kompress = false;
+            c.enable_code_aware = true;
+        });
+        let bundle = "x".repeat(4000);
+
+        let code = format!(
+            "def main():\n    blob = '{bundle}'\n    return blob\n\n\ndef helper(a, b):\n    return a + b\n"
+        );
+        let (out, _, chain) = apply_strategy(
+            &code,
+            CompressionStrategy::CodeAware,
+            &config,
+            "",
+            Some("python"),
+            1.0,
+        );
+        assert_eq!(chain.first().map(String::as_str), Some("code_aware"));
+        assert!(chain.contains(&"dense_elide".to_string()), "{chain:?}");
+        assert!(out.len() < code.len() / 2);
+
+        // All <script>: extraction yields whitespace, which is "nothing
+        // extracted", so the page falls through to dense elision instead of
+        // passing through whole or being replaced by an empty block.
+        let page =
+            format!("<html><head><script>{bundle}</script></head>\n<body>\n  \n</body></html>");
+        let (out, _, chain) =
+            apply_strategy(&page, CompressionStrategy::Html, &config, "", None, 1.0);
+        assert!(chain.contains(&"dense_elide".to_string()), "{chain:?}");
+        assert!(!out.trim().is_empty());
+        assert!(out.len() < page.len() / 2);
     }
 
     #[test]
