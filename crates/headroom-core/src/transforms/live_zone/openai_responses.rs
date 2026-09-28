@@ -366,7 +366,7 @@ pub fn compress_openai_responses_live_zone_with_config(
             tokenizer.as_ref(),
             &mut replacements,
             None, // PR-C3: no CCR store on the Responses path yet.
-            &DispatchConfig::default(),
+            dispatch_config,
         );
         block_outcomes.push(outcome);
     }
@@ -822,6 +822,48 @@ mod openai_responses_tests {
                 );
             }
         }
+    }
+
+    /// Prose long enough for the plain-text path, which only Kompress serves.
+    fn prose() -> String {
+        "The migration keeps the old column until every reader has moved over, \
+         then drops it in a second release once the dashboards agree. "
+            .repeat(40)
+    }
+
+    fn declined_by_kompress_switch(out: &LiveZoneOutcome) -> bool {
+        let manifest = match out {
+            LiveZoneOutcome::Modified { manifest, .. } | LiveZoneOutcome::NoChange { manifest } => {
+                manifest
+            }
+        };
+        manifest.block_outcomes.iter().any(|b| {
+            matches!(
+                &b.action,
+                BlockAction::NoCompressionApplied { declined_by: Some(d), .. } if d == "kompress_disabled"
+            )
+        })
+    }
+
+    /// `--disable-kompress-openai` reaches the block compressor on the
+    /// Responses path too.
+    #[test]
+    fn the_openai_kompress_switch_reaches_the_compressor() {
+        let b = body(json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "fetch_page", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": prose()}
+            ]
+        }));
+        let off = DispatchConfig {
+            disable_kompress: true,
+            ..Default::default()
+        };
+        let out =
+            compress_openai_responses_live_zone_with_config(&b, AuthMode::Payg, "gpt-4o", &off)
+                .unwrap();
+        assert!(declined_by_kompress_switch(&out), "{out:?}");
     }
 
     fn excluded_responses_config(exclude: &[&str]) -> DispatchConfig {

@@ -218,7 +218,7 @@ pub fn compress_openai_chat_live_zone_with_config(
             tokenizer.as_ref(),
             &mut replacements,
             None, // PR-C2: no CCR store yet on the OpenAI path.
-            &DispatchConfig::default(),
+            dispatch_config,
         );
         block_outcomes.push(outcome);
     }
@@ -609,6 +609,50 @@ mod openai_chat_tests {
                 panic!("control: unattributed tool payload must still compress")
             }
         }
+    }
+
+    /// Prose long enough for the plain-text path, which only Kompress serves.
+    fn prose() -> String {
+        "The migration keeps the old column until every reader has moved over, \
+         then drops it in a second release once the dashboards agree. "
+            .repeat(40)
+    }
+
+    fn declined_by_kompress_switch(out: &LiveZoneOutcome) -> bool {
+        let manifest = match out {
+            LiveZoneOutcome::Modified { manifest, .. } | LiveZoneOutcome::NoChange { manifest } => {
+                manifest
+            }
+        };
+        manifest.block_outcomes.iter().any(|b| {
+            matches!(
+                &b.action,
+                BlockAction::NoCompressionApplied { declined_by: Some(d), .. } if d == "kompress_disabled"
+            )
+        })
+    }
+
+    /// `--disable-kompress-openai` reaches the block compressor. It used to
+    /// stop at the planner, which got the operator config while
+    /// `compress_one_block` got the default.
+    #[test]
+    fn the_openai_kompress_switch_reaches_the_compressor() {
+        let b = body(json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "reading",
+                 "tool_calls": [{"id": "t1", "type": "function",
+                                "function": {"name": "fetch_page", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": prose()},
+            ]
+        }));
+        let off = DispatchConfig {
+            disable_kompress: true,
+            ..Default::default()
+        };
+        let out =
+            compress_openai_chat_live_zone_with_config(&b, AuthMode::Payg, "gpt-4o", &off).unwrap();
+        assert!(declined_by_kompress_switch(&out), "{out:?}");
     }
 
     fn excluded_config(exclude: &[&str]) -> DispatchConfig {
