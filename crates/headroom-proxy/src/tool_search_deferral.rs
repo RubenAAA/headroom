@@ -542,6 +542,10 @@ pub struct RepairOutcome {
 /// for call-side neutralization: `web_search` and code execution calls
 /// stand alone and must survive untouched.
 ///
+/// Client-side results (a `tool_result` listing `tool_reference` blocks)
+/// lose only their dead references; see [`drop_dead_client_references`].
+/// Each dropped reference counts in `neutralized`.
+///
 /// Replace in place rather than remove (upstream #3456). The block indexes
 /// of a message are load-bearing: the signed-thinking guard keys a thinking
 /// block by its position, so deleting a block that sits before a thinking
@@ -594,8 +598,18 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
         // Ids of the above seen so far, for pairing results below.
         let mut message_call_families: std::collections::HashMap<String, Option<ServerToolFamily>> =
             std::collections::HashMap::new();
+        // Client-side tool-search results with dead references dropped:
+        // (index, new content, references dropped).
+        let mut client_result_rewrites: Vec<(usize, Value, usize)> = Vec::new();
         for (index, block) in content.iter().enumerate() {
             let block_type = block.get("type").and_then(Value::as_str);
+            if block_type == Some("tool_result") {
+                if let Some((new_content, dropped)) = drop_dead_client_references(block, &available)
+                {
+                    client_result_rewrites.push((index, new_content, dropped));
+                }
+                continue;
+            }
             if block_type == Some("server_tool_use") {
                 let name = block.get("name").and_then(Value::as_str).unwrap_or("");
                 let family = server_call_family(name);
@@ -662,6 +676,11 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
             &mut neutralize_indexes,
             &mut generic_placeholder_indexes,
         );
+        for (index, new_content, dropped) in client_result_rewrites {
+            content[index]["content"] = new_content;
+            neutralized += dropped;
+            changed = true;
+        }
         if neutralize_indexes.is_empty() {
             seen_server_calls.extend(message_call_families);
             out.push(message);
@@ -693,6 +712,47 @@ pub fn strip_unsupported_blocks(messages: Vec<Value>, tools: &[Value]) -> Repair
     } else {
         unchanged(out)
     }
+}
+
+/// Content of a client-side tool-search result left with no resolvable
+/// references, so its paired `tool_use` is not orphaned (which 400s on its
+/// own). Constant so the repaired prefix stays byte-stable. Mirrors upstream
+/// `_CLIENT_TOOL_REF_PLACEHOLDER`.
+const CLIENT_TOOL_REF_PLACEHOLDER: &str = "[tool reference no longer available]";
+
+/// A client-side tool-search result is a plain `tool_result` whose content
+/// lists `tool_reference` blocks (Anthropic's custom tool search, and what
+/// Claude Code persists for MCP tools it discovers). Anthropic rejects one
+/// naming a tool absent from `tools`, e.g. after an MCP server dropped
+/// mid-session. Returns the content with those references dropped and how
+/// many went, or `None` when every reference resolves. Only the definitions
+/// are checked, not a typed search tool: a custom client-side search needs
+/// none. Upstream `f12e3fbe`.
+fn drop_dead_client_references(
+    block: &Value,
+    available: &std::collections::HashSet<&str>,
+) -> Option<(Value, usize)> {
+    let inner = block.get("content")?.as_array()?;
+    let is_reference = |b: &Value| b.get("type").and_then(Value::as_str) == Some("tool_reference");
+    let is_dead = |b: &Value| {
+        let name = b
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .or_else(|| b.get("name").and_then(Value::as_str));
+        is_reference(b) && name.is_some_and(|n| !available.contains(n))
+    };
+    let kept: Vec<Value> = inner.iter().filter(|b| !is_dead(b)).cloned().collect();
+    let dropped = inner.len() - kept.len();
+    if dropped == 0 {
+        return None;
+    }
+    let content = if kept.is_empty() {
+        Value::String(CLIENT_TOOL_REF_PLACEHOLDER.to_string())
+    } else {
+        Value::Array(kept)
+    };
+    Some((content, dropped))
 }
 
 type Indexes = std::collections::HashSet<usize>;
@@ -1148,6 +1208,67 @@ mod tests {
         );
         // Neighbor blocks untouched.
         assert_eq!(content[0]["text"], json!("looking"));
+    }
+
+    /// Claude Code's client-side search: a plain `tool_use` / `tool_result`
+    /// pair whose result lists `tool_reference` blocks. No typed search tool.
+    fn client_search_turn(refs: Vec<Value>) -> Vec<Value> {
+        vec![
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "ToolSearch", "input": {"query": "db"}}
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": refs}
+            ]}),
+        ]
+    }
+
+    #[test]
+    fn client_side_references_to_absent_tools_are_dropped() {
+        let mut deferred = tool("mcp__db__query");
+        deferred["defer_loading"] = json!(true);
+        let tools = vec![tool("ToolSearch"), deferred];
+
+        // All present (a deferred tool included): untouched.
+        let messages = client_search_turn(vec![tool_ref("mcp__db__query")]);
+        let out = strip_unsupported_blocks(messages.clone(), &tools);
+        assert_eq!(out.neutralized, 0);
+        assert_eq!(out.messages, messages);
+
+        // Mixed: the present reference stays, the absent one goes.
+        let out = strip_unsupported_blocks(
+            client_search_turn(vec![
+                tool_ref("mcp__db__query"),
+                json!({"type": "tool_reference", "name": "mcp__gone__x"}),
+            ]),
+            &tools,
+        );
+        assert_eq!(out.neutralized, 1);
+        assert_eq!(
+            out.messages[1]["content"][0]["content"],
+            json!([tool_ref("mcp__db__query")])
+        );
+
+        // None left: placeholder text, and the tool_use keeps its pair.
+        let out = strip_unsupported_blocks(
+            client_search_turn(vec![tool_ref("mcp__gone__x"), tool_ref("mcp__gone__y")]),
+            &tools,
+        );
+        assert_eq!(out.neutralized, 2);
+        let result = &out.messages[1]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "toolu_1");
+        assert_eq!(
+            result["content"],
+            json!("[tool reference no longer available]")
+        );
+        assert_eq!(out.messages[0]["content"][0]["type"], "tool_use");
+
+        // An ordinary tool result is never touched.
+        let messages = client_search_turn(vec![json!({"type": "text", "text": "ok"})]);
+        let out = strip_unsupported_blocks(messages.clone(), &[]);
+        assert_eq!(out.neutralized, 0);
+        assert_eq!(out.messages, messages);
     }
 
     #[test]
