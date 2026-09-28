@@ -102,9 +102,9 @@ Landed: `b84c4c9f` (3086be30), `dfdc7251` (8d0f8d1e; keys the full forwarded URL
 
 Accounting only.
 
-Landed: `5ff4ea1e` rest (27553b79; the admission gate now also books its 429s in the ledger), `3f3cf19e` (849e84df), `1455f002` edge-triggered warning only (0f5e8622; /stats has no compression_vs_cache block to carry `net_is_negative`), `89a58fd1` compaction back-off (06bbfd37; the live ledger was 32 MB with nothing out of retention) and read-first deferral pricing (9c8c95d8), `c766bdb2` (7a3402e2).
+Landed: `5ff4ea1e` rest (27553b79; the admission gate now also books its 429s in the ledger), `3f3cf19e` (849e84df), `1455f002` edge-triggered warning only (0f5e8622; /stats has no compression_vs_cache block to carry `net_is_negative`), `89a58fd1` compaction back-off (06bbfd37; the live ledger was 32 MB with nothing out of retention) and read-first deferral pricing (9c8c95d8), `c766bdb2` (7a3402e2), `2c4dc446` (576b122c; the Anthropic and OpenAI forward path now stamps the headers on buffered and streamed responses; holdout bookkeeping tags stay out of `x-headroom-transforms`), `e92cccca` (582ea2b7; `/stats` carries the rate in `lifetime_metrics.tokens`).
 
-Not landed: `1cb779e1`, rejected with numbers in `docs/notes/ideas/rejected/history-rollup-read-cost.md`. `2c4dc446`, declined at review (2026-09-28). `e92cccca`, low value, and it needs a /stats field the fork lacks.
+Not landed: `1cb779e1`, rejected with numbers in `docs/notes/ideas/rejected/history-rollup-read-cost.md`.
 
 | sha | kind | cache | behavior | Rust target | note |
 |---|---|---|---|---|---|
