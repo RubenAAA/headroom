@@ -7,8 +7,11 @@
 //! that signals we compressed too aggressively.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::SystemTime;
+
+use lru::LruCache;
 
 /// Cap on retained strategy labels. Labels are content-derived, so an
 /// unbounded map grows for the life of the process.
@@ -225,6 +228,11 @@ const MAX_STRATEGY_ENTRIES: usize = 50;
 const MAX_QUERY_ENTRIES: usize = 100;
 const MAX_FIELD_ENTRIES: usize = 50;
 const MAX_SIGNATURE_HASHES: usize = 100;
+/// Cap on distinct tools in `tool_patterns` (upstream `2d10b10a`). The tool
+/// name is client-controlled — an MCP server can expose any names it likes —
+/// so the outer map is LRU-bounded like the per-pattern maps already are.
+/// Well above the tool count of any real deployment.
+const MAX_TRACKED_TOOLS: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 /// Learn from retrieval patterns to improve compression.
 pub struct CompressionFeedback {
@@ -232,7 +240,8 @@ pub struct CompressionFeedback {
 }
 
 struct FeedbackInner {
-    tool_patterns: HashMap<String, LocalToolPattern>,
+    /// Recording a tool refreshes it; reading hints does not.
+    tool_patterns: LruCache<String, LocalToolPattern>,
     total_compressions: u64,
     total_retrievals: u64,
     enable_learning: bool,
@@ -242,7 +251,7 @@ impl CompressionFeedback {
     pub fn new(enable_learning: bool) -> Self {
         Self {
             inner: Mutex::new(FeedbackInner {
-                tool_patterns: HashMap::new(),
+                tool_patterns: LruCache::new(MAX_TRACKED_TOOLS),
                 total_compressions: 0,
                 total_retrievals: 0,
                 enable_learning,
@@ -271,8 +280,7 @@ impl CompressionFeedback {
         inner.total_compressions += 1;
         let pattern = inner
             .tool_patterns
-            .entry(tool_name.to_string())
-            .or_insert_with(|| LocalToolPattern::new(tool_name));
+            .get_or_insert_mut(tool_name.to_string(), || LocalToolPattern::new(tool_name));
 
         pattern.total_compressions += 1;
         pattern.last_compression = now_secs();
@@ -318,8 +326,7 @@ impl CompressionFeedback {
         inner.total_retrievals += 1;
         let pattern = inner
             .tool_patterns
-            .entry(tool_name.to_string())
-            .or_insert_with(|| LocalToolPattern::new(tool_name));
+            .get_or_insert_mut(tool_name.to_string(), || LocalToolPattern::new(tool_name));
 
         pattern.total_retrievals += 1;
         pattern.last_retrieval = now_secs();
@@ -362,7 +369,7 @@ impl CompressionFeedback {
         };
 
         let inner = self.inner.lock().unwrap();
-        let pattern = match inner.tool_patterns.get(tool_name) {
+        let pattern = match inner.tool_patterns.peek(tool_name) {
             Some(p) => p,
             None => {
                 return CompressionHints {
@@ -772,6 +779,31 @@ mod tests {
         assert!(
             p.strategy_retrievals.contains_key("s45"),
             "a top-retrieved strategy must be retained"
+        );
+    }
+
+    /// Past the cap the least-recently-recorded tool goes; a re-recorded tool
+    /// is refreshed and survives.
+    #[test]
+    fn tool_patterns_are_lru_bounded() {
+        let fb = CompressionFeedback::new(true);
+        let cap = MAX_TRACKED_TOOLS.get();
+        for i in 0..cap {
+            fb.record_compression(Some(&format!("tool_{i}")), 100, 10, None, None);
+        }
+        fb.record_compression(Some("tool_0"), 100, 10, None, None);
+        fb.record_compression(Some("tool_new"), 100, 10, None, None);
+
+        let stats = fb.get_stats();
+        assert_eq!(stats.tools_tracked, cap);
+        assert!(stats.tool_patterns.contains_key("tool_new"));
+        assert!(
+            stats.tool_patterns.contains_key("tool_0"),
+            "refreshed tool survives"
+        );
+        assert!(
+            !stats.tool_patterns.contains_key("tool_1"),
+            "LRU tool evicted"
         );
     }
 }
