@@ -438,7 +438,8 @@ pub(super) fn maybe_compact_tool_schemas(body: bytes::Bytes, request_id: &str) -
 /// `tools` prefix stays byte-stable through a one-tool flap. Runs before B2
 /// so the order replay sees a complete roster. Same passthrough rules as
 /// [`maybe_stabilize_tool_order`]: no `tools`, empty `session_key`, or any
-/// parse/serialize failure forwards the original bytes.
+/// parse/serialize failure forwards the original bytes. So does an empty
+/// `tools` array; see [`cache_stabilization::tool_roster_pin::pin_tool_roster`].
 pub(crate) fn maybe_pin_tool_roster(
     body: bytes::Bytes,
     store: &cache_stabilization::tool_roster_pin::RosterPinStore,

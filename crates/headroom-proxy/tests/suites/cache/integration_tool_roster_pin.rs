@@ -132,6 +132,36 @@ async fn a_flapping_tool_is_put_back_and_a_new_one_goes_to_the_tail() {
     proxy.shutdown().await;
 }
 
+/// A side request in the same session that sends `tools: []`, as a Claude
+/// Code prompt hook's verdict request does, goes out with no tools. The
+/// roster it would have been pinned to belongs to the session's turns.
+#[tokio::test]
+async fn an_empty_roster_is_forwarded_empty() {
+    let upstream = MockServer::start().await;
+    let captured = mount_capture(&upstream).await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.cache_pin_tool_roster = true;
+        c.cache_stable_tool_order = true;
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    post_turn(&client, &proxy.url(), &turn(&["Bash", "Read"], 0)).await;
+    post_turn(&client, &proxy.url(), &turn(&[], 1)).await;
+    // The session's own next turn still gets its roster pinned.
+    post_turn(&client, &proxy.url(), &turn(&["Bash"], 2)).await;
+
+    let bodies = captured.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 3);
+    assert!(
+        forwarded_tools(&bodies[1]).is_empty(),
+        "side request got tools"
+    );
+    assert_eq!(names(&forwarded_tools(&bodies[2])), ["Bash", "Read"]);
+    proxy.shutdown().await;
+}
+
 #[tokio::test]
 async fn off_by_default_forwards_the_roster_as_sent() {
     let upstream = MockServer::start().await;

@@ -83,6 +83,13 @@ impl PinOutcome {
 /// carries a `cache_control` marker. It still records the roster in that
 /// case, so a later turn without markers has something to pin to.
 pub fn pin_tool_roster(tools: &mut Vec<Value>, remembered: &mut Roster) -> PinOutcome {
+    // An empty roster is not a flap. It is a side request that offers the
+    // model nothing on purpose, like the verdict a Claude Code prompt hook
+    // asks for (seen 2026-09-28: 13 tools put back into a goal check that
+    // expected a bare JSON answer, 23 times in the log).
+    if tools.is_empty() {
+        return PinOutcome::default();
+    }
     if any_tool_marked(tools) {
         remember(tools, remembered);
         return PinOutcome::default();
