@@ -15,16 +15,22 @@ use serde_json::Value;
 /// map order, with compact separators and `serde_json` escaping
 /// throughout. `cache_control` members are dropped at any depth; the
 /// marker comment from the old tree walker still applies — a moving
-/// breakpoint must not change the key.
+/// breakpoint must not change the key. The one exception is a key of a
+/// JSON Schema `properties` object, where `cache_control` is a
+/// user-defined property name, not a marker (upstream `b84c4c9f`).
 fn normalized_key_json(messages: &[&Value], model: &str, extra: &[(&str, &Value)]) -> Vec<u8> {
     use std::io::Write as _;
-    fn write_stripped<W: std::io::Write>(w: &mut W, v: &Value) -> std::io::Result<()> {
+    fn write_stripped<W: std::io::Write>(
+        w: &mut W,
+        v: &Value,
+        in_properties: bool,
+    ) -> std::io::Result<()> {
         match v {
             Value::Object(map) => {
                 write!(w, "{{")?;
                 let mut first = true;
                 for (k, child) in map.iter() {
-                    if k.as_str() == "cache_control" {
+                    if k.as_str() == "cache_control" && !in_properties {
                         continue;
                     }
                     if !first {
@@ -33,7 +39,7 @@ fn normalized_key_json(messages: &[&Value], model: &str, extra: &[(&str, &Value)
                     first = false;
                     serde_json::to_writer(&mut *w, &k)?;
                     write!(w, ":")?;
-                    write_stripped(w, child)?;
+                    write_stripped(w, child, k.as_str() == "properties")?;
                 }
                 write!(w, "}}")
             }
@@ -43,7 +49,7 @@ fn normalized_key_json(messages: &[&Value], model: &str, extra: &[(&str, &Value)
                     if i > 0 {
                         write!(w, ",")?;
                     }
-                    write_stripped(w, item)?;
+                    write_stripped(w, item, false)?;
                 }
                 write!(w, "]")
             }
@@ -67,14 +73,14 @@ fn normalized_key_json(messages: &[&Value], model: &str, extra: &[(&str, &Value)
             if i > 0 {
                 write!(out, ",")?;
             }
-            write_stripped(&mut out, msg)?;
+            write_stripped(&mut out, msg, false)?;
         }
         write!(out, "]")?;
         for (k, v) in extra.iter().copied() {
             write!(out, ",")?;
             serde_json::to_writer(&mut out, &k)?;
             write!(out, ":")?;
-            write_stripped(&mut out, v)?;
+            write_stripped(&mut out, v, false)?;
         }
         write!(out, "}}")
     })();
@@ -526,5 +532,25 @@ mod cache_key_marker_tests {
             &extra,
         );
         assert_ne!(a, b, "different turn text must change the key");
+    }
+
+    /// `cache_control` as a tool-schema property name is content: two tool
+    /// lists that differ only by it must not share a cached response. A real
+    /// marker on the property's own schema is still dropped.
+    #[test]
+    fn a_schema_property_named_cache_control_changes_the_key() {
+        let schema = |props: Value| {
+            serde_json::json!([{"name": "maintain",
+                "input_schema": {"type": "object", "properties": props}}])
+        };
+        let without = schema(serde_json::json!({}));
+        let with = schema(serde_json::json!({"cache_control": {"type": "boolean"}}));
+        let marked = schema(serde_json::json!({"cache_control": {
+            "type": "boolean", "cache_control": {"type": "ephemeral"}}}));
+        let key = |tools: &Value| {
+            SemanticCache::compute_key(&refs(&msgs(false)), "claude-opus-5", &[("tools", tools)])
+        };
+        assert_ne!(key(&without), key(&with));
+        assert_eq!(key(&with), key(&marked));
     }
 }
