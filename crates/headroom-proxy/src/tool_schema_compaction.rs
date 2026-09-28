@@ -540,6 +540,20 @@ pub fn compact_tool_descriptions(payload: Value, max_chars: i64) -> (Value, bool
     if items.is_empty() {
         return (payload, false, 0, 0);
     }
+    // A cache_control marker on any tool means "cache everything up to and
+    // including this one". Truncating a description inside that span changes
+    // the bytes the provider hashed, so the whole tools prefix and every
+    // message after it re-bill as cache creation: a few hundred bytes saved
+    // for the entire conversation re-written (upstream `a2bf5ed1`).
+    if crate::cache_stabilization::tool_def_normalize::any_tool_has_cache_control(items) {
+        tracing::info!(
+            event = "tool_desc_compaction_skipped",
+            reason = "marker_present",
+            tool_count = items.len(),
+            "tool description compaction skipped: a tool carries cache_control"
+        );
+        return (payload, false, 0, 0);
+    }
 
     let strip_sem = strip_semantic_params();
     let key = cache_key(
@@ -831,6 +845,24 @@ mod tests {
         );
 
         reset_env_cache();
+        invalidate_cache();
+    }
+
+    #[test]
+    fn layer2_leaves_tools_alone_when_any_carries_cache_control() {
+        let _guard = compaction_test_lock();
+        invalidate_cache();
+
+        let long = "A long tool description that would be truncated. ".repeat(10);
+        let payload = json!({"tools": [
+            {"name": "a", "description": long},
+            {"name": "b", "description": long, "cache_control": {"type": "ephemeral"}}
+        ]});
+        let original = payload.clone();
+        let (out, modified, before, after) = compact_tool_descriptions(payload, 20);
+        assert!(!modified);
+        assert_eq!((before, after), (0, 0));
+        assert_eq!(out, original);
         invalidate_cache();
     }
 
