@@ -146,7 +146,9 @@ pub fn compress_openai_responses_live_zone_with_config(
             let name = item.get("name").and_then(Value::as_str).unwrap_or("");
             if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
                 call_name_by_id.insert(call_id, name);
-                if name == "headroom_retrieve" || name.ends_with("__headroom_retrieve") {
+                if name.ends_with("__headroom_retrieve")
+                    || crate::tool_exclusion::is_ccr_retrieve_tool(name)
+                {
                     headroom_retrieve_call_ids.insert(call_id);
                 }
                 if is_verbatim_excluded(name) {
@@ -941,28 +943,34 @@ mod openai_responses_tests {
     #[test]
     fn headroom_retrieve_output_not_in_live_zone() {
         let retrieved = "retrieved original content ".repeat(100);
-        let b = body(json!({
-            "model": "gpt-4o",
-            "input": [
-                {
-                    "type": "function_call",
-                    "call_id": "call_retrieve",
-                    "name": "mcp__headroom__headroom_retrieve",
-                    "arguments": "{}"
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_retrieve",
-                    "output": retrieved
+        // The last spelling is OpenCode's, which prefixes its server name.
+        for name in [
+            "mcp__headroom__headroom_retrieve",
+            "headroom_headroom_retrieve",
+        ] {
+            let b = body(json!({
+                "model": "gpt-4o",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_retrieve",
+                        "name": name,
+                        "arguments": "{}"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_retrieve",
+                        "output": retrieved
+                    }
+                ]
+            }));
+            let out = compress_openai_responses_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+            match &out {
+                LiveZoneOutcome::NoChange { manifest } => {
+                    assert!(manifest.block_outcomes.is_empty(), "{name}");
                 }
-            ]
-        }));
-        let out = compress_openai_responses_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
-        match &out {
-            LiveZoneOutcome::NoChange { manifest } => {
-                assert!(manifest.block_outcomes.is_empty());
+                _ => panic!("expected NoChange for {name}"),
             }
-            _ => panic!("expected NoChange"),
         }
     }
 

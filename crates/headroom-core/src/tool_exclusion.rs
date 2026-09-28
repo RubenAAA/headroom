@@ -100,7 +100,11 @@ pub fn tool_name_aliases(name: &str) -> Vec<String> {
     let mut aliases = vec![name.to_string()];
     let lname = name.to_ascii_lowercase();
 
-    if lname.starts_with("mcp__") {
+    // OpenCode prefixes its server name onto the tool name (upstream
+    // `c7ebaedd`), so the retrieve tool arrives doubled.
+    if lname == "headroom_headroom_retrieve" {
+        aliases.push("headroom_retrieve".to_string());
+    } else if lname.starts_with("mcp__") {
         let parts: Vec<&str> = name.splitn(3, "__").collect();
         if parts.len() == 3 && !parts[1].is_empty() && !parts[2].is_empty() {
             aliases.push(format!("mcp_{}_{}", parts[1], parts[2]));
@@ -292,6 +296,7 @@ mod tests {
             "headroom_retrieve",
             "mcp__Headroom__headroom_retrieve",
             "mcp_Headroom_headroom_retrieve",
+            "headroom_headroom_retrieve",
         ] {
             assert!(
                 is_ccr_retrieve_tool(name),
@@ -299,6 +304,8 @@ mod tests {
             );
         }
         assert!(!is_ccr_retrieve_tool("mcp__Other__something_else"));
+        assert!(!is_ccr_retrieve_tool("my_headroom_headroom_retrieve"));
+        assert!(!is_ccr_retrieve_tool("headroom_headroom_retrieve_v2"));
     }
 
     /// A literal '.' in a pattern must not act as a regex wildcard.
