@@ -121,7 +121,7 @@ sum by (reason) (rate(headroom_cache_miss_attribution_total{provider!="__init__"
     response cache, so it measures neither. Use the provider-cache pair above,
     or `recent_hit_rate` from `/cache-health`.
 
-**Fleet tile from `GET /cache-health`** (rolling window over the last 50
+**Fleet tile from `GET /cache-health`** (rolling window over the last 100
 compared turns — `RECENT_SAMPLE_CAPACITY`): `recent_hit_rate` + `samples`,
 `recent_cache_read_tokens` / `recent_cache_write_tokens`,
 `recent_cost_per_forwarded_kb`, and the `upstream` object (rejection summary,

@@ -68,7 +68,7 @@ pub(super) const CACHE_WRITE_5M_MULTIPLIER: f64 = 1.25;
 pub(super) const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
 /// Rolling window for the fleet-wide hit-rate shown in the
 /// statusline (`/cache-health`).
-pub(super) const RECENT_SAMPLE_CAPACITY: usize = 50;
+pub(super) const RECENT_SAMPLE_CAPACITY: usize = 100;
 /// Message-0 hashes of recent first turns, keyed for the fan-out check in
 /// [`first_turn_reason`]. Parallel subagents launch within seconds of each
 /// other, so a small window and a small table are enough.

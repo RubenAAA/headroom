@@ -59,7 +59,7 @@ hold_pct=$(printf '%s' "$health" | jq -r '
 # segment is dropped once that exceeds 25%, because past there the number is
 # reporting the model rather than the proxy.
 #
-# Read over the last 50 compared turns, not since process start. An ordinary
+# Read over the last 100 compared turns, not since process start. An ordinary
 # turn prices almost identically on both arms, so it drags a lifetime ratio
 # toward the marginal rate whatever came before it -- which makes the lifetime
 # figure slide steadily downward in any long session and look like a
