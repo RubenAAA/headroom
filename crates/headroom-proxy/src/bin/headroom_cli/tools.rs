@@ -18,6 +18,7 @@ const REGISTRY_JSON: &str = include_str!("../../../../../upstream-python/headroo
 const HEADROOM_BINARIES_MIRROR: &str = "HEADROOM_BINARIES_MIRROR";
 const HEADROOM_BINARIES_CACHE: &str = "HEADROOM_BINARIES_CACHE";
 const HEADROOM_BINARIES_OFFLINE: &str = "HEADROOM_BINARIES_OFFLINE";
+const HEADROOM_BINARIES_ALLOW_UNVERIFIED: &str = "HEADROOM_BINARIES_ALLOW_UNVERIFIED";
 
 #[derive(Debug)]
 pub struct BinaryError(String);
@@ -298,15 +299,30 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 }
 
 fn verify_sha256(path: &Path, expected: Option<&str>) -> Result<(), Error> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
     let Some(expected) = expected.filter(|s| !s.trim().is_empty()) else {
-        return Ok(());
+        // No pin means nothing but HTTPS vouches for the bytes, so refuse
+        // unless the user opted out, and then say so on stderr: the logger is
+        // often not set up yet when this runs (upstream 26a2c493).
+        if env(HEADROOM_BINARIES_ALLOW_UNVERIFIED).is_some() {
+            eprintln!(
+                "headroom: WARNING: installing {name} without a sha256 check \
+                 ({HEADROOM_BINARIES_ALLOW_UNVERIFIED} is set)"
+            );
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(path);
+        return Err(BinaryError::new(format!(
+            "refusing unpinned download {name}: the registry has no sha256 for it \
+             (set {HEADROOM_BINARIES_ALLOW_UNVERIFIED}=1 to install it anyway)"
+        ))
+        .into());
     };
     let got = sha256_file(path)?;
     if !got.eq_ignore_ascii_case(expected) {
         let _ = std::fs::remove_file(path);
         return Err(BinaryError::new(format!(
-            "sha256 mismatch for {}: expected {expected}, got {got}",
-            path.file_name().unwrap_or_default().to_string_lossy()
+            "sha256 mismatch for {name}: expected {expected}, got {got}"
         ))
         .into());
     }
@@ -768,6 +784,41 @@ mod tests {
             libc: "gnu".to_string(),
         };
         assert!(asset_for_platform("difft", difft, &plat).is_ok());
+    }
+
+    #[test]
+    fn unpinned_download_is_refused_and_deleted() {
+        // Only this test sets the variable, and it is absent by default.
+        assert!(env(HEADROOM_BINARIES_ALLOW_UNVERIFIED).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tool.tar.gz");
+        for pin in [None, Some(""), Some("  ")] {
+            std::fs::write(&file, b"bytes").unwrap();
+            let err = verify_sha256(&file, pin).expect_err("must refuse");
+            assert!(err.to_string().contains("unpinned"), "{err}");
+            assert!(!file.exists(), "an unverified download must not stay");
+        }
+        // A correct pin still passes.
+        std::fs::write(&file, b"bytes").unwrap();
+        let pin = sha256_file(&file).unwrap();
+        verify_sha256(&file, Some(&pin)).unwrap();
+    }
+
+    #[test]
+    fn every_registry_asset_is_pinned() {
+        // Refusing unpinned downloads must not break a registry install.
+        let reg = registry().unwrap();
+        for (tool, entry) in &reg.tools {
+            for (plat, asset) in &entry.assets {
+                assert!(
+                    asset
+                        .sha256
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty()),
+                    "{tool} {plat} has no sha256"
+                );
+            }
+        }
     }
 
     #[test]
