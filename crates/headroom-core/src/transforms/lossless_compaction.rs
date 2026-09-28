@@ -59,6 +59,11 @@ fn grep_row_re() -> &'static Regex {
 /// heading and strips it from every row, leaving the model a clock to
 /// reconstruct. The fold round-trips exactly, so the inverse check in
 /// [`compact_lossless`] cannot catch it — exclude it at the row matcher.
+/// Whether `line` starts with a timestamp, the way log rows do.
+pub(crate) fn is_timestamp_row(line: &str) -> bool {
+    timestamp_row_re().is_match(line)
+}
+
 fn timestamp_row_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {

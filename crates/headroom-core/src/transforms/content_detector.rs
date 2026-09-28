@@ -844,6 +844,14 @@ fn try_detect_html(content: &str) -> Option<DetectionResult> {
 /// those lines read as prose and code in them reaches the word-dropping
 /// Kompress compressor. The colon branch runs first; context is tried after.
 fn is_search_result_line(line: &str) -> bool {
+    // A timestamped log row is never grep output. The lossless fold skips
+    // those rows, so a payload claimed as search here falls through to the
+    // lossy SearchCompressor, which keeps a few rows per "file" and prints
+    // the minute back as an integer (upstream #3736). Same regex as the fold,
+    // so the two guards cannot drift apart.
+    if super::lossless_compaction::is_timestamp_row(line) {
+        return false;
+    }
     if SEARCH_RESULT_PATTERN.is_match(line) {
         let prefix = line.split(':').next().unwrap_or("");
         return prefix_looks_like_path(prefix);
@@ -1233,6 +1241,49 @@ fn try_detect_code(content: &str) -> Option<DetectionResult> {
 
 #[cfg(test)]
 mod tests {
+
+    fn timestamped_log(sep: char) -> String {
+        (0..120)
+            .map(|i| {
+                format!(
+                    "2026-09-23{sep}10:{:02}:{:02}Z INFO worker[{}] processed batch {i} in {}ms",
+                    i / 60,
+                    i % 60,
+                    i % 8,
+                    (i * 13) % 900
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn timestamped_log_rows_are_not_search_results() {
+        assert!(!is_search_result_line(
+            "2026-09-23T10:00:00Z INFO worker[0] processed batch 0 in 0ms"
+        ));
+        for sep in ['T', ' '] {
+            let payload = timestamped_log(sep);
+            assert!(try_detect_search(&payload).is_none(), "sep {sep:?}");
+            assert_ne!(
+                detect_content_type(&payload).content_type,
+                ContentType::SearchResults,
+                "sep {sep:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grep_output_still_routes_to_search_even_with_dated_file_names() {
+        for payload in [
+            "src/app.py:10:def main():\nsrc/app.py:20:print('hello')\nREADME.md:5:usage docs",
+            "logs/2026-09-23.log:42:ERROR something failed\nlogs/2026-09-23.log:43:INFO recovered\napp/2026-09-24.log:7:WARN retry",
+        ] {
+            let r = try_detect_search(payload).expect("grep output is search");
+            assert_eq!(r.content_type, ContentType::SearchResults);
+        }
+        assert!(is_search_result_line("Makefile:12:all:"));
+    }
     use super::*;
 
     #[test]
