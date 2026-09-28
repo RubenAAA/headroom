@@ -26,8 +26,11 @@ fn log_shaped_payload() -> String {
     out.push_str("2026-08-08T23:04:38.372256Z  early_messages  wasted_tokens 143871\n");
     out.push_str("2026-08-08T22:32:11.010203Z  early_messages  wasted_tokens 22032\n");
     for i in 0..60 {
+        // The log compressor keeps the first and last error and drops plain
+        // INFO rows, so these two are the lines whose digits get checked.
+        let level = if i == 0 || i == 59 { "ERROR" } else { "INFO" };
         out.push_str(&format!(
-            "2026-08-08T23:0{}:0{}.174635Z INFO worker-{} processing job {} \
+            "2026-08-08T23:0{}:0{}.174635Z {level} worker-{} processing job {} \
              version 1.09 build v2.08.0 key f4993f01a4bc27b6 id-000042 \
              elapsed 00:00:07 at 01:02:03 exit code 007 port 08080\n",
             i % 10,
@@ -86,7 +89,7 @@ fn compression_never_rewrites_digits_inside_a_tool_result() {
         } => (body, strategies_applied),
         other => panic!("reproducer did not exercise compression: {other:?}"),
     };
-    assert_eq!(strategies, vec!["search_compressor"]);
+    assert_eq!(strategies, vec!["log_compressor"]);
 
     let forwarded: serde_json::Value =
         serde_json::from_slice(&compressed).expect("compressed request stays valid JSON");
@@ -94,13 +97,12 @@ fn compression_never_rewrites_digits_inside_a_tool_result() {
         .as_str()
         .expect("tool_result content stays a string");
 
-    // SearchCompressor is lossy, so assert only on lines its selection policy
-    // promises to retain: first + last for the 23:xx group and the sole 22:xx
-    // line. This prevents an omitted line from turning the test into a pass.
+    // The log compressor is lossy, so assert only on lines its policy
+    // promises to retain: the first and last error. This prevents an omitted
+    // line from turning the test into a pass.
     let expected_kept_lines = [
-        "2026-08-08T23:02:36.174635Z  early_messages  wasted_tokens 1965",
-        "2026-08-08T22:32:11.010203Z  early_messages  wasted_tokens 22032",
-        "2026-08-08T23:09:09.174635Z INFO worker-59 processing job 1059 version 1.09 build v2.08.0 key f4993f01a4bc27b6 id-000042 elapsed 00:00:07 at 01:02:03 exit code 007 port 08080",
+        "2026-08-08T23:00:00.174635Z ERROR worker-0 processing job 1000 version 1.09 build v2.08.0 key f4993f01a4bc27b6 id-000042 elapsed 00:00:07 at 01:02:03 exit code 007 port 08080",
+        "2026-08-08T23:09:09.174635Z ERROR worker-59 processing job 1059 version 1.09 build v2.08.0 key f4993f01a4bc27b6 id-000042 elapsed 00:00:07 at 01:02:03 exit code 007 port 08080",
     ];
     for line in expected_kept_lines {
         assert!(
