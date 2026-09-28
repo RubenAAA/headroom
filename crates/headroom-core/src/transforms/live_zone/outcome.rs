@@ -207,6 +207,13 @@ pub enum ExclusionReason {
     /// content is not confidently data, and `HEADROOM_PROTECT_READS` is on.
     /// The agent is about to patch these bytes and needs them exactly.
     ProtectedRead,
+    /// Text the caller wrote into a user message: the prompt, a
+    /// continuation summary, a relayed message. Lossy compression here
+    /// rewrote what the model was asked to do (upstream `aceff2ea`); live,
+    /// it cut session continuation summaries from ~20KB to ~4KB, task
+    /// statement included. A user message answering a fenced shell command
+    /// is a text harness's tool output and stays compressible.
+    PromptText,
 }
 
 /// Aggregated per-request manifest. Always populated, regardless of

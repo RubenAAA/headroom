@@ -113,8 +113,13 @@ fn excludes_hot_zone_block_types() {
             reason: ExclusionReason::HotZoneBlockType
         }
     ));
-    // text block with "ok" → BelowByteThreshold.
-    assert!(matches!(actions[2], BlockAction::BelowByteThreshold { .. }));
+    // The caller's text stays verbatim.
+    assert!(matches!(
+        actions[2],
+        BlockAction::Excluded {
+            reason: ExclusionReason::PromptText
+        }
+    ));
 }
 
 #[test]
@@ -129,11 +134,64 @@ fn string_content_message_records_synthetic_block() {
     };
     assert_eq!(manifest.block_outcomes.len(), 1);
     assert_eq!(manifest.block_outcomes[0].block_type, "string_content");
-    // 13 bytes of plain text is well below the plain-text threshold.
     assert!(matches!(
         manifest.block_outcomes[0].action,
-        BlockAction::BelowByteThreshold { .. }
+        BlockAction::Excluded {
+            reason: ExclusionReason::PromptText
+        }
     ));
+}
+
+/// A large log pasted as the caller's text: lossy-compressible content, so
+/// only the prompt-text guard keeps it verbatim. The same text answering a
+/// fenced shell command is a text harness's tool output and still shrinks.
+fn pasted_log() -> String {
+    (0..400)
+        .map(|i| {
+            format!(
+                "2026-09-28T10:00:{:02}Z INFO worker heartbeat ok seq={i}\n",
+                i % 60
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn caller_text_stays_verbatim_in_every_user_message() {
+    let log = pasted_log();
+    let b = body(json!({
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": log}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "looking"}]},
+            {"role": "user", "content": log},
+        ]
+    }));
+    for out in [
+        compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap(),
+        compress_anthropic_all_messages(
+            &b,
+            AuthMode::Payg,
+            DEFAULT_MODEL,
+            None,
+            &DispatchConfig::default(),
+        )
+        .unwrap(),
+    ] {
+        assert!(matches!(out, LiveZoneOutcome::NoChange { .. }));
+    }
+}
+
+#[test]
+fn reply_to_a_fenced_command_still_compresses() {
+    let b = body(json!({
+        "messages": [
+            {"role": "user", "content": "tail the worker log"},
+            {"role": "assistant", "content": "```bash\ntail -n 400 worker.log\n```"},
+            {"role": "user", "content": pasted_log()},
+        ]
+    }));
+    let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+    assert!(matches!(out, LiveZoneOutcome::Modified { .. }));
 }
 
 #[test]

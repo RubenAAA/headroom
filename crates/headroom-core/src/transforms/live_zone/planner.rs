@@ -193,10 +193,44 @@ pub(super) fn block_has_string_text_field(block_json: &str) -> bool {
         .is_some_and(|t| t.get().trim_start().starts_with('"'))
 }
 
+/// The body of the first fenced code block in string `content`, if any.
+///
+/// Text-based harnesses (mini-swe-agent and similar) put the command in a
+/// fenced block in the assistant's string content, with no `tool_use` block.
+/// Port of upstream `_fenced_shell_command`.
+fn fenced_shell_command(content: &Value) -> Option<&str> {
+    static FENCE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?s)```(?:[\w.-]+)?[ \t]*\n(.*?)```").expect("valid regex")
+    });
+    let text = content.as_str()?;
+    let body = FENCE.captures(text)?.get(1)?.as_str().trim();
+    (!body.is_empty()).then_some(body)
+}
+
+/// True when the user message at `index` replies to a fenced shell command:
+/// a text harness's tool output, not the caller's own words. Walks back to
+/// the nearest assistant turn, stopping at an earlier user turn. Port of
+/// upstream `_answers_fenced_command`.
+pub(super) fn answers_fenced_command(messages: &[Value], index: usize) -> bool {
+    for msg in messages[..index].iter().rev() {
+        match msg.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                return msg.get("content").and_then(fenced_shell_command).is_some();
+            }
+            Some("user") => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `protect_text` keeps the message's text verbatim (see
+/// [`ExclusionReason::PromptText`]); its tool results stay compressible.
 pub(super) fn plan_block_replacements(
     body_raw: &[u8],
     target_msg_idx: usize,
     tool_guards: &HashMap<String, ToolGuard>,
+    protect_text: bool,
 ) -> Result<Vec<PlanSlot>, PlanError> {
     // `serde_json::from_slice` requires UTF-8; we re-validate here
     // explicitly so the pointer-arithmetic helper can take a `&str`
@@ -230,6 +264,15 @@ pub(super) fn plan_block_replacements(
     // Case 1: content is a JSON string (Anthropic legacy shape for
     // user messages).
     if content_str.starts_with('"') {
+        if protect_text {
+            return Ok(vec![PlanSlot {
+                block_index: 0,
+                kind: SlotKind::Excluded {
+                    block_type: "string_content".to_string(),
+                    reason: ExclusionReason::PromptText,
+                },
+            }]);
+        }
         let unescaped: String =
             serde_json::from_str(content_str).map_err(|_| PlanError::ParseFailed)?;
         return Ok(vec![PlanSlot {
@@ -269,6 +312,16 @@ pub(super) fn plan_block_replacements(
             None if block_has_string_text_field(block_raw.get()) => "text".to_string(),
             None => "unknown".to_string(),
         };
+        if protect_text && block_type == "text" {
+            slots.push(PlanSlot {
+                block_index: block_idx,
+                kind: SlotKind::Excluded {
+                    block_type,
+                    reason: ExclusionReason::PromptText,
+                },
+            });
+            continue;
+        }
 
         // Ahead of every other classification: a tool_result may answer a
         // tool whose output must not be compressed. See

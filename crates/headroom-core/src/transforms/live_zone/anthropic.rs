@@ -148,7 +148,8 @@ pub fn compress_anthropic_live_zone_with_ccr(
     // while computing it.
     let tool_guards = collect_tool_guards(messages, &dispatch_config.exclude_tools);
 
-    let plan = match plan_block_replacements(body_raw, target_idx, &tool_guards) {
+    let protect_text = !answers_fenced_command(messages, target_idx);
+    let plan = match plan_block_replacements(body_raw, target_idx, &tool_guards, protect_text) {
         Ok(p) => p,
         Err(_) => {
             // Body shape doesn't match what we expect (e.g. content
@@ -352,7 +353,8 @@ pub fn compress_anthropic_all_messages(
         }
 
         // Plan block replacements for this message.
-        let plan = match plan_block_replacements(body_raw, msg_idx, &tool_guards) {
+        let protect_text = !answers_fenced_command(messages, msg_idx);
+        let plan = match plan_block_replacements(body_raw, msg_idx, &tool_guards, protect_text) {
             Ok(p) => p,
             Err(_) => continue, // Skip messages with unexpected shape.
         };
