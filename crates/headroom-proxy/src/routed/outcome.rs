@@ -43,7 +43,7 @@ pub(crate) fn build_routed_outcome_context(
         .collect();
     let project_ctx = crate::memory::router::RequestContext {
         headers: hdrs,
-        system_prompt: crate::memory::router::extract_system_prompt(parsed),
+        system_prompt: crate::memory::router::extract_project_prompt(parsed),
         base_user_id: String::new(),
         project_root_override: None,
     };
@@ -522,6 +522,49 @@ mod tests {
             "second turn adds only what is novel: {lifetime}"
         );
         headroom_core::conversation_savings::reset_conversation_ledger();
+    }
+
+    /// `d7c1f413` moved the Claude path's project resolution off the
+    /// `system` field and onto the cwd stated in msg0's `# Environment`
+    /// block (`extract_project_prompt`), because Claude Code no longer puts
+    /// the cwd in `system`. This site kept reading `system` under a comment
+    /// claiming it matched the Claude path. A body with no `system` field
+    /// and a stated cwd only in msg0 must still resolve a project, not fall
+    /// back to the default bucket.
+    #[test]
+    fn routed_project_follows_the_stated_cwd_like_the_claude_path() {
+        let state = crate::test_support::test_state(|_| {});
+        let parsed = json!({
+            "model": "claude-codex-5.5",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "# Environment\nPrimary working directory: /home/dev/widgets\n"},
+                {"type": "text", "text": "fix the parser"}
+            ]}],
+        });
+        let report = crate::routed::transforms::CtxTransformReport::default();
+        let headers = axum::http::HeaderMap::new();
+        let now = std::time::Instant::now();
+
+        let ctx = build_routed_outcome_context(
+            &state,
+            &parsed,
+            &headers,
+            None,
+            false,
+            "codex-5.5",
+            report,
+            0.0,
+            now,
+            "req-test".to_string(),
+            None,
+            7,
+            0,
+        )
+        .expect("context builds");
+        assert!(
+            ctx.project.is_some(),
+            "a stated cwd in msg0 must resolve a project, not fall back to the default bucket"
+        );
     }
 
     /// C6 usage-preservation lock: the booked model is the UPSTREAM model,
