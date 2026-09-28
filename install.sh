@@ -745,19 +745,28 @@ fi
 # ── CLAUDE.md ─────────────────────────────────────────────────────────────
 # The proxy injects memory tools and headroom_retrieve; this excerpt tells
 # the model how to use them. Spliced between markers so a re-run replaces it.
+# Under --link the section is one `@` import of the checkout's file, so a pull
+# that changes the excerpt changes it here too; a pasted copy went stale.
 step "CLAUDE.md"
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
 BEGIN_MARK="<!-- headroom:begin -->"
 END_MARK="<!-- headroom:end -->"
 CLAUDE_MD_TMP="$CLAUDE_MD.tmp.$$"
-if grep -qF "$BEGIN_MARK" "$CLAUDE_MD"; then
-    awk -v b="$BEGIN_MARK" -v e="$END_MARK" -v f="$CONTRIB/claude/CLAUDE.headroom.md" '
+SECTION="$CONTRIB/claude/CLAUDE.headroom.md"
+if [ "$LINK" = 1 ]; then
+    SECTION="$CLAUDE_MD.section.$$"
+    printf '@%s\n' "$CONTRIB/claude/CLAUDE.headroom.md" > "$SECTION"
+fi
+if grep -qF "$BEGIN_MARK" "$CLAUDE_MD" 2>/dev/null; then
+    awk -v b="$BEGIN_MARK" -v e="$END_MARK" -v f="$SECTION" '
         index($0,b)==1 { print; while ((getline l < f) > 0) print l; skip=1; next }
         index($0,e)==1 { skip=0 }
         !skip' "$CLAUDE_MD" > "$CLAUDE_MD_TMP"
 else
-    { printf '\n%s\n' "$BEGIN_MARK"; cat "$CONTRIB/claude/CLAUDE.headroom.md"; printf '%s\n' "$END_MARK"; } > "$CLAUDE_MD_TMP"
+    # Append: whatever the file already says stays.
+    { if [ -f "$CLAUDE_MD" ]; then cat "$CLAUDE_MD"; fi; printf '\n%s\n' "$BEGIN_MARK"; cat "$SECTION"; printf '%s\n' "$END_MARK"; } > "$CLAUDE_MD_TMP"
 fi
+if [ "$LINK" = 1 ]; then rm -f "$SECTION"; fi
 if [ -f "$CLAUDE_MD" ] && cmp -s "$CLAUDE_MD_TMP" "$CLAUDE_MD"; then
     rm -f "$CLAUDE_MD_TMP"
     say "Headroom section already current in $CLAUDE_MD"
