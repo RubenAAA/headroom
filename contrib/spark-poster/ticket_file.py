@@ -116,7 +116,6 @@ split("\n") | map(select(length > 0) | fromjson?)
       + (if (.assistant | length) > 0
          then "ASSISTANT:\n\(.assistant | join("\n"))"
          else "(no assistant reply yet)" end))
-| join("\n\n---\n\n")
 """
 
 
@@ -134,23 +133,34 @@ def fail(outdir, session, reason):
 def extract_turns(transcript):
     """Last TURNS user+assistant pairs, speaker-prefixed. jq, not a byte tail.
 
-    Only the tail window is read; when the transcript is bigger than the
-    window the context carries a truncation warning up front.
+    Only a tail window is read. A long tool loop can fill a window with
+    tool calls and results and no text at all, so the window grows 4x until
+    it holds TURNS pairs or covers the whole file. When it stops short of
+    the whole file the context carries a truncation warning up front.
+    Returns "" when no turn has text.
     """
     size = os.path.getsize(transcript)
-    with open(transcript, "rb") as f:
-        if size > WINDOW_BYTES:
-            f.seek(-WINDOW_BYTES, os.SEEK_END)
-        raw = f.read().decode("utf-8", "replace")
-    proc = subprocess.run(
-        ["jq", "-R", "-s", TURNS_JQ],
-        input=raw, capture_output=True, text=True, timeout=120)
-    if proc.returncode != 0:
-        raise RuntimeError("turns jq failed: " + proc.stderr.strip()[-300:])
-    turns = json.loads(proc.stdout)
-    if size > WINDOW_BYTES:
+    window = WINDOW_BYTES
+    while True:
+        with open(transcript, "rb") as f:
+            if size > window:
+                f.seek(-window, os.SEEK_END)
+            raw = f.read().decode("utf-8", "replace")
+        proc = subprocess.run(
+            ["jq", "-R", "-s", TURNS_JQ],
+            input=raw, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            raise RuntimeError("turns jq failed: " + proc.stderr.strip()[-300:])
+        pairs = json.loads(proc.stdout)
+        if len(pairs) >= TURNS or window >= size:
+            break
+        window *= 4
+    if not pairs:
+        return ""
+    turns = "\n\n---\n\n".join(pairs)
+    if size > window:
         turns = ("[warning: transcript truncated to its last %d bytes; "
-                 "older turns omitted]\n\n" % WINDOW_BYTES) + turns
+                 "older turns omitted]\n\n" % window) + turns
     return turns
 
 
