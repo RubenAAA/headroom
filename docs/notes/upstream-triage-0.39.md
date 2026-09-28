@@ -19,19 +19,17 @@ Totals: **30 PORT, 3 PORT-NEW, 5 MERGED,
 The Python reference for every row is `upstream-python/` at `v0.39.1`
 (`git show <sha>` shows the diff and its tests).
 
-## Open decisions
+## Decisions (2026-09-28)
 
 - `7c3cbc82` (memory refuses to run when it cannot resolve the project):
-  marked N/A. The fork falls back to the shared user partition on
-  purpose (`memory/router.rs:90-103`). Take upstream's refusal only if
-  that fallback is unwanted.
-- `deca575c` (prefix replay for `/v1/chat/completions`): only direct
-  chat-completions clients gain; Claude Code and the Codex route do not.
-- `12c15796` (Claude Code auto-mode safeguards): worth it only if auto
-  mode is used.
-- `a9757c9c`: marked ALREADY-THERE; the hourly "client tool search
-  disabled" warning and the legacy `HEADROOM_TOOL_SEARCH_CORE` alias are
-  still absent.
+  N/A. Keep the fork's fallback to the shared user partition
+  (`memory/router.rs:90-103`).
+- `deca575c` (prefix replay for `/v1/chat/completions`) and `12c15796`
+  (Claude Code auto-mode safeguards): port. The maintainer's own logs show
+  no chat-completions traffic, but other people run this fork.
+- `a9757c9c`: ALREADY-THERE; the hourly "client tool search disabled"
+  warning and the legacy `HEADROOM_TOOL_SEARCH_CORE` alias are still
+  absent and not planned.
 
 ## Port order
 
