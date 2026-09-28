@@ -150,6 +150,9 @@ async fn spent_budget_refuses_every_generation_route() {
         "/v1/chat/completions",
         "/v1/responses",
         "/v1beta/models/gemini-2.5-pro:generateContent",
+        "/model/anthropic.claude-sonnet-4/invoke",
+        "/model/anthropic.claude-sonnet-4/converse-stream",
+        "/v1beta1/projects/p/locations/l/publishers/anthropic/models/claude-sonnet-4:rawPredict",
     ] {
         let r = post(
             &format!("{}{route}", proxy.url()),

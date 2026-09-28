@@ -1,8 +1,9 @@
 //! Admission gate: request rate, token rate and spend budget.
 //!
 //! One middleware in front of every generation route — Anthropic Messages
-//! (plain and Foundry), OpenAI Chat Completions and Responses, and Gemini
-//! `generateContent` — so no route can skip a limit. Upstream enforced these
+//! (plain and Foundry), OpenAI Chat Completions and Responses, Gemini
+//! `generateContent`, and Anthropic on Bedrock and Vertex — so no route can
+//! skip a limit. Upstream enforced these
 //! per handler and missed routes more than once (`138736c9` found TPM never
 //! checked, `f734c573` found the budget checked on Anthropic only). Here
 //! `/v1/messages` usually reaches the catch-all rather than a handler, which
@@ -32,6 +33,28 @@ fn is_generation_path(path: &str) -> bool {
     crate::compression::is_compressible_path(path)
         || path == "/anthropic/v1/messages"
         || gemini_generate_model(path).is_some()
+        || bedrock_model(path).is_some()
+        || vertex_model(path).is_some()
+}
+
+/// The model named by a Bedrock `invoke` / `converse` path (and their
+/// streaming forms), e.g. `/model/anthropic.claude-sonnet-4/invoke`.
+fn bedrock_model(path: &str) -> Option<&str> {
+    let (model, action) = path.strip_prefix("/model/")?.split_once('/')?;
+    matches!(
+        action,
+        "invoke" | "invoke-with-response-stream" | "converse" | "converse-stream"
+    )
+    .then_some(model)
+}
+
+/// The model named by a Vertex Anthropic publisher path, e.g.
+/// `/v1beta1/projects/p/locations/l/publishers/anthropic/models/claude-sonnet-4:rawPredict`.
+fn vertex_model(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/v1beta1/projects/")?;
+    let (_, model_action) = rest.split_once("/publishers/anthropic/models/")?;
+    let (model, action) = model_action.rsplit_once(':')?;
+    (!model.contains('/') && matches!(action, "rawPredict" | "streamRawPredict")).then_some(model)
 }
 
 /// The model named by a Gemini `generateContent` / `streamGenerateContent`
@@ -120,6 +143,8 @@ fn provider_label(path: &str) -> &'static str {
         Some(CompressibleEndpoint::OpenAiChatCompletions) => "openai_chat",
         Some(CompressibleEndpoint::OpenAiResponses) => "openai_responses",
         _ if path == "/anthropic/v1/messages" => "anthropic",
+        _ if bedrock_model(path).is_some() => "bedrock_anthropic",
+        _ if vertex_model(path).is_some() => "vertex_anthropic",
         _ => "gemini",
     }
 }
@@ -138,13 +163,16 @@ fn rate_limited(state: &AppState, path: &str, what: &str, wait_seconds: f64) -> 
 /// Input tokens a request asks for, estimated before anything is sent.
 /// Anthropic bodies go through the `count_tokens` estimator, which weighs
 /// images by size rather than by their base64 text; other shapes count the
-/// whole body with the model's tokenizer.
+/// whole body with the model's tokenizer. Bedrock and Vertex carry Anthropic
+/// bodies and name the model in the path.
 fn estimate_request_tokens(path: &str, body: &[u8]) -> u64 {
     let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let anthropic_on_cloud = bedrock_model(path).or_else(|| vertex_model(path));
     let model = gemini_generate_model(path)
+        .or(anthropic_on_cloud)
         .or_else(|| parsed.get("model").and_then(Value::as_str))
         .unwrap_or("");
-    if path.ends_with("/v1/messages") && parsed.is_object() {
+    if (path.ends_with("/v1/messages") || anthropic_on_cloud.is_some()) && parsed.is_object() {
         crate::handlers::count_tokens::estimate_input_tokens(&parsed, model)
     } else {
         headroom_core::tokenizer::get_tokenizer(model).count_text(&String::from_utf8_lossy(body))
@@ -214,6 +242,12 @@ mod tests {
             "/v1/responses",
             "/v1beta/models/gemini-2.5-pro:generateContent",
             "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+            "/model/anthropic.claude-sonnet-4/invoke",
+            "/model/anthropic.claude-sonnet-4/invoke-with-response-stream",
+            "/model/anthropic.claude-sonnet-4/converse",
+            "/model/anthropic.claude-sonnet-4/converse-stream",
+            "/v1beta1/projects/p/locations/l/publishers/anthropic/models/claude-sonnet-4:rawPredict",
+            "/v1beta1/projects/p/locations/l/publishers/anthropic/models/claude-sonnet-4:streamRawPredict",
         ] {
             assert!(is_generation_path(p), "{p}");
         }
@@ -222,6 +256,8 @@ mod tests {
             "/v1/models",
             "/v1beta/models/gemini-2.5-pro:countTokens",
             "/v1beta/models/gemini-2.5-pro:batchGenerateContent",
+            "/model/anthropic.claude-sonnet-4/count-tokens",
+            "/v1beta1/projects/p/locations/l/publishers/anthropic/models/claude-sonnet-4:countTokens",
         ] {
             assert!(!is_generation_path(p), "{p}");
         }
