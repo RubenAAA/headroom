@@ -885,6 +885,60 @@ where
     }
 }
 
+/// Stamps what this turn's compression did as `x-headroom-*` response
+/// headers, the set the Gemini handler already sends (upstream `2c4dc446`).
+/// Every value is known before the first byte, so streamed turns carry them
+/// too.
+pub(crate) fn stamp_compression_headers(headers: &mut HeaderMap, ctx: &OutcomeContext) {
+    let before = ctx.original_tokens.max(0);
+    let saved = ctx.tokens_saved.clamp(0, before);
+    for (name, value) in [
+        ("x-headroom-tokens-before", before),
+        ("x-headroom-tokens-after", before - saved),
+        ("x-headroom-tokens-saved", saved),
+    ] {
+        headers.insert(
+            HeaderName::from_static(name),
+            http::HeaderValue::from(value),
+        );
+    }
+    // The model is client-supplied; bytes a header cannot carry are skipped.
+    if let Ok(v) = http::HeaderValue::from_str(&ctx.model) {
+        headers.insert(HeaderName::from_static("x-headroom-model"), v);
+    }
+    let tags = header_safe_transforms(&ctx.transforms_applied);
+    if !tags.is_empty()
+        && let Ok(v) = http::HeaderValue::from_str(&tags.join(","))
+    {
+        headers.insert(HeaderName::from_static("x-headroom-transforms"), v);
+    }
+}
+
+/// The transform tags fit for the comma-joined `x-headroom-transforms`
+/// header, after upstream's `header_safe_transforms`: tags that carry detail
+/// (`read_lifecycle:<state>:<path>`, `smart_crush:<n>:<names>`) are cut back
+/// to their first two fields, since a path or a name list may hold a comma.
+/// The output-shaper holdout labels are ledger bookkeeping (arm, stratum,
+/// conversation digest), not something done to this request, so they stay
+/// out. Full detail stays in the request log.
+fn header_safe_transforms(tags: &[String]) -> Vec<&str> {
+    use headroom_core::output_savings::{parse_conversation_label, parse_stratum_label};
+    tags.iter()
+        .filter(|t| parse_stratum_label(t).is_none() && parse_conversation_label(t).is_none())
+        .map(|t| {
+            if t.starts_with("read_lifecycle:") || t.starts_with("smart_crush:") {
+                // Byte index of the second ':' if there is one.
+                match t.match_indices(':').nth(1) {
+                    Some((end, _)) => &t[..end],
+                    None => t.as_str(),
+                }
+            } else {
+                t.as_str()
+            }
+        })
+        .collect()
+}
+
 /// Builds the final HTTP response with headers, timing log, and outcome.
 ///
 /// Extracted from forward_http without behavior change.
@@ -1211,4 +1265,33 @@ where
         forward::wrap_streaming_body(resp_stream, is_sse, status, sse_kind, request_id)
     };
     (body, status, resp_headers)
+}
+
+#[cfg(test)]
+mod header_tag_tests {
+    use super::header_safe_transforms;
+
+    #[test]
+    fn header_tags_drop_bookkeeping_and_detail() {
+        let tags: Vec<String> = [
+            "live_zone",
+            "read_lifecycle:stale:/src/a,b.rs",
+            "smart_crush:3:tool_a,tool_b",
+            "output_shaper:verbosity:L2",
+            "output_shaper:stratum:small",
+            "output_shaper:control:small",
+            "output_shaper:conv:0123456789ab",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            header_safe_transforms(&tags),
+            [
+                "live_zone",
+                "read_lifecycle:stale",
+                "smart_crush:3",
+                "output_shaper:verbosity:L2"
+            ]
+        );
+    }
 }

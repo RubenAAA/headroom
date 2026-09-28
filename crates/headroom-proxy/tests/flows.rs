@@ -50,3 +50,6 @@ mod integration_ws;
 
 #[path = "suites/flows/integration_project_label.rs"]
 mod integration_project_label;
+
+#[path = "suites/flows/integration_compression_headers.rs"]
+mod integration_compression_headers;

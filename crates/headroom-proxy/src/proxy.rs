@@ -1047,6 +1047,10 @@ pub(crate) async fn forward_http(
         resp_headers,
     )
     .await;
+    let mut resp_headers = resp_headers;
+    if let Some(ctx) = &outcome_ctx {
+        forward::stamp_compression_headers(&mut resp_headers, ctx);
+    }
     forward::build_final_response(
         forward::FinalResponseParts {
             status,
