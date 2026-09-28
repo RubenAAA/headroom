@@ -1,10 +1,9 @@
 # Idea: make first turns read the shared prefix instead of writing it
 
-- **Status:** open (mechanism mapped 2026-09-17; revised twice same day after
-  review — round 1 corrected the prize, D4 gate, hierarchy order, and size
-  threshold; round 2 below corrects the D4 estimate basis, reason totals,
-  ledger accounting, and the D-tools claim; all corrections verified, not
-  assumed)
+- **Status:** rejected 2026-09-28 — every branch is dead or re-homed. D4
+  had ~8.1k savable tokens in six days (0.13%); D3 finds nothing shared left
+  to read; the re-key mass belonged to `rejected/recache-rekey-floor.md`,
+  which closed at ~0.5M over ten days. The D0 events and monitor stay.
 - **Source:** 2026-09-17 investigation starting from `prod 84%` → first-turn
   write share, plus same-day review. Code: `prefix_replay.rs`
   (`place_tail_cache_breakpoints`, `opening_scaffolding_target`,
@@ -240,3 +239,16 @@ Context: first turns are 19.6% of all cache creation in the window
 
 Sibling loop: 2,316 retrieval calls over 1,132 hashes = 2.05 calls per hash,
 down from 3.5 on the 2026-09-17 window.
+
+## Findings 2026-09-28 — D3 measured; close
+
+`compaction_restart` over 09-18→28, Claude models: 117 turns, 4,225,129
+write tokens. 108 of them read the shared prefix (p10 3,470, median 15,689
+tokens), so what they write is the new summary and history, which exists
+nowhere else to read. The other 9 read nothing and wrote 1,107,650 tokens,
+~123k each on 140–400-message histories. These look like cold returns after
+the 1h entry expired, not a sharing miss; nothing in this design would have
+turned them into reads.
+
+With D4 dead (above), D3 empty, D1 conditional on order variance D0 never
+showed, and D2 a behaviour change with no measured prize, no branch is left.
