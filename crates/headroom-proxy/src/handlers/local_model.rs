@@ -259,6 +259,7 @@ pub async fn handle_messages(
         use crate::cache_stabilization::drift_detector::{ApiKind, derive_session_key};
         crate::cache_stabilization::capture::maybe_capture(
             &openai_body,
+            &parsed,
             if is_responses {
                 "openai_responses"
             } else {

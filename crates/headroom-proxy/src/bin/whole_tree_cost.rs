@@ -1,7 +1,7 @@
 //! Whole-tree cost attribution (§6 of the harness doc).
 //!
-//! Offline-only. Groups captures by envelope `session_key` (one tree per
-//! session across all models), prices each turn with per-model pricing
+//! Offline-only. Groups captures by Claude Code session (one tree per
+//! session across all models, routed Codex/Spark workers included), prices each turn with per-model pricing
 //! ratios (stable run within the turn's own (session, model) lineage =
 //! read, rest = write), and reports per-tree totals with a per-model split.
 //! Guardrail instrument for routing proposals: ship only when tree cost
@@ -10,10 +10,11 @@
 //! Honest approximations (all stated in the output):
 //! - planner = first-turn model of the tree; workers = the rest. Role is
 //!   not observable offline; per-model shares let the reader re-designate.
-//! - session_key is the drift hash: system rewrites re-key, so re-keyed
-//!   continuations file as separate trees (the `recache-rekey-floor.md`
-//!   undercount). True key-stable joining needs the ledger's
-//!   session_key_hash — follow-up, not this file.
+//! - The tree key is the client's session id: the envelope's
+//!   `client_session_id`, else `metadata.user_id` in an Anthropic body.
+//!   Captures from before the envelope field lose it on routed turns (their
+//!   translated body has no `metadata`), so those fall back to the envelope
+//!   `session_key` and file as their own trees.
 //! - No sidecar filtering: tiny turns stay in their tree and show up as
 //!   small-model shares.
 //!
@@ -40,23 +41,36 @@ fn body_tokens(body: &Value, tok: &dyn Tokenizer) -> usize {
 }
 
 /// Leading-segment stability key: system + tools + per-message hashes.
+/// Responses bodies carry the same parts as `instructions` and `input`.
 fn segments(body: &Value) -> Vec<u64> {
     let mut segs = Vec::new();
-    if let Some(v) = body.get("system") {
-        segs.push(hash_bytes(&serde_json::to_vec(v).unwrap_or_default()));
-    }
-    if let Some(v) = body.get("tools") {
-        segs.push(hash_bytes(&serde_json::to_vec(v).unwrap_or_default()));
+    for field in ["system", "instructions", "tools"] {
+        if let Some(v) = body.get(field) {
+            segs.push(hash_bytes(&serde_json::to_vec(v).unwrap_or_default()));
+        }
     }
     let empty = vec![];
-    for m in body
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .unwrap_or(&empty)
-    {
-        segs.push(hash_bytes(&serde_json::to_vec(m).unwrap_or_default()));
+    for field in ["messages", "input"] {
+        for m in body.get(field).and_then(|m| m.as_array()).unwrap_or(&empty) {
+            segs.push(hash_bytes(&serde_json::to_vec(m).unwrap_or_default()));
+        }
     }
     segs
+}
+
+/// Which tree a captured turn belongs to: the client's session id when the
+/// capture has one, else its envelope `session_key`.
+fn tree_key(env: &Value, body: &Value) -> String {
+    if let Some(id) = env.get("client_session_id").and_then(|s| s.as_str()) {
+        return format!("sess:{id}");
+    }
+    if let Some(id) = headroom_proxy::cache_stabilization::capture::client_session_id(body) {
+        return format!("sess:{id}");
+    }
+    env.get("session_key")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn rates(model: &str, write_tier_1h: bool) -> (f64, f64) {
@@ -78,6 +92,8 @@ fn rates(model: &str, write_tier_1h: bool) -> (f64, f64) {
 }
 
 struct Turn {
+    /// Cache lineage: stability is measured within one `session_key`.
+    session_key: String,
     ts_ms: u64,
     seq: u64,
     model: String,
@@ -113,7 +129,7 @@ fn main() {
         }
     }
 
-    // session_key -> turns (all models = the tree).
+    // tree key -> turns (all models = the tree).
     let mut trees: BTreeMap<String, Vec<Turn>> = BTreeMap::new();
     let mut files = 0usize;
     let mut skipped = 0usize;
@@ -142,21 +158,18 @@ fn main() {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if env.get("endpoint").and_then(|e| e.as_str()) != Some("anthropic") {
-            skipped += 1;
-            continue;
-        }
         let body = env.get("body").cloned().unwrap_or(Value::Null);
         if body.is_null() {
             skipped += 1;
             continue;
         }
-        let sk = env
-            .get("session_key")
-            .and_then(|s| s.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        trees.entry(sk).or_default().push(Turn {
+        let tree = tree_key(&env, &body);
+        trees.entry(tree).or_default().push(Turn {
+            session_key: env
+                .get("session_key")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
             ts_ms: env.get("ts_ms").and_then(|s| s.as_u64()).unwrap_or(0),
             seq: env.get("seq").and_then(|s| s.as_u64()).unwrap_or(0),
             model: body
@@ -192,7 +205,7 @@ fn main() {
             let tok = get_tokenizer(&turn.model);
             let tokens = body_tokens(&turn.body, tok.as_ref());
             let segs = segments(&turn.body);
-            let key = (sk.clone(), turn.model.clone());
+            let key = (turn.session_key.clone(), turn.model.clone());
             let stable = match prev.get(&key) {
                 None => 0,
                 Some(p) => {
@@ -268,8 +281,11 @@ fn main() {
     // Summary: worker-share distribution.
     let n = acc.len().max(1);
     let mean_turns = acc.iter().map(|(_, t)| t.turns).sum::<usize>() as f64 / n as f64;
+    // Trees made only of free models (Spark) cost nothing and have no share.
+    let priced = acc.iter().filter(|(_, t)| t.equiv > 0.0).count().max(1);
     let mean_worker: f64 = acc
         .iter()
+        .filter(|(_, t)| t.equiv > 0.0)
         .map(|(_, t)| {
             let ps = t
                 .models
@@ -279,15 +295,15 @@ fn main() {
             100.0 - ps
         })
         .sum::<f64>()
-        / n as f64;
+        / priced as f64;
     let single_model = acc.iter().filter(|(_, t)| t.models.len() == 1).count();
     println!("\n== summary ==");
     println!("trees: {}  mean turns/tree: {:.1}", acc.len(), mean_turns);
     println!("single-model trees: {single_model} (no routing question there)");
     println!("mean non-planner (worker) cost share: {mean_worker:.1}%");
     println!("\nNotes: stability here is segment-count fraction (ranking-grade); exact");
-    println!("token splits live in section_cost_baseline. Re-keyed continuations file");
-    println!("as separate trees (undercount — needs the ledger session_key_hash join).");
+    println!("token splits live in section_cost_baseline. Routed turns captured before");
+    println!("`client_session_id` existed have no session id and file as their own trees.");
     println!("No sidecar filtering; tiny turns show as small-model shares.");
 }
 

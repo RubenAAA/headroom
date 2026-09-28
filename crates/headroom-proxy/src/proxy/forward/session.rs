@@ -182,7 +182,13 @@ pub(crate) fn park_session_observations(
         compression::CompressibleEndpoint::OpenAiChatCompletions => "openai_chat",
         compression::CompressibleEndpoint::OpenAiResponses => "openai_responses",
     };
-    cache_stabilization::capture::maybe_capture(parsed, endpoint_label, session_key, request_id);
+    cache_stabilization::capture::maybe_capture(
+        parsed,
+        parsed,
+        endpoint_label,
+        session_key,
+        request_id,
+    );
 
     // CTX-2: passive session capture. Same spot + inputs as
     // maybe_capture; same never-block rule — `observe` clones the

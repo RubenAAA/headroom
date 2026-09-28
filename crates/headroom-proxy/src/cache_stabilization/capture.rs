@@ -52,6 +52,18 @@ fn run_id() -> String {
     .clone()
 }
 
+/// The Claude Code session a request belongs to, from `metadata.user_id`.
+///
+/// Subagents share their parent's session id but not its `session_key`, and a
+/// routed worker's translated body drops `metadata` entirely, so this is the
+/// only field that joins a planner to its workers. Claude Code sends
+/// `user_id` as a JSON string holding `session_id`.
+pub fn client_session_id(client_body: &Value) -> Option<String> {
+    let user_id = client_body.get("metadata")?.get("user_id")?.as_str()?;
+    let v: Value = serde_json::from_str(user_id).ok()?;
+    v.get("session_id")?.as_str().map(str::to_string)
+}
+
 /// Append `parsed` to the capture corpus when `HEADROOM_CAPTURE_DIR` is set.
 ///
 /// No-op (one cheap `env::var`) when the env var is absent — the common path.
@@ -74,7 +86,13 @@ fn run_id() -> String {
 /// owns the bounded-queue design — duplicating it here would double the
 /// machinery for a debug-only path. If capture ever becomes always-on,
 /// route it through that queue instead of spawning here.
-pub fn maybe_capture(parsed: &Value, endpoint: &str, session_key: &str, request_id: &str) {
+pub fn maybe_capture(
+    parsed: &Value,
+    client_body: &Value,
+    endpoint: &str,
+    session_key: &str,
+    request_id: &str,
+) {
     let dir = match std::env::var("HEADROOM_CAPTURE_DIR") {
         Ok(d) if !d.is_empty() => d,
         _ => return,
@@ -90,6 +108,7 @@ pub fn maybe_capture(parsed: &Value, endpoint: &str, session_key: &str, request_
     // body clone is the only cost on the request path (a memcpy); the
     // serialize + Defender-scanned write run off the hot path.
     let body = parsed.clone();
+    let client_session_id = client_session_id(client_body);
     let endpoint = endpoint.to_string();
     let session_key = session_key.to_string();
     let request_id = request_id.to_string();
@@ -101,6 +120,7 @@ pub fn maybe_capture(parsed: &Value, endpoint: &str, session_key: &str, request_
             "endpoint": endpoint,
             "session_key": session_key,
             "request_id": request_id,
+            "client_session_id": client_session_id,
             "body": body,
         });
 
