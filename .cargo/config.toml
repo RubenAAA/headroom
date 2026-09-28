@@ -24,3 +24,11 @@ inherits = "dev"
 # Debug info dominates link time on the 84-binary integration tree without
 # helping failure diagnosis (nextest already captures output per test).
 debug = "line-tables-only"
+
+[env]
+# Tests run in-process proxies that book savings to the durable ledger. Without
+# this they append fixture turns to the real ~/.headroom/savings_events.jsonl
+# (2026-09-28: 587 fake `gpt-4o` rows there), skewing `headroom savings`.
+# Applies to every process cargo launches, so `cargo run` of a proxy books here
+# too; the installed binaries are not launched by cargo and are unaffected.
+HEADROOM_SAVINGS_EVENTS_PATH = { value = "target/test-savings-events.jsonl", relative = true }
