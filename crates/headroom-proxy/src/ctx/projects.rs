@@ -188,7 +188,18 @@ impl ProjectStores {
                 return ColdTierLookup::miss(started, scanned, false);
             }
         };
-        for entry in entries.flatten() {
+        // Newest first. A hash being retrieved was nearly always offloaded
+        // recently, and in directory order the budget could run out on months
+        // of stale projects before reaching the one that was written today.
+        let mut entries: Vec<_> = entries
+            .flatten()
+            .map(|e| {
+                let modified = e.metadata().and_then(|m| m.modified()).ok();
+                (modified, e)
+            })
+            .collect();
+        entries.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+        for (_, entry) in entries {
             // Budget checked per file rather than per row: one file is the
             // smallest unit of work here, and an indexed point lookup on a
             // few hundred `sources` rows is far quicker than the check.

@@ -204,14 +204,14 @@ impl ProjectResolver {
         None
     }
 
-    /// The canonical project directory for a request, or `None` when nothing
-    /// in the request names one.
+    /// The project a request's ctx stores belong to, or `None` when nothing in
+    /// the request names one.
     ///
-    /// Same tier order as [`Self::resolve`], but it yields the normalized
-    /// directory *path* rather than the derived key. The ctx stores shard on
-    /// the path itself (`hash_project_dir_canonical`), so they need the value
-    /// that hash is defined over — feeding them a key derived from it would
-    /// land in a different, unrelated bucket.
+    /// Same tier order as [`Self::resolve`], and the same project: the
+    /// repository's origin, or its root path when it has none. The ctx stores
+    /// hash this value into their file names (`hash_project_dir_canonical`), so
+    /// a subdirectory and a worktree share their repository's stores, and a
+    /// moved checkout keeps them.
     pub fn resolve_project_dir(ctx: &RequestContext) -> Option<String> {
         // An explicit project id is not a path. It is still a stable bucket of
         // its own, which is what sharding needs.
@@ -223,12 +223,12 @@ impl ProjectResolver {
         }
         [
             Self::first_nonempty_header(&ctx.headers, "x-headroom-cwd"),
-            ctx.project_root_override.clone(),
             Self::extract_cwd_from_system_prompt(&ctx.system_prompt),
+            ctx.project_root_override.clone(),
         ]
         .into_iter()
         .flatten()
-        .find_map(|raw| Self::normalize_cwd(&raw))
+        .find_map(|raw| Self::project_identity(&raw).map(|(identity, _name)| identity))
     }
 
     /// Canonicalize a cwd: resolve symlinks where the path exists, drop the
@@ -248,23 +248,35 @@ impl ProjectResolver {
     }
 
     fn identity_from_cwd(raw_cwd: &str) -> Option<(String, String)> {
+        let (identity, name) = Self::project_identity(raw_cwd)?;
+        let safe_name = Self::sanitize_basename(&name);
+        let safe_name = if safe_name.is_empty() {
+            "project".to_string()
+        } else {
+            safe_name
+        };
+        let digest = sha256_hex(identity.as_bytes());
+        Some((format!("{}-{}", safe_name, &digest[..16]), name))
+    }
+
+    /// What project a directory belongs to, as `(identity, display name)`.
+    ///
+    /// The repository, not the directory the session happened to start in, and
+    /// keyed on where the repository came from so a checkout keeps its
+    /// project when it is moved or cloned again somewhere else. A repository
+    /// with no `origin`, or no repository at all, is its root path.
+    fn project_identity(raw_cwd: &str) -> Option<(String, String)> {
         let normalised_str = Self::normalize_cwd(raw_cwd)?;
-        // The repository, not the directory the session happened to start in.
-        let normalised = Self::repo_root(&PathBuf::from(&normalised_str));
-        let normalised_str = normalised.to_string_lossy().to_string();
-        let basename = normalised
+        let root = Self::repo_root(&PathBuf::from(&normalised_str));
+        if let Some(remote) = Self::origin_remote(&root) {
+            let name = remote.rsplit('/').next().unwrap_or(&remote).to_string();
+            return Some((remote, name));
+        }
+        let name = root
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "root".to_string());
-        let safe_basename = Self::sanitize_basename(&basename);
-        let safe_basename = if safe_basename.is_empty() {
-            "project".to_string()
-        } else {
-            safe_basename
-        };
-        let digest = sha256_hex(normalised_str.as_bytes());
-        let key = format!("{}-{}", &safe_basename, &digest[..16]);
-        Some((key, basename))
+        Some((root.to_string_lossy().to_string(), name))
     }
 
     /// Walk up to the repository a directory belongs to.
@@ -298,6 +310,48 @@ impl ProjectResolver {
             cursor = path.parent();
         }
         dir.to_path_buf()
+    }
+
+    /// The `origin` URL of the repository at `root`, reduced to `host/owner/name`
+    /// so an https clone and an ssh clone of one repository agree.
+    ///
+    /// `None` sends the caller back to the path: no repository, no `origin`, a
+    /// relative URL (it means something different from every directory), or a
+    /// submodule, whose `.git` is a file and whose config lives elsewhere.
+    fn origin_remote(root: &Path) -> Option<String> {
+        let config = std::fs::read_to_string(root.join(".git").join("config")).ok()?;
+        let mut in_origin = false;
+        let mut url = None;
+        for line in config.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_origin = line == r#"[remote "origin"]"#;
+            } else if in_origin
+                && let Some((k, v)) = line.split_once('=')
+                && k.trim() == "url"
+            {
+                url = Some(v.trim().to_string());
+            }
+        }
+        let url = url?;
+        if url.is_empty() || url.starts_with('.') {
+            return None;
+        }
+        let rest = url.split_once("://").map_or(url.as_str(), |(_, r)| r);
+        let rest = match rest.split_once('@') {
+            Some((user, r)) if !user.contains('/') => r,
+            _ => rest,
+        };
+        // scp-like `host:owner/name`; a scheme URL has already lost its colon
+        // unless it names a port, which this leaves alone.
+        let rest = if !url.contains("://") {
+            rest.replacen(':', "/", 1)
+        } else {
+            rest.to_string()
+        };
+        let rest = rest.trim_end_matches('/');
+        let rest = rest.strip_suffix(".git").unwrap_or(rest);
+        Some(rest.to_lowercase())
     }
 
     /// The main repository a linked worktree points at, if that is what this is.
@@ -507,6 +561,100 @@ pub fn extract_system_prompt(body: &Value) -> String {
     String::new()
 }
 
+/// The system prompt, led by the working directory the client stated last.
+///
+/// Claude Code no longer states its directory in `system`: it arrives in the
+/// opening user message, and a later `cd` arrives as a `role: "system"`
+/// message reading `Primary working directory: /new (was /old)`. Read from
+/// `system` alone, every request fell through to `--memory-project-root`, so
+/// every repository shared that one project's memories. The statement goes
+/// first because the resolver takes the first line it finds.
+///
+/// Memory reads this one. It is injected at the tail, so it can follow a `cd`
+/// without touching the cached prefix.
+pub fn extract_project_prompt(body: &Value) -> String {
+    lead_with_cwd(stated_cwds(body).pop(), body)
+}
+
+/// The system prompt, led by the working directory the conversation opened in.
+///
+/// The ctx stores read this one. Recall is decided once per conversation,
+/// stored in that project's sessions DB, and replayed into message 0 — inside
+/// the cached prefix. Following a `cd` would switch projects, find no decision
+/// there, and rewrite message 0. The opening statement sits in message 0 and
+/// never changes, so neither does the project.
+pub fn extract_opening_prompt(body: &Value) -> String {
+    lead_with_cwd(stated_cwds(body).into_iter().next(), body)
+}
+
+fn lead_with_cwd(cwd: Option<String>, body: &Value) -> String {
+    let system = extract_system_prompt(body);
+    match cwd {
+        Some(cwd) => format!("{} {cwd}\n{system}", CWD_PREFIXES[0]),
+        None => system,
+    }
+}
+
+/// Every working directory the client stated in `messages`, oldest first.
+///
+/// Only a line under an `# Environment` heading counts. Tool results,
+/// assistant turns, and the recall and memory blocks the proxy adds itself all
+/// quote the line as often as not, so they are skipped.
+fn stated_cwds(body: &Value) -> Vec<String> {
+    let mut stated = Vec::new();
+    for msg in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if !matches!(
+            msg.get("role").and_then(Value::as_str),
+            Some("user" | "system")
+        ) {
+            continue;
+        }
+        let texts: Vec<&str> = match msg.get("content") {
+            Some(Value::String(s)) => vec![s.as_str()],
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let own = |t: &&str| {
+            t.contains(CWD_PREFIXES[0])
+                && !t
+                    .trim_start()
+                    .starts_with(headroom_core::ctx::INJECT_SENTINEL)
+                && !t.contains("<memory_context>")
+        };
+        for text in texts.into_iter().filter(own) {
+            let mut in_environment = false;
+            for line in text.lines() {
+                let line = line.trim_start();
+                if line.starts_with("# Environment") {
+                    in_environment = true;
+                    continue;
+                }
+                let Some(rest) = line
+                    .trim_start_matches("- ")
+                    .strip_prefix(CWD_PREFIXES[0])
+                    .filter(|_| in_environment)
+                else {
+                    continue;
+                };
+                let cwd = rest.split(" (was ").next().unwrap_or(rest).trim();
+                if !cwd.is_empty() {
+                    stated.push(cwd.to_string());
+                }
+            }
+        }
+    }
+    stated
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -614,6 +762,67 @@ mod tests {
             .0
         };
         assert_ne!(key(&a), key(&b));
+    }
+
+    /// A repository moved to another folder, or cloned again over ssh instead
+    /// of https, is the same project. One with no `origin` has nothing else to
+    /// go on and stays keyed by its path.
+    #[test]
+    fn the_origin_remote_keys_a_repository_wherever_it_sits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = |dir: &str, origin: Option<&str>| {
+            let path = tmp.path().join(dir);
+            std::fs::create_dir_all(path.join(".git")).unwrap();
+            std::fs::write(path.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+            let mut config = "[core]\n\tbare = false\n".to_string();
+            if let Some(url) = origin {
+                config.push_str(&format!(
+                    "[remote \"upstream\"]\n\turl = https://github.com/someone/else.git\n\
+                     [remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+                ));
+            }
+            std::fs::write(path.join(".git/config"), config).unwrap();
+            path
+        };
+        let key = |path: &std::path::Path| {
+            ProjectResolver::resolve(&RequestContext {
+                headers: HashMap::new(),
+                system_prompt: format!("Primary working directory: {}\n", path.display()),
+                base_user_id: "default".to_string(),
+                project_root_override: None,
+            })
+            .expect("cwd resolves")
+        };
+
+        let before = key(&repo(
+            "ext/capex-analysis",
+            Some("https://github.com/tzhang02-code/capex-analysis.git"),
+        ));
+        let moved = key(&repo(
+            "workspace/capex",
+            Some("git@github.com:tzhang02-code/capex-analysis.git"),
+        ));
+        assert_eq!(moved, before, "moving or re-cloning split the project");
+        assert_eq!(before.1, "capex-analysis");
+        assert!(
+            before.0.starts_with("capex-analysis-"),
+            "unexpected key {}",
+            before.0
+        );
+
+        let other = key(&repo(
+            "ext/letro",
+            Some("https://github.com/HugoDulce/letro.git"),
+        ));
+        assert_ne!(other.0, before.0, "different remotes share a project");
+
+        // Without an origin, two copies are two projects.
+        assert_ne!(key(&repo("a/local", None)).0, key(&repo("b/local", None)).0);
+        assert_ne!(
+            key(&repo("a/rel", Some("../rel.git"))).0,
+            key(&repo("b/rel", Some("../rel.git"))).0,
+            "a relative remote is not an identity"
+        );
     }
 
     /// The partition the backend actually uses.
@@ -922,6 +1131,158 @@ mod tests {
     fn extract_system_none() {
         let body = json!({"messages": [{"role": "user", "content": "hi"}]});
         assert!(extract_system_prompt(&body).is_empty());
+    }
+
+    /// The ctx stores stay with the repository a conversation opened in: a
+    /// subdirectory, a worktree and a moved clone share them, a `cd` does not
+    /// move them, the operator fallback only catches requests that name no
+    /// directory, and lines the proxy or the tools quote are not statements.
+    #[test]
+    fn the_ctx_project_is_the_repository_the_conversation_opened_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = |dir: &str| {
+            let path = tmp.path().join(dir);
+            std::fs::create_dir_all(path.join(".git/worktrees/wt")).unwrap();
+            std::fs::create_dir_all(path.join("apps/api")).unwrap();
+            std::fs::write(path.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(
+                path.join(".git/config"),
+                "[remote \"origin\"]\n\turl = git@github.com:acme/shop.git\n",
+            )
+            .unwrap();
+            path
+        };
+        let (shop, moved) = (repo("ext/shop"), repo("workspace/shop"));
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}/.git/worktrees/wt\n", shop.display()),
+        )
+        .unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let fallback = tmp.path().join("fallback");
+        std::fs::create_dir_all(&fallback).unwrap();
+
+        let environment = |dir: &std::path::Path| {
+            format!(
+                "<system-reminder>\n# Environment\nYou have been invoked in the following \
+                 environment: \n - Primary working directory: {}\n</system-reminder>",
+                dir.display()
+            )
+        };
+        let opened_in = |dir: &std::path::Path, later: Vec<Value>| {
+            let mut messages = vec![json!({"role": "user", "content": [
+                {"type": "text", "text": format!(
+                    "{}\n<session_recall>\n# Environment\n - Primary working directory: {}\n</session_recall>",
+                    headroom_core::ctx::INJECT_SENTINEL, elsewhere.display()
+                )},
+                {"type": "text", "text": environment(dir)},
+                {"type": "text", "text": "build the cart"},
+            ]})];
+            messages.extend(later);
+            json!({"system": [{"type": "text", "text": "You are Claude Code."}], "messages": messages})
+        };
+        let project = |body: &Value| {
+            ProjectResolver::resolve_project_dir(&RequestContext {
+                headers: HashMap::new(),
+                system_prompt: extract_opening_prompt(body),
+                base_user_id: String::new(),
+                project_root_override: Some(fallback.display().to_string()),
+            })
+            .expect("resolves")
+        };
+
+        let root = project(&opened_in(&shop, vec![]));
+        assert_eq!(root, "github.com/acme/shop");
+        assert_eq!(project(&opened_in(&shop.join("apps/api"), vec![])), root);
+        assert_eq!(project(&opened_in(&worktree, vec![])), root);
+        assert_eq!(project(&opened_in(&moved, vec![])), root);
+
+        let cd = json!({"role": "system", "content": format!(
+            "# Environment update\n - Primary working directory: {} (was {})",
+            elsewhere.display(), shop.display()
+        )});
+        let quoted = json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": environment(&elsewhere)},
+            {"type": "text", "text": format!("<memory_context>\n{}\n</memory_context>", environment(&elsewhere))},
+            {"type": "text", "text": format!("Primary working directory: {}", elsewhere.display())},
+        ]});
+        let later = opened_in(&shop, vec![quoted, cd]);
+        assert_eq!(
+            project(&later),
+            root,
+            "the ctx project moved mid-conversation"
+        );
+        // Memory, injected at the tail, does follow the cd.
+        assert!(extract_project_prompt(&later).starts_with(&format!(
+            "Primary working directory: {}\n",
+            elsewhere.display()
+        )));
+
+        let silent = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(project(&silent), fallback.display().to_string());
+    }
+
+    /// Shaped like a current Claude Code request: nothing in `system`, the
+    /// directory in the opening user message, a `cd` announced later, and the
+    /// line quoted in a tool result and by the assistant along the way.
+    #[test]
+    fn the_project_follows_the_directory_claude_code_states_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (opened, moved) = (tmp.path().join("workspace"), tmp.path().join("capex"));
+        std::fs::create_dir_all(&opened).unwrap();
+        std::fs::create_dir_all(&moved).unwrap();
+        let (opened, moved) = (opened.display().to_string(), moved.display().to_string());
+        let quoted = tmp.path().join("quoted").display().to_string();
+        let resolve = |body: &Value| {
+            ProjectResolver::resolve(&RequestContext {
+                headers: HashMap::new(),
+                system_prompt: extract_project_prompt(body),
+                base_user_id: "default".to_string(),
+                project_root_override: Some("/operator/fallback".to_string()),
+            })
+            .expect("resolves")
+            .1
+        };
+
+        let mut body = json!({
+            "system": [{"type": "text", "text": "You are Claude Code."}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": format!(
+                    "# Environment\n - Primary working directory: {opened}\n - Is a git repository: true"
+                )}]},
+            ]
+        });
+        assert_eq!(resolve(&body), "workspace", "opening directory missed");
+
+        let messages = body["messages"].as_array_mut().unwrap();
+        messages.push(json!({"role": "assistant", "content": [
+            {"type": "text", "text": format!("Primary working directory: {quoted}")}
+        ]}));
+        messages.push(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": format!("Primary working directory: {quoted}")}
+        ]}));
+        assert_eq!(
+            resolve(&body),
+            "workspace",
+            "a quoted line moved the project"
+        );
+
+        body["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role": "system", "content": format!(
+                "# Environment update\n - Primary working directory: {moved} (was {opened})"
+            )}));
+        assert_eq!(resolve(&body), "capex", "a later cd was not followed");
+
+        // No directory anywhere: the operator fallback, as before.
+        assert_eq!(
+            resolve(&json!({"messages": [{"role": "user", "content": "hi"}]})),
+            "fallback"
+        );
     }
 
     #[test]

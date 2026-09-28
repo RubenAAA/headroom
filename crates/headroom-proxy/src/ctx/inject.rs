@@ -89,6 +89,9 @@ type Decision = Option<String>;
 pub struct InjectEngine {
     stores: std::sync::Arc<ProjectStores>,
     cache: Mutex<LruCache<String, Decision>>,
+    /// Where a conversation's decision may already be stored when its own
+    /// project has none. See [`Self::with_fallback_project`].
+    fallback_project: Option<String>,
 }
 
 impl InjectEngine {
@@ -98,7 +101,22 @@ impl InjectEngine {
         Self {
             stores,
             cache: Mutex::new(LruCache::new(cap)),
+            fallback_project: None,
         }
+    }
+
+    /// Also look for a stored decision in `project`, the project requests
+    /// resolve to when they name none (`--memory-project-root`).
+    ///
+    /// From 2026-09-10 to 2026-09-28 Claude Code's directory went unread and
+    /// every conversation was filed there. A conversation still running when
+    /// that was fixed resolves to its real project, which has no decision for
+    /// it; building a new one, or injecting nothing past the first-sight depth,
+    /// would rewrite its message 0 and re-cache the whole prefix. Replaying the
+    /// stored block keeps it byte-identical.
+    pub fn with_fallback_project(mut self, project: Option<String>) -> Self {
+        self.fallback_project = project;
+        self
     }
 
     /// Decide + apply injection for one request. Mutates `parsed` in place;
@@ -217,6 +235,10 @@ impl InjectEngine {
         if let Some(replay) = Self::replay_stored_injection(&sessions, conv_id, request_id) {
             return replay;
         }
+        if let Some(replay) = self.replay_from_fallback(&sessions, conv_id, project_dir, request_id)
+        {
+            return replay;
+        }
 
         // No injection row. Distinguish a genuine row-miss from this request
         // racing its own capture: the observer writes the prefix chain from a
@@ -281,6 +303,42 @@ impl InjectEngine {
                 Some(None)
             }
         }
+    }
+
+    /// The decision stored for `conv_id` under the fallback project, copied into
+    /// the conversation's own sessions DB so the next lookup finds it there.
+    /// `None` when there is no fallback, it is this project, or it holds no row.
+    fn replay_from_fallback(
+        &self,
+        sessions: &SessionsStore,
+        conv_id: &str,
+        project_dir: &str,
+        request_id: &str,
+    ) -> Option<Decision> {
+        let fallback = self
+            .fallback_project
+            .as_deref()
+            .filter(|f| *f != project_dir)?;
+        let stored = self
+            .stores
+            .sessions(fallback)?
+            .get_injection(conv_id)
+            .ok()??;
+        if let Err(e) = sessions.put_injection(conv_id, &stored) {
+            tracing::warn!(
+                event = "ctx_inject_persist_failed",
+                request_id = %request_id,
+                conv = %conv_id,
+                error = %e
+            );
+        }
+        tracing::info!(
+            event = "ctx_inject_replayed_from_fallback",
+            request_id = %request_id,
+            conv = %conv_id,
+            "replayed a decision stored under the fallback project"
+        );
+        Some(Some(stored))
     }
 
     /// Row-miss fail-safe: a prefix chain strictly behind the current turn
@@ -618,6 +676,49 @@ mod tests {
         });
         assert!(eng.maybe_inject(&mut r2, "sk", PROJECT, &big_budget()));
         assert_eq!(r2["messages"][0]["content"][0]["text"], injected_text);
+    }
+
+    /// A conversation decided while every request fell back to one project
+    /// keeps its block when it starts resolving to its own: same bytes, past
+    /// the depth where a missing decision would otherwise inject nothing.
+    #[test]
+    fn a_conversation_decided_under_the_fallback_keeps_its_block() {
+        const FALLBACK: &str = "/home/dev/fallback";
+        let dir = TempDir::new().unwrap();
+        let mut opening = fresh_req("build a parser");
+        assert!(engine(&dir).maybe_inject(&mut opening, "sk", FALLBACK, &big_budget()));
+
+        let deep = || {
+            let mut messages = vec![json!({"role":"user","content":"build a parser"})];
+            for i in 0..MAX_FIRST_SIGHT_MESSAGES {
+                messages.push(json!({"role":"assistant","content":format!("reply {i}")}));
+                messages.push(json!({"role":"user","content":format!("more {i}")}));
+            }
+            json!({"system":"sys","messages":messages})
+        };
+
+        // A restarted proxy that cannot see the fallback loses the block.
+        let mut without = deep();
+        assert!(!engine(&dir).maybe_inject(&mut without, "sk", PROJECT, &big_budget()));
+
+        let dir2 = TempDir::new().unwrap();
+        let mut opening2 = fresh_req("build a parser");
+        assert!(engine(&dir2).maybe_inject(&mut opening2, "sk", FALLBACK, &big_budget()));
+        let restarted = engine(&dir2).with_fallback_project(Some(FALLBACK.to_string()));
+        let mut with = deep();
+        assert!(restarted.maybe_inject(&mut with, "sk", PROJECT, &big_budget()));
+        assert_eq!(
+            with["messages"][0]["content"][0]["text"],
+            opening2["messages"][0]["content"][0]["text"]
+        );
+        // Copied across, so the conversation no longer depends on the fallback.
+        let conv_id = identity::conversation_key(&deep(), "sk");
+        assert!(
+            sessions_of(&restarted)
+                .get_injection(&conv_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

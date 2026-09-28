@@ -18,7 +18,7 @@ pub(crate) fn resolve_ccr_workspace(
     body: &serde_json::Value,
     project_root_override: Option<&str>,
 ) -> Option<(String, Option<String>)> {
-    let system_prompt = crate::memory::router::extract_system_prompt(body);
+    let system_prompt = crate::memory::router::extract_opening_prompt(body);
     let ctx = crate::memory::router::RequestContext {
         headers: header_map_to_lowercase_strings(headers),
         system_prompt,
@@ -44,7 +44,7 @@ pub(crate) fn resolve_ctx_project(
 ) -> String {
     let ctx = crate::memory::router::RequestContext {
         headers: header_map_to_lowercase_strings(headers),
-        system_prompt: crate::memory::router::extract_system_prompt(body),
+        system_prompt: crate::memory::router::extract_opening_prompt(body),
         base_user_id: String::new(),
         project_root_override: project_root_override.map(str::to_string),
     };

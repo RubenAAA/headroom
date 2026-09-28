@@ -452,7 +452,7 @@ pub(crate) async fn inject_memory_context(
                 base_user_id,
                 &crate::memory::router::RequestContext {
                     headers: header_map_to_lowercase_strings(headers_snapshot.as_ref()),
-                    system_prompt: crate::memory::router::extract_system_prompt(value),
+                    system_prompt: crate::memory::router::extract_project_prompt(value),
                     base_user_id: base_user_id.to_string(),
                     project_root_override: state.config.memory_project_root.clone(),
                 },

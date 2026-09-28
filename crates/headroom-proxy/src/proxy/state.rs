@@ -512,9 +512,18 @@ impl AppState {
             ));
         }
         match (ctx_observer.as_ref(), ctx_stores.clone()) {
-            (Some(_), Some(stores)) => Ok(Some(Arc::new(crate::ctx::inject::InjectEngine::new(
-                stores,
-            )))),
+            (Some(_), Some(stores)) => Ok(Some(Arc::new(
+                crate::ctx::inject::InjectEngine::new(stores).with_fallback_project(
+                    crate::memory::router::ProjectResolver::resolve_project_dir(
+                        &crate::memory::router::RequestContext {
+                            headers: std::collections::HashMap::new(),
+                            system_prompt: String::new(),
+                            base_user_id: String::new(),
+                            project_root_override: config.memory_project_root.clone(),
+                        },
+                    ),
+                ),
+            ))),
             _ => {
                 // ctx_capture was on but capture failed to start; without
                 // the sessions layer injection cannot run. Log and disable.
