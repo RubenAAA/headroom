@@ -56,6 +56,7 @@
 //! SSE — so a Responses client is never handed an unanswerable tool either,
 //! just without a live rewriter.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -95,6 +96,47 @@ pub(crate) enum CcrShape {
     /// Upstream is a routed model speaking the OpenAI Responses API, whose
     /// turn is a flat `output[]` array rather than `choices[].message`.
     RoutedResponses { anthropic_request: Value },
+}
+
+/// Anthropic stream events this proxy folds into a turn. Anything else is
+/// opaque to it and has no place in the turn JSON.
+const FOLDED_EVENTS: [&str; 8] = [
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+    "ping",
+    "error",
+];
+
+/// What a folded continuation stream carried that its turn JSON cannot
+/// (upstream `12c15796`): events this proxy does not know, verbatim, and the
+/// `message_delta` fields it does not read. Claude Code's auto mode sends a
+/// `safeguard_results` event after a tool call; a continuation that makes one
+/// has to hand it on with the call, or the client never hears the verdict.
+#[derive(Debug, Default)]
+pub(crate) struct ContinuationExtras {
+    /// The continuation's own message id, so the extras are only replayed
+    /// with the turn they came from.
+    message_id: String,
+    frames: Vec<Bytes>,
+    /// `message_delta` fields other than `type`, `delta` and `usage`.
+    message_delta: serde_json::Map<String, Value>,
+    /// `message_delta.delta` fields other than `stop_reason` and
+    /// `stop_sequence`.
+    delta: serde_json::Map<String, Value>,
+}
+
+tokio::task_local! {
+    /// The extras of the last continuation stream folded on this task.
+    ///
+    /// The fold runs several calls below the stream rewriter, inside the
+    /// buffered CCR and memory resolvers that the non-streaming path shares,
+    /// so the extras travel by task local rather than through every resolver
+    /// signature. Unset outside the rewriter, where the fold records nothing.
+    static CONTINUATION_EXTRAS: RefCell<Option<ContinuationExtras>>;
 }
 
 /// Everything the rewriter needs to run a continuation round.
@@ -415,8 +457,10 @@ pub(crate) fn anthropic_stream_to_turn(body: &[u8]) -> Option<Value> {
     let mut framer = SseFramer::new();
     framer.push(body);
     let mut state = AnthropicStreamState::new();
+    let mut extras = ContinuationExtras::default();
     while let Some(event) = framer.next_event() {
         let Ok(event) = event else { continue };
+        collect_extras(&mut extras, &event);
         let _ = state.apply(event);
     }
     if matches!(state.status, StreamStatus::Errored) {
@@ -428,7 +472,35 @@ pub(crate) fn anthropic_stream_to_turn(body: &[u8]) -> Option<Value> {
         .and_then(Value::as_array)
         .is_some_and(|c| !c.is_empty())
         && turn.get("stop_reason").is_some_and(Value::is_string);
+    if complete {
+        extras.message_id = state.message_id.clone().unwrap_or_default();
+        let _ = CONTINUATION_EXTRAS.try_with(|slot| *slot.borrow_mut() = Some(extras));
+    }
     complete.then_some(turn)
+}
+
+/// Keep what [`rebuild_message`] would drop from one continuation event.
+fn collect_extras(extras: &mut ContinuationExtras, event: &SseEvent) {
+    let Ok(Value::Object(mut data)) = serde_json::from_slice::<Value>(&event.data) else {
+        return;
+    };
+    let kind = data.get("type").and_then(Value::as_str).unwrap_or("");
+    if !FOLDED_EVENTS.contains(&kind) {
+        extras.frames.push(reframe(event));
+        return;
+    }
+    if kind != "message_delta" {
+        return;
+    }
+    if let Some(Value::Object(mut delta)) = data.remove("delta") {
+        delta.remove("stop_reason");
+        delta.remove("stop_sequence");
+        extras.delta.extend(delta);
+    }
+    for known in ["type", "usage"] {
+        data.remove(known);
+    }
+    extras.message_delta.extend(data);
 }
 
 /// Every tool this proxy injects and therefore has to answer itself.
@@ -749,18 +821,26 @@ pub(crate) fn stop_reason_overclaims_tool_call(
 /// Usage comes from the final round, matching what the buffered path returns
 /// to the client. The rounds this replaced are accounted separately through
 /// [`crate::proxy::CcrRoundUsage`] so nothing is counted twice.
-pub(crate) fn synthesize_terminal(message: &Value) -> Vec<Bytes> {
+///
+/// A continuation's `message_delta` fields this proxy does not read ride along
+/// in `extras`; the fields it writes win over them.
+pub(crate) fn synthesize_terminal(
+    message: &Value,
+    extras: Option<&ContinuationExtras>,
+) -> Vec<Bytes> {
     let usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
     let stop_reason = message.get("stop_reason").cloned().unwrap_or(Value::Null);
+    let mut delta = extras.map(|e| e.delta.clone()).unwrap_or_default();
+    delta.insert("stop_reason".into(), stop_reason);
+    delta.insert("stop_sequence".into(), Value::Null);
+    let mut message_delta = extras.map(|e| e.message_delta.clone()).unwrap_or_default();
+    message_delta.insert("type".into(), json!("message_delta"));
+    message_delta.insert("delta".into(), Value::Object(delta));
+    message_delta.insert("usage".into(), usage);
     vec![
         event_bytes(
             "message_delta",
-            &serde_json::to_vec(&json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
-                "usage": usage,
-            }))
-            .unwrap_or_default(),
+            &serde_json::to_vec(&Value::Object(message_delta)).unwrap_or_default(),
         ),
         event_bytes(
             "message_stop",
@@ -964,7 +1044,18 @@ where
             return;
         }
 
-        let resolved = resolve_retrieval(&ctx, &rw, &round_usage).await;
+        let (resolved, extras) = CONTINUATION_EXTRAS
+            .scope(RefCell::new(None), async {
+                let resolved = resolve_retrieval(&ctx, &rw, &round_usage).await;
+                (resolved, CONTINUATION_EXTRAS.with(RefCell::take))
+            })
+            .await;
+        // Only the final continuation's extras describe the turn going out.
+        // One from a round the resolvers then discarded names another message.
+        let extras = extras.filter(|e| {
+            !e.message_id.is_empty()
+                && resolved.get("id").and_then(Value::as_str) == Some(e.message_id.as_str())
+        });
         let content = resolved
             .get("content")
             .and_then(Value::as_array)
@@ -1164,7 +1255,12 @@ where
         } else {
             synthesize_blocks(&emit, rw.next_client_index)
         };
-        events.extend(synthesize_terminal(&resolved));
+        // After the blocks they report on, before the turn closes: where the
+        // continuation itself sent them.
+        if let Some(extras) = &extras {
+            events.extend(extras.frames.iter().cloned());
+        }
+        events.extend(synthesize_terminal(&resolved, extras.as_ref()));
 
         for ev in events {
             if tx.send(Ok(ev)).await.is_err() {
@@ -1930,7 +2026,7 @@ mod tests {
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 900, "output_tokens": 40},
         });
-        let text = joined(&synthesize_terminal(&msg));
+        let text = joined(&synthesize_terminal(&msg, None));
         assert!(text.contains("event: message_delta"));
         assert!(text.contains("end_turn"));
         assert!(text.contains("900"));

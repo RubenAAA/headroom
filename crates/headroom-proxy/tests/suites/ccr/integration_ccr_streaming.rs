@@ -91,8 +91,12 @@ async fn ccr_upstream(rounds: Arc<AtomicUsize>) -> (SocketAddr, tokio::task::Joi
                                         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ANSWER_AFTER_RETRIEVAL\"}}\n\n",
                                         "event: content_block_stop\n",
                                         "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                                        // Claude Code auto mode: an event and
+                                        // fields this proxy does not know.
+                                        "event: safeguard_results\n",
+                                        "data: {\"type\":\"safeguard_results\",\"result\":{\"decision\":\"SAFEGUARD_VERDICT\"}}\n\n",
                                         "event: message_delta\n",
-                                        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}\n\n",
+                                        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"x_delta\":\"DELTA_EXTRA\"},\"usage\":{\"output_tokens\":12},\"x_message_delta\":\"EVENT_EXTRA\"}\n\n",
                                         "event: message_stop\n",
                                         "data: {\"type\":\"message_stop\"}\n\n",
                                     );
@@ -496,5 +500,37 @@ async fn the_spliced_turn_is_one_well_formed_message() {
     assert!(
         !sse.contains("tool_use"),
         "the retrieval's stop_reason must not leak:\n{sse}"
+    );
+}
+
+/// Upstream `12c15796`: the continuation is folded into a turn and re-sent as
+/// synthesized events, which used to drop whatever the fold does not model.
+/// Claude Code's auto mode relies on exactly that: a `safeguard_results`
+/// event after a tool call, and fields on `message_delta`.
+#[tokio::test]
+async fn the_splice_keeps_what_the_continuation_sent_that_the_proxy_does_not_know() {
+    let dir = TempDir::new().unwrap();
+    let sse = client_stream(&dir, Arc::new(AtomicUsize::new(0))).await;
+
+    assert_eq!(
+        sse.matches("event: safeguard_results").count(),
+        1,
+        "the continuation's unknown event must reach the client once:\n{sse}"
+    );
+    let verdict = sse.find("SAFEGUARD_VERDICT").unwrap();
+    assert!(
+        sse.find("ANSWER_AFTER_RETRIEVAL").unwrap() < verdict
+            && verdict < sse.find("event: message_delta").unwrap(),
+        "the event goes after the blocks and before the turn closes:\n{sse}"
+    );
+    let message_delta = sse
+        .split("\n\n")
+        .find(|frame| frame.starts_with("event: message_delta"))
+        .unwrap();
+    assert!(
+        message_delta.contains("EVENT_EXTRA")
+            && message_delta.contains("DELTA_EXTRA")
+            && message_delta.contains("end_turn"),
+        "message_delta keeps the continuation's extra fields: {message_delta}"
     );
 }
