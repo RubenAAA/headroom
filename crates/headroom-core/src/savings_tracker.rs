@@ -551,6 +551,10 @@ fn upstream_rate_limit_source() -> String {
 /// Externally tagged on purpose: an internally tagged enum buffers its fields,
 /// and with serde_json's `arbitrary_precision` on in this workspace a buffered
 /// number no longer reads back as `f64`, so every `request` line failed.
+///
+/// A field added later needs no `#[serde(default)]` when it is an `Option`:
+/// serde reads a missing `Option` as `None`, so older journal lines still
+/// load. Any other type needs one, like `source` on `RateLimited`.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum HandoffOp {
