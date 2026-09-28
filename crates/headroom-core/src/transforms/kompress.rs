@@ -134,6 +134,11 @@ fn must_keep_re() -> &'static Regex {
             | (?i:\b(?:not|never|none|cannot|can't|don't|doesn't|didn't|won't|shouldn't
             | mustn't|isn't|aren't|avoid|refuse|prohibited|forbidden|disallow|unless
             | except|without|must|should|shall|required|always|only|mandatory)\b)
+            # Boolean connectives decide WHICH predicates must hold: dropping
+            # one changes the condition while the rest still reads as code
+            # (upstream bf290ba9: 12 of 40 `or` lost from a repeated Python
+            # return line). Uppercase AND/OR were already held by ALLCAPS.
+            | (?i:\b(?:and|or|nor|xor)\b)
             ",
         )
         .expect("MUST_KEEP_RE is a valid regex")
@@ -879,6 +884,15 @@ mod tests {
         assert!(re.is_match("without"));
         assert!(re.is_match("NOT")); // scoped case-insensitive, like Python (?i:...)
         assert!(!re.is_match("notebook")); // substring, not a word
+        // Boolean connectives (upstream bf290ba9), bare and punctuated
+        for word in ["or", "and", "nor", "xor", "or,", "(and)"] {
+            assert!(re.is_match(word), "{word}");
+        }
+        for word in [
+            "orange", "random", "android", "core", "sort", "concat", "node",
+        ] {
+            assert!(!re.is_match(word), "{word}");
+        }
     }
 
     #[cfg(feature = "ml")]
