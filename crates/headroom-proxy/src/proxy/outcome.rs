@@ -73,6 +73,9 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             tokens_saved: outcome.tokens_saved,
             tool_schema_saved,
             compression_savings_cost_usd: Some(outcome.compression_savings_cost_usd()),
+            tool_schema_savings_cost_usd: Some(
+                outcome.tool_schema_savings_cost_usd_for(tool_schema_saved),
+            ),
             provider: Some(&outcome.provider),
             project: outcome.project.as_deref(),
             cache_read_tokens: outcome.cache_read_tokens,
@@ -235,9 +238,11 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         let model = outcome.model.clone();
         let client = outcome.client.clone();
         // Price the booked (headline) count, not the message-only count, so
-        // the ledger's token and dollar columns share one basis. The
-        // cache-aware rate selection is unchanged.
-        let priced_cost = outcome.compression_savings_cost_usd_for(saved);
+        // the ledger's token and dollar columns share one basis: message
+        // savings at the live-zone mix, tool-schema savings read-first.
+        let tool_schema_saved = saved - outcome.tokens_saved.clamp(0, saved);
+        let priced_cost = outcome.compression_savings_cost_usd_for(saved - tool_schema_saved)
+            + outcome.tool_schema_savings_cost_usd_for(tool_schema_saved);
         // `"free"` (zero-rate tier) makes the basis self-describing: the
         // counterfactual dollars below are 0.0 because the model costs
         // nothing, not because nothing was saved — do not read them

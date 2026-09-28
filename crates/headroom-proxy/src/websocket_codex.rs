@@ -728,6 +728,9 @@ impl OutcomeSink for CodexWsOutcomeSink {
             tokens_saved: outcome.tokens_saved,
             tool_schema_saved,
             compression_savings_cost_usd: Some(outcome.compression_savings_cost_usd()),
+            tool_schema_savings_cost_usd: Some(
+                outcome.tool_schema_savings_cost_usd_for(tool_schema_saved),
+            ),
             provider: Some(&outcome.provider),
             project: outcome.project.as_deref(),
             cache_read_tokens: outcome.cache_read_tokens,

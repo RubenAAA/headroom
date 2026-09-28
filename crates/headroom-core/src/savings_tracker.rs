@@ -560,6 +560,7 @@ enum HandoffOp {
         tokens_saved: i64,
         tool_schema_saved: i64,
         compression_savings_cost_usd: Option<f64>,
+        tool_schema_savings_cost_usd: Option<f64>,
         provider: Option<String>,
         project: Option<String>,
         cache_read_tokens: i64,
@@ -642,6 +643,9 @@ pub struct RequestRecord<'a> {
     /// Request-scoped pricing counterfactual for `tokens_saved`. `None` keeps
     /// the legacy fresh-input estimate for callers without cache placement.
     pub compression_savings_cost_usd: Option<f64>,
+    /// Request-scoped pricing counterfactual for `tool_schema_saved`, priced
+    /// read-first. `None` keeps the fresh-input estimate.
+    pub tool_schema_savings_cost_usd: Option<f64>,
     pub provider: Option<&'a str>,
     pub project: Option<&'a str>,
     pub cache_read_tokens: i64,
@@ -814,10 +818,9 @@ impl SavingsTracker {
         let ts = rec.timestamp.unwrap_or_else(utc_now);
         let delta_tokens_saved = coerce_int(rec.tokens_saved);
         // Headline leg: tool-schema tokens never entered context. Folded
-        // into token totals and priced with the same list-price
-        // counterfactual as message savings (removed input is removed
-        // input); excluded from cache-mix tier buckets downstream, which
-        // price only billed tiers.
+        // into token totals and priced by the caller read-first against the
+        // turn's cache mix, or at list without one; excluded from cache-mix
+        // tier buckets downstream, which price only billed tiers.
         let delta_tool_schema_saved = coerce_int(rec.tool_schema_saved);
         let delta_headline_saved = delta_tokens_saved.saturating_add(delta_tool_schema_saved);
         let delta_input_tokens = coerce_int(rec.input_tokens);
@@ -825,7 +828,12 @@ impl SavingsTracker {
             .compression_savings_cost_usd
             .map(|cost| cost.max(0.0))
             .unwrap_or_else(|| estimate_compression_savings_usd(rec.model, delta_tokens_saved))
-            + estimate_compression_savings_usd(rec.model, delta_tool_schema_saved);
+            + rec
+                .tool_schema_savings_cost_usd
+                .map(|cost| cost.max(0.0))
+                .unwrap_or_else(|| {
+                    estimate_compression_savings_usd(rec.model, delta_tool_schema_saved)
+                });
         // Output-shaping savings, priced at the OUTPUT rate and accumulated
         // separately — folding them into `tokens_saved` would mix an
         // output-side count into an input-side figure and misprice both.
@@ -858,6 +866,7 @@ impl SavingsTracker {
             tokens_saved: rec.tokens_saved,
             tool_schema_saved: rec.tool_schema_saved,
             compression_savings_cost_usd: rec.compression_savings_cost_usd,
+            tool_schema_savings_cost_usd: rec.tool_schema_savings_cost_usd,
             provider: rec.provider.map(str::to_string),
             project: rec.project.map(str::to_string),
             cache_read_tokens: rec.cache_read_tokens,
@@ -1933,6 +1942,7 @@ impl SavingsTracker {
                 tokens_saved,
                 tool_schema_saved,
                 compression_savings_cost_usd,
+                tool_schema_savings_cost_usd,
                 provider,
                 project,
                 cache_read_tokens,
@@ -1957,6 +1967,7 @@ impl SavingsTracker {
                     tokens_saved,
                     tool_schema_saved,
                     compression_savings_cost_usd,
+                    tool_schema_savings_cost_usd,
                     provider: provider.as_deref(),
                     project: project.as_deref(),
                     cache_read_tokens,

@@ -226,6 +226,21 @@ impl RequestOutcome {
     /// A zero input rate (free tier) prices to 0.0 through the normal mix
     /// math, and pairs with the `"free"` basis above — not a missing price.
     pub fn compression_savings_cost_usd_for(&self, tokens_saved: i64) -> f64 {
+        self.price_removed(tokens_saved, false)
+    }
+
+    /// Dollar counterfactual for removed PREFIX tokens: tool schemas that
+    /// deferral kept out of the request (upstream `89a58fd1`). Tools serialize
+    /// ahead of the system prompt and the turns, so on a warm turn they would
+    /// have been cache reads. The removed tokens fill the read bucket first,
+    /// up to the reads the turn reported, and only the rest spills into the
+    /// write/list mix. Pricing them like live-zone tokens overstated a warm
+    /// turn's deferral about tenfold.
+    pub fn tool_schema_savings_cost_usd_for(&self, tokens_saved: i64) -> f64 {
+        self.price_removed(tokens_saved, true)
+    }
+
+    fn price_removed(&self, tokens_saved: i64, read_first: bool) -> f64 {
         if tokens_saved <= 0 {
             return 0.0;
         }
@@ -253,17 +268,23 @@ impl RequestOutcome {
             (self.cache_write_tokens.max(0) as f64 - write_1h, write_1h)
         };
         let uncached = self.uncached_input_tokens.max(0) as f64;
-        let tokens = tokens_saved.max(0) as f64;
+        let read = if read_first {
+            (tokens_saved.max(0) as f64).min(self.cache_read_tokens.max(0) as f64)
+        } else {
+            0.0
+        };
+        let read_cost = read * pricing.cache_read_rate(long).unwrap_or(list_rate);
+        let tokens = tokens_saved.max(0) as f64 - read;
         let denom = write_5m + write_1h + uncached;
         if denom <= 0.0 {
-            return tokens * list_rate;
+            return read_cost + tokens * list_rate;
         }
         let w5 = tokens * write_5m / denom;
         let w1 = tokens * write_1h / denom;
         // Subtract so the parts sum to `tokens` exactly, no float drift
         // accumulating over a long session.
         let unc = tokens - w5 - w1;
-        w5 * write_rate + w1 * write_1h_rate + unc * list_rate
+        read_cost + w5 * write_rate + w1 * write_1h_rate + unc * list_rate
     }
 
     /// Tokens the forwarded request grew by, if it ended up larger.
@@ -742,6 +763,32 @@ mod tests {
         let expected =
             (1_000.0 * 1_013.0 / 1_015.0) * 6.25 / 1e6 + (1_000.0 * 2.0 / 1_015.0) * 5.0 / 1e6;
         assert!((outcome.compression_savings_cost_usd() - expected).abs() < 1e-12);
+    }
+
+    /// Deferred tool schemas are prefix tokens: read-first, spilling into the
+    /// write/list mix only past the reads the turn reported.
+    #[test]
+    fn tool_schema_savings_fill_the_read_bucket_first() {
+        let warm = RequestOutcome {
+            model: "claude-opus-5".into(),
+            cache_read_tokens: 480_000,
+            cache_write_tokens: 1_013,
+            uncached_input_tokens: 2,
+            ..Default::default()
+        };
+        // All 5,000 would have been reads ($0.50/MTok on opus-5).
+        let expected = 5_000.0 * 0.5 / 1e6;
+        assert!((warm.tool_schema_savings_cost_usd_for(5_000) - expected).abs() < 1e-12);
+        assert!(warm.compression_savings_cost_usd_for(5_000) > 10.0 * expected);
+
+        // Only 1,000 reads reported: the other 4,000 split like live-zone.
+        let cold = RequestOutcome {
+            cache_read_tokens: 1_000,
+            cache_write_tokens: 4_000,
+            ..warm
+        };
+        let expected = 1_000.0 * 0.5 / 1e6 + cold.compression_savings_cost_usd_for(4_000);
+        assert!((cold.tool_schema_savings_cost_usd_for(5_000) - expected).abs() < 1e-12);
     }
 
     #[test]
