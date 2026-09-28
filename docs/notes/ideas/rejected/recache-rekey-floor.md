@@ -1,8 +1,11 @@
 # Idea: size the hidden re-key / first-turn floor
 
-- **Status:** open — MEASURED 2026-09-21 and the floor is material
-  (3.37M tokens, 6.7× drift waste). Promote to a key-stability proposal;
-  see Findings at the bottom.
+- **Status:** rejected 2026-09-28 — the 3.37M "floor" below was the
+  criterion, not re-keys. 152 of the 186 `fresh_session` contradictions read
+  a prefix size that another session also read (3,470 tokens 21 times, 7,236
+  13 times): new sessions hitting the shared system and tools prefix, which is
+  the cache working. What is left over ten days is about 0.5M tokens. See the
+  2026-09-28 findings at the bottom.
 - **Source:** a continuation under a fresh key (compaction, model switch,
   system rewrite) files as `FirstTurn`, never reaches attribution, and its
   write is not waste-counted. `first_turn_contradictions_total` and
@@ -63,3 +66,42 @@ Two sub-answers the join settles:
 
 First turns are 19.6% of all cache creation in the window (9,158,609 tokens
 over 349 turns), which is the ceiling this floor sits under.
+
+
+## Findings 2026-09-28 — the contradictions are shared-prefix reads; close
+
+Same join over 2026-09-18 to 09-28, Anthropic models only. The criterion at
+`usage_observer.rs:2499` calls a `fresh_session` turn a contradiction when it
+reads anything. But a new session sends the same system prompt and tools as
+every other session of its kind, and the provider serves that prefix from any
+of them. A read there proves nothing about a lost key.
+
+| reason | contradicts | msgs | turns | creation tokens | read p50 |
+|---|---|---|---|---|---|
+| fresh_session | yes | ≤2 | 186 | 2,949,537 | 17,426 |
+| compaction_restart | no | 3–10 | 70 | 2,137,801 | 11,941 |
+| compaction_restart | no | >10 | 41 | 1,826,387 | 105,085 |
+| fresh_session | no | ≤2 | 63 | 1,778,734 | 0 |
+| session_key_drift | no | >10 | 27 | 955,855 | 88,042 |
+| arrived_with_history | no | >10 | 15 | 642,086 | — |
+| arrived_with_history | yes | >10 | 3 | 319,354 | 0 |
+
+The 186 fall across 185 distinct sessions, and none had replay or adoption.
+152 read a token count that at least one other session read too, the mark of
+a fixed shared prefix. Only 7 read more than 40k, which would be too much for
+scaffolding alone; they wrote 205,194 tokens.
+
+What could be a hidden re-key:
+
+- `arrived_with_history` with no read: 3 turns, 319,354 tokens.
+- `fresh_session` reads over 40k: 7 turns, 205,194 tokens.
+
+That is about 0.52M over ten days. `session_key_drift` (956k) is not hidden:
+prefix adoption found the donor, so replay already handles it, and what it
+still writes belongs to the drift work. `compaction_restart` is a real new
+prefix by design.
+
+A key-stability project would chase half a million tokens in ten days. Not
+worth it. If this comes back, tighten the criterion first so the counter stops
+reporting shared-prefix reads as contradictions, for example by only counting
+a `fresh_session` read above the largest prefix seen shared across sessions.

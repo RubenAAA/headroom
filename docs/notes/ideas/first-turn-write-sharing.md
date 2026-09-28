@@ -231,8 +231,9 @@ candidate counts, not a forecast.
 Where the mass actually is: `compaction_restart` (2.17M) plus
 `session_key_drift` (0.58M) is 2.75M, 44% of first-turn outer writes, and
 both are re-key events rather than scaffolding-sharing misses. That is the
-same lane as `recache-rekey-floor.md`, which measured 3.37M of uncounted
-contradiction writes over the same window. Retarget there.
+same lane as `rejected/recache-rekey-floor.md`. Its 3.37M of contradiction
+writes turned out to be shared-prefix reads on new sessions; the real hidden
+re-key floor is about 0.5M over ten days (2026-09-28).
 
 Context: first turns are 19.6% of all cache creation in the window
 (9,158,609 tokens over 349 conversations).
