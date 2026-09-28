@@ -14,6 +14,12 @@
   flip both. `--force-kompress-all` is still a no-op in Rust; the forced arm
   needs it built first (route every non-excluded type to Kompress in
   `live_zone/dispatch.rs`, size gate kept).
+- **Also unlocks (2026-09-28):** the Responses `instructions` slot. Codex
+  sends a 10–33KB prose system prompt on every turn (89/89 Codex turns,
+  0/961 Spark in the 09-25 capture); no compressor takes it while Kompress
+  is off. It is byte-identical across turns, so a deterministic Kompress
+  pass would cache well. The slot is not wired on the Responses path yet —
+  see `rejected/responses-instructions-call-input-slots.md` for the shape.
 - **Next:** enable on a canary (NOT `--force-compress-all` yet — that
   bypasses guards; test guarded first, forced second if guarded wins).
   Track: per-turn savings on `PlainText` blocks; answer-retention quality

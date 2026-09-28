@@ -1,6 +1,22 @@
 # Idea: compress `instructions` + call-input slots on the Responses live path
 
-- **Status:** open (measured 2026-09-25, ready to build)
+- **Status:** rejected 2026-09-28 — the slots are real but today's
+  compressors take nothing from them. Probe: every distinct payload in
+  `~/headroom-capture-netvalue` run through `compress_block_for_offload`
+  (the same detector + dispatcher stack).
+  - `function_call.arguments` (6.3% of Responses body bytes, nearly all of
+    it the same calls resent; 870 distinct ones ≥512B, 1.35MB): whole
+    strings 0% saved — no compressor takes a JSON object. Per string field,
+    10 of ~680 large fields compressed, ~80KB, about 0.4% of body bytes.
+    Those 10 were `bash.command` scripts and `write.content` /
+    `edit.new_string` code under the log and code-skeleton compressors: the
+    model would later read a mangled copy of what it wrote, and
+    `edit.old_string` has to match the file byte for byte. Declined.
+  - `instructions`: all 41 distinct Codex prompts (10–33KB) got no strategy.
+    The detector reads them as prose, and prose goes only to Kompress, which
+    is off. Moved to `kompress-enable-ab.md` as a second thing that A/B
+    unlocks.
+  The 5 emptied-input turns were not checked; nothing was built.
 - **Source:** upstream `be00a798` (gateway Responses shape, Sept 2026
   session) — skipped as a port because `/v1/compress` has no local
   contract, but its view design covers two slot classes our
