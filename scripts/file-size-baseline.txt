@@ -1,8 +1,8 @@
 # Rust files over 3000 lines: `path max_lines`, or `path *` for files that
 # grow by design. Read by scripts/check-file-size.sh. Lower numbers only.
-crates/headroom-core/src/savings_tracker.rs 3391
-crates/headroom-core/src/transforms/code_compressor.rs 3651
-crates/headroom-core/src/transforms/content_router.rs 4837
-crates/headroom-proxy/src/cache_stabilization/prefix_replay.rs 8624
-crates/headroom-proxy/src/cache_stabilization/usage_observer.rs 8242
+# smart_crusher/crusher.rs is pinned, not split: upstream still edits it, and
+# a local split would conflict with every upstream merge.
+crates/headroom-core/src/transforms/code_compressor.rs 3645
+crates/headroom-core/src/transforms/smart_crusher/crusher.rs 3144
+crates/headroom-proxy/src/cache_stabilization/usage_observer.rs 4510
 crates/headroom-proxy/src/config.rs *
