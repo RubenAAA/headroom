@@ -332,10 +332,33 @@ pub(crate) fn responses_json_to_sse(response: &Value) -> Vec<Bytes> {
 /// JSON body from an SSE stream. Some OpenAI-compatible upstreams answer a
 /// `stream: false` request with a valid 200 SSE body; the terminal
 /// `response.completed` event carries the complete object, so no delta
-/// accumulation is needed. `None` when no terminal event is present — the
-/// caller forwards the raw body unchanged in that case.
+/// accumulation is needed. `None` when no terminal event is present.
 pub(crate) fn responses_completed_from_sse(sse_text: &str) -> Option<Value> {
-    fn consume(lines: &[&str], completed: &mut Option<Value>) {
+    sse_data_events(sse_text)
+        .into_iter()
+        .filter(|data| data.get("type").and_then(Value::as_str) == Some("response.completed"))
+        .filter_map(|data| data.get("response").filter(|v| v.is_object()).cloned())
+        .next_back()
+}
+
+/// True when a Responses SSE body carries an error the client should see:
+/// an `error` event, a `response.failed` or `response.incomplete` terminal,
+/// or a bare `{"error": ...}` payload. Tells such a reply apart from one that
+/// held only keepalives when no `response.completed` arrived.
+pub(crate) fn responses_sse_has_error(sse_text: &str) -> bool {
+    sse_data_events(sse_text).iter().any(|data| {
+        data.get("error").is_some()
+            || matches!(
+                data.get("type").and_then(Value::as_str),
+                Some("error" | "response.failed" | "response.incomplete")
+            )
+    })
+}
+
+/// The JSON `data:` payloads of an SSE body, in order. `[DONE]` and payloads
+/// that are not JSON are skipped.
+fn sse_data_events(sse_text: &str) -> Vec<Value> {
+    fn consume(lines: &[&str], out: &mut Vec<Value>) {
         if lines.is_empty() {
             return;
         }
@@ -343,30 +366,25 @@ pub(crate) fn responses_completed_from_sse(sse_text: &str) -> Option<Value> {
         if data_str == "[DONE]" {
             return;
         }
-        let Ok(data): Result<Value, _> = serde_json::from_str(&data_str) else {
-            return;
-        };
-        if data.get("type").and_then(Value::as_str) == Some("response.completed")
-            && let Some(response) = data.get("response").filter(|v| v.is_object())
-        {
-            *completed = Some(response.clone());
+        if let Ok(data) = serde_json::from_str::<Value>(&data_str) {
+            out.push(data);
         }
     }
 
-    let mut completed = None;
+    let mut out = Vec::new();
     let mut data_lines: Vec<&str> = Vec::new();
     for raw_line in sse_text.split('\n') {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if line.is_empty() {
-            consume(&data_lines, &mut completed);
+            consume(&data_lines, &mut out);
             data_lines.clear();
         } else if let Some(data) = line.strip_prefix("data:") {
             // Per the SSE spec, strip at most one leading space.
             data_lines.push(data.strip_prefix(' ').unwrap_or(data));
         }
     }
-    consume(&data_lines, &mut completed);
-    completed
+    consume(&data_lines, &mut out);
+    out
 }
 
 /// The OpenAI wire shape for a post-commit stream error. Port of

@@ -16,6 +16,9 @@
 //!    own their transcript server-side).
 //! 3. no retrieve tool + `stream: true` → untouched (upstream sees
 //!    `stream: true`).
+//! 4. upstream answers the buffered request with SSE that holds only
+//!    keepalives → 502, not an empty 200 stream (upstream 000fefce); SSE
+//!    that carries an error event still reaches the client as sent.
 
 use super::common;
 
@@ -45,6 +48,15 @@ struct Seen {
 /// Hyper mock upstream: records the request body + Accept header, answers a
 /// fixed completed Responses JSON document.
 async fn json_upstream(seen: Arc<Mutex<Seen>>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    upstream(seen, "application/json", COMPLETED_JSON).await
+}
+
+/// Same, answering with `reply` under `content_type`.
+async fn upstream(
+    seen: Arc<Mutex<Seen>>,
+    content_type: &'static str,
+    reply: &'static str,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral");
@@ -82,11 +94,11 @@ async fn json_upstream(seen: Arc<Mutex<Seen>>) -> (SocketAddr, tokio::task::Join
                                 let (tx, rx) = tokio::sync::mpsc::channel::<
                                     Result<Frame<Bytes>, std::io::Error>,
                                 >(1);
-                                let _ = tx.send(Ok(Frame::data(Bytes::from(COMPLETED_JSON)))).await;
+                                let _ = tx.send(Ok(Frame::data(Bytes::from(reply)))).await;
                                 Ok::<_, Infallible>(
                                     Response::builder()
                                         .status(200)
-                                        .header("content-type", "application/json")
+                                        .header("content-type", content_type)
                                         .body(StreamBody::new(ReceiverStream::new(rx)))
                                         .unwrap(),
                                 )
@@ -250,5 +262,56 @@ async fn streaming_responses_without_retrieve_tool_is_untouched() {
         seen.body.expect("upstream saw a body").get("stream"),
         Some(&json!(true)),
         "requests without the retrieve tool must not be buffered"
+    );
+}
+
+async fn buffered_turn_against_sse(sse: &'static str) -> (u16, String, String) {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (addr, _upstream) = upstream(seen.clone(), "text/event-stream", sse).await;
+    let dir = TempDir::new().unwrap();
+    let store_dir = dir.path().to_path_buf();
+    let proxy = start_proxy_with(&format!("http://{addr}"), move |c| {
+        c.compression = true;
+        c.compression_mode = headroom_proxy::config::CompressionMode::Off;
+        c.ctx_offload = true;
+        c.ctx_store_dir = Some(store_dir);
+    })
+    .await;
+    let out = post_responses(&proxy.url(), responses_body(true, retrieve_tools()), false).await;
+    proxy.shutdown().await;
+    assert_eq!(
+        seen.lock()
+            .expect("seen lock")
+            .clone()
+            .body
+            .expect("upstream saw a body")["stream"],
+        json!(false),
+        "the request must have been de-streamed for buffered CCR"
+    );
+    out
+}
+
+#[tokio::test]
+async fn keepalive_only_sse_to_a_buffered_request_is_a_502() {
+    let (status, content_type, text) =
+        buffered_turn_against_sse(": keepalive\n\n: keepalive\n\n").await;
+    assert_eq!(
+        status, 502,
+        "an empty stream must not pass as success: {text}"
+    );
+    assert!(content_type.contains("application/json"), "{content_type}");
+    let body: Value = serde_json::from_str(&text).expect("JSON error body");
+    assert_eq!(body["error"]["type"], "upstream_protocol_error");
+}
+
+#[tokio::test]
+async fn error_event_sse_to_a_buffered_request_passes_through() {
+    const FAILED: &str = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n";
+    let (status, content_type, text) = buffered_turn_against_sse(FAILED).await;
+    assert_eq!(status, 200);
+    assert!(content_type.contains("text/event-stream"), "{content_type}");
+    assert!(
+        text.contains("response.failed") && text.contains("boom"),
+        "{text}"
     );
 }

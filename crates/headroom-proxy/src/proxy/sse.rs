@@ -217,8 +217,8 @@ pub(super) async fn maybe_rewrite_anthropic_stream(
 /// upstreams answer a `stream: false` request with a valid 200 SSE body. When
 /// this request was buffered for Responses CCR, collect that stream and
 /// reassemble the terminal JSON so the buffered arm below still resolves
-/// retrieval. Without a terminal event the collected bytes stream through
-/// unchanged (previous behaviour, error included).
+/// retrieval. Without a terminal event the collected bytes stay SSE, and
+/// `reject_unterminated_responses_sse` decides what the client gets.
 pub(super) async fn reframe_buffered_responses_sse(
     mut upstream_body: std::pin::Pin<
         Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,

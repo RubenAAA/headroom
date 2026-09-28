@@ -553,6 +553,60 @@ pub(crate) struct ResponseStreamCtx<'a> {
 }
 
 #[allow(clippy::type_complexity)]
+/// The reply to a de-streamed Responses request was an event stream with no
+/// `response.completed` in it (`reframe_buffered_responses_sse` found none).
+/// Port of upstream 000fefce: a body that held only keepalives used to reach
+/// the client as a 200 stream with nothing in it. An error event still passes
+/// through unchanged, so the client sees the upstream's own error; anything
+/// else is answered 502 rather than as an empty success.
+pub(crate) async fn reject_unterminated_responses_sse<S, E>(
+    resp_stream: S,
+    request_id: &str,
+    status: &mut StatusCode,
+    resp_headers: &mut HeaderMap,
+) -> Body
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    use futures_util::TryStreamExt as _;
+    let collected: Result<Vec<bytes::Bytes>, E> = resp_stream.try_collect().await;
+    let reason = match collected {
+        Ok(chunks) => {
+            let bytes = chunks.concat();
+            if crate::openai_buffered_ccr::responses_sse_has_error(&String::from_utf8_lossy(&bytes))
+            {
+                return Body::from(bytes);
+            }
+            "no terminal event".to_string()
+        }
+        Err(e) => e.to_string(),
+    };
+    tracing::warn!(
+        request_id = %request_id,
+        reason = %reason,
+        event = "upstream_protocol_error",
+        "upstream answered a buffered Responses request with an event stream \
+         that never completed"
+    );
+    *status = StatusCode::BAD_GATEWAY;
+    resp_headers.remove(http::header::CONTENT_TYPE);
+    resp_headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    resp_headers.remove(http::header::CONTENT_LENGTH);
+    Body::from(
+        serde_json::json!({
+            "error": {
+                "message": "upstream answered with an event stream that never completed",
+                "type": "upstream_protocol_error",
+            }
+        })
+        .to_string(),
+    )
+}
+
 pub(crate) async fn assemble_response_stream(
     upstream_resp: reqwest::Response,
     sse_prefix: bytes::Bytes,
@@ -1105,6 +1159,14 @@ where
                 Body::from(format!("upstream response buffering failed: {e}"))
             }
         }
+    } else if is_sse && status.is_success() && buffered_responses_ccr {
+        forward::reject_unterminated_responses_sse(
+            resp_stream,
+            request_id,
+            &mut status,
+            &mut resp_headers,
+        )
+        .await
     } else if is_sse
         && status.is_success()
         && matches!(sse_kind, SseStreamKind::Anthropic)
