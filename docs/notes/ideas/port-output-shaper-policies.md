@@ -1,7 +1,7 @@
 # Idea: port the upstream output-shaper policy split
 
 - **Status:** open, narrowed 2026-09-28 — 9 of 20 commits are pure file
-  splits; 4 behaviour items left, 1 blocked.
+  splits; 3 behaviour items left, 1 blocked.
 - **Source:** `docs/notes/upstream-port-backlog.md` group A (range
   `42ebbc6c..904bc675`)
 - **Summary:** upstream split output-shaping into single-purpose policy modules
@@ -21,12 +21,12 @@ The module split itself needs no port. Already in Rust: `3e976712`,
 
 Left:
 
-1. `4e5a67a3` + rest of `f542b704`: the memory query skips
-   `<system-reminder>` blocks and joins the rest. Rust `extract_user_query`
-   (`memory/handler.rs:1653`) returns the first non-empty text block, which
-   on Claude Code is usually a system reminder, so memory retrieval is keyed
-   on boilerplate. Verified. `ccr_expansion.rs:55` has the same shape.
-   Smallest item, largest payoff.
+1. Done 2026-09-28: `4e5a67a3` + rest of `f542b704`. `extract_user_query`
+   (`memory/handler.rs`) now skips `<system-reminder>` blocks and joins the
+   rest with `\n`; before, it returned the first text block, usually a
+   reminder, so memory search ran on boilerplate. `ccr_expansion.rs:55`
+   `latest_user_query` has the same shape and is not changed: it feeds ctx
+   injection, a different path.
 2. `71cbb6aa` + `63f74aa3`: steering for Responses (`instructions` tail,
    HTTP and WS); `1b8c11eb`: steering for chat (last system/developer
    message). The shaper runs on Anthropic bodies only

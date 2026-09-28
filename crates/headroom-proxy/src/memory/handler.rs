@@ -1651,26 +1651,35 @@ impl MemoryHandler {
 
 // ─── Free functions ──────────────────────────────────────────────────────
 
+/// The latest user message's typed text, the memory search query.
+///
+/// Claude Code opens a user message with `<system-reminder>` blocks, so taking
+/// the first text block searched on the reminder instead of what the user
+/// typed. Reminder blocks are skipped and the remaining text joined (upstream
+/// 4e5a67a3, f542b704).
 fn extract_user_query(messages: &[Value]) -> Option<String> {
+    let typed = |text: &str| {
+        let text = text.trim();
+        (!text.is_empty() && !text.starts_with("<system-reminder")).then(|| text.to_string())
+    };
     for msg in messages.iter().rev() {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
         if role != "user" {
             continue;
         }
         let content = msg.get("content")?;
-        match content {
-            Value::String(s) => return Some(s.clone()),
-            Value::Array(blocks) => {
-                for block in blocks {
-                    if block.get("type").and_then(Value::as_str) == Some("text")
-                        && let Some(text) = block.get("text").and_then(Value::as_str)
-                        && !text.is_empty()
-                    {
-                        return Some(text.to_string());
-                    }
-                }
-            }
-            _ => {}
+        let parts: Vec<String> = match content {
+            Value::String(s) => typed(s).into_iter().collect(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .filter_map(typed)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if !parts.is_empty() {
+            return Some(parts.join("\n"));
         }
     }
     None
@@ -1838,6 +1847,19 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
         ];
         assert_eq!(extract_user_query(&msgs).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn extract_user_query_skips_system_reminders() {
+        let msgs = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>\nproject rules\n</system-reminder>"},
+            {"type": "text", "text": "  fix the parser  "},
+            {"type": "text", "text": "then run the tests"},
+        ]})];
+        assert_eq!(
+            extract_user_query(&msgs).as_deref(),
+            Some("fix the parser\nthen run the tests")
+        );
     }
 
     #[test]
