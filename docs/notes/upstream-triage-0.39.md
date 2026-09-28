@@ -90,6 +90,8 @@ Landed: `d971f7c3` (b634a16a; its digit-integrity test now runs through the log 
 
 Cache key only; forwarded bytes do not change.
 
+Landed: `b84c4c9f` (3086be30), `dfdc7251` (8d0f8d1e; keys the full forwarded URL, not just the base), `2d10b10a` (fa7007c1).
+
 | sha | kind | cache | behavior | Rust target | note |
 |---|---|---|---|---|---|
 | `b84c4c9f` | PORT | no | Response-cache key strips cache_control directives but keeps a JSON-Schema property that happens to be named cache_control | proxy src/semantic_cache.rs:27 drops every `cache_control` key at any depth, including inside `properties`, so two different tool schemas share a key | Agrees with old doc. S. Cache key only, not forwarded bytes |
@@ -99,6 +101,10 @@ Cache key only; forwarded bytes do not change.
 ### 5. Savings and stats
 
 Accounting only.
+
+Landed: `5ff4ea1e` rest (27553b79; the admission gate now also books its 429s in the ledger), `3f3cf19e` (849e84df), `1455f002` edge-triggered warning only (0f5e8622; /stats has no compression_vs_cache block to carry `net_is_negative`), `89a58fd1` compaction back-off (06bbfd37; the live ledger was 32 MB with nothing out of retention) and read-first deferral pricing (9c8c95d8), `c766bdb2` (7a3402e2).
+
+Not landed: `1cb779e1`, rejected with numbers in `docs/notes/ideas/rejected/history-rollup-read-cost.md`. `2c4dc446`, declined at review (2026-09-28). `e92cccca`, low value, and it needs a /stats field the fork lacks.
 
 | sha | kind | cache | behavior | Rust target | note |
 |---|---|---|---|---|---|
