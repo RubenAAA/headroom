@@ -744,7 +744,14 @@ HEADROOM_FLAGS=(
   # none after a week means delete these two lines.
   --cache-stampede-gate true
   --cache-stampede-wait-cap 10s
-  --graceful-shutdown-timeout 30s
+  # Matches --upstream-timeout: a turn the proxy would let run is let finish.
+  # The port closes on SIGTERM and restart-headroom.sh starts the next proxy
+  # at once, so this only bounds how long the old process lingers. At 30s it
+  # cut 2 of 3 restarts on 2026-09-28 short with streams still open.
+  # Side-by-side is safe: SQLite stores wait on locks, the savings ledger and
+  # handoff journal take flock, and proxy_savings.json is handed over (see
+  # SavingsTracker::begin_handoff).
+  --graceful-shutdown-timeout 600s
   --max-body-bytes 100MB
   --anthropic-pre-upstream-concurrency 1000
   --rewrite-host true

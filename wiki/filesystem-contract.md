@@ -56,6 +56,7 @@ Examples:
 | Proxy savings ledger | `${WORKSPACE_DIR}/proxy_savings.json` | `HEADROOM_SAVINGS_PATH` |
 | Savings event ledger (append-only JSONL) | `${WORKSPACE_DIR}/savings_events.jsonl` | `HEADROOM_SAVINGS_EVENTS_PATH` |
 | Savings atomic-write temp files | `${WORKSPACE_DIR}/.proxy_savings_<nanos>.tmp` | — (same dir as the ledger) |
+| Savings handoff journal (see [Two proxies at once](#two-proxies-at-once)) | `${WORKSPACE_DIR}/proxy_savings.handoff.jsonl` | — (beside the ledger) |
 | Output-token savings ledger | `${WORKSPACE_DIR}/output_savings.json` | — (workspace only, no env override) |
 | TOIN telemetry JSON | `${WORKSPACE_DIR}/toin.json` | `HEADROOM_TOIN_PATH` |
 | Subscription tracker state | `${WORKSPACE_DIR}/subscription_state.json` | `HEADROOM_SUBSCRIPTION_STATE_PATH` |
@@ -110,6 +111,27 @@ retired; see the retired table below.
 
 !!! warning "One binary, one path"
     `install.sh`, `make install-proxy`, and the launcher all write only `~/.local/bin`. A second `headroom-proxy` copy on `PATH` (e.g. `~/.cargo/bin`) shadows it and dies on flags it does not know — the launcher warns when it sees duplicates.
+
+## Two proxies at once
+
+A restart runs two proxies on these files for up to
+`--graceful-shutdown-timeout` (600s in `contrib/headroom-flags.sh`). SIGTERM
+closes the old one's port, `restart-headroom.sh` starts the new one straight
+away, and the old one finishes the turns it already had. Checked file by file
+on 2026-09-28:
+
+| State | With two writers |
+|---|---|
+| `ctx/**/*.db`, `ctx/ccr.db`, `ctx/ctx-offload-index.db` | Safe. WAL, and every connection waits 3–120s on a lock rather than failing. |
+| `savings_events.jsonl` | Safe. Each line is appended under `flock`; compaction truncates in place under the same lock. |
+| `ctx/offload-gate/*.json` | Safe. Written when a request arrives, before forwarding, through a temp file named with the pid. The old proxy takes no new requests. |
+| `proxy_savings.json` | Handed over. Each proxy loads it once and rewrites it whole, so whichever wrote last used to erase the other's records. On SIGTERM the old proxy writes it one last time, before the port closes, then appends each record to `proxy_savings.handoff.jsonl` instead. The new proxy applies that journal every 5s and logs `savings_handoff_absorbed`. |
+| `~/headroom-proxy.log` | Both append. The old proxy's shutdown lines land in the new run's file. |
+
+Not shared: the upstream 429 hold and the Zen in-flight cap live in each
+process, so retries from the old proxy's open turns don't see the new proxy's
+hold. A lookup by process name (`pgrep -x headroom-proxy`) finds two; look the
+proxy up by port.
 
 ## Logs
 

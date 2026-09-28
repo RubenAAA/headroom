@@ -14,13 +14,16 @@
 //! order; byte-identical file parity is not required (each impl reads its own).
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use rustix::fs::{FlockOperation, flock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -516,6 +519,99 @@ pub struct SavingsTracker {
     /// [`MIN_SAVE_INTERVAL`], plus a final write when the tracker drops.
     last_write: Mutex<Option<Instant>>,
     dirty: AtomicBool,
+    /// Set by [`Self::begin_handoff`] when this process stops accepting work.
+    ///
+    /// A restart starts the next proxy while this one drains its open turns,
+    /// for as long as the graceful-shutdown timeout allows. Both load the file
+    /// once and rewrite it whole, so whichever wrote last erased the other's
+    /// records: the turns that finished during the drain went missing from the
+    /// totals. Once set, every `record_*` call is appended to the handoff
+    /// journal instead, and the next proxy applies it with
+    /// [`Self::absorb_handoff`].
+    handed_off: AtomicBool,
+}
+
+/// One `record_*` call made after [`SavingsTracker::begin_handoff`], with
+/// owned copies of its arguments. Timestamps are fixed when the call is made,
+/// so a replayed turn lands in the display session and history where it
+/// happened, not where it was applied.
+///
+/// Externally tagged on purpose: an internally tagged enum buffers its fields,
+/// and with serde_json's `arbitrary_precision` on in this workspace a buffered
+/// number no longer reads back as `f64`, so every `request` line failed.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HandoffOp {
+    CompressionSavings {
+        model: String,
+        tokens_saved: i64,
+        provider: Option<String>,
+        total_input_tokens: Option<i64>,
+        total_input_cost_usd: Option<f64>,
+        timestamp: DateTime<Utc>,
+    },
+    Request {
+        model: String,
+        input_tokens: i64,
+        tokens_saved: i64,
+        tool_schema_saved: i64,
+        compression_savings_cost_usd: Option<f64>,
+        provider: Option<String>,
+        project: Option<String>,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+        uncached_input_tokens: i64,
+        total_input_tokens: Option<i64>,
+        total_input_cost_usd: Option<f64>,
+        timestamp: DateTime<Utc>,
+        output_tokens_saved: i64,
+        output_tokens: i64,
+        attempted_input_tokens: i64,
+        cache_write_5m_tokens: i64,
+        cache_write_1h_tokens: i64,
+        cached: bool,
+        stack: Option<String>,
+        waste_signals: Option<Vec<(String, i64)>>,
+        offload_savings_usd: f64,
+    },
+    RateLimited {
+        provider: Option<String>,
+    },
+    FailedWork {
+        provider: Option<String>,
+        status_code: i64,
+        upstream_attempts: i64,
+        forwarded_tokens: i64,
+        provider_input_tokens: Option<i64>,
+        provider_output_tokens: Option<i64>,
+        timestamp: DateTime<Utc>,
+    },
+    CacheBust {
+        tokens_lost: i64,
+    },
+    CacheMiss {
+        provider: Option<String>,
+        reason: Option<String>,
+    },
+    ProxyOverhead {
+        before_bytes: i64,
+        after_bytes: i64,
+    },
+    UnbookedTurn {
+        partial_input_tokens: i64,
+        partial_output_tokens: i64,
+    },
+    Tools {
+        definitions: Vec<(String, i64)>,
+        calls: Vec<(String, i64)>,
+    },
+    WireFootprint {
+        bytes_in: i64,
+        bytes_out: i64,
+        input_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+    },
 }
 
 /// Floor on how often the state file is rewritten. A crash can cost the
@@ -625,6 +721,7 @@ impl SavingsTracker {
             state: Mutex::new(State::default()),
             last_write: Mutex::new(None),
             dirty: AtomicBool::new(false),
+            handed_off: AtomicBool::new(false),
         };
         let loaded = tracker.load_state();
         *tracker.state.lock().unwrap() = loaded;
@@ -663,6 +760,16 @@ impl SavingsTracker {
         let delta_usd = estimate_compression_savings_usd(model, delta_tokens);
 
         let mut st = self.state.lock().unwrap();
+        if self.divert(|| HandoffOp::CompressionSavings {
+            model: model.to_string(),
+            tokens_saved,
+            provider: provider.map(str::to_string),
+            total_input_tokens,
+            total_input_cost_usd,
+            timestamp: ts,
+        }) {
+            return true;
+        }
         st.lifetime.tokens_saved += delta_tokens;
         st.lifetime.compression_savings_usd =
             round_n(st.lifetime.compression_savings_usd + delta_usd, 6);
@@ -737,6 +844,32 @@ impl SavingsTracker {
         let delta_offload_savings_usd = coerce_float(rec.offload_savings_usd).max(0.0);
 
         let mut st = self.state.lock().unwrap();
+        if self.divert(|| HandoffOp::Request {
+            model: rec.model.to_string(),
+            input_tokens: rec.input_tokens,
+            tokens_saved: rec.tokens_saved,
+            tool_schema_saved: rec.tool_schema_saved,
+            compression_savings_cost_usd: rec.compression_savings_cost_usd,
+            provider: rec.provider.map(str::to_string),
+            project: rec.project.map(str::to_string),
+            cache_read_tokens: rec.cache_read_tokens,
+            cache_write_tokens: rec.cache_write_tokens,
+            uncached_input_tokens: rec.uncached_input_tokens,
+            total_input_tokens: rec.total_input_tokens,
+            total_input_cost_usd: rec.total_input_cost_usd,
+            timestamp: ts,
+            output_tokens_saved: rec.output_tokens_saved,
+            output_tokens: rec.output_tokens,
+            attempted_input_tokens: rec.attempted_input_tokens,
+            cache_write_5m_tokens: rec.cache_write_5m_tokens,
+            cache_write_1h_tokens: rec.cache_write_1h_tokens,
+            cached: rec.cached,
+            stack: rec.stack.map(str::to_string),
+            waste_signals: rec.waste_signals.clone(),
+            offload_savings_usd: rec.offload_savings_usd,
+        }) {
+            return true;
+        }
         let prev_tokens = st.lifetime.total_input_tokens;
         let prev_cost = st.lifetime.total_input_cost_usd;
 
@@ -889,6 +1022,11 @@ impl SavingsTracker {
     /// `headroom_requests_rate_limited_total{source}` split).
     pub fn record_rate_limited(&self, provider: Option<&str>) {
         let mut st = self.state.lock().unwrap();
+        if self.divert(|| HandoffOp::RateLimited {
+            provider: provider.map(str::to_string),
+        }) {
+            return;
+        }
         st.metrics.record_rate_limited(provider, None);
     }
 
@@ -899,6 +1037,17 @@ impl SavingsTracker {
         let ts = rec.timestamp.unwrap_or_else(utc_now);
 
         let mut st = self.state.lock().unwrap();
+        if self.divert(|| HandoffOp::FailedWork {
+            provider: rec.provider.clone(),
+            status_code: rec.status_code,
+            upstream_attempts: rec.upstream_attempts,
+            forwarded_tokens: rec.forwarded_tokens,
+            provider_input_tokens: rec.provider_input_tokens,
+            provider_output_tokens: rec.provider_output_tokens,
+            timestamp: ts,
+        }) {
+            return;
+        }
         st.metrics.record_failed(rec.provider.as_deref(), None);
         let failed = &mut st.failed_work;
         failed.requests = failed.requests.saturating_add(1);
@@ -929,6 +1078,9 @@ impl SavingsTracker {
     /// the response side, one turn after the request that caused it.
     pub fn record_cache_bust(&self, tokens_lost: i64) {
         let mut st = self.state.lock().unwrap();
+        if self.divert(|| HandoffOp::CacheBust { tokens_lost }) {
+            return;
+        }
         st.metrics.record_cache_bust(tokens_lost);
         self.save(&mut st);
     }
@@ -937,6 +1089,12 @@ impl SavingsTracker {
     /// `unknown`). `prefix_change` is the one that means we moved bytes.
     pub fn record_cache_miss(&self, provider: Option<&str>, reason: Option<&str>) {
         let mut st = self.state.lock().unwrap();
+        if self.divert(|| HandoffOp::CacheMiss {
+            provider: provider.map(str::to_string),
+            reason: reason.map(str::to_string),
+        }) {
+            return;
+        }
         st.metrics.record_cache_miss(provider, reason);
         self.save(&mut st);
     }
@@ -949,6 +1107,12 @@ impl SavingsTracker {
             return; // nothing moved; skip the lock and the write
         }
         let mut st = self.state.lock().unwrap();
+        if self.divert(|| HandoffOp::ProxyOverhead {
+            before_bytes,
+            after_bytes,
+        }) {
+            return;
+        }
         st.metrics.record_proxy_overhead(before_bytes, after_bytes);
         self.save(&mut st);
     }
@@ -958,6 +1122,12 @@ impl SavingsTracker {
     /// [`crate::persistent_metrics::PersistentMetricsState::record_unbooked_turn`].
     pub fn record_unbooked_turn(&self, partial_input_tokens: i64, partial_output_tokens: i64) {
         let mut st = self.state.lock().unwrap();
+        if self.divert(|| HandoffOp::UnbookedTurn {
+            partial_input_tokens,
+            partial_output_tokens,
+        }) {
+            return;
+        }
         st.metrics
             .record_unbooked_turn(partial_input_tokens, partial_output_tokens);
         self.save(&mut st);
@@ -970,6 +1140,12 @@ impl SavingsTracker {
             return;
         }
         let mut st = self.state.lock().unwrap();
+        if self.divert(|| HandoffOp::Tools {
+            definitions: definitions.to_vec(),
+            calls: calls.to_vec(),
+        }) {
+            return;
+        }
         st.metrics.record_tools(definitions, calls);
         self.save(&mut st);
     }
@@ -1012,6 +1188,15 @@ impl SavingsTracker {
         cache_write_tokens: i64,
     ) {
         let mut st = self.state.lock().unwrap();
+        if self.divert(|| HandoffOp::WireFootprint {
+            bytes_in,
+            bytes_out,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        }) {
+            return;
+        }
         st.metrics.record_wire_footprint(
             bytes_in,
             bytes_out,
@@ -1623,7 +1808,12 @@ impl SavingsTracker {
     /// For shutdown and for callers that need the file current — a coalesced
     /// write can otherwise sit unwritten for as long as the interval.
     pub fn flush(&self) {
-        if self.stateless || !self.dirty.load(Ordering::Relaxed) {
+        // After a handoff the file belongs to the next proxy; this write would
+        // replace its totals with ours. `Drop` lands here too.
+        if self.stateless
+            || !self.dirty.load(Ordering::Relaxed)
+            || self.handed_off.load(Ordering::Relaxed)
+        {
             return;
         }
         let mut st = match self.state.lock() {
@@ -1633,6 +1823,194 @@ impl SavingsTracker {
         self.write_state(&mut st);
         if let Ok(mut last) = self.last_write.lock() {
             *last = Some(Instant::now());
+        }
+    }
+
+    /// Write the state file one last time and send every later `record_*`
+    /// call to the handoff journal. Call it on the shutdown signal, before the
+    /// listener closes: the restart script starts the next proxy only once the
+    /// port is free, so that proxy loads a file that already holds everything
+    /// recorded here up to the signal.
+    ///
+    /// Taken under the state lock, which every `record_*` call holds while it
+    /// checks the flag, so no call can update memory after the final write.
+    pub fn begin_handoff(&self) {
+        if self.stateless {
+            return;
+        }
+        let mut st = match self.state.lock() {
+            Ok(st) => st,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.handed_off.load(Ordering::Relaxed) {
+            return;
+        }
+        self.write_state(&mut st);
+        self.handed_off.store(true, Ordering::Relaxed);
+    }
+
+    /// Apply the calls a draining proxy journaled, and empty the journal.
+    /// Returns how many were applied. Cheap when there is nothing to do: one
+    /// `stat`. A tracker that has itself handed off leaves the journal for the
+    /// proxy after it.
+    pub fn absorb_handoff(&self) -> usize {
+        if self.stateless || self.handed_off.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let path = self.handoff_path();
+        if !std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+            return 0;
+        }
+        let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&path) else {
+            return 0;
+        };
+        if flock(file.as_fd(), FlockOperation::LockExclusive).is_err() {
+            return 0;
+        }
+        // Read and emptied under the lock the writer takes for each line, so a
+        // line lands either in this batch or in the next one, never in neither.
+        let mut text = String::new();
+        let emptied = file.read_to_string(&mut text).is_ok() && file.set_len(0).is_ok();
+        let _ = flock(file.as_fd(), FlockOperation::Unlock);
+        if !emptied {
+            return 0;
+        }
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<HandoffOp>(line).ok())
+            .map(|op| self.apply_handoff(op))
+            .count()
+    }
+
+    fn handoff_path(&self) -> PathBuf {
+        self.path.with_extension("handoff.jsonl")
+    }
+
+    /// With the state lock held: once handed off, journal the call and tell
+    /// the caller to skip its update.
+    fn divert(&self, op: impl FnOnce() -> HandoffOp) -> bool {
+        if !self.handed_off.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Best effort, like the state file itself: a line that cannot be
+        // written costs that one record.
+        if let Ok(line) = serde_json::to_string(&op()) {
+            let _ = append_locked_line(&self.handoff_path(), &line);
+        }
+        true
+    }
+
+    fn apply_handoff(&self, op: HandoffOp) {
+        match op {
+            HandoffOp::CompressionSavings {
+                model,
+                tokens_saved,
+                provider,
+                total_input_tokens,
+                total_input_cost_usd,
+                timestamp,
+            } => {
+                self.record_compression_savings(
+                    &model,
+                    tokens_saved,
+                    provider.as_deref(),
+                    total_input_tokens,
+                    total_input_cost_usd,
+                    Some(timestamp),
+                );
+            }
+            HandoffOp::Request {
+                model,
+                input_tokens,
+                tokens_saved,
+                tool_schema_saved,
+                compression_savings_cost_usd,
+                provider,
+                project,
+                cache_read_tokens,
+                cache_write_tokens,
+                uncached_input_tokens,
+                total_input_tokens,
+                total_input_cost_usd,
+                timestamp,
+                output_tokens_saved,
+                output_tokens,
+                attempted_input_tokens,
+                cache_write_5m_tokens,
+                cache_write_1h_tokens,
+                cached,
+                stack,
+                waste_signals,
+                offload_savings_usd,
+            } => {
+                self.record_request(&RequestRecord {
+                    model: &model,
+                    input_tokens,
+                    tokens_saved,
+                    tool_schema_saved,
+                    compression_savings_cost_usd,
+                    provider: provider.as_deref(),
+                    project: project.as_deref(),
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    uncached_input_tokens,
+                    total_input_tokens,
+                    total_input_cost_usd,
+                    timestamp: Some(timestamp),
+                    output_tokens_saved,
+                    output_tokens,
+                    attempted_input_tokens,
+                    cache_write_5m_tokens,
+                    cache_write_1h_tokens,
+                    cached,
+                    stack: stack.as_deref(),
+                    waste_signals,
+                    offload_savings_usd,
+                });
+            }
+            HandoffOp::RateLimited { provider } => self.record_rate_limited(provider.as_deref()),
+            HandoffOp::FailedWork {
+                provider,
+                status_code,
+                upstream_attempts,
+                forwarded_tokens,
+                provider_input_tokens,
+                provider_output_tokens,
+                timestamp,
+            } => self.record_failed_work(&FailedWorkRecord {
+                provider,
+                status_code,
+                upstream_attempts,
+                forwarded_tokens,
+                provider_input_tokens,
+                provider_output_tokens,
+                timestamp: Some(timestamp),
+            }),
+            HandoffOp::CacheBust { tokens_lost } => self.record_cache_bust(tokens_lost),
+            HandoffOp::CacheMiss { provider, reason } => {
+                self.record_cache_miss(provider.as_deref(), reason.as_deref())
+            }
+            HandoffOp::ProxyOverhead {
+                before_bytes,
+                after_bytes,
+            } => self.record_proxy_overhead(before_bytes, after_bytes),
+            HandoffOp::UnbookedTurn {
+                partial_input_tokens,
+                partial_output_tokens,
+            } => self.record_unbooked_turn(partial_input_tokens, partial_output_tokens),
+            HandoffOp::Tools { definitions, calls } => self.record_tools(&definitions, &calls),
+            HandoffOp::WireFootprint {
+                bytes_in,
+                bytes_out,
+                input_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } => self.record_wire_footprint(
+                bytes_in,
+                bytes_out,
+                input_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            ),
         }
     }
 
@@ -1710,6 +2088,16 @@ impl Drop for SavingsTracker {
     fn drop(&mut self) {
         self.flush();
     }
+}
+
+/// Append one line under an exclusive `flock`, the lock
+/// [`SavingsTracker::absorb_handoff`] takes to read and empty the file.
+fn append_locked_line(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    flock(file.as_fd(), FlockOperation::LockExclusive)?;
+    let written = file.write_all(format!("{line}\n").as_bytes());
+    let _ = flock(file.as_fd(), FlockOperation::Unlock);
+    written
 }
 
 // ── free helpers for JSON shaping ──
@@ -2922,6 +3310,75 @@ mod tests {
         // Live counters update in memory, but no file is written.
         assert_eq!(t.snapshot()["lifetime"]["tokens_saved"], json!(100));
         assert!(!path.exists());
+    }
+
+    /// A restart runs two proxies on one file while the old one drains. Only
+    /// the new one may write it, and what the old one records after the signal
+    /// must still reach the totals: once, at the time it happened.
+    #[test]
+    fn a_draining_proxy_hands_its_records_to_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_savings.json");
+        let turn = |saved| RequestRecord {
+            model: "claude-sonnet-4",
+            input_tokens: 100,
+            tokens_saved: saved,
+            ..Default::default()
+        };
+
+        let old = tracker(&path);
+        old.record_request(&turn(1));
+        old.record_request(&turn(2)); // inside the save interval: memory only
+        old.begin_handoff();
+
+        // The restart script starts the next proxy once the port is free.
+        let new = tracker(&path);
+        assert_eq!(new.snapshot()["lifetime"]["tokens_saved"], json!(3));
+
+        let finished_at = utc_now() - Duration::minutes(3);
+        old.record_request(&RequestRecord {
+            timestamp: Some(finished_at),
+            ..turn(10)
+        });
+        old.record_failed_work(&FailedWorkRecord {
+            status_code: 529,
+            ..Default::default()
+        });
+        assert_eq!(old.snapshot()["lifetime"]["tokens_saved"], json!(3));
+        new.record_request(&turn(100));
+
+        // A line torn by a crash mid-append must not cost the lines after it.
+        OpenOptions::new()
+            .append(true)
+            .open(path.with_extension("handoff.jsonl"))
+            .unwrap()
+            .write_all(b"{\"request\":{\"mod\n")
+            .unwrap();
+        old.record_request(&turn(1000));
+
+        assert_eq!(old.absorb_handoff(), 0, "a draining proxy leaves the journal");
+        assert_eq!(new.absorb_handoff(), 3);
+        assert_eq!(new.absorb_handoff(), 0, "an absorbed line is gone");
+
+        let snap = new.snapshot();
+        assert_eq!(snap["lifetime"]["tokens_saved"], json!(1113));
+        assert_eq!(snap["lifetime"]["requests"], json!(5));
+        assert_eq!(snap["failed_work"]["requests"], json!(1));
+        let stamps: Vec<&str> = snap["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|h| h["timestamp"].as_str())
+            .collect();
+        assert!(stamps.contains(&to_utc_iso(finished_at).as_str()));
+
+        // The old process exits last; its final flush must not win.
+        new.flush();
+        drop(old);
+        assert_eq!(
+            tracker(&path).snapshot()["lifetime"]["tokens_saved"],
+            json!(1113)
+        );
     }
 
     #[test]

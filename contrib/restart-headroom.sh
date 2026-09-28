@@ -11,11 +11,13 @@
 #
 # SAFETY — what a restart costs and how this script limits it:
 #
-# 1. In-flight turns. SIGTERM starts the proxy's graceful drain
-#    (--graceful-shutdown-timeout, 30s); turns still generating past that die
-#    mid-SSE, truncated, with upstream tokens already paid for. So this script
-#    polls /debug/inflight and waits for zero (bounded by --wait-secs, default
-#    120s) BEFORE signalling. --force skips the wait.
+# 1. In-flight turns. SIGTERM closes the port at once and the old process
+#    keeps serving the turns it already has for --graceful-shutdown-timeout
+#    (600s, the upstream timeout), side by side with the new proxy. Turns
+#    running past that die mid-SSE. There is no wait before signalling: this
+#    script used to poll /debug/inflight for zero, which with several sessions
+#    open almost never came (12 of 19 restarts to 2026-09-28 gave up after
+#    120s), and at a 30s grace the drain then cut long turns anyway.
 #
 # 2. Connection-refused window. Between the old listener closing and the new
 #    one binding, connects get ECONNREFUSED. Sub-second; Claude Code retries.
@@ -27,15 +29,13 @@
 #    less, and never to fix a pin artifact.
 #
 # Usage: restart-headroom.sh [--force] [--wait-secs=N]
+# (both accepted for old callers and ignored; see 1.)
 
 set -uo pipefail
 
-FORCE=0
-WAIT_SECS=120
 for arg in "$@"; do
   case "$arg" in
-    --force) FORCE=1 ;;
-    --wait-secs=*) WAIT_SECS="${arg#--wait-secs=}" ;;
+    --force | --wait-secs=*) ;;
     *) echo "restart-headroom: unknown arg '$arg' (usage: restart-headroom.sh [--force] [--wait-secs=N])" >&2; exit 2 ;;
   esac
 done
@@ -233,43 +233,6 @@ start_proxy() {
 # that reply has to get out first.
 sleep 5
 
-# Turns currently in flight, or -1 when the endpoint is unreachable
-# (old proxy binary, proxy down, or transient curl failure).
-inflight() {
-  local n
-  n=$(curl -s --max-time 5 "http://127.0.0.1:$PORT/debug/inflight" 2>/dev/null \
-    | python3 -c 'import json,sys; j=json.load(sys.stdin); print(max(0, j.get("in_flight", -1) - j.get("zen_held", 0)) if "in_flight" in j else -1)' 2>/dev/null) \
-    || n="-1"
-  printf '%s' "$n"
-}
-
-# Wait for in-flight turns to finish BEFORE signalling the old proxy, so the
-# graceful drain (30s) is a backstop, not the plan. Bounded: after WAIT_SECS
-# the restart goes ahead anyway and stragglers die truncated. Returns 0 on a
-# clean drain (or drain-blind), 1 when stragglers remain.
-wait_for_drain() {
-  if [[ "$FORCE" == "1" ]]; then
-    log "drain: --force given, skipping inflight wait"
-    return 0
-  fi
-  local deadline=$(( $(date +%s) + WAIT_SECS )) n
-  n=$(inflight)
-  if [[ "$n" == "-1" ]]; then
-    log "drain: no inflight endpoint (old proxy); proceeding without drain"
-    return 0
-  fi
-  while (( $(date +%s) < deadline )); do
-    if [[ "$n" == "0" ]]; then
-      log "drain: no turns in flight, proceeding"
-      return 0
-    fi
-    sleep 2
-    n=$(inflight)
-  done
-  log "drain: timed out with in_flight=${n:-unknown}; restarting anyway"
-  return 1
-}
-
 log "=== restart begin ==="
 
 if [[ ! -x "$NEW_BIN" ]]; then
@@ -279,10 +242,6 @@ fi
 
 OLD_PID=$(listener_pid)
 log "current listener pid=${OLD_PID:-none}"
-
-if [[ -n "${OLD_PID:-}" ]]; then
-  wait_for_drain || log "restarting with turns still in flight; stragglers will truncate"
-fi
 
 # Keep the outgoing binary so a failed start can be undone.
 if [[ -f "$LIVE_BIN" ]]; then

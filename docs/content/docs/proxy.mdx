@@ -44,19 +44,22 @@ Served by the proxy itself, not forwarded:
 - `GET /healthz/upstream`, `/livez`, `/readyz` — upstream and readiness checks
 - `GET /cache-health` — hit rates and recent cache events
 - `GET /metrics`, `/stats`, `/stats-history`, `/stats-lifetime` — observability (see [Metrics](/docs/metrics))
-- `GET /debug/inflight` — turns currently generating (used by `restart-headroom.sh` to wait for a clean drain)
+- `GET /debug/inflight` — turns currently generating, per Zen egress too (used by `zen-rotate-watch.sh` to drain an egress)
 - `/ctx/*` (`search`, `get`, `index`, `fetch`, `stats`, `doctor`, `purge`) — context offload and retrieval
 - `/mcp/{conversation}` — MCP tools (`headroom_compress`, `headroom_retrieve`, `headroom_stats`)
 
 ## Restarting
 
 ```bash
-restart-headroom.sh            # waits for in-flight turns, then restarts onto a fresh build
-restart-headroom.sh --force    # skip the drain wait
-restart-headroom.sh --wait-secs=300
+restart-headroom.sh            # restarts onto a fresh build
 ```
 
-Restarts are safe but not free: in-flight turns past the graceful drain truncate, and per-process pins re-latch (see `contrib/restart-headroom.sh` header). Restart when nothing is mid-turn.
+The new proxy starts as soon as the old one's port closes. The old one keeps
+finishing the turns it already had for up to `--graceful-shutdown-timeout`
+(600s), side by side with the new one; "Two proxies at once" in
+`wiki/filesystem-contract.md` covers what that means for each file. Restarts
+still aren't free: per-process pins
+re-latch (see the `contrib/restart-headroom.sh` header).
 
 ## Python mirror
 

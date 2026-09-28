@@ -100,6 +100,7 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
 
     spawn_resource_heartbeat();
     spawn_cursor_reaper(&config, &state);
+    spawn_savings_handoff_absorber(&state);
     warn_on_open_bind(&config);
 
     serve(state, &config).await
@@ -336,6 +337,7 @@ async fn serve(
     state: AppState,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let savings_tracker = state.savings_tracker.clone();
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -358,6 +360,10 @@ async fn serve(
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown_signal().await;
         let _ = mark.set(std::time::Instant::now());
+        // Before this future returns and the listener closes: the next proxy
+        // starts once the port is free and loads the savings file then, so the
+        // final write has to be on disk first.
+        savings_tracker.begin_handoff();
         log_shutdown_started(grace);
         let _ = drain_started_tx.send(());
     });
@@ -486,6 +492,32 @@ async fn shutdown_signal() {
 
 /// Log the process's own memory and thread count once a minute.
 ///
+/// Fold in the savings records of the proxy this one replaced. That proxy
+/// keeps finishing its open turns for up to the graceful-shutdown timeout
+/// after this one starts, and journals what it would have recorded (see
+/// `SavingsTracker::begin_handoff`). The first tick runs at once, which also
+/// picks up a journal left by a proxy that stopped with nothing after it.
+fn spawn_savings_handoff_absorber(state: &AppState) {
+    let tracker = state.savings_tracker.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            let tracker = tracker.clone();
+            let absorbed = tokio::task::spawn_blocking(move || tracker.absorb_handoff())
+                .await
+                .unwrap_or(0);
+            if absorbed > 0 {
+                tracing::info!(
+                    event = "savings_handoff_absorbed",
+                    records = absorbed,
+                    "applied savings records from the proxy this one replaced"
+                );
+            }
+        }
+    });
+}
+
 /// The proxy reported plenty about the traffic it shaped and nothing about
 /// what it cost to run, so a leak or a thread pile-up could only be caught by
 /// watching from outside with `ps`. One line a minute is cheap and gives the
