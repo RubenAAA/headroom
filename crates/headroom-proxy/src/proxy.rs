@@ -577,8 +577,13 @@ pub(crate) async fn forward_http(
         // An auto-mode reply carries classifier results for this turn only;
         // never serve one from the response cache or store it there.
         if !auto_mode_turn
-            && let Some(hit) =
-                forward::check_semantic_cache(&state, &buffered, &request_id, &path_for_log)
+            && let Some(hit) = forward::check_semantic_cache(
+                &state,
+                &buffered,
+                &upstream_url,
+                &request_id,
+                &path_for_log,
+            )
         {
             return Ok(hit);
         }

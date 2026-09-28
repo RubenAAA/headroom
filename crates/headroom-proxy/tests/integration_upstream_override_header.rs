@@ -265,3 +265,56 @@ async fn override_bypasses_the_provider_http_proxy() {
 
     proxy.shutdown().await;
 }
+
+/// The response cache is partitioned by upstream (upstream `dfdc7251`): a body
+/// answered by an overridden gateway must not be served from the cache to the
+/// same body bound for the default upstream.
+#[tokio::test]
+async fn response_cache_does_not_cross_upstreams() {
+    allow_loopback_overrides();
+    let default_upstream = MockServer::start().await;
+    let override_upstream = MockServer::start().await;
+    for (server, id) in [
+        (&default_upstream, "default"),
+        (&override_upstream, "override"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": id})))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    let proxy = start_proxy_with(&default_upstream.uri(), |c| {
+        c.compression = true;
+        c.cache_enabled = true;
+    })
+    .await;
+    let send = |base_url: Option<String>| {
+        let mut req = reqwest::Client::new()
+            .post(format!("{}/v1/messages", proxy.url()))
+            .header("x-api-key", "gateway-key")
+            .json(&messages_body());
+        if let Some(url) = base_url {
+            req = req.header("x-headroom-base-url", url);
+        }
+        async move {
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+            resp.json::<serde_json::Value>().await.unwrap()["id"].clone()
+        }
+    };
+
+    assert_eq!(
+        send(Some(localhost_url(&override_upstream))).await,
+        "override"
+    );
+    assert_eq!(
+        send(None).await,
+        "default",
+        "served the other upstream's cached reply"
+    );
+
+    proxy.shutdown().await;
+}

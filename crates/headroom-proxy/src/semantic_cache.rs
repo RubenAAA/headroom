@@ -114,12 +114,21 @@ const KEY_EXTRA_FIELDS: &[&str] = &[
 /// we cannot key out of the cache instead of keying it on nothing — a missed
 /// cache hit costs latency, a false hit returns someone else's answer.
 ///
+/// `upstream` is the URL the request is forwarded to, keyed as
+/// `upstream_base_url`: an `x-headroom-base-url` override picks a different
+/// gateway, and two gateways answering the same body are not interchangeable
+/// (upstream `dfdc7251`). Taking it here makes the lookup and the store key on
+/// it alike.
+///
 /// Borrows: the old form cloned the whole turn array plus every extra
 /// field (measured 481x on a 100-tool body) just to hand them to
 /// `compute_key`, which only reads them. Both callers use the result
 /// immediately, so references tied to `parsed` are sufficient.
 #[allow(clippy::type_complexity)]
-pub fn cache_key_inputs(parsed: &Value) -> Option<(Vec<&Value>, Vec<(&str, &Value)>)> {
+pub fn cache_key_inputs<'a>(
+    parsed: &'a Value,
+    upstream: &'a Value,
+) -> Option<(Vec<&'a Value>, Vec<(&'a str, &'a Value)>)> {
     let turns: Vec<&Value> = match parsed.get("messages").or_else(|| parsed.get("input")) {
         Some(Value::Array(items)) => items.iter().collect(),
         // `input` may also be a bare string rather than an array of items.
@@ -127,7 +136,7 @@ pub fn cache_key_inputs(parsed: &Value) -> Option<(Vec<&Value>, Vec<(&str, &Valu
         _ => return None,
     };
 
-    let mut extra = Vec::new();
+    let mut extra = vec![("upstream_base_url", upstream)];
     for key in KEY_EXTRA_FIELDS {
         if let Some(val) = parsed.get(*key) {
             extra.push((*key, val));

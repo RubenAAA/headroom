@@ -166,6 +166,7 @@ pub(crate) fn store_semantic_cache_response(
     body_bytes: &bytes::Bytes,
     resp_headers: &HeaderMap,
     request_headers: &HeaderMap,
+    upstream_url: &Url,
     request_id: &str,
 ) {
     if let Some(ref cache) = state.semantic_cache
@@ -192,7 +193,10 @@ pub(crate) fn store_semantic_cache_response(
                 .collect();
             // Same key derivation as the lookup above; the two
             // have to move together or the cache stops hitting.
-            if let Some((messages, extra)) = crate::semantic_cache::cache_key_inputs(&parsed) {
+            let upstream = serde_json::Value::String(upstream_url.to_string());
+            if let Some((messages, extra)) =
+                crate::semantic_cache::cache_key_inputs(&parsed, &upstream)
+            {
                 cache.set(
                     &messages,
                     model,
@@ -1130,6 +1134,7 @@ where
                     &body_bytes,
                     &resp_headers,
                     outgoing_headers,
+                    upstream_url,
                     request_id,
                 );
                 // A buffered chat completion commits its parked replay turn

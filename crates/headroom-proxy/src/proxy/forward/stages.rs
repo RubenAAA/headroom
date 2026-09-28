@@ -15,6 +15,7 @@ use super::*;
 pub(crate) fn check_semantic_cache(
     state: &AppState,
     buffered: &bytes::Bytes,
+    upstream_url: &url::Url,
     request_id: &str,
     path_for_log: &str,
 ) -> Option<Response<Body>> {
@@ -30,7 +31,8 @@ pub(crate) fn check_semantic_cache(
                 .get("model")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown");
-            if let Some(entry) = crate::semantic_cache::cache_key_inputs(&parsed)
+            let upstream = serde_json::Value::String(upstream_url.to_string());
+            if let Some(entry) = crate::semantic_cache::cache_key_inputs(&parsed, &upstream)
                 .and_then(|(messages, extra)| cache.get(&messages, model, &extra))
             {
                 tracing::info!(
