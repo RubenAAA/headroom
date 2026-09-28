@@ -867,6 +867,59 @@ pub(crate) fn apply_prefix_replay(
     tail_breakpoints: usize,
     strip_system_breakpoints: bool,
 ) -> bytes::Bytes {
+    replay_prefix(
+        store,
+        session_key,
+        request_id,
+        original_messages,
+        body,
+        observer,
+        uptime_seconds,
+        Some((tail_breakpoints, strip_system_breakpoints)),
+    )
+}
+
+/// Prefix replay for OpenAI `/v1/chat/completions` (upstream `deca575c`).
+///
+/// The live zone compresses only the newest tool or user message, so the
+/// next turn sends that message raw and the provider's automatic prefix
+/// cache misses from there on. Same overlay and store as the Anthropic path,
+/// but no `cache_control` is placed or removed: OpenAI caches without
+/// markers, and markers a client sends for a gateway (OpenRouter) stay as
+/// the client wrote them.
+pub(crate) fn apply_chat_prefix_replay(
+    store: &SessionReplayStore,
+    session_key: &str,
+    request_id: &str,
+    original_messages: Vec<serde_json::Value>,
+    body: bytes::Bytes,
+    uptime_seconds: u64,
+) -> bytes::Bytes {
+    replay_prefix(
+        store,
+        session_key,
+        request_id,
+        original_messages,
+        body,
+        None,
+        uptime_seconds,
+        None,
+    )
+}
+
+/// `markers` is the Anthropic breakpoint placement: tail breakpoints and
+/// whether `system` markers may go. `None` leaves every marker alone.
+#[allow(clippy::too_many_arguments)]
+fn replay_prefix(
+    store: &SessionReplayStore,
+    session_key: &str,
+    request_id: &str,
+    original_messages: Vec<serde_json::Value>,
+    body: bytes::Bytes,
+    observer: Option<&cache_stabilization::usage_observer::UsageObserver>,
+    uptime_seconds: u64,
+    markers: Option<(usize, bool)>,
+) -> bytes::Bytes {
     use cache_stabilization::prefix_replay::{
         overlay_cached_prefix_reported, strip_system_cache_control,
     };
@@ -924,12 +977,17 @@ pub(crate) fn apply_prefix_replay(
             uptime_seconds,
         );
     }
-    let (normalized, breakpoints_placed, system_markers_trimmed) =
-        place_replay_breakpoints(&mut parsed, overlaid, tail_breakpoints, request_id);
+    let (normalized, breakpoints_placed, system_markers_trimmed) = match markers {
+        Some((tail_breakpoints, _)) => {
+            place_replay_breakpoints(&mut parsed, overlaid, tail_breakpoints, request_id)
+        }
+        None => (overlaid, 0, 0),
+    };
     note_rewritten_messages(&original_messages, &normalized, request_id);
     // Only once a message breakpoint is in place. With none placed the client's
     // system markers are the only ones on the request, and dropping them would
     // turn caching off rather than move it.
+    let strip_system_breakpoints = markers.is_some_and(|(_, strip)| strip);
     let system_markers_dropped = if strip_system_breakpoints && breakpoints_placed > 0 {
         strip_system_cache_control(&mut parsed)
     } else {

@@ -531,6 +531,14 @@ pub(super) async fn run_sse_state_machine(
                 &outcome_ctx,
                 upstream_status,
             );
+            // Commit the parked replay turn, on clean completion only, as
+            // the Anthropic arm does. Chat reports cache reads, no writes.
+            if let Some(store) = replay_store.as_ref()
+                && state.status == crate::sse::openai_chat::StreamStatus::Done
+            {
+                let (_, cached, _) = sse_openai::extract_chat_usage(&state);
+                store.complete(&request_id, cached.max(0) as u64, 0);
+            }
         }
         SseStreamKind::OpenAiResponses => {
             let state = sse_openai::drive_openai_responses_stream(

@@ -1132,6 +1132,22 @@ where
                     outgoing_headers,
                     request_id,
                 );
+                // A buffered chat completion commits its parked replay turn
+                // here; streamed ones do it at SSE close.
+                if state.config.prefix_replay
+                    && outcome_ctx
+                        .as_ref()
+                        .is_some_and(|ctx| ctx.provider == "openai_chat")
+                {
+                    let cached = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                        .ok()
+                        .and_then(|v| {
+                            v.pointer("/usage/prompt_tokens_details/cached_tokens")?
+                                .as_u64()
+                        })
+                        .unwrap_or(0);
+                    state.replay_store.complete(request_id, cached, 0);
+                }
                 forward::emit_buffered_outcome(
                     outcome_ctx,
                     &body_bytes,

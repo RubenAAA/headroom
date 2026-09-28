@@ -36,6 +36,9 @@ mod integration_tool_invariant;
 #[path = "suites/cache/integration_prefix_replay.rs"]
 mod integration_prefix_replay;
 
+#[path = "suites/cache/integration_chat_prefix_replay.rs"]
+mod integration_chat_prefix_replay;
+
 #[path = "suites/cache/integration_prefix_adoption.rs"]
 mod integration_prefix_adoption;
 

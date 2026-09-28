@@ -103,10 +103,13 @@ pub(crate) fn prepare_replay_inputs(
         AuthMode::Payg
     };
 
+    // Chat completions too (upstream `deca575c`): its live zone compresses
+    // the newest message, which the next turn would otherwise resend raw.
     let replay_original_messages: Option<Vec<serde_json::Value>> = if state.config.prefix_replay
         && matches!(
             endpoint,
             compression::CompressibleEndpoint::AnthropicMessages
+                | compression::CompressibleEndpoint::OpenAiChatCompletions
         ) {
         serde_json::from_slice::<serde_json::Value>(&buffered)
             .ok()
@@ -184,11 +187,26 @@ pub(crate) fn run_prefix_replay(
 ) -> bytes::Bytes {
     let RequestScope {
         state,
+        endpoint,
         request_id,
         headers_snapshot,
-        ..
     } = scope;
     let body_to_send = match (replay_original_messages, headers_snapshot.as_ref()) {
+        (Some(original_messages), Some(_headers))
+            if matches!(
+                endpoint,
+                compression::CompressibleEndpoint::OpenAiChatCompletions
+            ) =>
+        {
+            apply_chat_prefix_replay(
+                &state.replay_store,
+                request_lane_key,
+                request_id,
+                original_messages,
+                body_to_send,
+                state.started_at.elapsed().as_secs(),
+            )
+        }
         // `_headers` is matched, not used: the key was derived once above
         // from the unmutated body. The arm still guards on `Some` because
         // `request_lane_key` is empty without headers, which would key
