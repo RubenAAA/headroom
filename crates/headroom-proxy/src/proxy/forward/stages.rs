@@ -535,15 +535,12 @@ pub(crate) fn run_output_shaper(
     // enabled in config. The shaping is idempotent (steering
     // text includes a sentinel prefix) so repeated
     // applications are safe.
-    // Disabled in cache mode: steering writes into the
-    // provider prefix-cache key that mode exists to freeze.
+    // Runs in cache mode too: the level is fixed at startup, so
+    // the steering block is byte-stable and joins the cached
+    // prefix on turn 1 (upstream `c0292984`).
     if state.config.output_shaper_enabled {
-        let shape_result = crate::output_shaper::shape_request_for_mode(
-            value,
-            true,
-            state.config.verbosity_level,
-            &state.config.mode,
-        );
+        let shape_result =
+            crate::output_shaper::shape_request(value, true, state.config.verbosity_level);
         if shape_result.changed {
             *changed = true;
             tracing::debug!(
