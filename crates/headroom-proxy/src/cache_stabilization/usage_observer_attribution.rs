@@ -380,3 +380,70 @@ pub(super) fn recache_attribution<'a>(
         counts_as_waste: true,
     }
 }
+
+/// Count a booked recache in the metrics and, when the proxy's own CCR
+/// continuation caused it, charge it to the savings ledger as overhead.
+///
+/// `aftershock_of_continuation` is the one charged reason the proxy caused
+/// on purpose: the hidden retrieval rounds committed a prefix the next client
+/// turn cannot match. The tokens it rewrote would otherwise have been reads,
+/// so the charge is `wasted × (write rate − read rate)`, at the 1h write rate
+/// when the turn wrote under a 1h TTL. The other reasons stay out: the client
+/// caused them, or the evidence names no cause.
+pub(super) fn observe_recache_cost(
+    event: &RecacheEvent,
+    usage: &TurnUsage<'_>,
+    wasted_tokens: u64,
+    counts_as_waste: bool,
+) {
+    crate::observability::observe_recache_event(
+        event.attribution_reason.as_deref(),
+        counts_as_waste.then_some(wasted_tokens),
+    );
+    if !counts_as_waste
+        || wasted_tokens == 0
+        || event.attribution_reason.as_deref() != Some("aftershock_of_continuation")
+    {
+        return;
+    }
+    let model = event.forward_model.clone().unwrap_or_default();
+    let Some(pricing) = headroom_core::pricing::lookup(&model) else {
+        return;
+    };
+    let long = headroom_core::pricing::is_long_context(
+        (usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens)
+            as i64,
+    );
+    let list = pricing.input_rate(long);
+    let write_5m = pricing.cache_write_rate(long).unwrap_or(list);
+    let wrote_1h = usage.cache_write_ttl_split.is_some_and(|(_, h1)| h1 > 0)
+        || usage.cache_ttl >= Duration::from_secs(3600);
+    let write = if wrote_1h {
+        pricing.cache_write_1h_rate(long).unwrap_or(write_5m)
+    } else {
+        write_5m
+    };
+    let read = pricing.cache_read_rate(long).unwrap_or(list);
+    let usd = wasted_tokens as f64 * (write - read).max(0.0);
+    if usd <= 0.0 {
+        return;
+    }
+    let book = move || {
+        headroom_core::savings_ledger::record_savings_event(
+            headroom_core::savings_ledger::SavingsEvent {
+                model: Some(model.as_str()),
+                client: Some("proxy"),
+                source: Some("proxy"),
+                overhead_tokens: wasted_tokens as i64,
+                overhead_usd: usd,
+                ..Default::default()
+            },
+        );
+    };
+    // The append takes a cross-process flock; keep it off the async workers.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::spawn_blocking(book);
+    } else {
+        book();
+    }
+}

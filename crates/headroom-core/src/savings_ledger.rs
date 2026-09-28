@@ -178,8 +178,10 @@ pub struct SavingsEvent<'a> {
     pub source: Option<&'a str>,
     pub timestamp: Option<DateTime<Utc>>,
     pub cost_usd: Option<f64>,
-    /// How `cost_usd` was priced (`fresh_input` or `cache_read`). Absent on
-    /// legacy events whose placement was not measured.
+    /// How `cost_usd` was priced: `measured_mix`, `list` or `free` (see
+    /// `RequestOutcome::compression_savings_cost_basis`). Rows written before
+    /// 2026-09-28 say `fresh_input` or `cache_read`. Absent on legacy events
+    /// whose placement was not measured.
     pub cost_basis: Option<&'a str>,
     pub fallback_rate: Option<f64>,
     pub path: Option<&'a Path>,
@@ -192,6 +194,15 @@ pub struct SavingsEvent<'a> {
     /// cached prefix and never was new input, so the new-input rate leaves it
     /// out of its numerator.
     pub deferred_tokens: i64,
+    /// The share of `cost_usd` that prices `deferred_tokens`. A deferred token
+    /// is worth about a tenth of a compressed one, so the report shows the
+    /// two apart.
+    pub deferred_cost_usd: f64,
+    /// Tokens and dollars of upstream calls the proxy made that the client
+    /// never saw (CCR continuation rounds, turn-hook re-drives, recaches
+    /// those rounds caused). Charged against the saving, not added to it.
+    pub overhead_tokens: i64,
+    pub overhead_usd: f64,
 }
 
 /// Record a savings event from a completed request, given the count that was
@@ -220,16 +231,25 @@ pub fn record_from_forwarded(
         client,
         None,
         None,
-        None,
-        0,
+        SavingsSplit::default(),
     )
 }
 
+/// The parts of one request's saving that the report shows apart. Field
+/// meanings are those of the same-named [`SavingsEvent`] fields.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SavingsSplit {
+    pub new_input_tokens: Option<i64>,
+    pub deferred_tokens: i64,
+    pub deferred_cost_usd: f64,
+    pub overhead_tokens: i64,
+    pub overhead_usd: f64,
+}
+
 /// As [`record_from_forwarded`], with a request-scoped price derived from the
-/// provider's cache usage and the new-input basis described on
-/// [`SavingsEvent`]. New proxy paths use this; the legacy helper remains for
-/// callers that genuinely have no placement measurement.
-#[allow(clippy::too_many_arguments)]
+/// provider's cache usage and the split described on [`SavingsEvent`]. New
+/// proxy paths use this; the legacy helper remains for callers that genuinely
+/// have no placement measurement.
 pub fn record_from_forwarded_with_cost(
     forwarded_tokens: i64,
     tokens_saved: i64,
@@ -237,10 +257,9 @@ pub fn record_from_forwarded_with_cost(
     client: Option<&str>,
     cost_usd: Option<f64>,
     cost_basis: Option<&str>,
-    new_input_tokens: Option<i64>,
-    deferred_tokens: i64,
+    split: SavingsSplit,
 ) -> bool {
-    if tokens_saved <= 0 && new_input_tokens.is_none() {
+    if tokens_saved <= 0 && split.new_input_tokens.is_none() && split.overhead_usd <= 0.0 {
         return false;
     }
     record_savings_event(SavingsEvent {
@@ -254,8 +273,11 @@ pub fn record_from_forwarded_with_cost(
         cost_basis,
         fallback_rate: None,
         path: None,
-        new_input_tokens,
-        deferred_tokens,
+        new_input_tokens: split.new_input_tokens,
+        deferred_tokens: split.deferred_tokens,
+        deferred_cost_usd: split.deferred_cost_usd,
+        overhead_tokens: split.overhead_tokens,
+        overhead_usd: split.overhead_usd,
     })
 }
 
@@ -266,12 +288,14 @@ pub fn record_from_forwarded_with_cost(
 /// written, as a denominator-only line: the new-input rate must see every
 /// request that newly billed input, not only the ones compression touched, or
 /// a 100-saved/100-new turn followed by a 0-saved/10,000-new turn reads as 50%
-/// instead of under 1%. Without `new_input_tokens` a zero saving is skipped.
+/// instead of under 1%. A request that saved nothing but cost overhead is
+/// written too, so the overhead is charged. Otherwise a zero saving is skipped.
 pub fn record_savings_event(event: SavingsEvent) -> bool {
     let before = event.tokens_before.max(0);
     let after = event.tokens_after.max(0);
     let saved = (before - after).max(0);
-    if saved <= 0 && event.new_input_tokens.is_none() {
+    let overhead_usd = event.overhead_usd.max(0.0);
+    if saved <= 0 && event.new_input_tokens.is_none() && overhead_usd <= 0.0 {
         return false;
     }
 
@@ -305,11 +329,27 @@ pub fn record_savings_event(event: SavingsEvent) -> bool {
     obj.insert("client".into(), json!(label(event.client)));
     obj.insert("source".into(), json!(event.source.unwrap_or(UNKNOWN)));
     obj.insert("pid".into(), json!(std::process::id()));
+    let deferred = event.deferred_tokens.clamp(0, saved);
     if let Some(new_input) = event.new_input_tokens {
         obj.insert("new_input".into(), json!(new_input.max(0)));
+    }
+    if event.new_input_tokens.is_some() || deferred > 0 {
+        obj.insert("deferred".into(), json!(deferred));
+    }
+    if deferred > 0 {
         obj.insert(
-            "deferred".into(),
-            json!(event.deferred_tokens.clamp(0, saved)),
+            "deferred_cost_usd".into(),
+            json!(round_half_even(event.deferred_cost_usd.clamp(0.0, cost), 6)),
+        );
+    }
+    if overhead_usd > 0.0 {
+        obj.insert(
+            "overhead_tokens".into(),
+            json!(event.overhead_tokens.max(0)),
+        );
+        obj.insert(
+            "overhead_usd".into(),
+            json!(round_half_even(overhead_usd, 6)),
         );
     }
 
@@ -385,6 +425,38 @@ fn read_events(path: Option<&Path>, retention_days: i64, now: DateTime<Utc>) -> 
     events
 }
 
+/// One ledger line, as the aggregator reads it.
+struct Row {
+    saved: i64,
+    before: i64,
+    cost: f64,
+    new_input: Option<i64>,
+    deferred: i64,
+    deferred_cost: f64,
+    overhead_tokens: i64,
+    overhead_usd: f64,
+}
+
+impl Row {
+    fn parse(obj: &Value) -> Self {
+        let saved = coerce_i64(obj.get("saved")).max(0);
+        let cost = coerce_f64(obj.get("cost_usd")).max(0.0);
+        Row {
+            saved,
+            before: coerce_i64(obj.get("before")).max(0),
+            cost,
+            new_input: obj
+                .get("new_input")
+                .filter(|v| !v.is_null())
+                .map(|v| coerce_i64(Some(v)).max(0)),
+            deferred: coerce_i64(obj.get("deferred")).clamp(0, saved),
+            deferred_cost: coerce_f64(obj.get("deferred_cost_usd")).clamp(0.0, cost),
+            overhead_tokens: coerce_i64(obj.get("overhead_tokens")).max(0),
+            overhead_usd: coerce_f64(obj.get("overhead_usd")).max(0.0),
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 struct Bucket {
     tokens_saved: i64,
@@ -393,26 +465,34 @@ struct Bucket {
     calls: i64,
     new_input_tokens: i64,
     new_input_saved: i64,
+    deferred_tokens: i64,
+    deferred_cost_usd: f64,
+    overhead_tokens: i64,
+    overhead_usd: f64,
 }
 
 impl Bucket {
-    fn add(&mut self, saved: i64, before: i64, cost: f64, new_input: Option<(i64, i64)>) {
-        if saved <= 0
-            && let Some((tokens, _)) = new_input
-        {
-            // Denominator-only line (see `record_savings_event`): it belongs
-            // to the new-input basis and nowhere else, so calls, before/saved
-            // and cost keep meaning saving turns.
-            self.new_input_tokens += tokens;
+    fn add(&mut self, row: &Row) {
+        self.overhead_tokens += row.overhead_tokens;
+        self.overhead_usd += row.overhead_usd;
+        if row.saved <= 0 {
+            // Denominator-only or overhead-only line (see
+            // `record_savings_event`): calls, before/saved and cost keep
+            // meaning saving turns.
+            if let Some(tokens) = row.new_input {
+                self.new_input_tokens += tokens;
+            }
             return;
         }
-        self.tokens_saved += saved;
-        self.tokens_before += before;
-        self.cost_usd += cost;
+        self.tokens_saved += row.saved;
+        self.tokens_before += row.before;
+        self.cost_usd += row.cost;
         self.calls += 1;
-        if let Some((tokens, deferred)) = new_input {
+        self.deferred_tokens += row.deferred;
+        self.deferred_cost_usd += row.deferred_cost;
+        if let Some(tokens) = row.new_input {
             self.new_input_tokens += tokens;
-            self.new_input_saved += (saved - deferred).max(0);
+            self.new_input_saved += row.saved - row.deferred;
         }
     }
 
@@ -451,6 +531,11 @@ impl Bucket {
             "savings_percent": self.savings_percent(),
             "new_input_tokens": self.new_input_tokens,
             "new_input_savings_percent": self.new_input_savings_percent(),
+            "deferred_tokens": self.deferred_tokens,
+            "deferred_cost_usd": round_half_even(self.deferred_cost_usd, 6),
+            "overhead_tokens": self.overhead_tokens,
+            "overhead_usd": round_half_even(self.overhead_usd, 6),
+            "net_cost_usd": round_half_even(self.cost_usd - self.overhead_usd, 6),
         })
     }
 }
@@ -574,22 +659,14 @@ pub fn aggregate_savings(
 
     for event in &events {
         let obj = &event.value;
-        let saved = coerce_i64(obj.get("saved")).max(0);
-        let before = coerce_i64(obj.get("before")).max(0);
-        let cost = coerce_f64(obj.get("cost_usd")).max(0.0);
-        let new_input = obj.get("new_input").filter(|v| !v.is_null()).map(|v| {
-            (
-                coerce_i64(Some(v)).max(0),
-                coerce_i64(obj.get("deferred")).max(0),
-            )
-        });
+        let row = Row::parse(obj);
 
-        windowed.add(saved, before, cost, new_input);
+        windowed.add(&row);
         if event.ts >= today_cutoff {
-            today.add(saved, before, cost, new_input);
+            today.add(&row);
         }
         if event.ts >= week_cutoff {
-            last_7.add(saved, before, cost, new_input);
+            last_7.add(&row);
         }
 
         let model = obj
@@ -598,7 +675,7 @@ pub fn aggregate_savings(
             .filter(|s| !s.is_empty())
             .unwrap_or(UNKNOWN)
             .to_string();
-        by_model.entry(model).add(saved, before, cost, new_input);
+        by_model.entry(model).add(&row);
 
         let client = obj
             .get("client")
@@ -606,7 +683,7 @@ pub fn aggregate_savings(
             .filter(|s| !s.is_empty())
             .unwrap_or(UNKNOWN)
             .to_string();
-        by_client.entry(client).add(saved, before, cost, new_input);
+        by_client.entry(client).add(&row);
     }
 
     let model_rows = ranked(&by_model.into_ordered(), "model");
@@ -854,6 +931,40 @@ mod tests {
         assert_eq!(life["new_input_tokens"], json!(9_920));
         // 80 compression-saved / (9,920 + 80) = 0.8%.
         assert_eq!(life["new_input_savings_percent"], json!(0.8));
+    }
+
+    /// Deferral dollars are reported apart from compression, and overhead is
+    /// netted off — including a row that carries only overhead, which is a
+    /// charge, not a saving turn.
+    #[test]
+    fn deferral_and_overhead_split_out_of_the_gross() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("savings_events.jsonl");
+        assert!(record_savings_event(SavingsEvent {
+            cost_usd: Some(0.010),
+            deferred_tokens: 300,
+            deferred_cost_usd: 0.004,
+            overhead_tokens: 50,
+            overhead_usd: 0.001,
+            ..ev(1_000, 500, "c", &path)
+        }));
+        assert!(record_savings_event(SavingsEvent {
+            cost_usd: Some(0.0),
+            overhead_tokens: 200,
+            overhead_usd: 0.002,
+            ..ev(0, 0, "proxy", &path)
+        }));
+
+        let life = &aggregate_savings(Some(&path), None, DEFAULT_RETENTION_DAYS).lifetime;
+        assert_eq!(life["calls"], json!(1));
+        assert_eq!(life["tokens_saved"], json!(500));
+        assert_eq!(life["deferred_tokens"], json!(300));
+        assert_eq!(life["overhead_tokens"], json!(250));
+        let usd = |k: &str| life[k].as_f64().unwrap();
+        assert!((usd("cost_usd") - 0.010).abs() < 1e-9);
+        assert!((usd("deferred_cost_usd") - 0.004).abs() < 1e-9);
+        assert!((usd("overhead_usd") - 0.003).abs() < 1e-9);
+        assert!((usd("net_cost_usd") - 0.007).abs() < 1e-9);
     }
 
     #[test]

@@ -284,6 +284,14 @@ pub(crate) fn book_routed_outcome_with_ccr(
         attempted_input_tokens: input_tokens + ctx.tokens_saved.max(0),
         cache_read_tokens: cached,
         uncached_input_tokens: (input_tokens - cached).max(0),
+        // OpenAI shapes report input as a total that includes the cached
+        // prefix, so the rounds' uncached share is what is left after it.
+        hidden_rounds: headroom_core::request_outcome::HiddenRoundUsage {
+            input_tokens: (ccr_rounds.input_tokens - ccr_rounds.cache_read_tokens).max(0),
+            output_tokens: ccr_rounds.output_tokens,
+            cache_read_tokens: ccr_rounds.cache_read_tokens,
+            cache_write_tokens: ccr_rounds.cache_write_tokens,
+        },
         total_latency_ms: ctx.started_at.elapsed().as_secs_f64() * 1000.0,
         overhead_ms: ctx.overhead_ms,
         ttfb_ms,

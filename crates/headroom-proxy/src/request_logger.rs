@@ -634,6 +634,7 @@ mod tests {
             uncached_input_tokens: 1000,
             cache_inferred: false,
             from_response_cache: false,
+            hidden_rounds: Default::default(),
             // Unknown split: this fixture never saw a response body, so no
             // thinking count could be reported or inferred — and unknown is
             // not zero.

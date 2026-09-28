@@ -1114,6 +1114,31 @@ fn cmd_savings(as_json: bool, days: u32, reset: bool) -> Result<(), Box<dyn std:
         );
     }
 
+    // The headline mixes two savings a token apart in value: a deferred tool
+    // schema would have been a cache read, a compressed token new input. And
+    // it is gross of the upstream calls the proxy made to earn it.
+    println!();
+    println!("Where the dollars came from (net = compression + tool deferral - overhead):");
+    println!(
+        "{:<12} {:>26}  {:>26}  {:>26}  {:>11}",
+        "", "compression", "tool deferral (est.)", "overhead", "net"
+    );
+    println!("{}", split_line("Today", &report.windows["today"]));
+    println!(
+        "{}",
+        split_line("Last 7 days", &report.windows["last_7_days"])
+    );
+    println!(
+        "{}",
+        split_line(
+            &format!("Last {span} days"),
+            &report.windows["last_30_days"]
+        )
+    );
+    println!("  Tool deferral is our count of the schemas we asked the provider to defer;");
+    println!("  no response confirms it. Overhead is CCR continuation rounds, turn-hook");
+    println!("  re-drives, and the recaches those rounds caused.");
+
     if !report.by_model.is_empty() {
         println!();
         println!("Estimated cost avoided per model:");
@@ -1125,8 +1150,8 @@ fn cmd_savings(as_json: bool, days: u32, reset: bool) -> Result<(), Box<dyn std:
             let cost = row.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
             println!("  {:<24} {}", model, fmt_money(cost, 4));
         }
-        println!("  Legacy note: rows without cost_basis assumed fresh-input pricing;");
-        println!("  newer proxy rows use the measured fresh/cache-read placement.");
+        println!("  Gross, before overhead. Rows without cost_basis were priced at list input;");
+        println!("  newer proxy rows are priced from each turn's measured cache usage.");
     }
 
     if !report.by_client.is_empty() {
@@ -1192,6 +1217,27 @@ fn window_line(label: &str, window: &serde_json::Value) -> String {
         line.push_str(&format!("  · of new input {new_pct:.1}%"));
     }
     line
+}
+
+/// One row of the split table: compression, tool deferral and overhead as
+/// tokens and dollars, then the net.
+fn split_line(label: &str, window: &serde_json::Value) -> String {
+    let int = |key: &str| window.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    let money = |key: &str| window.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let deferred = int("deferred_tokens");
+    let deferred_usd = money("deferred_cost_usd");
+    let cell = |tokens: i64, usd: f64| format!("{} {}", commafy(tokens), fmt_money(usd, 2));
+    format!(
+        "{:<12} {:>26}  {:>26}  {:>26}  {:>11}",
+        label,
+        cell(
+            int("tokens_saved") - deferred,
+            money("cost_usd") - deferred_usd
+        ),
+        cell(deferred, deferred_usd),
+        cell(int("overhead_tokens"), -money("overhead_usd")),
+        fmt_money(money("net_cost_usd"), 2)
+    )
 }
 
 fn has_new_input(window: &serde_json::Value) -> bool {

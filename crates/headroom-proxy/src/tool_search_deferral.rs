@@ -466,6 +466,23 @@ fn tool_search_reference_names(content: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Tools a server-side search already loaded in this transcript.
+///
+/// The provider expands every `tool_reference` in history into the full
+/// definition, so a loaded tool bills as input again on each later turn even
+/// though its schema still carries `defer_loading`. Counting it as deferred
+/// would book a saving the bill never shows.
+pub fn loaded_tool_names(messages: &[Value]) -> std::collections::HashSet<String> {
+    messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_search_tool_result"))
+        .filter_map(|b| b.get("content"))
+        .flat_map(tool_search_reference_names)
+        .collect()
+}
+
 /// Stand-in for a tool-search block the outbound tools array cannot support.
 /// Text so it is inert to every validator, short so it costs ~10 tokens, and
 /// constant so the repaired prefix stays byte-stable across turns (the

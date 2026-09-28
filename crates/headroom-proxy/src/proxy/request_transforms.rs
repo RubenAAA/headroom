@@ -206,22 +206,44 @@ pub(crate) fn maybe_inject_tool_search(
         let inject = tsd::inject_deferral(tools_vec);
         if inject.changed {
             deferred_tools = inject.deferred.len();
-            let tokenizer = headroom_core::tokenizer::get_tokenizer(model);
-            let deferred_json = serde_json::to_string(&inject.deferred).unwrap_or_default();
-            deferred_tokens = tokenizer.count_text(&deferred_json) as i64;
-            core_deferred_tokens = if inject.core_deferred.is_empty() {
-                // An empty slice still serializes to `"[]"`, which every
-                // backend prices at >= 1 token — no core savings, not one
-                // phantom token (which also mistags the request downstream).
-                0
-            } else {
-                let core_json = serde_json::to_string(&inject.core_deferred).unwrap_or_default();
-                tokenizer.count_text(&core_json) as i64
+            // A tool the transcript already loaded bills as input again, so
+            // only the schemas still unloaded count as saved.
+            let loaded = value
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .map(|m| tsd::loaded_tool_names(m))
+                .unwrap_or_default();
+            let unloaded = |tools: &[serde_json::Value]| -> Vec<serde_json::Value> {
+                tools
+                    .iter()
+                    .filter(|t| {
+                        !t.get("name")
+                            .and_then(|n| n.as_str())
+                            .is_some_and(|n| loaded.contains(n))
+                    })
+                    .cloned()
+                    .collect()
             };
+            let still_deferred = unloaded(&inject.deferred);
+            let core_still_deferred = unloaded(&inject.core_deferred);
+            let tokenizer = headroom_core::tokenizer::get_tokenizer(model);
+            // An empty slice still serializes to `"[]"`, which every backend
+            // prices at >= 1 token — no savings, not one phantom token (which
+            // also mistags the request downstream).
+            let count = |tools: &[serde_json::Value]| {
+                if tools.is_empty() {
+                    0
+                } else {
+                    tokenizer.count_text(&serde_json::to_string(tools).unwrap_or_default()) as i64
+                }
+            };
+            deferred_tokens = count(&still_deferred);
+            core_deferred_tokens = count(&core_still_deferred);
             tracing::info!(
                 event = "tool_search_deferral",
                 request_id = %request_id,
                 deferred_tools = deferred_tools,
+                loaded_tools = deferred_tools - still_deferred.len(),
                 deferred_tokens = deferred_tokens,
                 core_deferred_tokens = core_deferred_tokens,
                 "deferred non-core tool schemas behind the search tool"
@@ -1176,6 +1198,54 @@ mod tool_search_wiring_tests {
         let tools = v["tools"].as_array().unwrap();
         assert_eq!(tools[0]["name"], json!("tool_search_tool_regex"));
         assert_eq!(tools.len(), 15);
+    }
+
+    /// A tool the transcript already loaded bills as input again, so it is
+    /// still deferred on the wire but no longer counted as saved.
+    #[test]
+    fn a_loaded_tool_is_not_counted_as_deferred() {
+        let loading = |names: &[&str]| {
+            let refs: Vec<serde_json::Value> = names
+                .iter()
+                .map(|n| json!({"type": "tool_reference", "tool_name": n}))
+                .collect();
+            json!([
+                {"role": "user", "content": "post it"},
+                {"role": "assistant", "content": [
+                    {"type": "server_tool_use", "id": "srvtoolu_1",
+                     "name": "tool_search_tool_regex", "input": {"query": "slack"}},
+                    {"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1",
+                     "content": {"type": "tool_search_tool_search_result",
+                                 "tool_references": refs}}
+                ]},
+                {"role": "user", "content": "go on"}
+            ])
+        };
+        let deferred = |messages: serde_json::Value| {
+            let (_, attr) = maybe_inject_tool_search(
+                body_with(fourteen_tools(), messages),
+                "https://api.anthropic.com",
+                "claude-opus-5",
+                "req-test",
+                true,
+            );
+            let attr = attr.expect("14 first-party tools must defer");
+            assert_eq!(attr.deferred_tools, 6, "the wire still defers all six");
+            attr.deferred_tokens
+        };
+
+        let none_loaded = deferred(loading(&[]));
+        let two_loaded = deferred(loading(&["Slack_post", "Linear_get"]));
+        assert!(0 < two_loaded && two_loaded < none_loaded);
+        let all_loaded = deferred(loading(&[
+            "Slack_post",
+            "Linear_get",
+            "Sentry_get",
+            "Notion_read",
+            "Snowflake_q",
+            "PagerDuty_get",
+        ]));
+        assert_eq!(all_loaded, 0);
     }
 
     #[test]

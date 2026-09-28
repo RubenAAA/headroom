@@ -1337,10 +1337,7 @@ impl UsageObserver {
             forwarded_head_moved,
             wasted_tokens,
         );
-        crate::observability::observe_recache_event(
-            event.attribution_reason.as_deref(),
-            counts_as_waste.then_some(wasted_tokens),
-        );
+        attribution::observe_recache_cost(&event, usage, wasted_tokens, counts_as_waste);
         inner.last_event = Some(event);
         Some(match event_kind {
             // A structural bust: bytes inside the cached prefix moved,

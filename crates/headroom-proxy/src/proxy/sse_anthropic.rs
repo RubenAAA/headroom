@@ -479,6 +479,12 @@ pub(super) fn emit_anthropic_outcome(close: &AnthropicClose<'_>) {
             // `input_tokens` is the total — do not copy that formula
             // here.
             uncached_input_tokens: attempted_input,
+            hidden_rounds: headroom_core::request_outcome::HiddenRoundUsage {
+                input_tokens: close.ccr_rounds.input_tokens,
+                output_tokens: close.ccr_rounds.output_tokens,
+                cache_read_tokens: close.ccr_rounds.cache_read_tokens,
+                cache_write_tokens: close.ccr_rounds.cache_write_tokens,
+            },
             waste_signals: ctx.waste_signals.clone(),
             total_latency_ms: ctx.total_latency_ms,
             overhead_ms: ctx.overhead_ms,

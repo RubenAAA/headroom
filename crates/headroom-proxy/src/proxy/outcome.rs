@@ -241,14 +241,21 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         // the ledger's token and dollar columns share one basis: message
         // savings at the live-zone mix, tool-schema savings read-first.
         let tool_schema_saved = saved - outcome.tokens_saved.clamp(0, saved);
-        let priced_cost = outcome.compression_savings_cost_usd_for(saved - tool_schema_saved)
-            + outcome.tool_schema_savings_cost_usd_for(tool_schema_saved);
+        let tool_schema_cost = outcome.tool_schema_savings_cost_usd_for(tool_schema_saved);
+        let priced_cost =
+            outcome.compression_savings_cost_usd_for(saved - tool_schema_saved) + tool_schema_cost;
         // `"free"` (zero-rate tier) makes the basis self-describing: the
         // counterfactual dollars below are 0.0 because the model costs
         // nothing, not because nothing was saved — do not read them
         // against priced rows.
         let priced_basis = outcome.compression_savings_cost_basis().to_string();
-        let new_input = outcome.new_input_tokens();
+        let split = headroom_core::savings_ledger::SavingsSplit {
+            new_input_tokens: outcome.new_input_tokens(),
+            deferred_tokens: tool_schema_saved,
+            deferred_cost_usd: tool_schema_cost,
+            overhead_tokens: outcome.hidden_rounds.total_tokens(),
+            overhead_usd: outcome.hidden_rounds_cost_usd(),
+        };
         let pricing = headroom_core::pricing::lookup(&model);
         let fresh_rate = pricing
             .map(|p| p.input_cost_per_token)
@@ -290,8 +297,7 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
                 client.as_deref(),
                 priced_cost,
                 &priced_basis,
-                new_input,
-                tool_schema_saved,
+                split,
                 offload,
             );
             return;
@@ -304,8 +310,7 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
                 client.as_deref(),
                 priced_cost,
                 &priced_basis,
-                new_input,
-                tool_schema_saved,
+                split,
                 offload,
             );
         });
@@ -323,8 +328,7 @@ pub(super) fn write_savings_ledger(
     client: Option<&str>,
     priced_cost: f64,
     priced_basis: &str,
-    new_input: Option<i64>,
-    deferred: i64,
+    split: headroom_core::savings_ledger::SavingsSplit,
     offload: Option<OffloadSavings>,
 ) {
     headroom_core::savings_ledger::record_from_forwarded_with_cost(
@@ -334,8 +338,7 @@ pub(super) fn write_savings_ledger(
         client,
         Some(priced_cost),
         Some(priced_basis),
-        new_input,
-        deferred,
+        split,
     );
     if let Some(offload) = offload {
         headroom_core::savings_ledger::record_savings_event(

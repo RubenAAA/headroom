@@ -388,6 +388,15 @@ pub(crate) fn emit_buffered_outcome(
             cache_write_5m_tokens: cache_write_5m,
             cache_write_1h_tokens: cache_write_1h,
             uncached_input_tokens: uncached_input,
+            // Uncached counts, the same way they were folded in above.
+            hidden_rounds: headroom_core::request_outcome::HiddenRoundUsage {
+                input_tokens: ccr_round_usage.input_tokens + hook_uncached_input,
+                output_tokens: ccr_round_usage.output_tokens + turn_hook_usage.output_tokens,
+                cache_read_tokens: ccr_round_usage.cache_read_tokens
+                    + turn_hook_usage.cache_read_tokens,
+                cache_write_tokens: ccr_round_usage.cache_write_tokens
+                    + turn_hook_usage.cache_write_tokens,
+            },
             total_latency_ms: ctx.total_latency_ms,
             overhead_ms: ctx.overhead_ms,
             // `ttfb_ms` stays at its 0 default: the convention

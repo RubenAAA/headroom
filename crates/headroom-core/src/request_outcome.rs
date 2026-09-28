@@ -21,6 +21,24 @@ fn round_half_even_i64(value: f64) -> i64 {
     value.round_ties_even() as i64
 }
 
+/// Billed usage of the upstream calls behind [`RequestOutcome::hidden_rounds`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HiddenRoundUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+}
+
+impl HiddenRoundUsage {
+    pub fn total_tokens(&self) -> i64 {
+        self.input_tokens.max(0)
+            + self.output_tokens.max(0)
+            + self.cache_read_tokens.max(0)
+            + self.cache_write_tokens.max(0)
+    }
+}
+
 /// Immutable, value-equal snapshot of a completed request.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RequestOutcome {
@@ -80,6 +98,11 @@ pub struct RequestOutcome {
     /// Headroom's own semantic response cache served this (distinct from
     /// upstream prompt-cache `cache_read_tokens`).
     pub from_response_cache: bool,
+    /// Upstream calls the proxy made that the client never saw: CCR
+    /// continuation rounds and turn-hook re-drives. Already folded into the
+    /// token fields above; kept apart so the ledger can charge them against
+    /// the saving that caused them.
+    pub hidden_rounds: HiddenRoundUsage,
 
     // ── Output composition ──
     // `output_tokens` pools two quantities that different levers move in
@@ -174,35 +197,32 @@ impl RequestOutcome {
         (uncached > 0 || write > 0).then(|| uncached.saturating_add(write))
     }
 
-    /// Rate class the removed input would have occupied on this request.
+    /// How the saving's dollars were priced, as the ledger's `cost_basis`.
     ///
-    /// Prompt caches are prefixes. `optimized_tokens` is the selected span
-    /// left after compression; if that span is larger than the request's
-    /// cache-write + uncached tail, it reaches into the cache-read prefix and
-    /// the removed tokens are priced at the cache-read rate. This deliberately
-    /// favours the proxy at the boundary: a span that fits in the fresh region
-    /// is wholly called fresh, even if some selected blocks came from earlier.
+    /// - `"free"`: a zero-rate model (free tiers such as Muse Spark). Its
+    ///   counterfactual dollars are 0.0 because the model costs nothing, not
+    ///   because nothing was saved, so the row must not be read against
+    ///   priced rows.
+    /// - `"list"`: no price for the model, or no cache usage to apportion
+    ///   against, so every removed token was priced at the list input rate.
+    /// - `"measured_mix"`: apportioned across this turn's reported cache
+    ///   usage — message savings over its writes and uncached input, deferred
+    ///   tool schemas read-first. See [`Self::price_removed`].
     ///
-    /// Binary by construction: one class per turn. A turn straddling
-    /// cached/fresh tokens is priced wholly at one rate — see
-    /// `compression_savings_cost_usd_for` for the proportional refinement.
-    ///
-    /// Zero-rate models (free tiers such as Muse Spark) report `"free"`:
-    /// their counterfactual dollars are 0.0 not because nothing was saved
-    /// but because the model costs nothing, so the row must not be read
-    /// against priced rows. See `compression_savings_cost_usd_for`.
+    /// This used to name one rate class (`cache_read` / `fresh_input`) while
+    /// the dollars came from the mix, so a row labelled `fresh_input` could be
+    /// priced at the cache-read rate.
     pub fn compression_savings_cost_basis(&self) -> &'static str {
-        if crate::pricing::lookup(&self.model).is_some_and(|p| p.input_cost_per_token == 0.0) {
-            return "free";
-        }
-        let fresh_region = self
-            .cache_write_tokens
-            .max(0)
-            .saturating_add(self.uncached_input_tokens.max(0));
-        if self.cache_read_tokens > 0 && self.optimized_tokens > fresh_region {
-            "cache_read"
-        } else {
-            "fresh_input"
+        match crate::pricing::lookup(&self.model) {
+            Some(p) if p.input_cost_per_token == 0.0 => "free",
+            Some(_)
+                if self.cache_read_tokens > 0
+                    || self.cache_write_tokens > 0
+                    || self.uncached_input_tokens > 0 =>
+            {
+                "measured_mix"
+            }
+            _ => "list",
         }
     }
 
@@ -223,7 +243,7 @@ impl RequestOutcome {
     /// rest at list. An inferred OpenAI write is dropped — it is the same
     /// tokens as `uncached`, so counting it would both double them and apply
     /// a premium OpenAI never charges. No usable mix prices at list and says
-    /// so via the basis (`"no-mix"`), rather than inventing one.
+    /// so via the basis (`"list"`), rather than inventing one.
     ///
     /// `tokens_saved` here is the LIVE-ZONE figure: handlers freeze the
     /// cached prefix and compress only the appended delta, so the removed
@@ -247,6 +267,37 @@ impl RequestOutcome {
     /// turn's deferral about tenfold.
     pub fn tool_schema_savings_cost_usd_for(&self, tokens_saved: i64) -> f64 {
         self.price_removed(tokens_saved, true)
+    }
+
+    /// What [`Self::hidden_rounds`] cost, priced from the model's own rates.
+    /// The rounds write under the same TTL as the turn, so a turn that wrote
+    /// any 1h tokens prices their writes at the 1h rate.
+    pub fn hidden_rounds_cost_usd(&self) -> f64 {
+        let r = self.hidden_rounds;
+        if r.total_tokens() == 0 {
+            return 0.0;
+        }
+        let Some(pricing) = crate::pricing::lookup(&self.model) else {
+            let fallback = crate::savings_ledger::DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN;
+            return (r.input_tokens.max(0) + r.cache_write_tokens.max(0)) as f64 * fallback;
+        };
+        let long = crate::pricing::is_long_context(
+            self.uncached_input_tokens
+                .max(0)
+                .saturating_add(self.cache_read_tokens.max(0))
+                .saturating_add(self.cache_write_tokens.max(0)),
+        );
+        let list = pricing.input_rate(long);
+        let write_5m = pricing.cache_write_rate(long).unwrap_or(list);
+        let write = if self.cache_write_1h_tokens > 0 {
+            pricing.cache_write_1h_rate(long).unwrap_or(write_5m)
+        } else {
+            write_5m
+        };
+        r.input_tokens.max(0) as f64 * list
+            + r.output_tokens.max(0) as f64 * pricing.output_rate(long)
+            + r.cache_read_tokens.max(0) as f64 * pricing.cache_read_rate(long).unwrap_or(list)
+            + r.cache_write_tokens.max(0) as f64 * write
     }
 
     fn price_removed(&self, tokens_saved: i64, read_first: bool) -> f64 {
@@ -462,6 +513,7 @@ impl RequestOutcome {
             uncached_input_tokens: p.uncached_input_tokens,
             cache_inferred: p.cache_inferred,
             from_response_cache: false,
+            hidden_rounds: HiddenRoundUsage::default(),
             thinking_tokens: p.thinking_tokens,
             thinking_inferred: p.thinking_inferred,
             stop_reason: p.stop_reason,
@@ -768,7 +820,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(outcome.compression_savings_cost_basis(), "cache_read");
+        assert_eq!(outcome.compression_savings_cost_basis(), "measured_mix");
         // 1,000 live-zone tokens on a warm turn: the mix is ~480k reads, so
         // almost all of the removed delta prices at the 5m-write rate
         // ($6.25/MTok), the 2 uncached tokens at list.
@@ -815,7 +867,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(outcome.compression_savings_cost_basis(), "fresh_input");
+        assert_eq!(outcome.compression_savings_cost_basis(), "measured_mix");
         // 1,000 live-zone tokens against a 4,000-write / 2-uncached mix:
         // pro-rata at the 5m-write rate ($6.25/MTok) and list ($5/MTok).
         let expected =
@@ -855,6 +907,7 @@ mod tests {
             ..Default::default()
         };
         assert!((outcome.compression_savings_cost_usd() - 0.005).abs() < 1e-12);
+        assert_eq!(outcome.compression_savings_cost_basis(), "list");
     }
 
     #[test]
@@ -882,7 +935,7 @@ mod tests {
             uncached_input_tokens: 2,
             ..Default::default()
         };
-        assert_eq!(priced.compression_savings_cost_basis(), "cache_read");
+        assert_eq!(priced.compression_savings_cost_basis(), "measured_mix");
     }
 
     #[test]
