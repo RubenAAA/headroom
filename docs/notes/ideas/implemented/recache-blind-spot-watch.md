@@ -3,7 +3,9 @@
 - **Status:** beta half shipped and ranked; model-flap witness shipped
   log-only and now **closed at zero over 456 observations** (2026-09-21 —
   do not build the forwarded-model witness); TTL + tail exonerated.
-  `markers_changed` still unrankable for want of a denominator.
+  `markers_changed` normalized since (`usage_observer.rs`, normalized marker
+  layout). Closed 2026-09-28: `recache-residual-triage.md` placed the
+  residual in the race lane, so nothing is left for this watch to find.
 - **Source:** 2026-09-17 code-reading proof that several provider key inputs
   are invisible to both drift lanes: beta headers (hash reads body only),
   `cache_control`/TTL moves (stripped), model-route changes (router runs

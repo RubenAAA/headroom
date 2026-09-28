@@ -1,10 +1,11 @@
 # Idea: stop a stabilized-away client edit from unlocking a history rewrite
 
-- **Status:** open, but parked 2026-09-21 — six days of traffic yielded five
+- **Status:** rejected 2026-09-28 — 4 absorbed events, 84,683 tokens over
+  six days (~14k/day); too rare to pay for a gate change. Parked 2026-09-21 — six days of traffic yielded five
   classifiable events. The phenomenon is rare, not under-instrumented; more
   waiting will not settle it. See Findings at the bottom.
 - **Source:** 2026-09-15 investigation of `cache_recache_observed
-  attribution_reason=tools`; see `gate-prior-thinking-drop.md` (implemented) for
+  attribution_reason=tools`; see `../implemented/gate-prior-thinking-drop.md` for
   the gate this would finish, and `prior-thinking-billing-question.md` for the
   billing side.
 - **Value:** one observed turn re-created 103,884 tokens of prefix that was
@@ -52,7 +53,7 @@ was measured on the body the pin had not touched yet.
 
 `thinking_drop_is_free(rebuild_boundary, forwarded_agreement_len)` is
 `rebuild_boundary || agreement.map_or(true, |n| n <= 1)`. The second operand was
-added (`gate-prior-thinking-drop.md`) precisely to refuse the drop while the
+added (`../implemented/gate-prior-thinking-drop.md`) precisely to refuse the drop while the
 provider still holds the history.
 
 It could not fire. `forwarded_agreement_len` reads

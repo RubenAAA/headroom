@@ -5,7 +5,7 @@
   changing the gate (fall-through names the same waste in the same bucket).
   Numbers that killed the fix: 3 instances / 0 abandoned / 0 tokens moved.
   Follow-up (beta attribution) filed in
-  `docs/notes/ideas/recache-blind-spot-watch.md`.
+  `docs/notes/ideas/implemented/recache-blind-spot-watch.md`.
 - **Source:** 2026-09-17 review of `recache_attribution` found two shapes:
   (a) empty inbound dims + `Some("")` outbound + `head_changed` still reports
   `prefix_head_changed`; (b) partial absorption keeps the absorbed dimension
@@ -48,6 +48,6 @@
   flipped exactly on the recache turn after 100–200 stable turns per
   session — provider-visible, both-lanes-quiet, and with **no arm in
   `recache_attribution`** (`beta_changed` rides along only as witness).
-  Follow-up belongs to `recache-blind-spot-watch.md`: rank `beta_changed`
+  Follow-up belongs to `../implemented/recache-blind-spot-watch.md`: rank `beta_changed`
   as attribution evidence (ordering vs head/divergence TBD). This file can
   close once that follow-up is filed.

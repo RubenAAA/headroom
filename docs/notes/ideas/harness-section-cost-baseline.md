@@ -10,7 +10,7 @@
   - `input-tokens-uncached-tail.md`: size from `bytes_out` / cache counters, never `input_tokens` (warm-turn `input_tokens=2` on 200KB+ bodies).
   - `savings-headline-semantics.md`: per-request savings re-applied to re-sent history repeat by construction — sum across turns double-counts. Headline stays transform-efficiency; net math stays in `savings_verdict`/`wire_verdict`.
   - `unbooked-share-of-wire.md`: unbooked are 17% of wire bytes — booked-only ratios cover 83%, say so.
-- **Neighbours (complementary, not duplicates):** `history-rollup-read-cost.md` (read-cost leg on steep-discount models) — this is the section leg. `recache-landing-natural-kinds.md` + `recache-blind-spot-watch.md` supply the waste ontology/witnesses this table will join to. `cost-saves-measured.md` sets the prior: writes 55% of bill, compression capped ~1.5% — expect the table to confirm it, not overturn it.
+- **Neighbours (complementary, not duplicates):** `history-rollup-read-cost.md` (read-cost leg on steep-discount models) — this is the section leg. `implemented/recache-landing-natural-kinds.md` + `implemented/recache-blind-spot-watch.md` supply the waste ontology/witnesses this table will join to. `cost-saves-measured.md` sets the prior: writes 55% of bill, compression capped ~1.5% — expect the table to confirm it, not overturn it.
 - **Exit:** close when the table exists and one ranked proposal cites it.
 - **Tool:** `crates/headroom-proxy/src/bin/section_cost_baseline.rs` (offline; capture dir in, three tables out; groups by session+model, stable run = read at pricing ratios, first turns reported separately, `--write-tier 5m|1h`).
 

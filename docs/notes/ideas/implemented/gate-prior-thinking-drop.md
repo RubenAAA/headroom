@@ -116,5 +116,5 @@ evidence again. No decision changed, because the `rebuild_boundary` arm
 short-circuits past it, which means §0 point 2 is reopened rather than
 re-settled. It needs a fresh window on the corrected field.
 
-See `../absorbed-rebuild-boundary.md` for the turn that prompted this and for
+See `../rejected/absorbed-rebuild-boundary.md` for the turn that prompted this and for
 the policy question the corrected field is needed to answer.

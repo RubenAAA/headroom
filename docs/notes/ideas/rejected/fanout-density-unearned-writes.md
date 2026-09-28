@@ -9,8 +9,8 @@
 - **Source:** 2026-09-21 reading of `productive_write_pct` on the live proxy.
   Code: `cache_stabilization/prefix_stampede.rs` (`head_key`, `admit`),
   `usage_observer.rs` (`split_cache_write`, `record_unearned_write`).
-  Neighbours: `recache-residual-triage.md` (the race lane),
-  `recache-commit-latency-proof.md` (the race itself, confirmed).
+  Neighbours: `../implemented/recache-residual-triage.md` (the race lane),
+  `../implemented/recache-commit-latency-proof.md` (the race itself, confirmed).
 - **Value:** 119,329 unearned tokens in five minutes, from one burst. Over the
   same six days unearned writes above the floor total 4,633,847 — 9.9% of all
   cache creation. This is the one slice of it that our own scheduling causes.
@@ -228,7 +228,7 @@ Reject the gate extension and the proxy-per-session topology. The remaining
 mechanism is provider-side: under our aggregate rate the provider returns a
 partial read of the conversation's own previous write
 (`provider_partial_of_previous_write`), which is the same staleness lane
-`recache-residual-triage.md` lands in, and nothing local reaches it.
+`../implemented/recache-residual-triage.md` lands in, and nothing local reaches it.
 
 What is left is the free option: fewer concurrent sessions against the same
 repo, worth about 400,000 tokens per six days. No code, and nothing else

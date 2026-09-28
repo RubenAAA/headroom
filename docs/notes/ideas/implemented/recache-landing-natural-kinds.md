@@ -1,6 +1,9 @@
 # Idea: test whether the five landings are natural kinds
 
-- **Status:** open (pure log query; no code)
+- **Status:** done 2026-09-17 — all five kinds kept, doc comments corrected
+  in `usage_observer_attribution.rs` (`CacheLanding`). Re-checked
+  2026-09-28 on 95 `between_entries` events (09-21 to 09-24): 87 land in
+  the bottom tenth of the older segment, median 773 tokens above `pp`.
 - **Source:** `CacheLanding::classify` in
   `crates/headroom-proxy/src/cache_stabilization/usage_observer.rs`.
   `MissedNewestWrite` (gaps under 3s) and `PartialOfPreviousWrite` (Fable's

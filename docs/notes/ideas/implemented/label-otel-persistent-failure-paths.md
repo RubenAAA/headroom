@@ -17,3 +17,6 @@
 - **Not ported:** dashboard (lives elsewhere, skipped), OTel mirrors
   (unused — debugging goes through logs), per the operator decision
   2026-09-24.
+- **Verified 2026-09-28:** live `/stats` serves both splits under
+  `lifetime_metrics.requests` (`failed_by_provider`: openai_responses 105,
+  anthropic 1; `rate_limited_by_provider`: anthropic 1).
