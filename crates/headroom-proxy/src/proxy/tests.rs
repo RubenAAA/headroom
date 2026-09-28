@@ -1819,6 +1819,26 @@ fn latest_user_query_reads_latest_text_block() {
 }
 
 #[test]
+fn latest_user_query_skips_system_reminders() {
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "<system-reminder>\nproject rules\n</system-reminder>"},
+                {"type": "text", "text": " fix the parser "},
+                {"type": "text", "text": "then run the tests"}
+            ]}
+        ]
+    });
+
+    assert_eq!(
+        latest_user_query(&body),
+        "fix the parser\nthen run the tests"
+    );
+}
+
+#[test]
 fn append_context_adds_text_block_to_latest_user_only() {
     let mut body = serde_json::json!({
         "messages": [

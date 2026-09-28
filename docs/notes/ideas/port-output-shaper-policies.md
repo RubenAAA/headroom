@@ -24,9 +24,9 @@ Left:
 1. Done 2026-09-28: `4e5a67a3` + rest of `f542b704`. `extract_user_query`
    (`memory/handler.rs`) now skips `<system-reminder>` blocks and joins the
    rest with `\n`; before, it returned the first text block, usually a
-   reminder, so memory search ran on boilerplate. `ccr_expansion.rs:55`
-   `latest_user_query` has the same shape and is not changed: it feeds ctx
-   injection, a different path.
+   reminder, so memory search ran on boilerplate. `latest_user_query`
+   (`ccr_expansion.rs`), which picks proactive CCR expansions, had the same
+   flaw and got the same filter.
 2. `71cbb6aa` + `63f74aa3`: steering for Responses (`instructions` tail,
    HTTP and WS); `1b8c11eb`: steering for chat (last system/developer
    message). The shaper runs on Anthropic bodies only

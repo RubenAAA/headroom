@@ -52,7 +52,15 @@ pub(crate) fn resolve_ctx_project(
         .unwrap_or_else(|| crate::ctx::projects::UNRESOLVED_PROJECT.to_string())
 }
 
+/// The latest user message's typed text. `<system-reminder>` blocks are
+/// skipped and the rest joined, as in `memory::handler::extract_user_query`:
+/// Claude Code opens a user message with reminders, and taking the first text
+/// block matched CCR expansions against the reminder instead of the request.
 pub(crate) fn latest_user_query(body: &serde_json::Value) -> String {
+    let typed = |text: &str| {
+        let text = text.trim();
+        (!text.is_empty() && !text.starts_with("<system-reminder")).then(|| text.to_string())
+    };
     body.get("messages")
         .and_then(serde_json::Value::as_array)
         .and_then(|messages| {
@@ -60,20 +68,19 @@ pub(crate) fn latest_user_query(body: &serde_json::Value) -> String {
                 if msg.get("role").and_then(serde_json::Value::as_str) != Some("user") {
                     return None;
                 }
-                match msg.get("content") {
-                    Some(serde_json::Value::String(s)) => Some(s.clone()),
-                    Some(serde_json::Value::Array(blocks)) => blocks.iter().find_map(|block| {
-                        (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-                            .then(|| {
-                                block
-                                    .get("text")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .flatten()
-                    }),
-                    _ => None,
-                }
+                let parts: Vec<String> = match msg.get("content") {
+                    Some(serde_json::Value::String(s)) => typed(s).into_iter().collect(),
+                    Some(serde_json::Value::Array(blocks)) => blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        })
+                        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                        .filter_map(typed)
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                (!parts.is_empty()).then(|| parts.join("\n"))
             })
         })
         .unwrap_or_default()
