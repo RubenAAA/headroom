@@ -1,7 +1,7 @@
 # Idea: per-section cost share baseline (§1)
 
 - **Status:** implemented 2026-09-28 — the tool exists, the tables are
-  below, and two proposals cite them (`harness-mcp-on-demand-schemas.md`,
+  below, and two proposals cite them (`implemented/harness-mcp-on-demand-schemas.md`,
   `rejected/harness-sparse-line-numbers.md`). Re-run it; do not rebuild it.
 - **Source:** `LOOK_AT_THIS_WHEN_YOU_HAVE_TIME.md` §1 + §8. Proxy counterparts: `docs/measurement.md` (savings_verdict vs wire_verdict; billed = creation + uncached input, reads free on subscription), `cache_stabilization/usage_observer.rs:1-51` (turn classifier, conversation-keyed, observer-only).
 - **Gap, verified:** totals exist (saved vs lost-to-busts, billed tokens, hit %) but no source split (system/tools/reads/search/commands/history). Ledger rows carry `cost_basis` (fresh/read/free) without source, so "share × removable ÷ risk" ranking is guesswork.

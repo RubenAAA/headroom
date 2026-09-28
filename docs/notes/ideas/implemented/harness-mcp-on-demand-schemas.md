@@ -1,6 +1,7 @@
 # Idea: MCP server on-demand schemas (§3)
 
-- **Status:** open — needs prevalence proof before any build
+- **Status:** implemented 2026-09-28 — default tool-search deferral
+  (`31c99a07`) already sends MCP schemas on demand; nothing left to build.
 - **Source:** `LOOK_AT_THIS_WHEN_YOU_HAVE_TIME.md` §3 (magnitudes only: rare-tool offload 60% of tool-description tokens; MCP offload 46.9% of total in sessions using them). Proxy: `--prune-drop-mcp`/`--prune-drop-tools` (drop), `tool_search_deferral.rs:1-33` (defer via injected `tool_search_tool_regex`; tools prefix still caches; savings in tags), `CORE_TOOLS` + `MIN_TOOLS=12`.
 - **Not a retry of:** `rejected/tools-block-cuts.md` (2026-09-03: pruning harder returns little at 0.1× read pricing, $32/day, quality trade) — this is deferral (excluded from first-party billing until searched), not pruning. `rejected/port-sdk-integrations-on-demand.md` (don't port framework integrations until users exist) — same principle applies here: no build until MCP-heavy sessions are shown in our traffic. `defer-core-tool-schemas.md` (open, built-ins) — this is the MCP-server half, grouped per server.
 - **Constraints from existing work:** keep tool order stable (`enable-e1-e2-sort-ab.md`; `first-turn-write-sharing.md` D1: only 1 tool-set in 2 orders, wrong sort breaks history reads). Deferral must be order-preserving and deterministic so the tools prefix still caches. Resident set keeps high-frequency + hallucinated-when-absent tools.
@@ -24,3 +25,24 @@ Schema leg (`tools:mcp` billed equiv): netvalue 3.2% (1.71M/53.0M, ~3.8k schema 
 
 - **Parked, not rejected:** the core-deferral experiment (`defer-core-tool-schemas.md`, ~13–15k tokens/turn prize) uses the identical mechanism for ~3× the prize. Its round-trip findings (added searches, latency, 400/retry rate) price this idea's cost side exactly. Revisit when it reports; if round trips prove cheap there, MCP servers are the next tranche. Do not prototype independently before then.
 - **Lane split:** `result:mcp` (blindguard 1.6%, athena alone 6.4M result tokens) is a compression/offload target, not a schema target — belongs to ctx-offload, not here.
+
+## Findings 2026-09-28 — already deferred on the wire
+
+Every `mcp__` tool in the netvalue `out/` wire copies, by day and model:
+
+| day | model | deferred | resident |
+|---|---|---|---|
+| 08-23 | claude opus + sonnet | 0 | 16,030 |
+| 09-25 | claude opus | 945 | 0 |
+| 09-25 | gpt / spark (routed) | 0 | 87 |
+
+The August rows predate deferral. Since then every MCP schema on a
+first-party Claude request goes out with `defer_loading`, which is this
+idea. The routed rows stay resident because third-party upstreams reject the
+search shape. The 2.1–3.8% `tools:mcp` share in the section baseline counts
+inbound bodies, before deferral, so it overstates the wire.
+
+The cost side this note waited on (added search round trips) was never
+measured, because `defer-core-tool-schemas.md` did not run. If search
+errors show up, the tool-error audit in `section_cost_baseline` table 3 is
+where to look.
