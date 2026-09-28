@@ -767,6 +767,14 @@ else
     say "updated Headroom section in $CLAUDE_MD"
 fi
 
+# ── pre-push hook ─────────────────────────────────────────────────────────
+# Only for a checkout someone works in, which is what --link is for.
+if [ "$LINK" = 1 ]; then
+    step "Pre-push hook"
+    bash "$REPO_DIR/scripts/install-local-hooks.sh" >/dev/null
+    say "linked .git/hooks/pre-push to scripts/hooks/pre-push"
+fi
+
 # ── done ──────────────────────────────────────────────────────────────────
 step "Done"
 say "Start Claude Code with:  cclaude"

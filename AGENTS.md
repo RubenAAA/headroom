@@ -82,8 +82,9 @@ sourcing scripts ignore the file unless it is yours with mode `0600`. Setup and
 rotation details: "Nord SOCKS5 relay pool" in `contrib/README.md`.
 
 Under `--link`, the contrib scripts, hooks, flag file and usage dump are
-symlinked into the checkout. Binaries are always copied, so those still need
-reinstalling after relevant changes.
+symlinked into the checkout, and so is the git pre-push gate (see Testing).
+Binaries are always copied, so those still need reinstalling after relevant
+changes.
 In copy mode a `git pull` leaves every installed copy stale. `update-headroom.sh`
 (installed in `~/.local/bin`) pulls, infers link mode from the flags-file symlink
 unless overridden with `--link`/`--copy`, reinstalls, and restarts the proxy. The
@@ -201,9 +202,12 @@ Before pushing:
 make ci-precheck   # fmt, clippy, tests; the same gate CI runs
 ```
 
-`make install-local-hooks` registers the pre-push gate (same checks,
-plus the touched-area suites and the ratchets below — no CI). It runs
-`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`make install-local-hooks` registers the pre-push gate, and
+`install.sh --link` runs it for you. It symlinks `.git/hooks/pre-push` to
+`scripts/hooks/pre-push`, so a pull that changes the gate needs no reinstall;
+edit that file, not the installer. The gate runs the same checks as
+`ci-precheck`, plus the touched-area suites and the ratchets below, with no
+CI: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 `scripts/what-to-run.sh --run`, `check-drift`, `check-log-events`,
 `check-complexity`, `check-file-size`, and `check-hygiene` (rustdoc
 links, unused deps via `cargo-machete`, TOML format via `taplo` +

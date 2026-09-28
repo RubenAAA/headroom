@@ -63,6 +63,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     SHELLCHECK_FILES=(
         "$ROOT"/contrib/*.sh
         "$ROOT"/scripts/*.sh
+        "$ROOT"/scripts/hooks/pre-push
         "$ROOT"/upstream-python/scripts/install-git-hooks.sh
     )
     # Newly covered entry points (extensionless launcher, nested bench and

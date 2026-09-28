@@ -1,138 +1,23 @@
 #!/usr/bin/env bash
-# Install the local-only pre-push hook. No CI, no network, no npx/venv.
+# Install the local-only pre-push hook: symlink .git/hooks/pre-push to
+# scripts/hooks/pre-push, which lists what it runs. A symlink rather than a
+# copy, so a `git pull` that changes the gate changes it for the next push; a
+# copy went stale once and skipped `--all-targets` and cargo deny for days.
 #
-# The hook runs, on every `git push`:
-#   1. cargo fmt --check (fast fail)
-#   2. cargo clippy --workspace --all-targets (fast fail; tests included)
-#   3. scripts/what-to-run.sh --run (touched-area suites only, not the
-#      full workspace — full `make test-nextest` stays a manual call)
-#   4. scripts/check-drift.sh (flags.md freshness, shellcheck, var coverage;
-#      runs inside what-to-run when config/scripts changed, plus once here
-#      unconditionally because it is seconds-cheap)
-#   5. scripts/check-log-events.sh (warn!/error! must carry an event)
-#   6. scripts/check-complexity.sh (no new function over clippy's cognitive
-#      complexity threshold)
-#   7. scripts/check-file-size.sh (no Rust file grows past 3000 lines)
-#   8. scripts/check-hygiene.sh (rustdoc links resolve, no unused deps,
-#      touched TOML canonical; needs cargo-machete, taplo-cli, cargo-sort
-#      for the optional legs — each skips gracefully when absent)
-#   9. cargo deny check (advisories, licenses, bans, sources; skipped with
-#      a note when cargo-deny is not installed)
-#
-# Idempotent. Bypass per-push with `git push --no-verify`.
+# Idempotent; replaces an older copied hook. Bypass per-push with
+# `git push --no-verify`.
 # (Replaces upstream-python/scripts/install-git-hooks.sh for local use;
 # that script pulls npx + venv + full ci-precheck and is left untouched.)
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HOOK="$ROOT/.git/hooks/pre-push"
+HOOKS_DIR="$(git -C "$ROOT" rev-parse --path-format=absolute --git-path hooks)"
+HOOK="$HOOKS_DIR/pre-push"
 
-if [[ ! -d "$ROOT/.git/hooks" ]]; then
-    echo "error: .git/hooks/ not found — run from a git checkout root" >&2
-    exit 1
-fi
-
-cat > "$HOOK" <<'HOOK_EOF'
-#!/usr/bin/env bash
-# Local-only pre-push: fmt + clippy + touched-area tests + drift.
-# Bypass: git push --no-verify
-set -euo pipefail
-ROOT="$(git rev-parse --show-toplevel)"
-
-while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
-    if [[ "$local_sha" == "0000000000000000000000000000000000000000" ]]; then
-        continue
-    fi
-    echo "── pre-push (local): verifying $local_ref → $remote_ref"
-    # Pushed range, not the working tree: what-to-run maps --base...HEAD,
-    # and for the current branch local_sha == HEAD at push time. New
-    # branches (remote zero) keep the working-tree default below.
-    if [[ "$remote_sha" != "0000000000000000000000000000000000000000" && -z "${PUSH_BASE:-}" ]]; then
-        PUSH_BASE="$remote_sha"
-    fi
-done
-
-cd "$ROOT"
-echo "── pre-push (local): cargo fmt --check"
-cargo fmt --all -- --check || {
-    echo "❌ pre-push: fmt failed. Run 'cargo fmt --all'." >&2
-    echo "   Bypass: git push --no-verify" >&2
-    exit 1
-}
-echo "── pre-push (local): cargo clippy"
-cargo clippy --workspace --all-targets -- -D warnings || {
-    echo "❌ pre-push: clippy failed." >&2
-    echo "   Bypass: git push --no-verify" >&2
-    exit 1
-}
-echo "── pre-push (local): touched-area suites"
-if [[ -n "${PUSH_BASE:-}" ]]; then
-    bash scripts/what-to-run.sh --base "$PUSH_BASE" --run || {
-        echo "❌ pre-push: touched-area tests failed." >&2
-        echo "   Bypass: git push --no-verify" >&2
-        exit 1
-    }
-else
-    bash scripts/what-to-run.sh --run || {
-        echo "❌ pre-push: touched-area tests failed." >&2
-        echo "   Bypass: git push --no-verify" >&2
-        exit 1
-    }
-fi
-echo "── pre-push (local): drift checks"
-bash scripts/check-drift.sh || {
-    echo "❌ pre-push: drift checks failed." >&2
-    echo "   Bypass: git push --no-verify" >&2
-    exit 1
-}
-echo "── pre-push (local): log-event ratchet"
-bash scripts/check-log-events.sh || {
-    echo "❌ pre-push: new warn!/error! without event field." >&2
-    echo "   Bypass: git push --no-verify" >&2
-    exit 1
-}
-echo "── pre-push (local): complexity ratchet"
-bash scripts/check-complexity.sh || {
-    echo "❌ pre-push: function over the cognitive complexity threshold." >&2
-    echo "   Bypass: git push --no-verify" >&2
-    exit 1
-}
-echo "── pre-push (local): file-size ratchet"
-bash scripts/check-file-size.sh || {
-    echo "❌ pre-push: a Rust file grew past its line limit." >&2
-    echo "   Bypass: git push --no-verify" >&2
-    exit 1
-}
-echo "── pre-push (local): hygiene (doc links, unused deps, TOML)"
-if [[ -n "${PUSH_BASE:-}" ]]; then
-    bash scripts/check-hygiene.sh --base "$PUSH_BASE" || {
-        echo "❌ pre-push: hygiene failed." >&2
-        echo "   Bypass: git push --no-verify" >&2
-        exit 1
-    }
-else
-    bash scripts/check-hygiene.sh || {
-        echo "❌ pre-push: hygiene failed." >&2
-        echo "   Bypass: git push --no-verify" >&2
-        exit 1
-    }
-fi
-if command -v cargo-deny >/dev/null; then
-    echo "── pre-push (local): cargo deny"
-    cargo deny check || {
-        echo "❌ pre-push: cargo deny failed (advisory, license, ban or source)." >&2
-        echo "   Bypass: git push --no-verify" >&2
-        exit 1
-    }
-else
-    echo "── pre-push (local): cargo deny skipped (cargo install --locked cargo-deny)"
-fi
-echo "✅ pre-push (local): PASSED"
-HOOK_EOF
-
-chmod +x "$HOOK"
-echo "✅ installed: $HOOK"
+mkdir -p "$HOOKS_DIR"
+ln -sfn "$ROOT/scripts/hooks/pre-push" "$HOOK"
+echo "✅ installed: $HOOK -> $ROOT/scripts/hooks/pre-push"
 echo "   Runs fmt + clippy + what-to-run --run + check-drift + check-log-events + check-complexity + check-file-size + check-hygiene + cargo deny."
 echo "   Hygiene needs cargo-machete, taplo-cli, cargo-sort for its optional legs:"
 echo "     cargo install cargo-machete taplo-cli cargo-sort --locked"
