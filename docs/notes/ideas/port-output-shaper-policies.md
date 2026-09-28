@@ -26,7 +26,11 @@ Left:
    rest with `\n`; before, it returned the first text block, usually a
    reminder, so memory search ran on boilerplate. `latest_user_query`
    (`ccr_expansion.rs`), which picks proactive CCR expansions, had the same
-   flaw and got the same filter.
+   flaw and got the same filter. Neither saves anything on the live flags:
+   `HEADROOM_MEMORY_MODE=tool` returns before the query is built (30,412 of
+   30,412 searches in the current log skipped as `mode_is_tool`), and
+   `--ccr-proactive-expansion false` gates out the only reader of the CCR
+   query. They matter only if `auto_tail` or expansion come back.
 2. `71cbb6aa` + `63f74aa3`: steering for Responses (`instructions` tail,
    HTTP and WS); `1b8c11eb`: steering for chat (last system/developer
    message). The shaper runs on Anthropic bodies only
