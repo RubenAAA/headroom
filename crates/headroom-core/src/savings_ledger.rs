@@ -36,6 +36,13 @@ pub const DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN: f64 = 3.0 / 1_000_000.0;
 const PROJECT_NAME_MAX_LENGTH: usize = 128;
 /// Compact the ledger once it grows past this size.
 const COMPACT_SIZE_BYTES: u64 = 8 * 1024 * 1024;
+/// How much a ledger with nothing to drop must grow before this process looks
+/// again. See [`maybe_compact`].
+const COMPACT_GROWTH_BYTES: u64 = 1024 * 1024;
+/// Per-process floor for the next compaction attempt: starts at the threshold,
+/// ratchets up while compaction finds nothing to drop, resets once it does.
+static COMPACT_MIN_SIZE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(COMPACT_SIZE_BYTES);
 
 fn utc_now() -> DateTime<Utc> {
     Utc::now()
@@ -575,12 +582,20 @@ fn coerce_f64(value: Option<&Value>) -> f64 {
 }
 
 /// Rewrite the ledger dropping out-of-retention events once it grows large.
+///
+/// Compaction can only drop events older than the retention window, so a
+/// ledger whose whole window is past the threshold has nothing to drop.
+/// Without the back-off every append re-read and rewrote the whole file under
+/// an exclusive lock (upstream `89a58fd1`; measured here: 32 MB, 22k events,
+/// none out of retention). The back-off is a per-process heuristic, not a
+/// correctness mechanism: retention is also enforced on read.
 fn maybe_compact(target: &Path) {
+    use std::sync::atomic::Ordering;
     let size = match std::fs::metadata(target) {
         Ok(m) => m.len(),
         Err(_) => return,
     };
-    if size <= COMPACT_SIZE_BYTES {
+    if size <= COMPACT_MIN_SIZE.load(Ordering::Relaxed) {
         return;
     }
 
@@ -595,6 +610,7 @@ fn maybe_compact(target: &Path) {
     }
 
     let mut kept: Vec<String> = Vec::new();
+    let mut dropped = 0usize;
     {
         let reader = BufReader::new(&file);
         for raw in reader.lines() {
@@ -616,10 +632,18 @@ fn maybe_compact(target: &Path) {
                 .and_then(parse_timestamp);
             match parsed {
                 Some(p) if p >= cutoff => kept.push(stripped.to_string()),
-                _ => continue,
+                _ => dropped += 1,
             }
         }
     }
+    if dropped == 0 {
+        // Nothing aged out: the file really is this big. The rewrite would
+        // change nothing, so skip it and wait for real growth.
+        COMPACT_MIN_SIZE.store(size + COMPACT_GROWTH_BYTES, Ordering::Relaxed);
+        let _ = flock(file.as_fd(), FlockOperation::Unlock);
+        return;
+    }
+    COMPACT_MIN_SIZE.store(COMPACT_SIZE_BYTES, Ordering::Relaxed);
 
     let mut file = file;
     let _ = (|| -> std::io::Result<()> {
@@ -647,6 +671,44 @@ mod tests {
             path: Some(path),
             ..Default::default()
         }
+    }
+
+    /// A ledger over the threshold with nothing out of retention is left alone,
+    /// and not re-read until it grows; once something ages out it compacts.
+    /// The unparseable line is the witness: only a rewrite removes it.
+    #[test]
+    fn compaction_backs_off_while_nothing_ages_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("savings_events.jsonl");
+        let fresh = format!(
+            "{{\"ts\":\"{}\",\"pad\":\"{}\"}}\n",
+            utc_now().to_rfc3339(),
+            "x".repeat(1000)
+        );
+        let append = |text: &str| {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+        };
+        append("not json\n");
+        append(&fresh.repeat((COMPACT_SIZE_BYTES as usize / fresh.len()) + 10));
+
+        maybe_compact(&path);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.starts_with("not json\n"),
+            "rewrote a ledger with nothing to drop"
+        );
+
+        append("{\"ts\":\"2020-01-01T00:00:00Z\"}\n");
+        append(&fresh.repeat((COMPACT_GROWTH_BYTES as usize / fresh.len()) + 10));
+        maybe_compact(&path);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("not json") && !body.contains("2020-01-01"));
     }
 
     #[test]
