@@ -165,20 +165,58 @@ pub fn is_custom_anthropic_base_url(value: Option<&str>) -> bool {
     !matches!(gate_view_host(raw).as_str(), "" | "api.anthropic.com")
 }
 
-/// Whether `tools` already carries a tool-search mechanism (typed or
-/// name-prefixed): the client defers on its own, so leave it alone.
+/// Every other wire spelling of a tool-search meta-tool, as a `type` or a
+/// name. Codex and the Responses API send a bare `tool_search` type with no
+/// name, Copilot CLI `tool_search_tool` (which does not start with
+/// [`TOOL_SEARCH_TYPE_PREFIX`]), VS Code Copilot and Kiro `tool_search`, and
+/// Codebuff `composio_search_tools`. Upstream `665b73df`.
+const TOOL_SEARCH_META_TOOL_NAMES: &[&str] = &[
+    "tool_search",
+    "tool_search_tool",
+    "tool_search_tool_regex",
+    "composio_search_tools",
+];
+
+/// Every tool entry in `tools`, plus the tools one level inside a Responses
+/// `{"type": "namespace", "tools": [...]}` group, which is how Codex ships
+/// its MCP servers. One level is all the API defines.
+fn tool_entries(tools: &[Value]) -> impl Iterator<Item = &Value> {
+    tools.iter().flat_map(|t| {
+        let nested = (t.get("type").and_then(Value::as_str) == Some("namespace"))
+            .then(|| t.get("tools").and_then(Value::as_array))
+            .flatten()
+            .map(|a| a.as_slice())
+            .unwrap_or_default();
+        std::iter::once(t).chain(nested)
+    })
+}
+
+fn is_tool_search_meta_tool(tool: &Value) -> bool {
+    let is_meta = |s: &str| {
+        s.starts_with(TOOL_SEARCH_TYPE_PREFIX) || TOOL_SEARCH_META_TOOL_NAMES.contains(&s)
+    };
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(is_meta)
+        || tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|n| is_meta(&resident_key(n)))
+}
+
+/// Whether the client already defers its own tool schemas, so leave it
+/// alone: deferring on top suppresses its mechanism and inlines the catalog
+/// it was keeping out. Keyed on wire shape: a tool-search meta-tool in any
+/// known spelling, or `defer_loading: true` on any tool, top level or one
+/// level inside a namespace. A bare client tool named `ToolSearch` does not
+/// count; a client sends it whether or not it is deferring.
 ///
 /// Visible crate-wide so the forward path can tag `tool_search_mode`:
 /// `client` when the client already defers (stand-down, book nothing),
 /// `headroom` only when we actually deferred something.
 pub(crate) fn client_uses_tool_search(tools: &[Value]) -> bool {
-    tools.iter().any(|t| {
-        t.get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|ty| ty.starts_with(TOOL_SEARCH_TYPE_PREFIX))
-            || t.get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|n| n.to_lowercase().starts_with(TOOL_SEARCH_TYPE_PREFIX))
+    tool_entries(tools).any(|t| {
+        is_tool_search_meta_tool(t) || t.get("defer_loading").and_then(Value::as_bool) == Some(true)
     })
 }
 
@@ -849,6 +887,49 @@ mod tests {
         let out = inject_deferral(tools);
         assert!(!out.changed);
         assert_eq!(out.tools, before);
+    }
+
+    #[test]
+    fn every_wire_shape_of_client_deferral_is_detected() {
+        let base = many_tools(&["read", "mcp__db__query"]);
+        let with = |extra: Value| {
+            let mut t = base.clone();
+            t.push(extra);
+            client_uses_tool_search(&t)
+        };
+        assert!(!client_uses_tool_search(&base));
+        // Codex / Responses: a bare type with no name.
+        assert!(with(json!({"type": "tool_search"})));
+        // Copilot CLI, VS Code Copilot / Kiro, Codebuff, as names.
+        for name in [
+            "tool_search_tool",
+            "tool_search",
+            "composio_search_tools",
+            "_Tool_Search_Tool_BM25",
+        ] {
+            assert!(with(tool(name)), "{name}");
+        }
+        // Deferral marks alone, whatever the search tool is called.
+        assert!(with(
+            json!({"name": "lookup", "defer_loading": true, "input_schema": {}})
+        ));
+        assert!(!with(
+            json!({"name": "lookup", "defer_loading": false, "input_schema": {}})
+        ));
+        // One level inside a Responses namespace.
+        assert!(with(json!({"type": "namespace", "name": "mcp",
+            "tools": [tool("q"), {"type": "tool_search"}]})));
+        assert!(with(json!({"type": "namespace", "name": "mcp",
+            "tools": [{"name": "q", "defer_loading": true}]})));
+        assert!(!with(
+            json!({"type": "namespace", "name": "mcp", "tools": [tool("q")]})
+        ));
+        // Not a namespace: its `tools` field is not descended into.
+        assert!(!with(
+            json!({"name": "group", "tools": [{"type": "tool_search"}]})
+        ));
+        // The client's own schema-fetch tool is sent whether or not it defers.
+        assert!(!with(tool("ToolSearch")));
     }
 
     #[test]

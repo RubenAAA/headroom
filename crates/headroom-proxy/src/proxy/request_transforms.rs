@@ -1238,6 +1238,47 @@ mod tool_search_wiring_tests {
         assert!(attr.is_none(), "nothing happened, nothing to report");
     }
 
+    /// Our own forwarded tools carry `defer_loading` and the injected search
+    /// tool, which the wider client-deferral detection (upstream `665b73df`)
+    /// would read as the client deferring. Two turns through the stages in
+    /// `forward_http` order — inject, roster pin, stable order — with the
+    /// stores kept between turns: turn 2 must still be ours, and send the
+    /// same tools bytes as turn 1.
+    #[test]
+    fn deferral_stays_ours_and_byte_stable_across_turns() {
+        let roster = cache_stabilization::tool_roster_pin::RosterPinStore::default();
+        let order = cache_stabilization::tool_order::ToolOrderStore::default();
+        let mut sent_tools = Vec::new();
+        for messages in [
+            json!([{"role": "user", "content": "hi"}]),
+            json!([{"role": "user", "content": "hi"},
+                   {"role": "assistant", "content": "hello"},
+                   {"role": "user", "content": "go on"}]),
+        ] {
+            let body = body_with(fourteen_tools(), messages);
+            let (body, attr) = maybe_inject_tool_search(
+                body,
+                "https://api.anthropic.com",
+                "claude-opus-5",
+                "req",
+                true,
+            );
+            assert_eq!(attr.expect("must defer").mode, "headroom");
+            let body = maybe_pin_tool_roster(body, &roster, "lane", "req");
+            let body = maybe_stabilize_tool_order(body, &order, "lane", "req");
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let tools = v["tools"].as_array().unwrap();
+            assert!(
+                tools
+                    .iter()
+                    .any(|t| t["name"] == crate::tool_search_deferral::TOOL_SEARCH_NAME),
+                "{tools:?}"
+            );
+            sent_tools.push(serde_json::to_string(&v["tools"]).unwrap());
+        }
+        assert_eq!(sent_tools[0], sent_tools[1]);
+    }
+
     #[test]
     fn small_tool_array_is_byte_identical() {
         let body = body_with(
