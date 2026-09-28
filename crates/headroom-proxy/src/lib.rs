@@ -7,6 +7,7 @@
 
 pub mod admission;
 pub mod audit;
+pub mod auto_mode;
 pub mod background_compression;
 pub mod bedrock;
 pub mod body;

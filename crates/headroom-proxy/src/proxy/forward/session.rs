@@ -81,6 +81,7 @@ pub(crate) fn park_session_observations(
     scope: RequestScope<'_>,
     keys: RequestKeys<'_>,
     drift_dims: Option<String>,
+    auto_mode_turn: bool,
     outgoing_headers: &mut HeaderMap,
 ) -> Option<Response<Body>> {
     let RequestScope {
@@ -218,8 +219,9 @@ pub(crate) fn park_session_observations(
     // so both cache-stability subsystems agree on
     // conversation identity. Mutates upstream-bound
     // HEADERS only; body bytes stay untouched (Phase-A
-    // cache-safety invariant).
-    if state.config.beta_header_sticky.is_enabled() {
+    // cache-safety invariant). An auto-mode turn neither takes the
+    // union nor feeds it (see `auto_mode`).
+    if state.config.beta_header_sticky.is_enabled() && !auto_mode_turn {
         let provider = match endpoint {
             compression::CompressibleEndpoint::AnthropicMessages => BetaProvider::Anthropic,
             compression::CompressibleEndpoint::OpenAiChatCompletions
@@ -261,6 +263,7 @@ pub(crate) struct SessionAnalysisOut<'a> {
 /// Extracted from `forward_http` without behavior change.
 pub(crate) fn analyze_buffered_session(
     parsed: &mut serde_json::Value,
+    auto_mode_turn: bool,
     scope: RequestScope<'_>,
     client_addr: &std::net::SocketAddr,
     out: SessionAnalysisOut<'_>,
@@ -411,6 +414,7 @@ pub(crate) fn analyze_buffered_session(
                 api_kind: Some(kind),
             },
             drift_dims,
+            auto_mode_turn,
             outgoing_headers,
         );
     }

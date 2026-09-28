@@ -769,13 +769,7 @@ fn parse_json(data: &bytes::Bytes) -> Result<Value, StateError> {
 /// Up to 96 bytes of the payload, lossy-decoded for log readability.
 /// Used only on warn paths — never on the success hot path.
 fn payload_preview(data: &bytes::Bytes) -> String {
-    const LIMIT: usize = 96;
-    let slice = if data.len() > LIMIT {
-        &data[..LIMIT]
-    } else {
-        &data[..]
-    };
-    String::from_utf8_lossy(slice).into_owned()
+    crate::auto_mode::log_preview(data, 96)
 }
 
 #[cfg(test)]

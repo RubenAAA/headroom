@@ -229,6 +229,9 @@ pub(crate) async fn forward_http(
         .get(http::header::HOST)
         .and_then(|v| v.to_str().ok());
 
+    // Claude Code auto mode: kept aside so the turn can go upstream with
+    // exactly these, whatever the stages below add (see `auto_mode`).
+    let client_capability_headers = crate::auto_mode::capability_headers(req.headers());
     let (mut outgoing_headers, _strip_internal, _pre_strip_internal_count) =
         forward::build_outgoing_headers(
             &req,
@@ -541,9 +544,16 @@ pub(crate) async fn forward_http(
         // as the inbound one. `None` means no session identity, and nothing
         // downstream observes drift either way.
         let mut request_api_kind: Option<ApiKind> = None;
-        if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&buffered)
-            && let Some(shed) = forward::analyze_buffered_session(
+        let mut auto_mode_turn = false;
+        if let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
+            auto_mode_turn =
+                matches!(
+                    endpoint,
+                    compression::CompressibleEndpoint::AnthropicMessages
+                ) && crate::auto_mode::is_auto_mode_turn(&parsed, &client_capability_headers);
+            if let Some(shed) = forward::analyze_buffered_session(
                 &mut parsed,
+                auto_mode_turn,
                 forward::RequestScope {
                     state: &state,
                     endpoint,
@@ -560,12 +570,15 @@ pub(crate) async fn forward_http(
                     pre_boundary_agreement: &mut pre_boundary_agreement,
                     outgoing_headers: &mut outgoing_headers,
                 },
-            )
-        {
-            return Ok(shed);
+            ) {
+                return Ok(shed);
+            }
         }
-        if let Some(hit) =
-            forward::check_semantic_cache(&state, &buffered, &request_id, &path_for_log)
+        // An auto-mode reply carries classifier results for this turn only;
+        // never serve one from the response cache or store it there.
+        if !auto_mode_turn
+            && let Some(hit) =
+                forward::check_semantic_cache(&state, &buffered, &request_id, &path_for_log)
         {
             return Ok(hit);
         }
@@ -797,6 +810,7 @@ pub(crate) async fn forward_http(
             auth_mode,
             selected_upstream.base.as_str(),
             skip_model_routing,
+            auto_mode_turn,
             &mut outcome_ctx,
         );
         stage_timer.record("rewrite", rewrite_start.elapsed().as_secs_f64() * 1000.0);
@@ -834,6 +848,12 @@ pub(crate) async fn forward_http(
             &mut outgoing_headers,
             &mut outcome_ctx,
         );
+        if auto_mode_turn {
+            crate::auto_mode::restore_capability_headers(
+                &client_capability_headers,
+                &mut outgoing_headers,
+            );
+        }
         let body_to_send = forward::run_finalize_pipeline(
             body_to_send,
             endpoint,

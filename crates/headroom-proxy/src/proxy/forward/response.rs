@@ -165,10 +165,13 @@ pub(crate) fn store_semantic_cache_response(
     original_buffered: &bytes::Bytes,
     body_bytes: &bytes::Bytes,
     resp_headers: &HeaderMap,
+    request_headers: &HeaderMap,
     request_id: &str,
 ) {
     if let Some(ref cache) = state.semantic_cache
         && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(original_buffered)
+        // An auto-mode reply carries classifier results for this turn only.
+        && !crate::auto_mode::is_auto_mode_turn(&parsed, request_headers)
     {
         let is_streaming = parsed
             .get("stream")
@@ -1126,6 +1129,7 @@ where
                     original_buffered,
                     &body_bytes,
                     &resp_headers,
+                    outgoing_headers,
                     request_id,
                 );
                 forward::emit_buffered_outcome(

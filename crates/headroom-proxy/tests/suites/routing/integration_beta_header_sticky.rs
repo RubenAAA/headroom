@@ -42,6 +42,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[derive(Clone)]
 struct Seen {
     beta: Option<String>,
+    version: Option<String>,
     session_id_header: Option<String>,
     body: Vec<u8>,
 }
@@ -65,6 +66,7 @@ async fn mount_capture(upstream: &MockServer, route: &str, beta_header: &'static
             };
             captured_clone.lock().unwrap().push(Seen {
                 beta: get(beta_header),
+                version: get("anthropic-version"),
                 session_id_header: get("x-headroom-session-id"),
                 body: req.body.clone(),
             });
@@ -523,6 +525,102 @@ async fn body_bytes_stay_byte_equal_while_header_is_rewritten() {
         Sha256::digest(&seen[1].body),
         Sha256::digest(&turn2),
         "sticky beta union must never mutate body bytes"
+    );
+
+    proxy.shutdown().await;
+}
+
+/// Claude Code auto mode (upstream `12c15796`): a turn carrying
+/// `safeguards` or a `dangerous-tool-use-*` beta goes upstream with the
+/// client's own `anthropic-beta` and `anthropic-version`, untouched by the
+/// sticky union or the context-management beta, and does not feed the union
+/// either: the next ordinary turn must not inherit its classifier token.
+#[tokio::test]
+async fn auto_mode_turn_forwards_client_capability_headers_exactly() {
+    let upstream = MockServer::start().await;
+    let captured = mount_capture(&upstream, "/v1/messages", "anthropic-beta").await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.context_edit = true;
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/messages", proxy.url());
+    let session = ("x-headroom-session-id", "conv-auto-1");
+
+    let resp = post(
+        &client,
+        url.clone(),
+        anthropic_body(&[("user", "hello")]),
+        &[("anthropic-beta", "a-1,b-2"), session],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    let mut auto_body: serde_json::Value = serde_json::from_slice(&anthropic_body(&[
+        ("user", "hello"),
+        ("assistant", "hi"),
+        ("user", "run it"),
+    ]))
+    .unwrap();
+    auto_body["safeguards"] = json!({"classifier": "opaque"});
+    let resp = post(
+        &client,
+        url.clone(),
+        serde_json::to_vec(&auto_body).unwrap(),
+        &[
+            ("anthropic-beta", "a-1,dangerous-tool-use-2026-09-01"),
+            ("anthropic-version", "2023-06-01"),
+            session,
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    let resp = post(
+        &client,
+        url,
+        anthropic_body(&[
+            ("user", "hello"),
+            ("assistant", "hi"),
+            ("user", "run it"),
+            ("assistant", "done"),
+            ("user", "thanks"),
+        ]),
+        &[("anthropic-beta", "a-1"), session],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    let seen = captured.lock().unwrap().clone();
+    assert_eq!(seen.len(), 3);
+    // Control: on an ordinary turn the proxy does add its own beta.
+    assert!(
+        seen[0]
+            .beta
+            .as_deref()
+            .unwrap()
+            .contains("context-management-2025-06-27"),
+        "{:?}",
+        seen[0].beta
+    );
+    assert_eq!(
+        seen[1].beta.as_deref(),
+        Some("a-1,dangerous-tool-use-2026-09-01")
+    );
+    assert_eq!(seen[1].version.as_deref(), Some("2023-06-01"));
+    let forwarded: serde_json::Value = serde_json::from_slice(&seen[1].body).unwrap();
+    assert!(forwarded.get("context_management").is_none());
+    assert_eq!(forwarded["safeguards"], auto_body["safeguards"]);
+
+    let after = seen[2].beta.as_deref().unwrap();
+    assert!(
+        after.contains("b-2"),
+        "the union still holds turn 1: {after}"
+    );
+    assert!(
+        !after.contains("dangerous-tool-use"),
+        "the auto-mode token stuck: {after}"
     );
 
     proxy.shutdown().await;

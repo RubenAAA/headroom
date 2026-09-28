@@ -113,6 +113,7 @@ pub(crate) fn rewrite_anthropic_body(
     request_id: &str,
     selected_upstream_base: &str,
     skip_model_routing: bool,
+    auto_mode_turn: bool,
     outcome_ctx: &mut Option<OutcomeContext>,
 ) -> bytes::Bytes {
     // Cost-aware model routing (#1706). Runs before sanitisation so
@@ -201,7 +202,9 @@ pub(crate) fn rewrite_anthropic_body(
     } else {
         body_to_send
     };
-    if state.config.context_edit {
+    // Its beta would be taken off again on an auto-mode turn (see
+    // `auto_mode`), so the body must not ask for it either.
+    if state.config.context_edit && !auto_mode_turn {
         maybe_inject_context_management(body_to_send, &state.config, request_id)
     } else {
         body_to_send

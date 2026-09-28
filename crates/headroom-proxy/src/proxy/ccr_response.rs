@@ -1025,9 +1025,7 @@ async fn retry_or_fail_ccr_fold(
         body_bytes = bytes.len(),
         content_type = %content_type,
         terminal = terminal.unwrap_or("absent"),
-        body_head = %String::from_utf8_lossy(
-            &bytes[..bytes.len().min(200)]
-        ),
+        body_head = %crate::auto_mode::log_preview(&bytes, 200),
         "ccr: failed to parse continuation response"
     );
     CcrRoundRead::Done

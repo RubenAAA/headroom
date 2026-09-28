@@ -264,6 +264,7 @@ pub(crate) fn run_prefix_replay(
 ///
 /// OpenAI prompt-cache-key injection or the Anthropic rewrite pipeline.
 /// Returns the body. Extracted from forward_http without behavior change.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_endpoint_rewrite(
     body_to_send: bytes::Bytes,
     scope: RequestScope<'_>,
@@ -271,6 +272,7 @@ pub(crate) fn run_endpoint_rewrite(
     auth_mode: AuthMode,
     selected_upstream_base: &str,
     skip_model_routing: bool,
+    auto_mode_turn: bool,
     outcome_ctx: &mut Option<OutcomeContext>,
 ) -> bytes::Bytes {
     let RequestScope {
@@ -302,6 +304,7 @@ pub(crate) fn run_endpoint_rewrite(
             request_id,
             selected_upstream_base,
             skip_model_routing,
+            auto_mode_turn,
             outcome_ctx,
         ),
     }
