@@ -625,6 +625,33 @@ pub fn record_cache_bust(tokens_lost: u64) {
     if tokens_lost > 0 {
         cache_bust_tokens_lost().inc_by(tokens_lost);
     }
+    static NET_NEGATIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let (saved, lost) = (tokens_saved().get(), cache_bust_tokens_lost().get());
+    if crossed_net_negative(&NET_NEGATIVE, saved, lost) {
+        tracing::warn!(
+            event = "net_tokens_negative",
+            tokens_saved = saved,
+            tokens_lost_to_cache_bust = lost,
+            net_tokens = saved as i64 - lost as i64,
+            busts = cache_bust_total().get(),
+            "prompt-cache busts now outweigh compression savings for this process; \
+             compression is a net loss on this traffic"
+        );
+    }
+}
+
+/// Whether this bust is the one that took busts past savings (upstream
+/// `1455f002`). Edge-triggered: a process that is losing loses on every bust,
+/// and a warning per bust would be noise. The latch re-arms once savings are
+/// ahead again, so each crossing warns once.
+fn crossed_net_negative(latch: &std::sync::atomic::AtomicBool, saved: u64, lost: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    if lost > saved {
+        !latch.swap(true, Ordering::Relaxed)
+    } else {
+        latch.store(false, Ordering::Relaxed);
+        false
+    }
 }
 
 /// Increment active WS sessions gauge.
@@ -1398,6 +1425,16 @@ mod tests {
     #[test]
     fn records_cache_bust() {
         record_cache_bust(1000);
+    }
+
+    #[test]
+    fn net_negative_warns_once_per_crossing() {
+        let latch = std::sync::atomic::AtomicBool::new(false);
+        let crossings: Vec<bool> = [(100, 50), (100, 150), (100, 300), (400, 300), (400, 500)]
+            .into_iter()
+            .map(|(saved, lost)| crossed_net_negative(&latch, saved, lost))
+            .collect();
+        assert_eq!(crossings, [false, true, false, false, true]);
     }
 
     #[test]
