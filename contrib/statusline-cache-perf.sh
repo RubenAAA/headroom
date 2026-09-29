@@ -78,7 +78,7 @@ vs_stock=$(printf '%s' "$health" | jq -r '
 # Pre-filter before parsing: three event names out of ~17 lines a turn keeps
 # this at a few hundred lines of JSON per statusline render.
 cr=$(tail -n "$WINDOW" "$LOG" 2>/dev/null \
-    | grep -E 'turn_cost_ledger|no_previous_turn|headroom-proxy starting' \
+    | grep -E 'turn_cost_ledger|no_previous_turn|first_turn_write_observed|headroom-proxy starting' \
     | python3 -c '
 import json, sys
 
@@ -112,6 +112,13 @@ for line in lines:
         # whole thing. That cost scales with how many conversations start, not
         # with anything the proxy controls, and it is large enough to invert the
         # verdict — so it gets its own number rather than polluting the steady one.
+        cold.add(rid)
+    elif event == "first_turn_write_observed" and f.get("attribution_reason") in (
+            "fresh_session", "compaction_restart", "arrived_with_history"):
+        # Same cost, other cause: the client started a conversation, compacted
+        # it, or brought its history to a new proxy. session_key_drift and
+        # identical_prompt_fanout stay in the steady number on purpose, since
+        # a proxy that re-keys a live session should show up there.
         cold.add(rid)
 
 if not turn:
