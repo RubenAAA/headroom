@@ -60,14 +60,34 @@ pub(crate) fn anthropic_to_openai_request(
     }
 
     if let Some(msgs) = anthropic.get("messages").and_then(|v| v.as_array()) {
+        // System messages the client sends mid-conversation (its environment
+        // or a hook changed) stay where they were sent. Chat Completions wants
+        // each `tool` reply right behind the assistant's `tool_calls`, so one
+        // that lands between them waits until the replies are in.
+        let mut held: Vec<Value> = Vec::new();
+        let awaiting_replies = |messages: &[Value]| {
+            messages
+                .last()
+                .is_some_and(|m| m.get("tool_calls").is_some())
+        };
         for msg in msgs {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             match role {
                 "user" => translate_user_message(msg, &mut messages),
                 "assistant" => translate_assistant_message(msg, &mut messages, include_tool_calls),
+                "system" | "developer" => {
+                    let text = plain_message_text(msg);
+                    if !text.is_empty() {
+                        held.push(json!({"role": "system", "content": text}));
+                    }
+                }
                 _ => {}
             }
+            if !awaiting_replies(&messages) {
+                messages.append(&mut held);
+            }
         }
+        messages.append(&mut held);
     }
 
     let tools = anthropic
@@ -1357,6 +1377,59 @@ mod tests {
         assert_eq!(output["max_tokens"], 1024);
         assert!(output.get("max_output_tokens").is_none());
         assert_eq!(output["stream"], false);
+    }
+
+    /// The Chat path used to drop every `system` message in `messages`, so a
+    /// model never saw the environment or hook notes Claude Code sends
+    /// mid-conversation. They keep their place, and one that lands between an
+    /// assistant's tool calls and the replies waits behind the replies.
+    #[test]
+    fn chat_keeps_mid_conversation_system_messages_in_place() {
+        let input = json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 64,
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "system", "content": "env one"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}
+                ]},
+                {"role": "system", "content": [{"type": "text", "text": "env two"}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]},
+                {"role": "system", "content": ""},
+                {"role": "system", "content": "env three"}
+            ]
+        });
+        let output = anthropic_to_openai_request(&input, true, true).unwrap();
+        let seen: Vec<(String, String)> = output["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let role = m["role"].as_str().unwrap().to_string();
+                let text = m["content"].as_str().unwrap_or("").to_string();
+                (role, text)
+            })
+            .collect();
+        let roles: Vec<&str> = seen.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(
+            roles,
+            [
+                "system",
+                "user",
+                "system",
+                "assistant",
+                "tool",
+                "system",
+                "system"
+            ]
+        );
+        assert_eq!(seen[2].1, "env one");
+        assert_eq!(seen[5].1, "env two", "held behind the tool reply");
+        assert_eq!(seen[6].1, "env three");
     }
 
     #[test]
