@@ -25,6 +25,16 @@
   the lane drains first. Free-server exits are shared by many free users, so
   the lane should be expected to hit Zen's limit sooner than a Nord lane; not
   yet measured.
+- **Errors (measured 2026-09-30 01:35-01:50):** `opencode.ai` is IPv4-only,
+  so Zen sees the IPv4 exit the relay fingerprints, not the IPv6 one. A dead
+  tunnel (peer endpoint black-holed) answers a by-name CONNECT with SOCKS
+  reply 4 after 10.7 s, when the lookup inside the tunnel times out; a
+  by-address CONNECT gets no reply at all. A live tunnel answers a bad name
+  with 4 and a refused port with 1, the way Nord does, but a silently dropped
+  port also hangs where Nord replies 4 at once. So on the Proton lane a
+  refused CONNECT counts toward suspicion; on Nord it stays neutral. Zen 429s
+  reach the watcher as `zen_egress_rate_limited` with the egress ID, the same
+  as for Nord, and a Proton rotation takes about 6 s against about 1 s.
 - **Status:** shipped with the `egress-relay` rename. Rate-limit behaviour of
   the Proton lane under real Spark load is still open.
 - **Source:** the setup session of 2026-09-30; configs in

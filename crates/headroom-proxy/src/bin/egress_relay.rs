@@ -832,6 +832,19 @@ impl Lane {
                     self.slot, destination, response_head[1]
                 );
             }
+            // A dead WireGuard tunnel still answers SOCKS: wireproxy resolves
+            // names inside the tunnel and replies "host unreachable" once that
+            // lookup times out (about 11 s, measured 2026-09-30). Without
+            // counting it, the Proton lane never turns suspect and waits for
+            // the five-minute check. A bad destination does not trip this: a
+            // connect that succeeds resets the count, and a lane turns
+            // suspect only after a quiet minute.
+            if self.credentials.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::HostUnreachable,
+                    "wireproxy refused the CONNECT",
+                ));
+            }
             return Ok(());
         }
 
@@ -2437,6 +2450,75 @@ mod tests {
         worker.join().unwrap();
         upstream.join().unwrap();
         assert_eq!(lock_unpoisoned(&lane.state).connects, 1);
+    }
+
+    /// wireproxy reports a dead tunnel only as a refused CONNECT, so on the
+    /// Proton lane that counts toward suspicion. On Nord it stays the
+    /// destination's problem, as before.
+    #[test]
+    fn refused_connect_counts_as_a_failure_only_on_the_proton_lane() {
+        let failures_after_refusal = |credentials: Option<Credentials>| {
+            let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let upstream_port = upstream_listener.local_addr().unwrap().port();
+            let with_auth = credentials.is_some();
+            let upstream = thread::spawn(move || {
+                let (mut stream, _) = upstream_listener.accept().unwrap();
+                if with_auth {
+                    read_exact_vec(&mut stream, 3).unwrap();
+                    stream.write_all(&[5, 2]).unwrap();
+                    let head = read_exact_vec(&mut stream, 2).unwrap();
+                    let username = read_exact_vec(&mut stream, head[1] as usize).unwrap();
+                    let password_length = read_exact_vec(&mut stream, 1).unwrap()[0];
+                    read_exact_vec(&mut stream, password_length as usize).unwrap();
+                    assert_eq!(username, b"user");
+                    stream.write_all(&[1, 0]).unwrap();
+                } else {
+                    read_exact_vec(&mut stream, 3).unwrap();
+                    stream.write_all(&[5, 0]).unwrap();
+                }
+                read_socks_request(&mut stream).unwrap();
+                stream.write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            });
+            let lane_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let lane_address = lane_listener.local_addr().unwrap();
+            let lane = Arc::new(Lane::new(
+                0,
+                upstream_port,
+                "test".to_string(),
+                "127.0.0.1".to_string(),
+                "198.51.100.1".to_string(),
+                credentials,
+            ));
+            let worker_lane = lane.clone();
+            let worker = thread::spawn(move || {
+                let (stream, _) = lane_listener.accept().unwrap();
+                worker_lane.handle(stream);
+            });
+            let mut client = TcpStream::connect(lane_address).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            client.write_all(&[5, 1, 0]).unwrap();
+            assert_eq!(read_exact_vec(&mut client, 2).unwrap(), [5, 0]);
+            let mut request = vec![5, 1, 0, 3, 11];
+            request.extend_from_slice(b"opencode.ai");
+            request.extend_from_slice(&[1, 187]);
+            client.write_all(&request).unwrap();
+            // The client still gets the upstream's own reply code.
+            assert_eq!(read_exact_vec(&mut client, 4).unwrap(), [5, 4, 0, 1]);
+            drop(client);
+            worker.join().unwrap();
+            upstream.join().unwrap();
+            let state = lock_unpoisoned(&lane.state);
+            assert_eq!(state.connects, 0);
+            state.failures
+        };
+        assert_eq!(failures_after_refusal(None), 1);
+        let nord = Credentials {
+            username: b"user".to_vec(),
+            password: b"pass".to_vec(),
+        };
+        assert_eq!(failures_after_refusal(Some(nord)), 0);
     }
 
     #[test]
