@@ -169,10 +169,14 @@ cclaude --context
 ```
 
 Nothing starts the relay at boot. After a reboot the file still names its
-loopback ports, but nothing listens on them and every Zen request fails until
-you run the first two commands again. Do the same after `nord-socks-egress
-stop`: the relay can come back with eight lanes or ten, and the file must
-match.
+loopback ports, but nothing listens on them and every Zen request fails with a
+503. `claude-launcher --context` checks for this: when the relay is down and
+this launch starts the proxy, it reruns `env` into the file; when a proxy is
+already up, it runs `nord-socks-egress start` and leaves the file alone, since
+the running proxy keeps the pool it started with. `restart-headroom.sh` reruns
+`env` into the file on every restart. It starts the relay if it is down and
+never restarts a running one, so the file always matches the lanes the relay
+has, eight or ten. After `nord-socks-egress stop`, a restart is all it takes.
 
 The `env` command starts the local relay daemon and prints exports for one
 loopback SOCKS URL per verified lane (eight, or ten when all preferred exits

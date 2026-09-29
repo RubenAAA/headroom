@@ -223,6 +223,25 @@ if [ "$use_context" -eq 1 ]; then
     if [ -e "$ZEN_POOL_ENV" ]; then
         zen_pool_perm=$(stat -c '%u %a' "$ZEN_POOL_ENV" 2>/dev/null || stat -f '%u %Lp' "$ZEN_POOL_ENV" 2>/dev/null || true)
         if [[ "$zen_pool_perm" =~ ^$(id -u)\ [0-7]*00$ ]]; then
+            # The relay does not survive a reboot, but this file does. Its lanes
+            # then refuse every connect and each Spark request comes back as a
+            # 503 "error sending request" (2026-09-29). Bring the relay back up
+            # first. A proxy already running keeps the pool it started with, so
+            # rewrite the file only when this launch starts the proxy — else
+            # validate_zen_pool would refuse the session over the mismatch.
+            nord_egress="$HOME/.local/bin/nord-socks-egress"
+            if [ -x "$nord_egress" ] && ! "$nord_egress" status >/dev/null 2>&1; then
+                echo "headroom: Nord SOCKS relay is down; starting it"
+                if curl -fsS --max-time 1 "$PROXY_URL/cache-health" >/dev/null 2>&1; then
+                    "$nord_egress" start >/dev/null ||
+                        echo "headroom: could not start the Nord SOCKS relay; Spark requests will fail" >&2
+                elif (umask 077; "$nord_egress" env >"$ZEN_POOL_ENV.new"); then
+                    mv -f "$ZEN_POOL_ENV.new" "$ZEN_POOL_ENV"
+                else
+                    rm -f "$ZEN_POOL_ENV.new"
+                    echo "headroom: could not start the Nord SOCKS relay; Spark requests will fail" >&2
+                fi
+            fi
             unset HEADROOM_ZEN_HTTP_PROXY_POOL HEADROOM_ZEN_EGRESS_ROTATE_COMMAND
             set -a
             # shellcheck source=/dev/null

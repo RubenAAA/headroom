@@ -69,13 +69,17 @@ for working on Headroom. The maintainer does.
 It does not write `~/.headroom-zen-pool.env`, the Zen egress pool that
 `cclaude` and `restart-headroom.sh` source; the installer only reports whether
 it exists. Without it, each Zen 429 rotates the device-wide VPN and resets every
-Codex and Spark stream in flight. With Nord SOCKS credentials, create it once
-and again after every reboot:
+Codex and Spark stream in flight. With Nord SOCKS credentials, create it once:
 
 ```bash
 (umask 077; ~/.local/bin/nord-socks-egress env > ~/.headroom-zen-pool.env)
 restart-headroom.sh
 ```
+
+After a reboot the relay is down. `cclaude --context` (and the profiles that
+default to it) starts it again, and rewrites the file when it is also the one
+starting the proxy. `restart-headroom.sh` rewrites the file on every restart,
+starting the relay only if it is down.
 
 For other relays, start from `contrib/headroom-zen-pool.env.example`. Both
 sourcing scripts ignore the file unless it is yours with mode `0600`. Setup and

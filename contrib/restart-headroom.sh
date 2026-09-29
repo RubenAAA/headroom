@@ -86,6 +86,22 @@ ZEN_POOL_ENV="${HEADROOM_ZEN_POOL_ENV:-$HOME/.headroom-zen-pool.env}"
 if [ -e "$ZEN_POOL_ENV" ]; then
   zen_pool_perm=$(stat -c '%u %a' "$ZEN_POOL_ENV" 2>/dev/null || stat -f '%u %Lp' "$ZEN_POOL_ENV" 2>/dev/null)
   if [[ "$zen_pool_perm" =~ ^$(id -u)\ [0-7]*00$ ]]; then
+    # A restart is the one moment the file can change safely: the new proxy
+    # reads it at start. `env` starts the relay if a reboot or `stop` took it
+    # down and otherwise just reports the running one, so the file always
+    # names the lanes the relay has now — eight or ten — and never forces a
+    # relay restart, which would reset every Spark stream in flight. The
+    # helper's own HEADROOM_NORD_SOCKS_* settings pass through untouched.
+    nord_egress="$HOME/.local/bin/nord-socks-egress"
+    if [ -x "$nord_egress" ]; then
+      if (umask 077; "$nord_egress" env >"$ZEN_POOL_ENV.new"); then
+        mv -f "$ZEN_POOL_ENV.new" "$ZEN_POOL_ENV"
+      else
+        rm -f "$ZEN_POOL_ENV.new"
+        echo "restart-headroom: WARNING: nord-socks-egress env failed; keeping $ZEN_POOL_ENV as it is" >&2
+        log "WARNING: nord-socks-egress env failed; keeping $ZEN_POOL_ENV as it is"
+      fi
+    fi
     unset HEADROOM_ZEN_HTTP_PROXY_POOL HEADROOM_ZEN_EGRESS_ROTATE_COMMAND
     # `set -a`: the proxy only sees the pool if it is exported, and the file
     # may hold bare assignments.
