@@ -2704,14 +2704,10 @@ impl UsageObserver {
         // billed totals minus the client baseline `complete` was given.
         // Zero on the common single-round path. Existing fields stay as
         // they are.
-        let (rounds_input_tokens, rounds_cache_read_tokens, rounds_cache_write_tokens) =
-            pending.billed_totals.map_or((0, 0, 0), |(bi, bcr, bcw)| {
-                (
-                    bi.saturating_sub(input_tokens),
-                    bcr.saturating_sub(cache_read_input_tokens),
-                    bcw.saturating_sub(cache_creation_input_tokens),
-                )
-            });
+        let rounds_input_tokens = billed_input.saturating_sub(input_tokens);
+        let rounds_cache_read_tokens = billed_cache_read.saturating_sub(cache_read_input_tokens);
+        let rounds_cache_write_tokens =
+            billed_cache_write.saturating_sub(cache_creation_input_tokens);
         // Same window as the hit rate above, and the same reason: the
         // statusline needs it per render and cannot afford to re-read the
         // log. Kept here rather than beside the hit rate because the
@@ -2743,10 +2739,8 @@ impl UsageObserver {
             // so the ledger joins to `ccr_continuation_usage` directly.
             rounds_input_tokens = rounds_input_tokens,
             rounds_cache_read_tokens = rounds_cache_read_tokens,
-            // The 5m/1h split below covers the client-visible round only, while
-            // the totals above cover every round. This is the write the split
-            // leaves out: `cache_write_5m + cache_write_1h + this` equals the
-            // billed creation total when the provider reports a split.
+            // The 5m/1h split below covers the client's round only; this is the
+            // write it leaves out, so split + this = the billed creation total.
             rounds_cache_write_tokens = rounds_cache_write_tokens,
             // Which TTL the provider actually billed the write at. The
             // proxy asks for the 1-hour tier on the prefix, but asking is
