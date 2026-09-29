@@ -32,6 +32,11 @@
   rewrote 25 of 1,169 messages in one sample, saves 2.6% of tokens, and costs
   time (see `spark-proxy-overhead-on-free-path.md`). Rewrites can also move
   cached bytes.
+- **Added, not dropped:** `routed/tool_alias.rs` lowercases tool names and, on
+  tool-poor turns, adds marked shadow copies of `bash`/`edit`/`glob`/`grep`/
+  `read` so Zen's free-tier gate passes. A shadow call with no matching client
+  tool reaches the client as an unknown tool. Not measured: how often a Spark
+  turn calls one, or whether the extra definitions change what it picks.
 - **Not passed:** the input token count (see `spark-usage-and-compaction.md`).
 - **Next:** read the info-level unhandled-event lines after a day of traffic;
   answer the reasoning-replay question with one lane test; diff a forwarded
