@@ -156,12 +156,15 @@ sweep() {
     # "$@" is one cargo-sweep criterion set. Check mode adds --dry-run.
     # Auto mode swallows failures (GC must never fail a build); force
     # mode records them and exits non-zero at the end.
+    # The binary takes the `sweep` subcommand: `cargo sweep` passes it for
+    # us, but calling cargo-sweep directly without it fails on every flag
+    # ("unexpected argument '--installed'"), and auto mode hid that.
     if [ "$MODE" = "check" ]; then
-        cargo-sweep --dry-run "$@" || log "warning: cargo-sweep $* exited $?"
+        cargo-sweep sweep --dry-run "$@" || log "warning: cargo-sweep $* exited $?"
     elif [ "$MODE" = "auto" ]; then
-        cargo-sweep "$@" || log "warning: cargo-sweep $* exited $?"
+        cargo-sweep sweep "$@" || log "warning: cargo-sweep $* exited $?"
     else
-        cargo-sweep "$@" || { log "error: cargo-sweep $* exited $?"; FAILED=1; }
+        cargo-sweep sweep "$@" || { log "error: cargo-sweep $* exited $?"; FAILED=1; }
     fi
 }
 
