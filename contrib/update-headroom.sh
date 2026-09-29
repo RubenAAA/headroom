@@ -94,3 +94,17 @@ if [ -x "$HOME/.local/bin/restart-headroom.sh" ]; then
 else
     say "restart-headroom.sh not installed — start the proxy with cclaude"
 fi
+
+# The relay is never restarted here: that would cut every Spark stream in
+# flight. So a relay started by an older binary keeps its lanes until someone
+# stops it, and a Proton lane added since then is not in use. Say so.
+RELAY="$HOME/.local/bin/egress-relay"
+PROTON_DIR="${HEADROOM_PROTON_WG_DIR:-$HOME/.config/headroom/proton-wg}"
+if [ -x "$RELAY" ] && ls "$PROTON_DIR"/*.conf >/dev/null 2>&1; then
+    if "$RELAY" status 2>/dev/null | python3 -c 'import json,sys; j=json.load(sys.stdin); sys.exit(0 if any(l.get("provider")=="proton" for l in j.get("lanes",[])) else 1)' 2>/dev/null; then
+        :
+    else
+        say "the running relay has no Proton lane although $PROTON_DIR has configs."
+        say "  To pick it up once Spark work is idle: $RELAY stop && restart-headroom.sh"
+    fi
+fi

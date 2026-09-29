@@ -41,7 +41,8 @@
   pauses of at most 5 s, then the 503. The hold is a cap, not a delay: it ends
   when any lane works. With half the lanes rejecting, four failed lanes in a
   row is a few percent of turns.
-- Relay (`bin/nord_socks_egress.rs`, `nord_socks_egress/servers.rs`): the
+- Relay (`bin/egress_relay.rs`, `egress_relay/nord.rs`; `nord_socks_egress`
+  before the Proton rename): the
   server list comes from Nord's listing, cached in `servers.json`, refreshed
   hourly; only `socks-xx#.nordvpn.com` names get credentials. Candidates rank by
   recent probe result, then smoothed round trip. Every lane's own server is

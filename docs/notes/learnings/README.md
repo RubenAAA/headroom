@@ -28,3 +28,6 @@ number to its window; do not quote across windows.
 - [`nord-socks-acceptance-flaps.md`](nord-socks-acceptance-flaps.md): the
   SOCKS servers that accept the account change every ~10 minutes and Nord
   says nothing about why; keep the list live and re-rotate lanes by probe.
+- [`proton-free-wireproxy-lane.md`](proton-free-wireproxy-lane.md): Proton's
+  free plan adds one lane, not a pool (one connection, no SOCKS service);
+  `wireproxy` serves it as loopback SOCKS without touching routes.

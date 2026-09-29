@@ -27,8 +27,9 @@ repository = "https://github.com/RubenAAA/headroom"
 authors = ["Headroom Maintainers"]
 
 [workspace.lints.rust]
-# The five unsafe sites (libc calls in nord_socks_egress, one sqlite3_config)
-# carry #[allow(unsafe_code)] and a SAFETY comment; anything new must too.
+# The unsafe sites (libc calls in egress_relay, one sqlite3_config, one env
+# edit in main.rs) carry #[allow(unsafe_code)] and a SAFETY comment; anything
+# new must too.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "warn"
 

@@ -1,12 +1,15 @@
-//! Per-lane local SOCKS5 relays over Nord's authenticated SOCKS5 endpoints.
+//! Per-lane local SOCKS5 relays over VPN egresses: Nord's authenticated
+//! SOCKS5 endpoints, and a Proton WireGuard tunnel run by `wireproxy`.
 //!
 //! This is an operator sidecar, not part of Headroom's HTTP request path. Its
 //! CLI and line-delimited Unix-socket control protocol intentionally remain
 //! compatible with the previous helper so the watcher can rotate either
 //! implementation during a drained migration.
 
-#[path = "nord_socks_egress/servers.rs"]
-mod servers;
+#[path = "egress_relay/nord.rs"]
+mod nord;
+#[path = "egress_relay/proton.rs"]
+mod proton;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -17,7 +20,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,14 +33,18 @@ use sha2::{Digest, Sha256};
 use tokio::signal::unix::SignalKind;
 use url::Url;
 
-use servers::ServerBook;
+use nord::ServerBook;
 
-const MIN_LANES: usize = 8;
-const MAX_LANES: usize = 10;
+const NORD_MIN_LANES: usize = 8;
+const NORD_MAX_LANES: usize = 10;
+/// Every lane one relay can run: Nord's ten and the Proton one.
+const MAX_LANES: usize = NORD_MAX_LANES + 1;
 const DEFAULT_BASE_PORT: u16 = 18_600;
 const UPSTREAM_PORT: u16 = 1080;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const EGRESS_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+/// Answers with the caller's public address: how every lane's exit is read.
+const EXIT_PROBE_URL: &str = "https://api.ipify.org";
 // A SOCKS tunnel can be quiet in one direction while an SSE response is still
 // flowing in the other. Poll reads so only a wholly idle tunnel expires; keep
 // that bound well above Headroom's usual 600s upstream request timeout.
@@ -63,7 +70,7 @@ const HEAL_COOLDOWN: Duration = Duration::from_secs(300);
 const SWEEP_PROBES: usize = 12;
 
 #[derive(Parser)]
-#[command(name = "nord-socks-egress", version, about)]
+#[command(name = "egress-relay", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: CommandKind,
@@ -118,7 +125,9 @@ struct LaneState {
 struct Lane {
     slot: usize,
     upstream_port: u16,
-    credentials: Credentials,
+    /// Nord's SOCKS servers need a login. `None` is the Proton lane, whose
+    /// upstream is `wireproxy` on loopback and takes no authentication.
+    credentials: Option<Credentials>,
     state: Mutex<LaneState>,
     active: Mutex<HashMap<u64, Vec<Arc<TcpStream>>>>,
     next_connection: AtomicU64,
@@ -126,8 +135,11 @@ struct Lane {
 
 struct Manager {
     base_port: u16,
+    /// Lanes this relay would run with every configured provider healthy.
+    max_lanes: AtomicUsize,
     servers: Mutex<ServerBook>,
     lanes: Mutex<Vec<Arc<Lane>>>,
+    proton: Mutex<Option<proton::Tunnel>>,
     rotation_lock: Mutex<()>,
     running: Arc<AtomicBool>,
 }
@@ -166,38 +178,43 @@ fn credentials_path() -> PathBuf {
 }
 
 fn state_dir() -> PathBuf {
-    std::env::var_os("HEADROOM_NORD_SOCKS_STATE_DIR")
+    std::env::var_os("HEADROOM_EGRESS_RELAY_STATE_DIR")
         .map(PathBuf::from)
         .map(expand_home)
-        .unwrap_or_else(|| home_dir().join(".local/state/headroom/nord-socks-pool"))
+        .unwrap_or_else(|| home_dir().join(".local/state/headroom/egress-relay"))
 }
 
 fn base_port() -> Result<u16, String> {
-    let port = std::env::var("HEADROOM_NORD_SOCKS_BASE_PORT")
+    let port = std::env::var("HEADROOM_EGRESS_RELAY_BASE_PORT")
         .ok()
         .map(|value| {
             value
                 .parse::<u16>()
-                .map_err(|_| "invalid HEADROOM_NORD_SOCKS_BASE_PORT".to_string())
+                .map_err(|_| "invalid HEADROOM_EGRESS_RELAY_BASE_PORT".to_string())
         })
         .transpose()?
         .unwrap_or(DEFAULT_BASE_PORT);
     if port == 0 || port.checked_add(MAX_LANES as u16 - 1).is_none() {
-        return Err("HEADROOM_NORD_SOCKS_BASE_PORT is outside the valid range".to_string());
+        return Err("HEADROOM_EGRESS_RELAY_BASE_PORT is outside the valid range".to_string());
     }
     Ok(port)
 }
 
+/// Owned by this user, with no access for group or others.
 #[allow(unsafe_code)]
+fn is_private(metadata: &fs::Metadata) -> bool {
+    // SAFETY: geteuid has no preconditions and does not retain pointers.
+    let uid = unsafe { libc::geteuid() };
+    metadata.uid() == uid && metadata.mode() & 0o077 == 0
+}
+
 fn ensure_state_dir() -> Result<PathBuf, String> {
     let path = state_dir();
     fs::create_dir_all(&path).map_err(|_| "could not create private relay state directory")?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
         .map_err(|_| "could not secure relay state directory")?;
     let metadata = fs::metadata(&path).map_err(|_| "could not inspect relay state directory")?;
-    // SAFETY: geteuid has no preconditions and does not retain pointers.
-    let uid = unsafe { libc::geteuid() };
-    if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+    if !is_private(&metadata) {
         return Err("relay state directory must be owned by this user and mode 0700".to_string());
     }
     Ok(path)
@@ -221,25 +238,22 @@ fn egress_id(url: &str) -> String {
 }
 
 fn startup_lane_count(verified_count: usize) -> Result<usize, String> {
-    if verified_count < MIN_LANES {
+    if verified_count < NORD_MIN_LANES {
         return Err(format!(
-            "only {verified_count} distinct Nord SOCKS exits verified; need at least {MIN_LANES}"
+            "only {verified_count} distinct Nord SOCKS exits verified; need at least {NORD_MIN_LANES}"
         ));
     }
-    Ok(if verified_count >= MAX_LANES {
-        MAX_LANES
+    Ok(if verified_count >= NORD_MAX_LANES {
+        NORD_MAX_LANES
     } else {
-        MIN_LANES
+        NORD_MIN_LANES
     })
 }
 
-#[allow(unsafe_code)]
 fn load_credentials() -> Result<Credentials, String> {
     let path = credentials_path();
     let metadata = fs::metadata(&path).map_err(|_| "could not read Nord SOCKS credentials file")?;
-    // SAFETY: geteuid has no preconditions and does not retain pointers.
-    let uid = unsafe { libc::geteuid() };
-    if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+    if !is_private(&metadata) {
         return Err("credential file must be owned by this user and mode 0600".to_string());
     }
     let parent = path
@@ -292,16 +306,21 @@ fn probe_exit(host: &str, address: &str, credentials: &Credentials) -> Result<St
         host,
         address,
         UPSTREAM_PORT,
-        credentials,
-        "https://api.ipify.org",
+        Some(credentials),
+        EXIT_PROBE_URL,
     )
+}
+
+/// The exit address of whatever `wireproxy` serves on `port`.
+fn probe_proton_exit(name: &str, port: u16) -> Result<String, String> {
+    probe_exit_via_local_lane(name, "127.0.0.1", port, None, EXIT_PROBE_URL)
 }
 
 fn probe_exit_via_local_lane(
     host: &str,
     address: &str,
     upstream_port: u16,
-    credentials: &Credentials,
+    credentials: Option<&Credentials>,
     probe_url: &str,
 ) -> Result<String, String> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -320,11 +339,11 @@ fn probe_exit_via_local_lane(
         host.to_string(),
         address.to_string(),
         String::new(),
-        credentials.clone(),
+        credentials.cloned(),
     ));
     let worker_lane = lane.clone();
     let worker = thread::Builder::new()
-        .name("nord-socks-probe-lane".to_string())
+        .name("egress-relay-probe-lane".to_string())
         .spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
                 worker_lane.handle(stream);
@@ -335,7 +354,7 @@ fn probe_exit_via_local_lane(
     let result = client
         .get(probe_url)
         .send()
-        .map_err(|_| "Nord SOCKS endpoint failed the public egress probe".to_string())
+        .map_err(|_| "SOCKS endpoint failed the public egress probe".to_string())
         .and_then(read_ipify);
     drop(client);
     let worker_result = worker.join();
@@ -523,7 +542,7 @@ fn read_exact_vec<R: Read>(reader: &mut R, length: usize) -> io::Result<Vec<u8>>
 
 fn trace_upstream<T>(lane: usize, stage: &'static str, result: io::Result<T>) -> io::Result<T> {
     result.inspect_err(|error| {
-        if std::env::var_os("HEADROOM_NORD_SOCKS_TRACE").is_some() {
+        if std::env::var_os("HEADROOM_EGRESS_RELAY_TRACE").is_some() {
             eprintln!(
                 "upstream SOCKS I/O failed lane={lane} stage={stage} kind={:?}",
                 error.kind()
@@ -584,7 +603,7 @@ impl Lane {
         upstream_host: String,
         upstream_address: String,
         exit_ip: String,
-        credentials: Credentials,
+        credentials: Option<Credentials>,
     ) -> Self {
         Self {
             slot,
@@ -602,6 +621,14 @@ impl Lane {
             }),
             active: Mutex::new(HashMap::new()),
             next_connection: AtomicU64::new(1),
+        }
+    }
+
+    fn provider(&self) -> &'static str {
+        if self.credentials.is_some() {
+            "nord"
+        } else {
+            "proton"
         }
     }
 
@@ -678,6 +705,42 @@ impl Lane {
         self.unregister(connection_id);
     }
 
+    /// Nord's username/password handshake (RFC 1929).
+    fn authenticate(&self, upstream: &mut TcpStream, credentials: &Credentials) -> io::Result<()> {
+        trace_upstream(self.slot, "method-write", upstream.write_all(&[5, 1, 2]))?;
+        if trace_upstream(self.slot, "method-read", read_exact_vec(upstream, 2))? != [5, 2] {
+            if std::env::var_os("HEADROOM_EGRESS_RELAY_TRACE").is_some() {
+                eprintln!(
+                    "upstream SOCKS authentication method unavailable lane={}",
+                    self.slot
+                );
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "SOCKS auth method rejected",
+            ));
+        }
+        let mut auth =
+            Vec::with_capacity(credentials.username.len() + credentials.password.len() + 3);
+        auth.push(1);
+        auth.push(credentials.username.len() as u8);
+        auth.extend_from_slice(&credentials.username);
+        auth.push(credentials.password.len() as u8);
+        auth.extend_from_slice(&credentials.password);
+        trace_upstream(self.slot, "auth-write", upstream.write_all(&auth))?;
+        auth.fill(0);
+        if trace_upstream(self.slot, "auth-read", read_exact_vec(upstream, 2))? != [1, 0] {
+            if std::env::var_os("HEADROOM_EGRESS_RELAY_TRACE").is_some() {
+                eprintln!("upstream SOCKS authentication rejected lane={}", self.slot);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "SOCKS auth rejected",
+            ));
+        }
+        Ok(())
+    }
+
     fn handle_connected(
         &self,
         connection_id: u64,
@@ -713,37 +776,17 @@ impl Lane {
         upstream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
         self.track_upstream(connection_id, &upstream)?;
 
-        trace_upstream(self.slot, "method-write", upstream.write_all(&[5, 1, 2]))?;
-        if trace_upstream(self.slot, "method-read", read_exact_vec(&mut upstream, 2))? != [5, 2] {
-            if std::env::var_os("HEADROOM_NORD_SOCKS_TRACE").is_some() {
-                eprintln!(
-                    "upstream SOCKS authentication method unavailable lane={}",
-                    self.slot
-                );
+        if let Some(credentials) = &self.credentials {
+            self.authenticate(&mut upstream, credentials)?;
+        } else {
+            trace_upstream(self.slot, "method-write", upstream.write_all(&[5, 1, 0]))?;
+            if trace_upstream(self.slot, "method-read", read_exact_vec(&mut upstream, 2))? != [5, 0]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "SOCKS no-auth method rejected",
+                ));
             }
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "SOCKS auth method rejected",
-            ));
-        }
-        let mut auth = Vec::with_capacity(
-            self.credentials.username.len() + self.credentials.password.len() + 3,
-        );
-        auth.push(1);
-        auth.push(self.credentials.username.len() as u8);
-        auth.extend_from_slice(&self.credentials.username);
-        auth.push(self.credentials.password.len() as u8);
-        auth.extend_from_slice(&self.credentials.password);
-        trace_upstream(self.slot, "auth-write", upstream.write_all(&auth))?;
-        auth.fill(0);
-        if trace_upstream(self.slot, "auth-read", read_exact_vec(&mut upstream, 2))? != [1, 0] {
-            if std::env::var_os("HEADROOM_NORD_SOCKS_TRACE").is_some() {
-                eprintln!("upstream SOCKS authentication rejected lane={}", self.slot);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "SOCKS auth rejected",
-            ));
         }
 
         trace_upstream(self.slot, "connect-write", upstream.write_all(&request))?;
@@ -763,7 +806,7 @@ impl Lane {
             "connect-read-address",
             read_socks_address(&mut upstream, response_head[3]),
         )?;
-        if std::env::var_os("HEADROOM_NORD_SOCKS_TRACE").is_some() {
+        if std::env::var_os("HEADROOM_EGRESS_RELAY_TRACE").is_some() {
             eprintln!(
                 "upstream SOCKS CONNECT response lane={} reply={} reserved={} atyp={} address_bytes={} normalized_bound_address=true",
                 self.slot,
@@ -780,7 +823,7 @@ impl Lane {
         let client_response = [5, response_head[1], 0, 1, 0, 0, 0, 0, 0, 0];
         client.write_all(&client_response)?;
         if response_head[1] != 0 {
-            if std::env::var_os("HEADROOM_NORD_SOCKS_TRACE").is_some() {
+            if std::env::var_os("HEADROOM_EGRESS_RELAY_TRACE").is_some() {
                 let destination = socks_destination(&request)
                     .map(|(host, port)| format!("{host}:{port}"))
                     .unwrap_or_else(|| "invalid".to_string());
@@ -820,11 +863,11 @@ fn tunnel(client: &mut TcpStream, upstream: &mut TcpStream) -> io::Result<()> {
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let client_to_upstream_activity = Arc::clone(&last_activity);
     let first = thread::Builder::new()
-        .name("nord-socks-upstream-write".to_string())
+        .name("egress-relay-upstream-write".to_string())
         .spawn(move || copy_stream(client_read, upstream_write, client_to_upstream_activity))?;
     let upstream_to_client_activity = Arc::clone(&last_activity);
     let second = thread::Builder::new()
-        .name("nord-socks-client-write".to_string())
+        .name("egress-relay-client-write".to_string())
         .spawn(move || copy_stream(upstream_read, client_write, upstream_to_client_activity))?;
     let first_result = first
         .join()
@@ -865,6 +908,39 @@ fn copy_stream(
     }
 }
 
+/// Close a lane to new work and wait until the proxy has nothing left on it.
+fn gate_and_drain(lane: &Lane, egress_id: &str, proxy_url: &str) -> Result<(), Value> {
+    if let Err(error) = set_proxy_egress_maintenance(proxy_url, egress_id, true) {
+        return Err(json!({"ok": false, "error": error}));
+    }
+    lock_unpoisoned(&lane.state).rotating = true;
+    if let Err(error) = wait_for_proxy_drain(proxy_url, egress_id) {
+        lock_unpoisoned(&lane.state).rotating = false;
+        let reset = set_proxy_egress_maintenance(proxy_url, egress_id, false);
+        return Err(match reset {
+            Ok(()) => json!({"ok": false, "error": error}),
+            Err(_) => json!({
+                "ok": false,
+                "error": "drain failed and proxy egress remains gated; restart Headroom"
+            }),
+        });
+    }
+    Ok(())
+}
+
+/// Cut whatever still runs on the lane's old upstream and open it again.
+fn reopen(lane: &Lane, egress_id: &str, proxy_url: &str) -> Result<(), Value> {
+    lane.close_active();
+    lock_unpoisoned(&lane.state).rotating = false;
+    if set_proxy_egress_maintenance(proxy_url, egress_id, false).is_err() {
+        return Err(json!({
+            "ok": false,
+            "error": "rotation finished but proxy egress remains gated; restart Headroom"
+        }));
+    }
+    Ok(())
+}
+
 impl Manager {
     fn new(base_port: u16) -> Self {
         let book = fs::read_to_string(servers_cache_path())
@@ -873,8 +949,10 @@ impl Manager {
             .unwrap_or_else(ServerBook::seeded);
         Self {
             base_port,
+            max_lanes: AtomicUsize::new(0),
             servers: Mutex::new(book),
             lanes: Mutex::new(Vec::new()),
+            proton: Mutex::new(None),
             rotation_lock: Mutex::new(()),
             running: Arc::new(AtomicBool::new(true)),
         }
@@ -892,6 +970,7 @@ impl Manager {
                 let state = lock_unpoisoned(&lane.state);
                 json!({
                     "slot": lane.slot,
+                    "provider": lane.provider(),
                     "egress_id": egress_id(&pool_url(self.base_port, lane.slot)),
                     "host": state.upstream_host,
                     "failures": state.failures,
@@ -901,11 +980,12 @@ impl Manager {
                 })
             })
             .collect();
+        let max_lanes = self.max_lanes.load(Ordering::SeqCst);
         json!({
             "ok": true,
             "lane_count": lanes.len(),
-            "max_lanes": MAX_LANES,
-            "degraded": lanes.len() < MAX_LANES,
+            "max_lanes": max_lanes,
+            "degraded": lanes.len() < max_lanes,
             "base_port": self.base_port,
             "lanes": lanes,
         })
@@ -949,7 +1029,9 @@ impl Manager {
             active_ips.insert(state.exit_ip.clone());
         }
 
-        let credentials = lane.credentials.clone();
+        let Some(credentials) = lane.credentials.clone() else {
+            return self.rotate_proton(&lane, requested_id, reason, proxy_url, &old, &active_ips);
+        };
         let candidates =
             lock_unpoisoned(&self.servers).candidates(&old.upstream_host, &active_hosts);
         for host in candidates.iter().map(String::as_str) {
@@ -983,23 +1065,8 @@ impl Manager {
                 continue;
             }
 
-            if let Err(error) = set_proxy_egress_maintenance(proxy_url, requested_id, true) {
-                return json!({"ok": false, "error": error});
-            }
-            {
-                let mut state = lock_unpoisoned(&lane.state);
-                state.rotating = true;
-            }
-            if let Err(error) = wait_for_proxy_drain(proxy_url, requested_id) {
-                lock_unpoisoned(&lane.state).rotating = false;
-                let reset = set_proxy_egress_maintenance(proxy_url, requested_id, false);
-                return match reset {
-                    Ok(()) => json!({"ok": false, "error": error}),
-                    Err(_) => json!({
-                        "ok": false,
-                        "error": "drain failed and proxy egress remains gated; restart Headroom"
-                    }),
-                };
+            if let Err(response) = gate_and_drain(&lane, requested_id, proxy_url) {
+                return response;
             }
 
             {
@@ -1015,13 +1082,8 @@ impl Manager {
                 state.exit_ip = candidate_ip.clone();
                 state.generation = state.generation.wrapping_add(1);
             }
-            lane.close_active();
-            lock_unpoisoned(&lane.state).rotating = false;
-            if set_proxy_egress_maintenance(proxy_url, requested_id, false).is_err() {
-                return json!({
-                    "ok": false,
-                    "error": "rotation finished but proxy egress remains gated; restart Headroom"
-                });
+            if let Err(response) = reopen(&lane, requested_id, proxy_url) {
+                return response;
             }
             return json!({
                 "ok": true,
@@ -1035,18 +1097,121 @@ impl Manager {
         json!({"ok": false, "error": "no verified distinct Nord exit available"})
     }
 
+    /// The Proton lane has one server at a time and the account one
+    /// connection, so a candidate cannot be probed beside the live tunnel the
+    /// way a Nord server can. Drain first, then walk the configs until one
+    /// comes up on a new exit; if none does, put the old one back.
+    fn rotate_proton(
+        &self,
+        lane: &Arc<Lane>,
+        requested_id: &str,
+        reason: &str,
+        proxy_url: &str,
+        old: &LaneSnapshot,
+        active_ips: &HashSet<String>,
+    ) -> Value {
+        let mut guard = lock_unpoisoned(&self.proton);
+        let Some(tunnel) = guard.as_mut() else {
+            return json!({"ok": false, "error": "the Proton tunnel is not running"});
+        };
+        // A heal may restart the same server: what failed is its tunnel, and a
+        // fresh session is the fix when it is the only config.
+        let heal = reason == "heal";
+        let current = tunnel.current();
+        let ring: Vec<usize> = tunnel
+            .ring()
+            .into_iter()
+            .filter(|&index| heal || index != current)
+            .collect();
+        if ring.is_empty() {
+            return json!({"ok": false, "error": "no other Proton config to rotate to"});
+        }
+        if let Err(response) = gate_and_drain(lane, requested_id, proxy_url) {
+            return response;
+        }
+        let mut exit = None;
+        for index in ring {
+            if let Err(why) = tunnel.start(index) {
+                eprintln!(
+                    "rotation candidate unavailable lane={} stage=wireproxy reason={why}",
+                    lane.slot
+                );
+                continue;
+            }
+            let host = tunnel.name();
+            match probe_proton_exit(&host, tunnel.port()) {
+                Ok(ip) if !active_ips.contains(&ip) && (heal || ip != old.exit_ip) => {
+                    exit = Some(ip);
+                    break;
+                }
+                Ok(_) => eprintln!(
+                    "rotation candidate duplicate lane={} host={host}",
+                    lane.slot
+                ),
+                Err(why) => eprintln!(
+                    "rotation candidate unavailable lane={} stage=public-egress-probe host={host} reason={why}",
+                    lane.slot
+                ),
+            }
+        }
+        let Some(exit_ip) = exit else {
+            let error = if tunnel.start(current).is_ok() {
+                "no verified distinct Proton exit available"
+            } else {
+                "no Proton config came up; the lane stays down until it heals"
+            };
+            let _ = reopen(lane, requested_id, proxy_url);
+            return json!({"ok": false, "error": error});
+        };
+        let host = tunnel.name();
+        {
+            let mut state = lock_unpoisoned(&lane.state);
+            state.upstream_host = host.clone();
+            state.failures = 0;
+            state.exit_ip = exit_ip.clone();
+            state.generation = state.generation.wrapping_add(1);
+        }
+        if let Err(response) = reopen(lane, requested_id, proxy_url) {
+            return response;
+        }
+        json!({
+            "ok": true,
+            "slot": lane.slot,
+            "old_host": old.upstream_host,
+            "new_host": host,
+            "exit_fingerprint": fingerprint(&exit_ip),
+            "reason": reason,
+        })
+    }
+
     fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
         for lane in self.lane_list() {
             lane.close_active();
         }
+        if let Some(tunnel) = lock_unpoisoned(&self.proton).as_mut() {
+            tunnel.stop();
+        }
     }
 
-    fn serve(self: Arc<Self>) -> Result<(), String> {
-        let _daemon_lock = DaemonLock::acquire()?;
-        let credentials = load_credentials()?;
+    /// Nord servers nearest first, probed until eight distinct exits answer,
+    /// or ten when the preferred ones all do.
+    fn verify_nord_exits(
+        &self,
+        credentials: &Credentials,
+    ) -> Result<Vec<(String, String, String)>, String> {
         let mut verified = Vec::new();
         let mut seen_ips = HashSet::new();
+        // Without a cached list (a new machine, or the first start after the
+        // rename moved the state directory) the book holds only the seed, and
+        // on 2026-09-30 the account was refused on 9 of its 16 hosts at once.
+        // Take Nord's live listing before probing.
+        if let Ok(listing) = fetch_server_listing() {
+            let mut book = lock_unpoisoned(&self.servers);
+            if book.apply_listing(&listing, &HashSet::new()) && save_servers_cache(&book).is_err() {
+                eprintln!("startup: could not save the server list cache");
+            }
+        }
         // Lowest round trip first, so the lanes start on the nearest servers
         // that accept the account.
         let listed = lock_unpoisoned(&self.servers).candidates("", &HashSet::new());
@@ -1058,7 +1223,7 @@ impl Manager {
         }
         let hosts = lock_unpoisoned(&self.servers).candidates("", &HashSet::new());
         for (index, host) in hosts.iter().enumerate() {
-            if index >= MAX_LANES && verified.len() >= MIN_LANES {
+            if index >= NORD_MAX_LANES && verified.len() >= NORD_MIN_LANES {
                 break;
             }
             let address = match resolve_server(host) {
@@ -1070,7 +1235,7 @@ impl Manager {
                     continue;
                 }
             };
-            let probed = probe_exit(host, &address, &credentials);
+            let probed = probe_exit(host, &address, credentials);
             lock_unpoisoned(&self.servers).mark(host, probed.is_ok());
             let exit_ip = match probed {
                 Ok(ip) => ip,
@@ -1086,26 +1251,97 @@ impl Manager {
                 continue;
             }
             verified.push((host.clone(), address, exit_ip));
-            if verified.len() >= MAX_LANES {
+            if verified.len() >= NORD_MAX_LANES {
                 break;
             }
         }
         let lane_count = startup_lane_count(verified.len())?;
-        let lanes: Vec<_> = verified
-            .into_iter()
-            .take(lane_count)
-            .enumerate()
-            .map(|(slot, (upstream_host, address, exit_ip))| {
-                Arc::new(Lane::new(
-                    slot,
+        Ok(verified.into_iter().take(lane_count).collect())
+    }
+
+    /// Bring up the first Proton config whose exit no Nord lane already uses.
+    /// Returns the lane's host label, `wireproxy`'s port and the exit address.
+    fn start_proton(
+        &self,
+        configs: Vec<PathBuf>,
+        seen_ips: &HashSet<String>,
+    ) -> Result<(String, u16, String), String> {
+        let wireproxy = proton::wireproxy_path()
+            .ok_or_else(|| "wireproxy is not installed; rerun install.sh".to_string())?;
+        let mut tunnel = proton::Tunnel::new(wireproxy, configs, ensure_state_dir()?)?;
+        for index in 0..tunnel.config_count() {
+            if let Err(why) = tunnel.start(index) {
+                eprintln!("startup candidate unavailable stage=wireproxy reason={why}");
+                continue;
+            }
+            let host = tunnel.name();
+            match probe_proton_exit(&host, tunnel.port()) {
+                Ok(ip) if !seen_ips.contains(&ip) => {
+                    let port = tunnel.port();
+                    *lock_unpoisoned(&self.proton) = Some(tunnel);
+                    return Ok((host, port, ip));
+                }
+                Ok(_) => eprintln!("startup candidate duplicate host={host}"),
+                Err(why) => eprintln!(
+                    "startup candidate unavailable stage=public-egress-probe host={host} reason={why}"
+                ),
+            }
+        }
+        Err("no Proton config came up with a distinct exit".to_string())
+    }
+
+    fn serve(self: Arc<Self>) -> Result<(), String> {
+        let _daemon_lock = DaemonLock::acquire()?;
+        let mut lanes = Vec::new();
+        let mut seen_ips = HashSet::new();
+        let mut max_lanes = 0;
+        // Nord is set up when its credential file exists. A file that exists
+        // but is unsafe or malformed still stops the relay.
+        if credentials_path().exists() {
+            let credentials = load_credentials()?;
+            for (upstream_host, address, exit_ip) in self.verify_nord_exits(&credentials)? {
+                seen_ips.insert(exit_ip.clone());
+                lanes.push(Arc::new(Lane::new(
+                    lanes.len(),
                     UPSTREAM_PORT,
                     upstream_host,
                     address,
                     exit_ip,
-                    credentials.clone(),
-                ))
-            })
-            .collect();
+                    Some(credentials.clone()),
+                )));
+            }
+            max_lanes += NORD_MAX_LANES;
+        }
+        // Proton is the free extra lane: when it does not come up, or its
+        // configs are refused as unsafe, the relay runs without it.
+        let proton = match proton::find_configs(&proton::configs_dir()) {
+            Ok(configs) if configs.is_empty() => None,
+            Ok(configs) => Some(self.start_proton(configs, &seen_ips)),
+            Err(reason) => Some(Err(reason)),
+        };
+        if let Some(started) = proton {
+            max_lanes += 1;
+            match started {
+                Ok((host, port, exit_ip)) => lanes.push(Arc::new(Lane::new(
+                    lanes.len(),
+                    port,
+                    host,
+                    "127.0.0.1".to_string(),
+                    exit_ip,
+                    None,
+                ))),
+                Err(reason) => eprintln!("warning: starting without the Proton lane: {reason}"),
+            }
+        }
+        if lanes.is_empty() {
+            return Err(format!(
+                "no egress lanes: add Nord SOCKS credentials at {} or Proton WireGuard configs in {}",
+                credentials_path().display(),
+                proton::configs_dir().display()
+            ));
+        }
+        self.max_lanes.store(max_lanes, Ordering::SeqCst);
+        let lane_count = lanes.len();
 
         let socket_path = control_socket_path()?;
         if socket_path.exists() {
@@ -1116,7 +1352,7 @@ impl Manager {
             )
             .is_ok()
             {
-                return Err("a Nord SOCKS relay is already running".to_string());
+                return Err("an egress relay is already running".to_string());
             }
             fs::remove_file(&socket_path).map_err(|_| "could not remove stale relay socket")?;
         }
@@ -1145,30 +1381,29 @@ impl Manager {
         for (lane, listener) in listeners {
             let running = self.running.clone();
             thread::Builder::new()
-                .name(format!("nord-socks-accept-{}", lane.slot))
+                .name(format!("egress-relay-accept-{}", lane.slot))
                 .spawn(move || accept_loop(lane, listener, running))
                 .map_err(|_| "could not start local SOCKS listener thread")?;
         }
         install_signal_handlers(self.running.clone());
         let maintainer = self.clone();
         thread::Builder::new()
-            .name("nord-socks-maintain".to_string())
+            .name("egress-relay-maintain".to_string())
             .spawn(move || maintainer.maintain())
             .map_err(|_| "could not start server maintenance thread")?;
-        eprintln!("verified distinct Nord SOCKS exits; active_lanes={lane_count}/{MAX_LANES}");
-        if lane_count < MAX_LANES {
+        if lane_count < max_lanes {
             eprintln!(
-                "warning: using {lane_count} distinct Nord SOCKS lanes; up to {MAX_LANES} are supported"
+                "warning: using {lane_count} distinct exits; up to {max_lanes} are configured"
             );
         }
-        eprintln!("Nord SOCKS relay ready ({lane_count}/{MAX_LANES} lanes)");
+        eprintln!("egress relay ready ({lane_count}/{max_lanes} lanes)");
 
         while self.running.load(Ordering::SeqCst) {
             match control.accept() {
                 Ok((stream, _)) => {
                     let manager = self.clone();
                     let _ = thread::Builder::new()
-                        .name("nord-socks-control".to_string())
+                        .name("egress-relay-control".to_string())
                         .spawn(move || handle_control(manager, stream));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1223,12 +1458,12 @@ fn fetch_server_listing() -> Result<Vec<(String, u64)>, String> {
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|_| "could not create listing client")?
-        .get(servers::LISTING_URL)
+        .get(nord::LISTING_URL)
         .send()
         .and_then(Response::error_for_status)
         .and_then(|response| response.json())
         .map_err(|_| "Nord server listing request failed")?;
-    Ok(servers::parse_listing(&body))
+    Ok(nord::parse_listing(&body))
 }
 
 fn save_servers_cache(book: &ServerBook) -> io::Result<()> {
@@ -1281,6 +1516,14 @@ impl Manager {
     /// Refresh the list from Nord, re-measure every server's round trip, and
     /// fully probe the idle servers checked longest ago.
     fn sweep(&self) {
+        // Only Nord has a server list; a relay without Nord lanes skips this.
+        let Some(credentials) = self
+            .lane_list()
+            .iter()
+            .find_map(|lane| lane.credentials.clone())
+        else {
+            return;
+        };
         let held = self.lane_hosts();
         match fetch_server_listing() {
             Ok(listing) => {
@@ -1306,17 +1549,10 @@ impl Manager {
             }
         }
         let targets = lock_unpoisoned(&self.servers).sweep_targets(&held, SWEEP_PROBES);
-        let credentials = self
-            .lane_list()
-            .first()
-            .map(|lane| lane.credentials.clone());
         let (mut accepted, mut rejected) = (0, 0);
         for host in &targets {
-            let Some(credentials) = &credentials else {
-                break;
-            };
             let probed =
-                resolve_server(host).and_then(|address| probe_exit(host, &address, credentials));
+                resolve_server(host).and_then(|address| probe_exit(host, &address, &credentials));
             lock_unpoisoned(&self.servers).mark(host, probed.is_ok());
             if probed.is_ok() {
                 accepted += 1;
@@ -1357,9 +1593,19 @@ impl Manager {
         if rotating || !(suspect || full_check || failing_since.contains_key(&lane.slot)) {
             return;
         }
-        match probe_exit(&host, &address, &lane.credentials) {
+        let probed = probe_exit_via_local_lane(
+            &host,
+            &address,
+            lane.upstream_port,
+            lane.credentials.as_ref(),
+            EXIT_PROBE_URL,
+        );
+        let nord = lane.credentials.is_some();
+        match probed {
             Ok(_) => {
-                lock_unpoisoned(&self.servers).mark(&host, true);
+                if nord {
+                    lock_unpoisoned(&self.servers).mark(&host, true);
+                }
                 if failing_since.remove(&lane.slot).is_some() {
                     eprintln!("heal: lane={} host={host} accepts again", lane.slot);
                 }
@@ -1367,7 +1613,9 @@ impl Manager {
                 return;
             }
             Err(reason) => {
-                lock_unpoisoned(&self.servers).mark(&host, false);
+                if nord {
+                    lock_unpoisoned(&self.servers).mark(&host, false);
+                }
                 failing_since.entry(lane.slot).or_insert_with(|| {
                     eprintln!("heal: lane={} host={host} rejects us ({reason})", lane.slot);
                     Instant::now()
@@ -1401,7 +1649,7 @@ fn accept_loop(lane: Arc<Lane>, listener: TcpListener, running: Arc<AtomicBool>)
             Ok((stream, _)) => {
                 let lane = lane.clone();
                 let _ = thread::Builder::new()
-                    .name(format!("nord-socks-lane-{}", lane.slot))
+                    .name(format!("egress-relay-lane-{}", lane.slot))
                     .spawn(move || lane.handle(stream));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1483,8 +1731,25 @@ fn control_request_at(path: &Path, request: &Value, timeout: Duration) -> Result
     serde_json::from_slice(&response).map_err(|_| "relay returned invalid control data".to_string())
 }
 
+/// Where the relay lived while it was called `nord-socks-egress`. A daemon
+/// started by that binary keeps running across an update and speaks the same
+/// protocol, so it is still asked before a second relay is started beside it.
+fn legacy_control_socket_path() -> Option<PathBuf> {
+    if std::env::var_os("HEADROOM_EGRESS_RELAY_STATE_DIR").is_some() {
+        return None;
+    }
+    Some(home_dir().join(".local/state/headroom/nord-socks-pool/control.sock"))
+        .filter(|path| path.exists())
+}
+
 fn control_request(request: &Value, timeout: Duration) -> Result<Value, String> {
-    control_request_at(&control_socket_path()?, request, timeout)
+    let primary = control_request_at(&control_socket_path()?, request, timeout);
+    match legacy_control_socket_path() {
+        Some(legacy) if primary.is_err() => {
+            control_request_at(&legacy, request, timeout).or(primary)
+        }
+        _ => primary,
+    }
 }
 
 fn status_is_supported(status: &Value) -> bool {
@@ -1495,11 +1760,24 @@ fn status_is_supported(status: &Value) -> bool {
         .iter()
         .filter_map(|lane| lane.get("slot").and_then(Value::as_u64))
         .collect();
+    // The lane count depends on which providers are set up, so only its
+    // consistency is checked. A relay from before the rename reports eight to
+    // ten Nord lanes the same way and passes too.
     status.get("ok").and_then(Value::as_bool) == Some(true)
         && status.get("lane_count").and_then(Value::as_u64) == Some(lanes.len() as u64)
-        && status.get("max_lanes").and_then(Value::as_u64) == Some(MAX_LANES as u64)
-        && (MIN_LANES..=MAX_LANES).contains(&lanes.len())
+        && status
+            .get("max_lanes")
+            .and_then(Value::as_u64)
+            .is_some_and(|max| max >= lanes.len() as u64)
+        && (1..=MAX_LANES).contains(&lanes.len())
         && slots == (0..lanes.len() as u64).collect::<Vec<_>>()
+}
+
+fn status_max_lanes(status: &Value) -> u64 {
+    status
+        .get("max_lanes")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
 }
 
 fn status_base_port(status: &Value, configured: u16) -> u16 {
@@ -1527,7 +1805,7 @@ fn ensure_running() -> Result<Value, String> {
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
         return Err(format!(
-            "an existing Nord SOCKS relay has {lane_count} lanes; this helper requires {MIN_LANES}-{MAX_LANES}. Drain its users, run `nord-socks-egress stop`, then start again"
+            "an existing egress relay reports {lane_count} lanes in an unsupported shape. Drain its users, run `egress-relay stop`, then start again"
         ));
     }
 
@@ -1564,7 +1842,7 @@ fn ensure_running() -> Result<Value, String> {
     }
     let mut child = command
         .spawn()
-        .map_err(|_| "could not launch Nord SOCKS relay daemon")?;
+        .map_err(|_| "could not launch egress relay daemon")?;
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while Instant::now() < deadline {
         if let Ok(status) = control_request(&json!({"op": "status"}), Duration::from_secs(2)) {
@@ -1576,7 +1854,7 @@ fn ensure_running() -> Result<Value, String> {
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len);
             return Err(format!(
-                "Nord SOCKS relay reported unsupported lane count {lane_count}"
+                "egress relay reported an unsupported lane count {lane_count}"
             ));
         }
         if child
@@ -1585,14 +1863,14 @@ fn ensure_running() -> Result<Value, String> {
             .is_some()
         {
             return Err(format!(
-                "Nord SOCKS relay exited during startup; inspect its private log at {}",
+                "egress relay exited during startup; inspect its private log at {}",
                 log_path.display()
             ));
         }
         thread::sleep(Duration::from_millis(100));
     }
     Err(format!(
-        "Nord SOCKS relay did not start; inspect its private log at {}",
+        "egress relay did not start; inspect its private log at {}",
         log_path.display()
     ))
 }
@@ -1609,7 +1887,7 @@ fn probe_lane(base_port: u16, slot: usize) -> Result<String, String> {
     )
     .map_err(|_| "client configuration failed".to_string())?;
     let response = client
-        .get("https://api.ipify.org")
+        .get(EXIT_PROBE_URL)
         .send()
         .map_err(|error| format!("{:?}", error.without_url()))?;
     read_ipify(response)
@@ -1617,7 +1895,7 @@ fn probe_lane(base_port: u16, slot: usize) -> Result<String, String> {
         .map_err(|_| "egress probe returned an invalid response".to_string())
 }
 
-fn run_probe_command(base_port: u16, slots: usize) -> i32 {
+fn run_probe_command(base_port: u16, slots: usize, max_lanes: u64) -> i32 {
     let mut fingerprints = Vec::with_capacity(slots);
     let mut successful = true;
     // Keep diagnostics serial: this command is run by operators, not on the
@@ -1637,7 +1915,7 @@ fn run_probe_command(base_port: u16, slots: usize) -> i32 {
     }
     let unique: HashSet<_> = fingerprints.iter().collect();
     println!(
-        "unique successful egresses: {} / {slots} active (max {MAX_LANES})",
+        "unique successful egresses: {} / {slots} active (max {max_lanes})",
         unique.len()
     );
     i32::from(!(successful && unique.len() == slots))
@@ -1645,7 +1923,7 @@ fn run_probe_command(base_port: u16, slots: usize) -> i32 {
 
 fn install_signal_handlers(running: Arc<AtomicBool>) {
     let _ = thread::Builder::new()
-        .name("nord-socks-signals".to_string())
+        .name("egress-relay-signals".to_string())
         .spawn(move || {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1670,10 +1948,19 @@ fn install_signal_handlers(running: Arc<AtomicBool>) {
 }
 
 #[allow(unsafe_code)]
+fn signal_process(pid: i32, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: kill takes two integers and no pointers; a stale pid at worst
+    // fails with ESRCH.
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn process_is_alive(pid: i32) -> bool {
-    // SAFETY: kill(pid, 0) only tests process existence and has no pointer args.
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // Signal 0 only tests that the process exists.
+    signal_process(pid, 0).map_or_else(|error| error.raw_os_error() == Some(libc::EPERM), |()| true)
 }
 
 impl DaemonLock {
@@ -1697,7 +1984,7 @@ impl DaemonLock {
                         .and_then(|text| text.trim().parse::<i32>().ok());
                     if owner.is_some_and(process_is_alive) {
                         return Err(
-                            "another Nord SOCKS relay startup is already in progress".to_string()
+                            "another egress relay startup is already in progress".to_string()
                         );
                     }
                     let _ = fs::remove_file(&path);
@@ -1745,7 +2032,8 @@ fn run() -> Result<i32, String> {
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             println!(
-                "Nord SOCKS relay ready: {count}/{MAX_LANES} local lanes, state under {}",
+                "egress relay ready: {count}/{} local lanes, state under {}",
+                status_max_lanes(&status),
                 state_dir().display()
             );
         }
@@ -1760,9 +2048,10 @@ fn run() -> Result<i32, String> {
                 "export HEADROOM_ZEN_HTTP_PROXY_POOL={}",
                 shell_quote(&pool_urls(active_port, count).join("\n"))
             );
-            if count < MAX_LANES {
+            let max_lanes = status_max_lanes(&status);
+            if (count as u64) < max_lanes {
                 eprintln!(
-                    "nord-socks-egress: using {count}/{MAX_LANES} verified exits; cap concurrent Spark fan-out at {count}"
+                    "egress-relay: using {count}/{max_lanes} verified exits; cap concurrent Spark fan-out at {count}"
                 );
             }
             let executable = std::env::current_exe()
@@ -1798,12 +2087,16 @@ fn run() -> Result<i32, String> {
                 .get("lane_count")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
-            return Ok(run_probe_command(status_base_port(&status, port), count));
+            return Ok(run_probe_command(
+                status_base_port(&status, port),
+                count,
+                status_max_lanes(&status),
+            ));
         }
         CommandKind::Stop => {
             let response = control_request(&json!({"op": "stop"}), Duration::from_secs(3))?;
             if response.get("ok").and_then(Value::as_bool) == Some(true) {
-                println!("Nord SOCKS relay stopped");
+                println!("egress relay stopped");
                 return Ok(0);
             }
             println!("stop failed");
@@ -1836,7 +2129,7 @@ fn main() {
     match run() {
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("nord-socks-egress: {error}");
+            eprintln!("egress-relay: {error}");
             std::process::exit(1);
         }
     }
@@ -2001,10 +2294,10 @@ mod tests {
             "test".to_string(),
             "127.0.0.1".to_string(),
             "198.51.100.1".to_string(),
-            Credentials {
+            Some(Credentials {
                 username: b"user".to_vec(),
                 password: b"pass".to_vec(),
-            },
+            }),
         ));
         lock_unpoisoned(&lane.state).rotating = true;
         let worker_lane = lane.clone();
@@ -2056,10 +2349,10 @@ mod tests {
             "test".to_string(),
             "127.0.0.1".to_string(),
             "198.51.100.1".to_string(),
-            Credentials {
+            Some(Credentials {
                 username: b"user".to_vec(),
                 password: b"pass".to_vec(),
-            },
+            }),
         ));
         let worker_lane = lane.clone();
         let worker = thread::spawn(move || {
@@ -2087,6 +2380,79 @@ mod tests {
         worker.join().unwrap();
         upstream.join().unwrap();
         assert_eq!(lock_unpoisoned(&lane.state).connects, 1);
+    }
+
+    /// The Proton lane's upstream is `wireproxy`, which takes no login: the
+    /// relay must offer only the no-auth method and never send credentials.
+    #[test]
+    fn credentialless_lane_uses_no_auth_upstream_and_tunnels_data() {
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let upstream = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+            assert_eq!(read_exact_vec(&mut stream, 3).unwrap(), [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+            let request = read_socks_request(&mut stream).unwrap();
+            assert_eq!(&request[..4], &[5, 1, 0, 3]);
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                .unwrap();
+            let payload = read_exact_vec(&mut stream, 4).unwrap();
+            stream.write_all(&payload).unwrap();
+        });
+
+        let lane_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let lane_address = lane_listener.local_addr().unwrap();
+        let lane = Arc::new(Lane::new(
+            0,
+            upstream_port,
+            "proton:NL-FREE-1".to_string(),
+            "127.0.0.1".to_string(),
+            "198.51.100.1".to_string(),
+            None,
+        ));
+        assert_eq!(lane.provider(), "proton");
+        let worker_lane = lane.clone();
+        let worker = thread::spawn(move || {
+            let (stream, _) = lane_listener.accept().unwrap();
+            worker_lane.handle(stream);
+        });
+
+        let mut client = TcpStream::connect(lane_address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client.write_all(&[5, 1, 0]).unwrap();
+        assert_eq!(read_exact_vec(&mut client, 2).unwrap(), [5, 0]);
+        let mut request = vec![5, 1, 0, 3, 11];
+        request.extend_from_slice(b"example.com");
+        request.extend_from_slice(&[0, 80]);
+        client.write_all(&request).unwrap();
+        let response_head = read_exact_vec(&mut client, 4).unwrap();
+        read_socks_address(&mut client, response_head[3]).unwrap();
+        assert_eq!(response_head, [5, 0, 0, 1]);
+        client.write_all(b"ping").unwrap();
+        assert_eq!(read_exact_vec(&mut client, 4).unwrap(), b"ping");
+        drop(client);
+        worker.join().unwrap();
+        upstream.join().unwrap();
+        assert_eq!(lock_unpoisoned(&lane.state).connects, 1);
+    }
+
+    #[test]
+    fn status_check_accepts_any_consistent_provider_mix_and_the_legacy_relay() {
+        let status = |count: u64, max: u64| {
+            let lanes: Vec<_> = (0..count).map(|slot| json!({"slot": slot})).collect();
+            json!({"ok": true, "lane_count": count, "max_lanes": max, "lanes": lanes})
+        };
+        // Proton alone, Nord's eight plus Proton, all eleven, a pre-rename relay.
+        assert!(status_is_supported(&status(1, 1)));
+        assert!(status_is_supported(&status(9, 11)));
+        assert!(status_is_supported(&status(11, 11)));
+        assert!(status_is_supported(&status(8, 10)));
+        assert!(!status_is_supported(&status(0, 11)));
+        assert!(!status_is_supported(&status(9, 8)));
+        assert!(!status_is_supported(&status(12, 12)));
     }
 
     #[test]
@@ -2135,7 +2501,7 @@ mod tests {
             "test",
             "127.0.0.1",
             upstream_port,
-            &credentials,
+            Some(&credentials),
             "http://api.ipify.org/",
         )
         .unwrap();

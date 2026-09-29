@@ -34,9 +34,9 @@ Default is project scope. Use `scope: "global"` for facts about the user, their 
 
 ## Muse Spark fan-out budget
 
-The Nord SOCKS helper starts eight lanes, or all ten when every preferred exit
-verifies.
-Before fan-out, run `~/.local/bin/nord-socks-egress status` and read its
+The egress relay runs eight Nord lanes, or all ten when every preferred exit
+verifies, plus one Proton lane when Proton is set up.
+Before fan-out, run `~/.local/bin/egress-relay status` and read its
 `lane_count`; if the helper or status is unavailable, budget for eight. Count
 every Spark session whose task is still running, including the
 current session if you are Muse Spark. Never start a task that would put that

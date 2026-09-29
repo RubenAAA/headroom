@@ -218,7 +218,7 @@ if [ "$use_context" -eq 1 ]; then
     # device-wide route with Zen, and each Zen 429 then rotates the VPN under
     # every Codex and Spark stream (2026-09-25). restart-headroom.sh reads the
     # same file. Write it with:
-    #   (umask 077; nord-socks-egress env > ~/.headroom-zen-pool.env)
+    #   (umask 077; egress-relay env > ~/.headroom-zen-pool.env)
     ZEN_POOL_ENV="${HEADROOM_ZEN_POOL_ENV:-$HOME/.headroom-zen-pool.env}"
     if [ -e "$ZEN_POOL_ENV" ]; then
         zen_pool_perm=$(stat -c '%u %a' "$ZEN_POOL_ENV" 2>/dev/null || stat -f '%u %Lp' "$ZEN_POOL_ENV" 2>/dev/null || true)
@@ -229,17 +229,17 @@ if [ "$use_context" -eq 1 ]; then
             # first. A proxy already running keeps the pool it started with, so
             # rewrite the file only when this launch starts the proxy — else
             # validate_zen_pool would refuse the session over the mismatch.
-            nord_egress="$HOME/.local/bin/nord-socks-egress"
-            if [ -x "$nord_egress" ] && ! "$nord_egress" status >/dev/null 2>&1; then
-                echo "headroom: Nord SOCKS relay is down; starting it"
+            egress_relay="$HOME/.local/bin/egress-relay"
+            if [ -x "$egress_relay" ] && ! "$egress_relay" status >/dev/null 2>&1; then
+                echo "headroom: egress relay is down; starting it"
                 if curl -fsS --max-time 1 "$PROXY_URL/cache-health" >/dev/null 2>&1; then
-                    "$nord_egress" start >/dev/null ||
-                        echo "headroom: could not start the Nord SOCKS relay; Spark requests will fail" >&2
-                elif (umask 077; "$nord_egress" env >"$ZEN_POOL_ENV.new"); then
+                    "$egress_relay" start >/dev/null ||
+                        echo "headroom: could not start the egress relay; Spark requests will fail" >&2
+                elif (umask 077; "$egress_relay" env >"$ZEN_POOL_ENV.new"); then
                     mv -f "$ZEN_POOL_ENV.new" "$ZEN_POOL_ENV"
                 else
                     rm -f "$ZEN_POOL_ENV.new"
-                    echo "headroom: could not start the Nord SOCKS relay; Spark requests will fail" >&2
+                    echo "headroom: could not start the egress relay; Spark requests will fail" >&2
                 fi
             fi
             unset HEADROOM_ZEN_HTTP_PROXY_POOL HEADROOM_ZEN_EGRESS_ROTATE_COMMAND

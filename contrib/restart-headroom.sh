@@ -77,11 +77,11 @@ log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"; }
 
 # The Zen egress pool comes from a private file, not from whatever the calling
 # shell exports. On 2026-09-25 the proxy ran pool-less because the shell that
-# restarted it never ran `nord-socks-egress env`. Zen then shared the
+# restarted it never ran `egress-relay env`. Zen then shared the
 # device-wide route, each Zen 429 made the watcher rotate the VPN, and every
 # rotation reset the Codex and Spark streams in flight. Nothing reported it.
 # Write the file with:
-#   (umask 077; nord-socks-egress env > ~/.headroom-zen-pool.env)
+#   (umask 077; egress-relay env > ~/.headroom-zen-pool.env)
 ZEN_POOL_ENV="${HEADROOM_ZEN_POOL_ENV:-$HOME/.headroom-zen-pool.env}"
 if [ -e "$ZEN_POOL_ENV" ]; then
   zen_pool_perm=$(stat -c '%u %a' "$ZEN_POOL_ENV" 2>/dev/null || stat -f '%u %Lp' "$ZEN_POOL_ENV" 2>/dev/null)
@@ -89,17 +89,19 @@ if [ -e "$ZEN_POOL_ENV" ]; then
     # A restart is the one moment the file can change safely: the new proxy
     # reads it at start. `env` starts the relay if a reboot or `stop` took it
     # down and otherwise just reports the running one, so the file always
-    # names the lanes the relay has now — eight or ten — and never forces a
-    # relay restart, which would reset every Spark stream in flight. The
-    # helper's own HEADROOM_NORD_SOCKS_* settings pass through untouched.
-    nord_egress="$HOME/.local/bin/nord-socks-egress"
-    if [ -x "$nord_egress" ]; then
-      if (umask 077; "$nord_egress" env >"$ZEN_POOL_ENV.new"); then
+    # names the lanes the relay has now — Nord's eight or ten, plus Proton's
+    # one when it is set up — and never forces a relay restart, which would
+    # reset every Spark stream in flight. The relay's own settings
+    # (HEADROOM_EGRESS_RELAY_*, HEADROOM_PROTON_WG_DIR and the Nord
+    # credential path) pass through untouched.
+    egress_relay="$HOME/.local/bin/egress-relay"
+    if [ -x "$egress_relay" ]; then
+      if (umask 077; "$egress_relay" env >"$ZEN_POOL_ENV.new"); then
         mv -f "$ZEN_POOL_ENV.new" "$ZEN_POOL_ENV"
       else
         rm -f "$ZEN_POOL_ENV.new"
-        echo "restart-headroom: WARNING: nord-socks-egress env failed; keeping $ZEN_POOL_ENV as it is" >&2
-        log "WARNING: nord-socks-egress env failed; keeping $ZEN_POOL_ENV as it is"
+        echo "restart-headroom: WARNING: egress-relay env failed; keeping $ZEN_POOL_ENV as it is" >&2
+        log "WARNING: egress-relay env failed; keeping $ZEN_POOL_ENV as it is"
       fi
     fi
     unset HEADROOM_ZEN_HTTP_PROXY_POOL HEADROOM_ZEN_EGRESS_ROTATE_COMMAND
@@ -118,11 +120,11 @@ fi
 # Starting without a pool is legitimate on a machine with no relay. With a
 # healthy relay up it means Zen goes back on the shared route, so say so on
 # the terminal and in the log.
-if [ -z "${HEADROOM_ZEN_HTTP_PROXY_POOL:-}" ] && [ -x "$HOME/.local/bin/nord-socks-egress" ]; then
-  zen_lanes=$("$HOME/.local/bin/nord-socks-egress" status 2>/dev/null |
+if [ -z "${HEADROOM_ZEN_HTTP_PROXY_POOL:-}" ] && [ -x "$HOME/.local/bin/egress-relay" ]; then
+  zen_lanes=$("$HOME/.local/bin/egress-relay" status 2>/dev/null |
     python3 -c 'import json,sys; j=json.load(sys.stdin); print(j.get("lane_count", 0) if j.get("ok") else 0)' 2>/dev/null) || zen_lanes=0
   if [[ "${zen_lanes:-0}" =~ ^[1-9][0-9]*$ ]]; then
-    zen_msg="WARNING: starting WITHOUT the Zen egress pool while nord-socks-egress has $zen_lanes lanes up. Zen will share the device-wide route and every Zen 429 will rotate the VPN, resetting Codex and Spark streams. Fix: (umask 077; nord-socks-egress env > $ZEN_POOL_ENV)"
+    zen_msg="WARNING: starting WITHOUT the Zen egress pool while egress-relay has $zen_lanes lanes up. Zen will share the device-wide route and every Zen 429 will rotate the VPN, resetting Codex and Spark streams. Fix: (umask 077; egress-relay env > $ZEN_POOL_ENV)"
     printf '\n!!! restart-headroom: %s\n\n' "$zen_msg" >&2
     log "$zen_msg"
   fi

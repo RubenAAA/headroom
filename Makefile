@@ -23,7 +23,7 @@ help:
 	@echo "  make test-parity        - parity-run against recorded fixtures"
 	@echo "  make bench              - cargo bench --workspace"
 	@echo "  make build-proxy        - release build proxy tools; strip headroom-proxy and print size"
-	@echo "  make install-proxy      - build-proxy, then install the proxy and Nord egress helper"
+	@echo "  make install-proxy      - build-proxy, then install the proxy and the egress relay"
 	@echo "  make build-wheel        - release wheel for headroom-py"
 	@echo "  make verify-rust-core   - build + install + import-verify headroom._core"
 	@echo "  make fmt                - cargo fmt --all"
@@ -132,9 +132,9 @@ build-proxy:
 install-proxy: build-proxy
 	@mkdir -p "$(PREFIX)/bin"
 	@install -m 0755 target/release/headroom-proxy "$(PREFIX)/bin/headroom-proxy"
-	@install -m 0755 target/release/nord-socks-egress "$(PREFIX)/bin/nord-socks-egress"
+	@install -m 0755 target/release/egress-relay "$(PREFIX)/bin/egress-relay"
 	@echo "installed $(PREFIX)/bin/headroom-proxy"
-	@echo "installed $(PREFIX)/bin/nord-socks-egress"
+	@echo "installed $(PREFIX)/bin/egress-relay"
 	@RESOLVED=$$(command -v headroom-proxy || true); \
 	if [ -z "$$RESOLVED" ]; then \
 		echo "warning: $(PREFIX)/bin is not on PATH" >&2; \

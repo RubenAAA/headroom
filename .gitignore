@@ -289,3 +289,12 @@ context-mode/
 .claude/
 .serena/
 .codegraph/
+
+# VPN credentials and keys. They belong in ~/.config/headroom/ (0700), never
+# in the checkout; these catch a copy dropped in here by mistake. WireGuard
+# configs carry a private key, and no tracked file is a .conf.
+nord-socks-credentials.json
+proton-wg/
+*.conf
+.headroom-zen-pool.env
+headroom-zen-pool.env

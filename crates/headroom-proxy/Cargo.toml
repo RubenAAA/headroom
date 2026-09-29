@@ -25,8 +25,8 @@ name = "headroom"
 path = "src/bin/headroom_cli.rs"
 
 [[bin]]
-name = "nord-socks-egress"
-path = "src/bin/nord_socks_egress.rs"
+name = "egress-relay"
+path = "src/bin/egress_relay.rs"
 
 [features]
 # Pass-through to headroom-core. `ml` is OFF by default, so a stock build is

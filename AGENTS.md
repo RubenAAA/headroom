@@ -49,7 +49,11 @@ for working on Headroom. The maintainer does.
 `install.sh` writes:
 
 - `~/.local/bin/headroom-proxy`, `~/.local/bin/headroom`, and the Rust
-  `~/.local/bin/nord-socks-egress` helper, built release.
+  `~/.local/bin/egress-relay` helper, built release. An old
+  `nord-socks-egress` binary there becomes a symlink to it.
+- `~/.local/bin/wireproxy`, pinned and checksum-verified, which the relay
+  runs for its Proton lane, and `~/.config/headroom/proton-wg/` (mode 0700)
+  for the Proton WireGuard configs.
 - `~/.local/bin/claude-launcher`, with `cclaude` symlinked to it, and
   `~/.local/bin/restart-headroom.sh`.
 - `~/.headroom-flags.sh`, a bash array of proxy flags copied from
@@ -69,10 +73,11 @@ for working on Headroom. The maintainer does.
 It does not write `~/.headroom-zen-pool.env`, the Zen egress pool that
 `cclaude` and `restart-headroom.sh` source; the installer only reports whether
 it exists. Without it, each Zen 429 rotates the device-wide VPN and resets every
-Codex and Spark stream in flight. With Nord SOCKS credentials, create it once:
+Codex and Spark stream in flight. With Nord SOCKS credentials, Proton
+WireGuard configs, or both, create it once:
 
 ```bash
-(umask 077; ~/.local/bin/nord-socks-egress env > ~/.headroom-zen-pool.env)
+(umask 077; ~/.local/bin/egress-relay env > ~/.headroom-zen-pool.env)
 restart-headroom.sh
 ```
 
@@ -83,7 +88,9 @@ starting the relay only if it is down.
 
 For other relays, start from `contrib/headroom-zen-pool.env.example`. Both
 sourcing scripts ignore the file unless it is yours with mode `0600`. Setup and
-rotation details: "Nord SOCKS5 relay pool" in `contrib/README.md`.
+rotation details: "Egress relay pool" in `contrib/README.md`. Credentials and
+WireGuard configs live in `~/.config/headroom/`, never in the checkout;
+`.gitignore` refuses the known file names should one be copied in.
 
 Under `--link`, the contrib scripts, hooks, flag file and usage dump are
 symlinked into the checkout, and so is the git pre-push gate (see Testing).

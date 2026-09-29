@@ -155,12 +155,20 @@ if [ "$BUILD" = 1 ]; then
         ( cd "$REPO_DIR" && cargo build --release -p headroom-proxy --bins )
     fi
 fi
-for bin in headroom-proxy headroom nord-socks-egress; do
+for bin in headroom-proxy headroom egress-relay; do
     src="$REPO_DIR/target/release/$bin"
     [ -x "$src" ] || { echo "missing $src — run without --no-build" >&2; exit 1; }
     install -m 755 "$src" "$BIN_DIR/$bin"
     say "installed $BIN_DIR/$bin"
 done
+# The relay was called nord-socks-egress until it gained a Proton lane. A pool
+# file written back then names that path as its rotate command, so keep the
+# name, pointing at the new binary. The next restart-headroom.sh rewrites the
+# file with the new path.
+if [ -e "$BIN_DIR/nord-socks-egress" ] && [ ! -L "$BIN_DIR/nord-socks-egress" ]; then
+    ln -sfn egress-relay "$BIN_DIR/nord-socks-egress"
+    say "nord-socks-egress -> egress-relay (old name, kept for existing pool files)"
+fi
 
 # ── build cache GC ──────────────────────────────────────────────────────
 # Every Rust build leaves fingerprints in target/, and each toolchain bump
@@ -250,6 +258,40 @@ else
         unset _mold_arch _mold_ver _mold_url
     fi
 fi
+
+# ── wireproxy (Proton lane) ─────────────────────────────────────────────
+# egress-relay runs Proton's free WireGuard server as one extra Zen lane
+# through wireproxy: userspace WireGuard served as a loopback SOCKS5 port, so
+# no TUN device, no root, and no route change for anything else. Pinned and
+# checked against the release's own checksums. Never fatal: without it the
+# relay runs its Nord lanes and logs that the Proton lane is missing.
+step "wireproxy (Proton lane)"
+_wp_ver="1.1.3"
+case "$OS-$(uname -m)" in
+    Linux-x86_64) _wp_asset="linux_amd64"; _wp_sum="e88c1d090740373fc606c1bafd81d9a5eadc642cce5667616e20e9d7a444f51c" ;;
+    Linux-aarch64|Linux-arm64) _wp_asset="linux_arm64"; _wp_sum="370e00bd2167960d1ecd1c3c1439715bbaa94a0a110a2040468670c9af6021b6" ;;
+    Darwin-x86_64) _wp_asset="darwin_amd64"; _wp_sum="5d89742a0f381d9508d3ad828a0d300dceee24fa49015427eaff42a23f7a50bd" ;;
+    Darwin-arm64) _wp_asset="darwin_arm64"; _wp_sum="28d34342c48c309b628d9c06ab4efc05b82fba49821f360605c02139c02547a5" ;;
+    *) _wp_asset="" ;;
+esac
+if "$BIN_DIR/wireproxy" --version 2>/dev/null | grep -q "version $_wp_ver\$"; then
+    say "wireproxy $_wp_ver already installed"
+elif [ -z "$_wp_asset" ]; then
+    say "WARNING: no pinned wireproxy build for $OS $(uname -m) — the relay runs without the Proton lane"
+else
+    _wp_tmp=$(mktemp -d)
+    if curl -fsSL --proto '=https' --tlsv1.2 -o "$_wp_tmp/wp.tar.gz" \
+            "https://github.com/windtf/wireproxy/releases/download/v${_wp_ver}/wireproxy_${_wp_asset}.tar.gz" \
+        && [ "$( (sha256sum "$_wp_tmp/wp.tar.gz" 2>/dev/null || shasum -a 256 "$_wp_tmp/wp.tar.gz") | cut -d' ' -f1)" = "$_wp_sum" ] \
+        && tar xzf "$_wp_tmp/wp.tar.gz" -C "$_wp_tmp" wireproxy \
+        && install -m 755 "$_wp_tmp/wireproxy" "$BIN_DIR/wireproxy"; then
+        say "installed wireproxy $_wp_ver to $BIN_DIR (checksum verified)"
+    else
+        say "WARNING: could not install wireproxy — the relay runs without the Proton lane"
+    fi
+    rm -rf "$_wp_tmp"
+fi
+unset _wp_ver _wp_asset _wp_sum _wp_tmp
 
 # ── flag set ──────────────────────────────────────────────────────────────
 # contrib/headroom-flags.sh is the measured flag set — every option the
@@ -377,8 +419,29 @@ fi
 unset _vpn_provider
 
 # The per-egress pool keeps a Zen 429 from rotating the device-wide route under
-# every routed stream. Never generated here: `nord-socks-egress env` starts a
+# every routed stream. Never generated here: `egress-relay env` starts a
 # relay daemon and probes live exits, which an installer should not do quietly.
+# Its lanes come from whichever providers are set up; say which ones are.
+_nord_creds="${HEADROOM_NORD_SOCKS_CREDENTIALS_FILE:-$HOME/.config/headroom/nord-socks-credentials.json}"
+_proton_dir="${HEADROOM_PROTON_WG_DIR:-$HOME/.config/headroom/proton-wg}"
+# Private from the start: every file dropped in here holds a WireGuard key.
+(umask 077; mkdir -p "$_proton_dir") && chmod 700 "$_proton_dir"
+if [ -f "$_nord_creds" ]; then
+    say "Nord lanes: credentials at $_nord_creds"
+else
+    say "Nord lanes: off (no $_nord_creds)"
+fi
+_proton_count=$(find "$_proton_dir" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l | tr -d ' ')
+if [ "$_proton_count" -gt 0 ]; then
+    say "Proton lane: $_proton_count WireGuard config(s) in $_proton_dir"
+    if find "$_proton_dir" -maxdepth 1 -name '*.conf' -perm -g+r 2>/dev/null | grep -q . \
+        || find "$_proton_dir" -maxdepth 1 -name '*.conf' -perm -o+r 2>/dev/null | grep -q .; then
+        say "  WARNING: the relay skips the Proton lane while others can read a config: chmod 600 $_proton_dir/*.conf"
+    fi
+else
+    say "Proton lane: off. Drop Proton WireGuard configs (free servers) in $_proton_dir, mode 0600"
+fi
+unset _nord_creds _proton_dir _proton_count
 ZEN_POOL_FILE="${HEADROOM_ZEN_POOL_ENV:-$HOME/.headroom-zen-pool.env}"
 if [ -f "$ZEN_POOL_FILE" ]; then
     _pool_perm=$(stat -c '%u %a' "$ZEN_POOL_FILE" 2>/dev/null || stat -f '%u %Lp' "$ZEN_POOL_FILE" 2>/dev/null || true)
@@ -388,11 +451,11 @@ if [ -f "$ZEN_POOL_FILE" ]; then
         say "WARNING: $ZEN_POOL_FILE is ignored until it is yours with mode 0600: chmod 600 $ZEN_POOL_FILE"
     fi
     unset _pool_perm
-elif [ -x "$BIN_DIR/nord-socks-egress" ]; then
+elif [ -x "$BIN_DIR/egress-relay" ]; then
     say "no Zen egress pool. Without one, the watcher rotates the whole VPN on each"
     say "  Zen 429 and resets every Codex and Spark stream in flight. To set it up:"
-    say "  (umask 077; $BIN_DIR/nord-socks-egress env > $ZEN_POOL_FILE) && restart-headroom.sh"
-    say "  Needs Nord SOCKS credentials; see 'Nord SOCKS5 relay pool' in contrib/README.md"
+    say "  (umask 077; $BIN_DIR/egress-relay env > $ZEN_POOL_FILE) && restart-headroom.sh"
+    say "  Needs Nord SOCKS credentials or Proton configs; see 'Egress relay pool' in contrib/README.md"
 fi
 
 

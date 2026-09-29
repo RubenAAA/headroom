@@ -16,9 +16,10 @@ nothing here is on the request path.
 | `update-headroom.sh` | `~/.local/bin/` | Pulls the checkout, reinstalls in the last install's mode, restarts the proxy. Run after `git pull`, or instead of it. |
 | `concurrency-report.sh` | `~/.local/bin/` | Verdict on the 2026-09-15 concurrency fixes from the proxy log: sidecar 404 fallbacks, Zen slot timeouts, proxy-side stalls, and whether `--cache-stampede-gate` held any follower that then read cache. Run after a day of use; it says when to drop the gate flag. |
 | `headroom-flags.sh` | `~/.headroom-flags.sh` | The flag array both starters read. An existing file is never overwritten, so tuning survives a re-install. |
-| `headroom-zen-pool.env.example` | not installed | Shape of `~/.headroom-zen-pool.env`, the Zen egress pool both starters source. Generate the real file with `nord-socks-egress env`; see [Nord SOCKS5 relay pool](#nord-socks5-relay-pool). |
+| `headroom-zen-pool.env.example` | not installed | Shape of `~/.headroom-zen-pool.env`, the Zen egress pool both starters source. Generate the real file with `egress-relay env`; see [Egress relay pool](#egress-relay-pool). |
 | `zen-rotate-watch.sh` | `~/.local/bin/` | Watches Zen/Spark rate limits; rotates a device-wide VPN in legacy mode or configured egresses individually in pool mode. Not started by the installer. |
-| `nord-socks-egress` | `~/.local/bin/` | Rust helper binary for the optional local SOCKS5 relay pool over Nord; exposes eight verified loopback lanes, or ten when all preferred exits pass, and rotates a lane to an unused endpoint when a spare is available. |
+| `egress-relay` | `~/.local/bin/` | Rust helper binary for the optional local SOCKS5 relay pool: eight verified Nord lanes (ten when all preferred exits pass) plus one Proton lane over `wireproxy` when Proton WireGuard configs are set up. Rotates a lane to an unused endpoint when a spare is available. Called `nord-socks-egress` before the Proton lane; `install.sh` leaves that name as a symlink. |
+| `wireproxy` | `~/.local/bin/` | Third-party, pinned and checksum-verified by `install.sh`: userspace WireGuard served as a loopback SOCKS5 port. The relay starts it for the Proton lane; nothing else uses it. |
 | `headroom-rss-sample` | `~/.local/bin/` | Samples the proxy's RSS once a minute into `~/headroom-rss.log`, so a leak over a long session is visible. |
 | `reconcile_books.py` | not installed | Checks the proxy's token books against a number it did not compute (the Anthropic usage API, or a console export). Run by hand. |
 
@@ -132,7 +133,7 @@ Put both variables in `~/.headroom-zen-pool.env` (mode `0600`) rather than
 exporting them from a shell: `claude-launcher` and `restart-headroom.sh` source
 that file themselves, so a proxy started from a shell without the exports
 still gets the pool. `headroom-zen-pool.env.example` shows the shape. With
-`nord-socks-egress`, generate the file instead (next section). For another
+`egress-relay`, generate the file instead (next section). For another
 relay, write it by hand and keep the credentials out of shell history:
 
 ```bash
@@ -158,19 +159,30 @@ tunnels. Candidate probing itself does not interrupt the current lane. A timed
 pool rotation remains scheduled even when individual lanes are rotating
 reactively for 429s.
 
-### Nord SOCKS5 relay pool
+### Egress relay pool
 
-The Rust `nord-socks-egress` binary adapts Nord's remote SOCKS5 service to
-Headroom's per-egress rotation hook. It reads `USERNAME=...` and `PASSWORD=...` from
-`~/.config/headroom/nord-socks-credentials.json` (or the path in
-`HEADROOM_NORD_SOCKS_CREDENTIALS_FILE`). Keep that file `0600` and its parent
-directory `0700`. Credentials are not placed in the process command line,
-exported Headroom pool, or relay logs.
+The Rust `egress-relay` binary turns VPN egresses into loopback SOCKS5 lanes
+for Headroom's per-egress rotation hook. Each provider is optional; the relay
+runs the lanes of whichever are set up and refuses to start with none.
+
+- **Nord** (eight or ten lanes): Nord's remote SOCKS5 service. The relay reads
+  `USERNAME=...` and `PASSWORD=...` from
+  `~/.config/headroom/nord-socks-credentials.json` (or the path in
+  `HEADROOM_NORD_SOCKS_CREDENTIALS_FILE`). Keep that file `0600` and its parent
+  directory `0700`. Credentials are not placed in the process command line,
+  exported Headroom pool, or relay logs. Details below.
+- **Proton** (one lane): see [Proton lane](#proton-lane).
+
+Lanes are numbered from `HEADROOM_EGRESS_RELAY_BASE_PORT` (default 18600):
+Nord's first, then Proton's. State, the control socket and the private relay
+log live in `~/.local/state/headroom/egress-relay` (or
+`HEADROOM_EGRESS_RELAY_STATE_DIR`). `HEADROOM_EGRESS_RELAY_TRACE=1` logs SOCKS
+handshake stages.
 
 Once, from any shell, after existing proxy requests have drained:
 
 ```bash
-(umask 077; ~/.local/bin/nord-socks-egress env > ~/.headroom-zen-pool.env)
+(umask 077; ~/.local/bin/egress-relay env > ~/.headroom-zen-pool.env)
 restart-headroom.sh    # replaces a device-wide watcher with a per-egress one
 cclaude --context
 ```
@@ -179,15 +191,14 @@ Nothing starts the relay at boot. After a reboot the file still names its
 loopback ports, but nothing listens on them and every Zen request fails with a
 503. `claude-launcher --context` checks for this: when the relay is down and
 this launch starts the proxy, it reruns `env` into the file; when a proxy is
-already up, it runs `nord-socks-egress start` and leaves the file alone, since
+already up, it runs `egress-relay start` and leaves the file alone, since
 the running proxy keeps the pool it started with. `restart-headroom.sh` reruns
 `env` into the file on every restart. It starts the relay if it is down and
 never restarts a running one, so the file always matches the lanes the relay
-has, eight or ten. After `nord-socks-egress stop`, a restart is all it takes.
+has. After `egress-relay stop`, a restart is all it takes.
 
 The `env` command starts the local relay daemon and prints exports for one
-loopback SOCKS URL per verified lane (eight, or ten when all preferred exits
-pass) plus the per-egress rotator path. `claude-launcher` and
+loopback SOCKS URL per verified lane plus the per-egress rotator path. `claude-launcher` and
 `restart-headroom.sh` both source `~/.headroom-zen-pool.env`
 (`HEADROOM_ZEN_POOL_ENV` overrides the path). The file takes precedence over
 whatever the shell exports, and they skip it unless it belongs to you with
@@ -210,10 +221,10 @@ With no verified spare endpoint,
 a lane rotation fails rather than sharing another lane's exit. An older
 running relay with fewer than eight lanes is
 not replaced automatically, to avoid killing in-flight sessions: drain its
-users, run `nord-socks-egress stop`, then start it again. Run
-`nord-socks-egress status` to see endpoint assignments,
-`nord-socks-egress test` to check egresses (it prints hashes, not IP
-addresses), or `nord-socks-egress stop` to stop the relay.
+users, run `egress-relay stop`, then start it again. Run
+`egress-relay status` to see endpoint assignments and each lane's provider,
+`egress-relay test` to check egresses (it prints hashes, not IP
+addresses), or `egress-relay stop` to stop the relay.
 
 Headroom reads the pool only when its proxy process starts. The Claude and
 OpenCode launchers compare the configured opaque egress IDs with the live
@@ -226,11 +237,69 @@ up to ten simultaneous device sessions per account and up to five on one
 server. Ten SOCKS lanes therefore consume the full account session allowance;
 an existing NordVPN app/NordLynx connection or other device sessions can make
 fewer lanes available. Check the relay's `lane_count` with
-`nord-socks-egress status` and keep concurrent Spark fan-out at or below
+`egress-relay status` and keep concurrent Spark fan-out at or below
 that number. The installed Claude instructions tell Spark parents and workers
 to count unfinished Spark tasks, forbid nested Spark fan-out, and continue
 sequentially when all lanes are occupied. The helper never silently shares an
-exit or starts with fewer than eight lanes.
+exit or starts with fewer than eight Nord lanes when Nord is set up.
+
+#### Proton lane
+
+Proton's free plan has no SOCKS5 service and allows one VPN connection per
+account, so it adds one lane, not a pool. The relay runs `wireproxy`, which
+holds the WireGuard session in userspace and serves it as a loopback SOCKS5
+port: no TUN device, no root, and no route change, so only Zen traffic sent to
+that lane goes through Proton. (tun2socks goes the other way, SOCKS into a
+TUN device, and does not help here.)
+
+Set it up once:
+
+1. `install.sh` installs `wireproxy` and creates
+   `~/.config/headroom/proton-wg/` (mode `0700`; `HEADROOM_PROTON_WG_DIR`
+   overrides it).
+2. At account.protonvpn.com → Downloads → WireGuard configuration, pick
+   Linux and a free server, with NetShield on no filtering and port
+   forwarding and Moderate NAT off. Download three to five, each for a
+   different free server; every server exits from its own address.
+3. Save them in that directory as `<server>.conf` (for example
+   `NL-FREE-119.conf`; the stem becomes the lane's `host` in status), mode
+   `0600`. When others can read the directory or a config, the relay starts
+   without the Proton lane and logs why: each config holds a WireGuard
+   private key.
+4. Pick the lane up with `egress-relay stop && restart-headroom.sh` once Spark
+   work is idle. `update-headroom.sh` reminds you when configs exist but the
+   running relay has no Proton lane.
+
+At start the relay tries the configs in name order and keeps the first whose
+exit no Nord lane uses. If none comes up, it logs a warning and runs without
+the lane. Rotation drains the lane first, then stops the tunnel before starting
+the next config, so two sessions never overlap; if no other config yields a
+new exit, it puts the old one back. A `heal` may restart the same config, since
+what failed there is the tunnel, not the exit. `HEADROOM_WIREPROXY_BIN` points
+at a `wireproxy` other than `~/.local/bin/wireproxy` or the one on `PATH`.
+
+Free-server exits are shared by many users, so expect this lane to meet Zen's
+rate limit sooner than a Nord lane. Most sites see it over IPv6 first.
+
+#### Moving from `nord-socks-egress`
+
+A relay started under the old name keeps running across an update: its state
+directory is `~/.local/state/headroom/nord-socks-pool`, and `egress-relay`
+still reaches it there when no new relay answers. `install.sh` replaces the
+old binary with a symlink to `egress-relay`, so a pool file that names it as
+its rotate command keeps working until `restart-headroom.sh` rewrites the
+file. To switch without cutting streams, start the new relay on other ports,
+move the proxy onto it, then stop the old one:
+
+```bash
+(umask 077; mkdir -p ~/.local/state/headroom/egress-relay)
+HEADROOM_EGRESS_RELAY_BASE_PORT=18620 setsid egress-relay daemon \
+  >>~/.local/state/headroom/egress-relay/relay.log 2>&1 </dev/null &
+egress-relay status     # answers from the new relay once it is up
+restart-headroom.sh     # drains, then restarts the proxy onto the new pool
+HEADROOM_EGRESS_RELAY_STATE_DIR=~/.local/state/headroom/nord-socks-pool \
+  egress-relay stop     # addresses the old relay only
+```
 
 Do not put proxy URLs or credentials in the repository, command-line
 arguments, or logs. Keep the pool in a local secret store or permission-
