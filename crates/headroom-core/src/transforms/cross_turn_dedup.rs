@@ -447,9 +447,10 @@ pub fn is_prefix_monotonic_with(blocks: &[DedupBlock], min_lines: usize, min_cha
 /// Mutates `messages` in place only when at least one span folds; returns
 /// the stats either way.
 pub fn dedup_messages(messages: &mut [Value], frozen_message_count: usize) -> DedupStats {
-    // (message index, Some(block index) for content-list blocks or None
-    // for string-content tool messages), parallel to `dblocks`.
-    let mut locs: Vec<(usize, Option<usize>)> = Vec::new();
+    // (message index, Some(block index) for content-list blocks or None for
+    // string-content tool messages, Some(sub-block index) when the block's own
+    // content is a list holding one text part), parallel to `dblocks`.
+    let mut locs: Vec<(usize, Option<usize>, Option<usize>)> = Vec::new();
     let mut dblocks: Vec<DedupBlock> = Vec::new();
 
     for (i, msg) in messages.iter().enumerate() {
@@ -463,14 +464,32 @@ pub fn dedup_messages(messages: &mut [Value], frozen_message_count: usize) -> De
                     if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
                         continue;
                     }
-                    let Some(text) = obj.get("content").and_then(Value::as_str) else {
-                        continue;
+                    let protected = frozen || obj.contains_key("cache_control");
+                    let (text, sub) = match obj.get("content") {
+                        Some(Value::String(t)) => (t.as_str(), None),
+                        // List content (MCP and most Anthropic tool results):
+                        // fold the single text part, and leave a block with
+                        // several text parts or none as sent.
+                        Some(Value::Array(parts)) => {
+                            let mut texts = parts.iter().enumerate().filter_map(|(si, p)| {
+                                let p = p.as_object()?;
+                                (p.get("type").and_then(Value::as_str) == Some("text"))
+                                    .then(|| p.get("text").and_then(Value::as_str))
+                                    .flatten()
+                                    .filter(|t| !t.is_empty())
+                                    .map(|t| (si, t))
+                            });
+                            match (texts.next(), texts.next()) {
+                                (Some((si, t)), None) => (t, Some(si)),
+                                _ => continue,
+                            }
+                        }
+                        _ => continue,
                     };
                     if text.is_empty() {
                         continue;
                     }
-                    let protected = frozen || obj.contains_key("cache_control");
-                    locs.push((i, Some(bidx)));
+                    locs.push((i, Some(bidx), sub));
                     dblocks.push(DedupBlock {
                         text: text.to_string(),
                         turn: i,
@@ -479,7 +498,10 @@ pub fn dedup_messages(messages: &mut [Value], frozen_message_count: usize) -> De
                 }
             }
             Some(Value::String(content)) => {
-                if msg.get("role").and_then(Value::as_str) != Some("tool") {
+                if !matches!(
+                    msg.get("role").and_then(Value::as_str),
+                    Some("tool" | "function")
+                ) {
                     continue;
                 }
                 if content.is_empty() {
@@ -489,7 +511,7 @@ pub fn dedup_messages(messages: &mut [Value], frozen_message_count: usize) -> De
                     || msg
                         .as_object()
                         .is_some_and(|o| o.contains_key("cache_control"));
-                locs.push((i, None));
+                locs.push((i, None, None));
                 dblocks.push(DedupBlock {
                     text: content.clone(),
                     turn: i,
@@ -512,13 +534,13 @@ pub fn dedup_messages(messages: &mut [Value], frozen_message_count: usize) -> De
         return stats;
     }
 
-    for (((mi, blk_idx), od), nd) in locs.iter().zip(&dblocks).zip(&deduped) {
+    for (((mi, blk_idx, sub_idx), od), nd) in locs.iter().zip(&dblocks).zip(&deduped) {
         if od.protected || nd.text == od.text {
             continue;
         }
         let new_text = Value::String(nd.text.clone());
-        match blk_idx {
-            Some(bidx) => {
+        match (blk_idx, sub_idx) {
+            (Some(bidx), None) => {
                 if let Some(slot) = messages[*mi]
                     .get_mut("content")
                     .and_then(Value::as_array_mut)
@@ -528,7 +550,20 @@ pub fn dedup_messages(messages: &mut [Value], frozen_message_count: usize) -> De
                     slot.insert("content".to_string(), new_text);
                 }
             }
-            None => {
+            (Some(bidx), Some(sidx)) => {
+                if let Some(slot) = messages[*mi]
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|c| c.get_mut(*bidx))
+                    .and_then(|b| b.get_mut("content"))
+                    .and_then(Value::as_array_mut)
+                    .and_then(|c| c.get_mut(*sidx))
+                    .and_then(Value::as_object_mut)
+                {
+                    slot.insert("text".to_string(), new_text);
+                }
+            }
+            (None, _) => {
                 if let Some(obj) = messages[*mi].as_object_mut() {
                     obj.insert("content".to_string(), new_text);
                 }
@@ -942,6 +977,76 @@ mod tests {
                 .unwrap()
                 .contains("same as msg ")
         );
+    }
+
+    /// `role: "function"` is the legacy spelling of a tool result and folds like
+    /// `role: "tool"`.
+    #[test]
+    fn dedup_messages_function_role_string_content() {
+        let span = code("", 12);
+        let mut messages = vec![
+            serde_json::json!({"role": "function", "name": "read", "content": format!("a\n{span}")}),
+            serde_json::json!({"role": "function", "name": "read", "content": format!("b\n{span}")}),
+        ];
+        let stats = dedup_messages(&mut messages, 0);
+        assert_eq!(stats.spans_folded, 1);
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("same as msg 0")
+        );
+    }
+
+    fn list_tool_result_msg(parts: &[&str], id: &str) -> Value {
+        let content: Vec<Value> = parts
+            .iter()
+            .map(|t| serde_json::json!({"type": "text", "text": t}))
+            .collect();
+        serde_json::json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": id, "content": content}
+        ]})
+    }
+
+    /// A tool result whose content is a list (MCP tools, most Anthropic results)
+    /// with one text part folds that part in place; the block keeps its shape.
+    #[test]
+    fn dedup_messages_folds_list_content_tool_result() {
+        let span = code("", 12);
+        let mut messages = vec![
+            list_tool_result_msg(&[&format!("a\n{span}")], "t1"),
+            list_tool_result_msg(&[&format!("b\n{span}")], "t2"),
+        ];
+        let stats = dedup_messages(&mut messages, 0);
+        assert_eq!(stats.spans_folded, 1);
+        let first = messages[0]["content"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let second = &messages[1]["content"][0]["content"];
+        assert!(!first.contains("same as msg "));
+        assert_eq!(second.as_array().unwrap().len(), 1, "still one text part");
+        assert_eq!(second[0]["type"], "text");
+        assert!(
+            second[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("same as msg 0")
+        );
+    }
+
+    /// Several text parts are left as sent: which one a pointer would replace is
+    /// ambiguous, and the block is not worth a wrong guess.
+    #[test]
+    fn dedup_messages_leaves_multi_part_list_content_alone() {
+        let span = code("", 12);
+        let before = vec![
+            list_tool_result_msg(&[&format!("a\n{span}")], "t1"),
+            list_tool_result_msg(&[&format!("b\n{span}"), "second part"], "t2"),
+        ];
+        let mut messages = before.clone();
+        let stats = dedup_messages(&mut messages, 0);
+        assert_eq!(stats.spans_folded, 0);
+        assert_eq!(messages, before);
     }
 
     /// Appending a turn must not change a single byte of what came before, or
