@@ -1605,6 +1605,37 @@ pub struct CliArgs {
     )]
     pub retry_zen_max_inflight: usize,
 
+    /// Max time (ms) a Zen turn keeps trying once every egress lane has
+    /// failed to connect. Default `60000`. `0` returns the 503 at once.
+    ///
+    /// A connect failure sends nothing, so the turn moves to another lane at
+    /// once. Only when the lanes it tried all fail does it pause here, with
+    /// capped backoff, instead of returning the 503 that ends a Claude Code
+    /// agent. The 2026-09-25..29 logs show a single lane down for minutes
+    /// while the others kept answering.
+    #[arg(
+        long = "retry-zen-transport-hold-ms",
+        env = "HEADROOM_RETRY_ZEN_TRANSPORT_HOLD_MS",
+        default_value_t = 60_000
+    )]
+    pub retry_zen_transport_hold_ms: u32,
+
+    /// Max time (ms) a Zen turn keeps trying while Zen answers 5xx.
+    /// Default `180000`. `0` returns the error once the fast attempts are spent.
+    ///
+    /// Zen answers `503 service_overloaded` ("the backend is temporarily
+    /// overloaded") and now and then a bare 500 while the model behind it is
+    /// short of capacity. That is not a lane fault, so no lane move helps: the
+    /// turn pauses in capped backoff and re-sends. 2026-09-30 00:03-00:06 +04:
+    /// 19 Spark turns died in one three-minute episode with only the fast
+    /// attempts to their name.
+    #[arg(
+        long = "retry-zen-overload-hold-ms",
+        env = "HEADROOM_RETRY_ZEN_OVERLOAD_HOLD_MS",
+        default_value_t = 180_000
+    )]
+    pub retry_zen_overload_hold_ms: u32,
+
     /// Attempts for a 200 response whose SSE body opens with an error event.
     /// Default `6`.
     ///
@@ -2622,6 +2653,8 @@ pub struct Config {
     pub retry_zen_hold_enabled: bool,
     pub retry_zen_hold_budget_ms: u32,
     pub retry_zen_max_inflight: usize,
+    pub retry_zen_transport_hold_ms: u32,
+    pub retry_zen_overload_hold_ms: u32,
     pub retry_overload_max_attempts: u32,
     /// Bytes held back before a streamed response counts as committed.
     pub retry_stream_hold_bytes: usize,
@@ -2931,6 +2964,8 @@ impl Config {
             retry_zen_hold_enabled: args.retry_zen_hold_enabled,
             retry_zen_hold_budget_ms: args.retry_zen_hold_budget_ms,
             retry_zen_max_inflight: args.retry_zen_max_inflight,
+            retry_zen_transport_hold_ms: args.retry_zen_transport_hold_ms,
+            retry_zen_overload_hold_ms: args.retry_zen_overload_hold_ms,
             retry_overload_max_attempts: args.retry_overload_max_attempts,
             retry_stream_hold_bytes: args.retry_stream_hold_bytes,
             retry_base_delay_ms: args.retry_base_delay_ms,
@@ -3156,6 +3191,8 @@ impl Config {
             retry_zen_hold_enabled: true,
             retry_zen_hold_budget_ms: 0,
             retry_zen_max_inflight: 10,
+            retry_zen_transport_hold_ms: 60_000,
+            retry_zen_overload_hold_ms: 180_000,
             retry_overload_max_attempts: 6,
             retry_stream_hold_bytes: 2048,
             retry_base_delay_ms: 1000,

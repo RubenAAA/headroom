@@ -11,6 +11,8 @@ mod common;
 
 #[path = "suites/routing/routed_early_stream_retry.rs"]
 mod routed_early_stream_retry;
+#[path = "suites/routing/routed_forward_continuity.rs"]
+mod routed_forward_continuity;
 
 #[path = "suites/routing/integration_sidecar.rs"]
 mod integration_sidecar;

@@ -802,6 +802,22 @@ Options:
           [env: HEADROOM_RETRY_ZEN_MAX_INFLIGHT=]
           [default: 10]
 
+      --retry-zen-transport-hold-ms <RETRY_ZEN_TRANSPORT_HOLD_MS>
+          Max time (ms) a Zen turn keeps trying once every egress lane has failed to connect. Default `60000`. `0` returns the 503 at once.
+          
+          A connect failure sends nothing, so the turn moves to another lane at once. Only when the lanes it tried all fail does it pause here, with capped backoff, instead of returning the 503 that ends a Claude Code agent. The 2026-09-25..29 logs show a single lane down for minutes while the others kept answering.
+          
+          [env: HEADROOM_RETRY_ZEN_TRANSPORT_HOLD_MS=]
+          [default: 60000]
+
+      --retry-zen-overload-hold-ms <RETRY_ZEN_OVERLOAD_HOLD_MS>
+          Max time (ms) a Zen turn keeps trying while Zen answers 5xx. Default `180000`. `0` returns the error once the fast attempts are spent.
+          
+          Zen answers `503 service_overloaded` ("the backend is temporarily overloaded") and now and then a bare 500 while the model behind it is short of capacity. That is not a lane fault, so no lane move helps: the turn pauses in capped backoff and re-sends. 2026-09-30 00:03-00:06 +04: 19 Spark turns died in one three-minute episode with only the fast attempts to their name.
+          
+          [env: HEADROOM_RETRY_ZEN_OVERLOAD_HOLD_MS=]
+          [default: 180000]
+
       --retry-overload-max-attempts <RETRY_OVERLOAD_MAX_ATTEMPTS>
           Attempts for a 200 response whose SSE body opens with an error event. Default `6`.
           

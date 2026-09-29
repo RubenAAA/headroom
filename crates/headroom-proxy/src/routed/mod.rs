@@ -2,6 +2,7 @@
 
 pub(crate) mod auth;
 pub(crate) mod ccr;
+pub(crate) mod continuity;
 pub(crate) mod early_stream_retry;
 pub(crate) mod outcome;
 pub(crate) mod prepare;

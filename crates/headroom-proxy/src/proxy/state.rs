@@ -208,8 +208,17 @@ impl AppState {
     ) -> Result<ZenEgressSelection<'_>, String> {
         match self.zen_egresses.as_ref() {
             Some(pool) => {
-                let slot = pool.slot_for_lane(lane_key.unwrap_or_default());
-                let guard = pool.acquire(slot)?;
+                let sticky = pool.slot_for_lane(lane_key.unwrap_or_default());
+                // The lane's own egress unless it is rotating or just failed
+                // a connect; then any other lane, since a turn that has sent
+                // nothing loses nothing by moving. The assignment stays.
+                let (slot, guard) = match pool.acquire(sticky) {
+                    Ok(guard) if !pool.is_unhealthy(sticky) => (sticky, guard),
+                    own => match pool.failover(sticky, &[sticky]) {
+                        Some(other) => other,
+                        None => (sticky, own?),
+                    },
+                };
                 Ok((
                     &pool.clients[slot],
                     slot,
@@ -218,6 +227,31 @@ impl AppState {
                 ))
             }
             None => Ok((&self.client, 0, self.default_egress_id.as_str(), None)),
+        }
+    }
+
+    /// Move a Zen turn whose lane failed to another one. `tried` lists the
+    /// slots it has used; `None` when no other lane is open (no pool, or every
+    /// one is tried or rotating).
+    pub(crate) fn zen_failover(
+        &self,
+        after: usize,
+        tried: &[usize],
+    ) -> Option<ZenEgressSelection<'_>> {
+        let pool = self.zen_egresses.as_ref()?;
+        let (slot, guard) = pool.failover(after, tried)?;
+        Some((
+            &pool.clients[slot],
+            slot,
+            pool.egress_ids[slot].as_str(),
+            Some(guard),
+        ))
+    }
+
+    /// Pass a Zen lane over for new turns after a connect through it failed.
+    pub(crate) fn mark_zen_lane_unhealthy(&self, slot: usize) {
+        if let Some(pool) = self.zen_egresses.as_ref() {
+            pool.mark_unhealthy(slot);
         }
     }
 

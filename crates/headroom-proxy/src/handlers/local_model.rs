@@ -327,6 +327,12 @@ pub async fn handle_messages(
         &state.redact_store,
     );
 
+    crate::routed::continuity::note(
+        &egress_lane_key,
+        &openai_body,
+        openai_body_vec.len(),
+        &request_id,
+    );
     let openai_body_bytes = Bytes::from(openai_body_vec);
 
     // J0 outbound leg on the routed translate path: pairs with the inbound

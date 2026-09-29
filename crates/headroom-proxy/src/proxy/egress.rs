@@ -37,7 +37,16 @@ pub(crate) struct ProviderEgressPool {
     /// `/debug/inflight` as `egress_in_flight` so a rotation drains only the
     /// lane it rotates instead of waiting for the whole proxy to go idle.
     pub(super) in_flight: Vec<std::sync::atomic::AtomicUsize>,
+    /// Per slot, the moment (ms since `born`) until which new turns skip it
+    /// because a connect through it just failed. `0` means healthy.
+    pub(super) unhealthy_until_ms: Vec<std::sync::atomic::AtomicU64>,
+    pub(super) born: std::time::Instant,
 }
+
+/// How long a lane whose connect failed is passed over for new turns. Long
+/// enough that a burst does not keep re-trying a dead relay, short enough
+/// that a lane the watcher just fixed is back within a rotation.
+pub(super) const LANE_UNHEALTHY_MS: u64 = 30_000;
 
 pub(super) struct ProviderEgressAssignments {
     pub(super) lanes: lru::LruCache<String, usize>,
@@ -58,6 +67,10 @@ impl ProviderEgressPool {
             in_flight: (0..egress_ids.len())
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
+            unhealthy_until_ms: (0..egress_ids.len())
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            born: std::time::Instant::now(),
             egress_ids,
         }
     }
@@ -114,6 +127,50 @@ impl ProviderEgressPool {
             pool: Arc::clone(self),
             slot,
         })
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.born.elapsed().as_millis() as u64
+    }
+
+    /// Pass `slot` over for new turns for [`LANE_UNHEALTHY_MS`].
+    pub(crate) fn mark_unhealthy(&self, slot: usize) {
+        self.unhealthy_until_ms[slot].store(
+            self.now_ms() + LANE_UNHEALTHY_MS,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub(super) fn is_unhealthy(&self, slot: usize) -> bool {
+        self.unhealthy_until_ms[slot].load(std::sync::atomic::Ordering::Relaxed) > self.now_ms()
+    }
+
+    /// The next lane after `after`, in ring order, that this turn has not
+    /// tried and that is not rotating. Lanes not marked unhealthy come first;
+    /// an unhealthy one is still better than none. The in-flight guard comes
+    /// with it, taken under the same check as [`Self::acquire`].
+    pub(crate) fn failover(
+        self: &Arc<Self>,
+        after: usize,
+        tried: &[usize],
+    ) -> Option<(usize, EgressInflightGuard)> {
+        let n = self.clients.len();
+        let ring = || {
+            (1..n)
+                .map(|offset| (after + offset) % n)
+                .filter(|s| !tried.contains(s))
+        };
+        for want_healthy in [true, false] {
+            for slot in ring() {
+                if self.is_unhealthy(slot) == want_healthy {
+                    continue;
+                }
+                if let Ok(guard) = self.acquire(slot) {
+                    return Some((slot, guard));
+                }
+            }
+        }
+        None
     }
 
     pub(super) fn in_flight_by_egress(&self) -> serde_json::Map<String, serde_json::Value> {

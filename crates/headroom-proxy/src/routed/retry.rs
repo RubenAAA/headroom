@@ -150,13 +150,14 @@ pub(crate) async fn send_with_retry(
     // byte of the answer (it rides in the response body) — except while the
     // turn is parked in the 429 hold, which is waiting on that egress's
     // rotation and must not block its drain.
-    let (upstream_client, egress_slot, egress_id, mut egress_guard) =
-        select_upstream_client(state, lane_key, request_id, is_zen)?;
+    let selected = select_upstream_client(state, lane_key, request_id, is_zen)?;
     let upstream_host = crate::routed::upstream_gate::upstream_host(upstream_url)
         .unwrap_or_else(|| "unknown-upstream".to_string());
-    let egress_gate_key = format!("{upstream_host}#{egress_id}");
+    let mut lane = Lane::new(selected, &upstream_host);
+    let mut transport_hold: Option<HoldClock> = None;
+    let mut overload_hold: Option<HoldClock> = None;
     if is_zen {
-        log_zen_egress_selected(egress_id, egress_slot, lane_key, request_id);
+        log_zen_egress_selected(lane.id, lane.slot, lane_key, request_id);
     }
     let mut refreshed = false;
     let mut attempt: u32 = 0;
@@ -169,7 +170,7 @@ pub(crate) async fn send_with_retry(
     let mut zen_slot = if is_zen {
         Some(
             crate::routed::upstream_gate::acquire_global_zen_slot(
-                &egress_gate_key,
+                &lane.gate_key,
                 state.config.retry_zen_max_inflight,
                 max_delay_ms,
                 request_id,
@@ -179,20 +180,21 @@ pub(crate) async fn send_with_retry(
     } else {
         None
     };
-    wait_behind_parked_host(upstream_url, &egress_gate_key, max_delay_ms, request_id).await;
+    wait_behind_parked_host(upstream_url, &lane.gate_key, max_delay_ms, request_id).await;
     let mut slow_probe = None;
     let upstream_resp = loop {
         attempt += 1;
         let attempt_started = std::time::Instant::now();
         let probe = url::Url::parse(upstream_url).ok().and_then(|url| {
             crate::upstream_route_probe::SlowUpstreamProbe::arm(
-                upstream_client.clone(),
+                lane.client.clone(),
                 &url,
                 request_id,
                 state.config.http_proxy.is_some(),
             )
         });
-        let result = upstream_client
+        let result = lane
+            .client
             .post(upstream_url)
             .headers(headers.clone())
             .body(body.clone())
@@ -211,13 +213,28 @@ pub(crate) async fn send_with_retry(
                     attempt,
                 );
                 if is_zen && status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    log_zen_rate_limited(egress_id, egress_slot, status, request_id);
+                    log_zen_rate_limited(lane.id, lane.slot, status, request_id);
+                    // The limit is per egress, so another lane answers now
+                    // where this one would hold for the watcher's rotation.
+                    // The limited lane stays parked for the turns behind it.
+                    let limited_key = lane.gate_key.clone();
+                    if lane.move_on(state, &upstream_host, "rate_limited", request_id) {
+                        crate::routed::upstream_gate::gate_hold(
+                            &limited_key,
+                            crate::proxy::backoff_ms(state, attempt - 1),
+                        );
+                        drop(r);
+                        drop(probe);
+                        // The move is not an attempt against the budget.
+                        attempt -= 1;
+                        continue;
+                    }
                 }
                 if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed && is_chatgpt_auth {
                     drop(probe);
                     let Some(r) = try_codex_token_refresh(
                         state,
-                        upstream_client,
+                        lane.client,
                         &mut headers,
                         &mut refreshed,
                         r,
@@ -236,7 +253,7 @@ pub(crate) async fn send_with_retry(
                         max_attempts,
                         max_delay_ms,
                         upstream_url,
-                        &egress_gate_key,
+                        &lane.gate_key,
                         request_id,
                         session_key,
                         is_zen,
@@ -268,7 +285,7 @@ pub(crate) async fn send_with_retry(
                     drop(probe);
                     return try_replay_stripped_resend(
                         state,
-                        upstream_client,
+                        lane.client,
                         upstream_url,
                         &headers,
                         &body,
@@ -278,7 +295,7 @@ pub(crate) async fn send_with_retry(
                     )
                     .await
                     .map(|mut send| {
-                        send.resp = crate::proxy::attach_egress_guard(send.resp, egress_guard);
+                        send.resp = crate::proxy::attach_egress_guard(send.resp, lane.guard);
                         send
                     });
                 }
@@ -286,9 +303,9 @@ pub(crate) async fn send_with_retry(
                     drop(r);
                     match try_zen_hold(
                         state,
-                        upstream_client,
-                        egress_slot,
-                        &mut egress_guard,
+                        lane.client,
+                        lane.slot,
+                        &mut lane.guard,
                         upstream_url,
                         &mut headers,
                         &body,
@@ -305,6 +322,23 @@ pub(crate) async fn send_with_retry(
                         Err(resp) => return Err(resp),
                     }
                 }
+                if is_zen
+                    && is_provider_overload(status)
+                    && hold_for_overload(
+                        state,
+                        &mut lane,
+                        &mut zen_slot,
+                        &mut overload_hold,
+                        status,
+                        &mut attempt,
+                        request_id,
+                    )
+                    .await
+                {
+                    drop(r);
+                    drop(probe);
+                    continue;
+                }
                 slow_probe = probe;
                 break r;
             }
@@ -316,8 +350,24 @@ pub(crate) async fn send_with_retry(
                     &upstream_host,
                     attempt_started,
                     attempt,
+                    (lane.slot, lane.id),
                 );
                 drop(probe);
+                if is_zen
+                    && recover_zen_send(
+                        state,
+                        &mut lane,
+                        &mut transport_hold,
+                        &e,
+                        &mut attempt,
+                        max_attempts,
+                        &upstream_host,
+                        request_id,
+                    )
+                    .await
+                {
+                    continue;
+                }
                 // Same filter the Claude path uses: a decode or builder error
                 // is not transient and gets no retry, only the transport-level
                 // ones do.
@@ -338,12 +388,225 @@ pub(crate) async fn send_with_retry(
         }
     };
     Ok(UpstreamSend {
-        resp: crate::proxy::attach_egress_guard(upstream_resp, egress_guard),
+        resp: crate::proxy::attach_egress_guard(upstream_resp, lane.guard),
         headers,
         attempts: attempt,
         slow_probe,
         retried_without_replay: None,
     })
+}
+
+/// The Zen lane a send is on, and what the turn has tried since its last
+/// pause. `guard` counts the turn against the lane until the last byte of the
+/// answer (it rides in the response body) — except while the turn is parked,
+/// which is waiting on that lane's rotation and must not block its drain.
+struct Lane<'a> {
+    client: &'a reqwest::Client,
+    slot: usize,
+    id: &'a str,
+    guard: Option<crate::proxy::EgressInflightGuard>,
+    gate_key: String,
+    tried: Vec<usize>,
+    failovers: u32,
+}
+
+impl<'a> Lane<'a> {
+    fn new((client, slot, id, guard): crate::proxy::ZenEgressSelection<'a>, host: &str) -> Self {
+        Self {
+            client,
+            slot,
+            id,
+            guard,
+            gate_key: format!("{host}#{id}"),
+            tried: vec![slot],
+            failovers: 0,
+        }
+    }
+
+    /// Move to another lane when the turn may still move and one is open.
+    fn move_on(&mut self, state: &'a AppState, host: &str, reason: &str, request_id: &str) -> bool {
+        if self.failovers >= MAX_LANE_FAILOVERS {
+            return false;
+        }
+        let Some(next) = switch_lane(state, self.slot, &mut self.tried, reason, request_id) else {
+            return false;
+        };
+        self.failovers += 1;
+        (self.client, self.slot, self.id, self.guard) = next;
+        self.gate_key = format!("{host}#{}", self.id);
+        true
+    }
+}
+
+/// After a failed send on a Zen lane: `true` when the turn moved to another
+/// lane, or paused and started a fresh round, and should send again.
+#[allow(clippy::too_many_arguments)]
+async fn recover_zen_send<'a>(
+    state: &'a AppState,
+    lane: &mut Lane<'a>,
+    hold: &mut Option<HoldClock>,
+    e: &reqwest::Error,
+    attempt: &mut u32,
+    max_attempts: u32,
+    host: &str,
+    request_id: &str,
+) -> bool {
+    if e.is_connect() {
+        state.mark_zen_lane_unhealthy(lane.slot);
+    }
+    // A connect that failed sent nothing, so the turn can go to another lane
+    // with no wait. The backoff in `handle_transport_error` only applies once
+    // the lanes are out.
+    if crate::proxy::is_retryable_transport_error(e)
+        && lane.move_on(state, host, transport_error_kind(e), request_id)
+    {
+        *attempt -= 1;
+        return true;
+    }
+    // Every lane it tried failed to connect: pause and start over rather than
+    // return the 503 that ends an agent.
+    if !(e.is_connect() && *attempt >= max_attempts) {
+        return false;
+    }
+    let hold = hold.get_or_insert_with(HoldClock::start);
+    let Some(pause) = hold.next_pause(
+        state.config.retry_zen_transport_hold_ms,
+        TRANSPORT_HOLD_PAUSE_CAP_MS,
+        state,
+    ) else {
+        return false;
+    };
+    tracing::warn!(
+        event = "zen_transport_hold",
+        pause_ms = pause.as_millis() as u64,
+        held_ms = hold.started.elapsed().as_millis() as u64,
+        round = hold.rounds,
+        request_id = %request_id,
+        "every tried Zen lane failed to connect; pausing before another round"
+    );
+    lane.guard.take();
+    tokio::time::sleep(pause).await;
+    lane.tried = vec![lane.slot];
+    lane.failovers = 0;
+    *attempt = 0;
+    if !lane.move_on(state, host, "hold_round", request_id) {
+        lane.guard = state.acquire_zen_egress(lane.slot).ok().flatten();
+    }
+    true
+}
+
+/// Lane moves a turn may make before it backs off. Ten lanes, and a bad one
+/// or two at a time, so three moves reach a working one.
+const MAX_LANE_FAILOVERS: u32 = 3;
+
+/// Longest single pause while every lane the turn tried is failing.
+const TRANSPORT_HOLD_PAUSE_CAP_MS: u64 = 5_000;
+
+/// Longest single pause while Zen's backend answers 5xx. Longer than the lane
+/// pause: every held turn re-sends its whole body, and an overloaded backend
+/// is not helped by ten agents doing that every five seconds.
+const OVERLOAD_HOLD_PAUSE_CAP_MS: u64 = 15_000;
+
+/// The statuses Zen answers while its model backend is short of capacity.
+fn is_provider_overload(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 500 | 502 | 503 | 504)
+}
+
+/// A Zen turn waiting out a stretch in which it cannot be served.
+struct HoldClock {
+    started: std::time::Instant,
+    rounds: u32,
+}
+
+impl HoldClock {
+    fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            rounds: 0,
+        }
+    }
+
+    /// How long to pause before the next round, or `None` once `budget_ms` is
+    /// spent.
+    fn next_pause(
+        &mut self,
+        budget_ms: u32,
+        cap_ms: u64,
+        state: &AppState,
+    ) -> Option<std::time::Duration> {
+        let left = std::time::Duration::from_millis(budget_ms.into())
+            .checked_sub(self.started.elapsed())
+            .filter(|d| !d.is_zero())?;
+        let backoff = crate::proxy::backoff_ms(state, self.rounds).min(cap_ms);
+        self.rounds += 1;
+        Some(std::time::Duration::from_millis(backoff).min(left))
+    }
+}
+
+/// The fast attempts are spent and Zen still answers 5xx: pause and go round
+/// again rather than return the error that ends an agent. `true` means the
+/// caller re-sends. The lane's count and the global slot are given back for the
+/// pause, as in the 429 hold, so a parked turn blocks neither a rotation's
+/// drain nor the turns behind it.
+async fn hold_for_overload(
+    state: &AppState,
+    lane: &mut Lane<'_>,
+    zen_slot: &mut Option<crate::routed::upstream_gate::ZenSlot>,
+    hold: &mut Option<HoldClock>,
+    status: reqwest::StatusCode,
+    attempt: &mut u32,
+    request_id: &str,
+) -> bool {
+    let (max_attempts, _) = retry_bounds(state);
+    if *attempt < max_attempts {
+        return false;
+    }
+    let hold = hold.get_or_insert_with(HoldClock::start);
+    let Some(pause) = hold.next_pause(
+        state.config.retry_zen_overload_hold_ms,
+        OVERLOAD_HOLD_PAUSE_CAP_MS,
+        state,
+    ) else {
+        return false;
+    };
+    tracing::warn!(
+        event = "zen_overload_hold",
+        status = status.as_u16(),
+        pause_ms = pause.as_millis() as u64,
+        held_ms = hold.started.elapsed().as_millis() as u64,
+        round = hold.rounds,
+        egress_slot = lane.slot,
+        request_id = %request_id,
+        "Zen's backend is overloaded; pausing before another round"
+    );
+    lane.guard.take();
+    zen_slot.take();
+    tokio::time::sleep(pause).await;
+    lane.guard = state.acquire_zen_egress(lane.slot).ok().flatten();
+    *attempt = 0;
+    true
+}
+
+/// Take another lane for a Zen turn, and log the move.
+fn switch_lane<'a>(
+    state: &'a AppState,
+    from_slot: usize,
+    tried_slots: &mut Vec<usize>,
+    reason: &str,
+    request_id: &str,
+) -> Option<crate::proxy::ZenEgressSelection<'a>> {
+    let next = state.zen_failover(from_slot, tried_slots)?;
+    tried_slots.push(next.1);
+    tracing::warn!(
+        event = "zen_egress_failover",
+        reason,
+        from_slot,
+        to_slot = next.1,
+        to_egress_id = next.2,
+        request_id = %request_id,
+        "moving the turn to another Zen lane"
+    );
+    Some(next)
 }
 
 /// The client to send on. A Zen turn gets its lane's sticky egress; one whose
@@ -435,10 +698,13 @@ fn log_send_failed(
     upstream_host: &str,
     attempt_started: std::time::Instant,
     attempt: u32,
+    (egress_slot, egress_id): (usize, &str),
 ) {
     tracing::warn!(
         target: "headroom.proxy",
         event = "routed_upstream_send_failed",
+        egress_slot,
+        egress_id,
         request_id = %request_id,
         upstream_host = %upstream_host,
         upstream_wait_ms = attempt_started.elapsed().as_secs_f64() * 1000.0,
@@ -872,6 +1138,8 @@ async fn handle_transport_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Transport exhaustion on the routed path must answer 503 + Retry-After
     /// (not a bare 502): rotation RSTs, wifi flaps, and corpse-pool misses
@@ -1447,5 +1715,251 @@ mod tests {
         assert_eq!(send.resp.status(), 413);
         assert_eq!(hits.load(Ordering::SeqCst), 1, "no pointless re-send");
         assert_eq!(send.retried_without_replay, None);
+    }
+
+    /// A client whose relay refuses connections at once: a port that was
+    /// free a moment ago. (Port 1 is not an option; the sandbox drops those
+    /// packets and the connect hangs for 30s.)
+    fn dead_lane() -> reqwest::Client {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).unwrap())
+            .build()
+            .unwrap()
+    }
+
+    /// A lane whose relay refuses connections (slot 0, where a turn with no
+    /// lane key lands) next to `healthy` working ones.
+    fn lanes_with_dead_first(healthy: usize) -> Arc<crate::proxy::ProviderEgressPool> {
+        let mut clients = vec![dead_lane()];
+        let mut ids = vec!["proxy-dead".to_string()];
+        for i in 0..healthy {
+            clients.push(reqwest::Client::new());
+            ids.push(format!("proxy-ok{i}"));
+        }
+        Arc::new(crate::proxy::ProviderEgressPool::new(clients, ids))
+    }
+
+    async fn zen_state(
+        pool: &Arc<crate::proxy::ProviderEgressPool>,
+        mock: &wiremock::MockServer,
+        transport_hold_ms: u32,
+    ) -> AppState {
+        let mut config = crate::config::Config::for_test(mock.uri().parse().unwrap());
+        config.retry_enabled = true;
+        config.retry_max_attempts = 3;
+        config.retry_base_delay_ms = 20;
+        config.retry_max_delay_ms = 20;
+        config.retry_zen_hold_enabled = true;
+        config.retry_zen_hold_budget_ms = 30_000;
+        config.retry_zen_transport_hold_ms = transport_hold_ms;
+        let mut state = AppState::new(config).expect("app state");
+        state.zen_egresses = Some(pool.clone());
+        state
+    }
+
+    async fn zen_send(state: &AppState, url: &str, id: &str) -> Result<UpstreamSend, Response> {
+        send_with_retry(
+            state,
+            url,
+            HeaderMap::new(),
+            Bytes::from("{}"),
+            id,
+            None,
+            None,
+            false,
+            true,
+        )
+        .await
+    }
+
+    async fn ok_mock() -> (wiremock::MockServer, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mock = wiremock::MockServer::start().await;
+        let seen = hits.clone();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                wiremock::ResponseTemplate::new(200).set_body_string("ok")
+            })
+            .mount(&mock)
+            .await;
+        (mock, hits)
+    }
+
+    /// The failure this exists for: the lane a turn is pinned to cannot
+    /// connect. The turn must land on another lane at once, not spend its
+    /// retries (and a backoff each) on the dead one.
+    #[tokio::test]
+    async fn a_dead_lane_moves_the_turn_to_a_working_one_without_a_backoff() {
+        let pool = lanes_with_dead_first(2);
+        let (mock, hits) = ok_mock().await;
+        let mut state = zen_state(&pool, &mock, 0).await;
+        state.config = Arc::new({
+            let mut c = (*state.config).clone();
+            c.retry_base_delay_ms = 5_000;
+            c.retry_max_delay_ms = 5_000;
+            c
+        });
+        let started = std::time::Instant::now();
+        let send = zen_send(&state, &mock.uri(), "t-dead-lane")
+            .await
+            .expect("served");
+        assert_eq!(send.resp.status(), 200);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "one request reached upstream"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}: a 5s backoff ran before the move",
+            started.elapsed()
+        );
+        assert_eq!(state.zen_egress_in_flight()["proxy-ok0"].as_u64(), Some(1));
+        assert_eq!(state.zen_egress_in_flight()["proxy-dead"].as_u64(), Some(0));
+        assert_eq!(send.attempts, 1, "the move is not an attempt");
+    }
+
+    /// The next turn of the same session does not walk into the dead lane
+    /// again while its failure is fresh.
+    #[tokio::test]
+    async fn a_lane_that_just_failed_is_skipped_by_the_next_turn() {
+        let pool = lanes_with_dead_first(1);
+        let (mock, _hits) = ok_mock().await;
+        let state = zen_state(&pool, &mock, 0).await;
+        let first = zen_send(&state, &mock.uri(), "t-skip-1")
+            .await
+            .expect("served");
+        drop(first);
+        let (_, slot, id, _guard) = state.zen_client_for_lane(None).expect("a lane");
+        assert_eq!((slot, id), (1, "proxy-ok0"));
+    }
+
+    /// A lane that is rotating used to refuse its turns with a 503. Another
+    /// lane takes them.
+    #[tokio::test]
+    async fn a_rotating_lane_hands_its_turn_to_another() {
+        let pool = lanes_with_dead_first(1);
+        let (mock, hits) = ok_mock().await;
+        let state = zen_state(&pool, &mock, 0).await;
+        assert!(pool.set_maintenance("proxy-dead", true));
+        let send = zen_send(&state, &mock.uri(), "t-rotating")
+            .await
+            .expect("served");
+        assert_eq!(send.resp.status(), 200);
+        assert_eq!(send.attempts, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A 429 is per lane: the turn goes to another lane instead of holding
+    /// for the watcher's rotation of the limited one.
+    #[tokio::test]
+    async fn a_429_moves_the_turn_to_another_lane_instead_of_holding() {
+        let pool = Arc::new(crate::proxy::ProviderEgressPool::new(
+            vec![reqwest::Client::new(), reqwest::Client::new()],
+            vec!["proxy-a".to_string(), "proxy-b".to_string()],
+        ));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mock = wiremock::MockServer::start().await;
+        let seen = hits.clone();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    wiremock::ResponseTemplate::new(429)
+                } else {
+                    wiremock::ResponseTemplate::new(200).set_body_string("ok")
+                }
+            })
+            .mount(&mock)
+            .await;
+        let state = zen_state(&pool, &mock, 0).await;
+        let started = std::time::Instant::now();
+        let send = zen_send(&state, &mock.uri(), "t-429-move")
+            .await
+            .expect("served");
+        assert_eq!(send.resp.status(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(state.zen_egress_in_flight()["proxy-b"].as_u64(), Some(1));
+        assert_eq!(state.zen_egress_in_flight()["proxy-a"].as_u64(), Some(0));
+    }
+
+    /// Every lane dead: the turn pauses for the configured hold, then gets
+    /// the same 503 as before. With the hold at 0 the 503 is immediate.
+    #[tokio::test]
+    async fn every_lane_dead_pauses_for_the_hold_then_returns_the_503() {
+        let pool = Arc::new(crate::proxy::ProviderEgressPool::new(
+            vec![dead_lane(), dead_lane()],
+            vec!["proxy-a".to_string(), "proxy-b".to_string()],
+        ));
+        let (mock, _) = ok_mock().await;
+        for (hold_ms, min_ms, max_ms) in [(0u32, 0u128, 1_500u128), (600, 600, 3_000)] {
+            let state = zen_state(&pool, &mock, hold_ms).await;
+            let started = std::time::Instant::now();
+            let err = zen_send(&state, &mock.uri(), "t-all-dead")
+                .await
+                .err()
+                .expect("no lane can connect");
+            assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let took = started.elapsed().as_millis();
+            assert!(
+                (min_ms..=max_ms).contains(&took),
+                "hold {hold_ms}ms: took {took}ms"
+            );
+        }
+    }
+
+    /// Zen's backend answers `503 service_overloaded` for a stretch. The fast
+    /// attempts run out inside a couple of seconds; the hold is what keeps the
+    /// turn alive until the backend answers, and a zero budget restores the old
+    /// give-up.
+    #[tokio::test]
+    async fn a_zen_overload_is_ridden_out_by_the_hold_and_not_returned() {
+        let pool = Arc::new(crate::proxy::ProviderEgressPool::new(
+            vec![reqwest::Client::new()],
+            vec!["proxy-a".to_string()],
+        ));
+        // Overloaded for the first six sends: the three fast attempts, then
+        // one more round of them. The seventh succeeds.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mock = wiremock::MockServer::start().await;
+        let seen = hits.clone();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                if seen.fetch_add(1, Ordering::SeqCst) < 6 {
+                    wiremock::ResponseTemplate::new(503).set_body_string(
+                        r#"{"error":{"code":"service_overloaded","message":"The backend is temporarily overloaded."}}"#,
+                    )
+                } else {
+                    wiremock::ResponseTemplate::new(200).set_body_string("ok")
+                }
+            })
+            .mount(&mock)
+            .await;
+        for (hold_ms, expect_ok) in [(0u32, false), (5_000, true)] {
+            hits.store(0, Ordering::SeqCst);
+            let mut state = zen_state(&pool, &mock, 0).await;
+            let mut config = (*state.config).clone();
+            config.retry_zen_overload_hold_ms = hold_ms;
+            state.config = Arc::new(config);
+            let sent = zen_send(&state, &mock.uri(), "t-overload").await;
+            match (expect_ok, sent) {
+                (true, Ok(send)) => {
+                    assert_eq!(send.resp.status(), StatusCode::OK);
+                    assert!(hits.load(Ordering::SeqCst) >= 7, "rode out six 503s");
+                }
+                (false, Ok(send)) => {
+                    assert_eq!(send.resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(hits.load(Ordering::SeqCst), 3, "only the fast attempts");
+                }
+                (false, Err(resp)) => assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE),
+                (true, Err(resp)) => panic!("hold {hold_ms}ms returned {}", resp.status()),
+            }
+        }
     }
 }

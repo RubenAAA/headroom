@@ -70,18 +70,65 @@ const TRUNCATION_MARKER: &str = "\n\n[truncated: the connection to the API dropp
 /// Naming the call is what makes it recoverable. The model reads this on its
 /// next turn and re-issues the call itself, which is the only repair available
 /// here — the tokens are gone and the block cannot be rebuilt from a fragment.
-fn tool_truncation_marker(tool_name: Option<&str>) -> String {
-    match tool_name {
-        Some(name) => format!(
+///
+/// `target` is what the call was aimed at, when the fragment that reached us
+/// already held it (see `call_target`). It saves the model, and whoever reads
+/// the transcript, from re-deriving which of a worker's edits was lost.
+fn tool_truncation_marker(tool_name: Option<&str>, target: Option<&str>) -> String {
+    match (tool_name, target) {
+        (Some(name), Some(target)) => format!(
+            "\n\n[truncated: the connection to the API dropped mid-response. \
+             A pending `{name}` tool call ({target}) was discarded and did NOT run. \
+             Re-issue it if it is still wanted.]"
+        ),
+        (Some(name), None) => format!(
             "\n\n[truncated: the connection to the API dropped mid-response. \
              A pending `{name}` tool call was discarded and did NOT run. \
              Re-issue it if it is still wanted.]"
         ),
-        None => "\n\n[truncated: the connection to the API dropped mid-response. \
+        (None, _) => "\n\n[truncated: the connection to the API dropped mid-response. \
              A pending tool call was discarded and did NOT run. \
              Re-issue it if it is still wanted.]"
             .to_string(),
     }
+}
+
+/// How much of a call's arguments is kept to name its target.
+const TARGET_SCAN_BYTES: usize = 1024;
+/// Longest target shown in the marker.
+const TARGET_SHOWN_CHARS: usize = 120;
+
+/// What a cut-off tool call was aimed at, read from the start of its arguments:
+/// the first of `file_path`, `path`, `notebook_path`, `command`, `pattern`,
+/// `url` whose string value had fully arrived. A value cut off mid-string is
+/// left out, since half a path names the wrong file.
+fn call_target(partial_json: &str) -> Option<String> {
+    [
+        "file_path",
+        "path",
+        "notebook_path",
+        "command",
+        "pattern",
+        "url",
+    ]
+    .iter()
+    .find_map(|key| {
+        let rest = partial_json.split_once(&format!("\"{key}\":\""))?.1;
+        let mut value = String::new();
+        let mut chars = rest.chars();
+        loop {
+            match chars.next()? {
+                '"' => break,
+                '\\' => value.push(chars.next()?),
+                c => value.push(c),
+            }
+        }
+        (!value.is_empty()).then(|| {
+            let shown: String = value.chars().take(TARGET_SHOWN_CHARS).collect();
+            let cut = if shown.len() < value.len() { "..." } else { "" };
+            format!("{key}: {shown}{cut}")
+        })
+    })
 }
 
 /// The kind of content block currently open on the wire.
@@ -104,6 +151,8 @@ struct Wire {
     open: Option<(u64, Kind)>,
     /// Name of the open `tool_use` block, for the marker when it is discarded.
     open_tool_name: Option<String>,
+    /// The start of the open `tool_use` block's arguments, to name its target.
+    open_tool_args: String,
     /// Highest block index the client has seen, for placing a new tail block.
     max_index: u64,
     /// Whether any block index has been seen at all.
@@ -160,6 +209,7 @@ impl Wire {
                             .map(str::to_owned)
                     })
                     .flatten();
+                self.open_tool_args.clear();
                 self.open = Some((index, kind));
                 self.max_index = self.max_index.max(index);
                 self.any_block = true;
@@ -169,6 +219,15 @@ impl Wire {
                 // The block completed, so its name is no longer the name of
                 // anything that was lost.
                 self.open_tool_name = None;
+                self.open_tool_args.clear();
+            }
+            "content_block_delta" => {
+                if self.open_tool_name.is_some()
+                    && self.open_tool_args.len() < TARGET_SCAN_BYTES
+                    && let Some(part) = v.pointer("/delta/partial_json").and_then(|p| p.as_str())
+                {
+                    self.open_tool_args.push_str(part);
+                }
             }
             "message_delta" => {
                 if let Some(n) = v.pointer("/usage/output_tokens").and_then(|n| n.as_u64()) {
@@ -196,7 +255,10 @@ impl Wire {
         // it: that is the difference between a turn the model can repair and
         // one that reads as finished.
         let marker: String = match self.open {
-            Some((_, Kind::ToolUse)) => tool_truncation_marker(self.open_tool_name.as_deref()),
+            Some((_, Kind::ToolUse)) => tool_truncation_marker(
+                self.open_tool_name.as_deref(),
+                call_target(&self.open_tool_args).as_deref(),
+            ),
             _ => TRUNCATION_MARKER.to_string(),
         };
         // Where the marker goes. An open text block can take it directly;
@@ -462,7 +524,10 @@ where
                     // one, and a stop for an index the client never opened is
                     // the one thing it cannot parse.
                     let index = wire.max_index + 1;
-                    let marker = tool_truncation_marker(wire.open_tool_name.as_deref());
+                    let marker = tool_truncation_marker(
+                        wire.open_tool_name.as_deref(),
+                        call_target(&wire.open_tool_args).as_deref(),
+                    );
                     for frame in [
                         start_event(index),
                         delta_event(index, marker.trim_start()),
@@ -817,6 +882,32 @@ mod tests {
             !out.contains("{\\\"b"),
             "round-2 partial input leaked:\n{out}"
         );
+    }
+
+    /// A worker's `Edit` dropped mid-arguments: the marker says which file, so
+    /// resuming does not start with forensics. A path cut off mid-string is not
+    /// named, since half a path points at the wrong file.
+    #[test]
+    fn a_dropped_edit_names_its_file_only_when_the_path_arrived_whole() {
+        let edit = |args: &str| {
+            drive(&[
+                START,
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Edit\"}}\n\n",
+                &format!(
+                    "event: content_block_delta\ndata: {}\n\n",
+                    serde_json::json!({"type":"content_block_delta","index":0,
+                        "delta":{"type":"input_json_delta","partial_json":args}})
+                ),
+            ])
+        };
+        let whole = edit(r#"{"file_path":"/repo/src/lib.rs","old_string":"fn a("#);
+        assert!(
+            whole.contains("`Edit` tool call (file_path: /repo/src/lib.rs) was discarded"),
+            "{whole}"
+        );
+        let cut = edit(r#"{"file_path":"/repo/src/li"#);
+        assert!(cut.contains("`Edit` tool call was discarded"), "{cut}");
+        assert!(!cut.contains("/repo/src/li"), "named half a path:\n{cut}");
     }
 
     /// The 2026-08-26 07:59:16 incident: a stream died with an `Agent` block
