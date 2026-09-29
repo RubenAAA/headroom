@@ -11,6 +11,10 @@ if [[ -n "${ZEN_ROTATOR_TEST_CAPTURE:-}" ]]; then
   fi
   [[ "${HEADROOM_PROXY_URL:-}" == "http://127.0.0.1:8787" ]] || exit 4
   printf '%s %s\n' "${1:-}" "${2:-}" >>"$ZEN_ROTATOR_TEST_CAPTURE"
+  if [[ -n "${ZEN_ROTATOR_TEST_FAIL:-}" ]]; then
+    echo '{"ok":false,"error":"no verified distinct Nord exit available"}'
+    exit 1
+  fi
   exit 0
 fi
 
@@ -101,6 +105,29 @@ rotate_all_zen_egresses proactive
 for id in proxy-aaaaaaaaaaaa proxy-bbbbbbbbbbbb proxy-cccccccccccc; do
   [[ "$(grep -cF "$id proactive" "$ZEN_ROTATOR_TEST_CAPTURE")" -eq 1 ]]
 done
+
+# A rotator that answers no is logged with what it said, and is not retried
+# at once: the whole-cycle retry drained every healthy lane for nothing.
+ZEN_ROTATOR_TEST_FAIL=1
+export ZEN_ROTATOR_TEST_FAIL
+rc=0
+rotate_zen_egress proxy-aaaaaaaaaaaa proactive || rc=$?
+[[ "$rc" -eq 3 ]]
+grep -qF 'rotation FAILED (proactive)' "$WATCHLOG"
+grep -qF 'no verified distinct Nord exit available' "$WATCHLOG"
+rotate_all_zen_egresses proactive || {
+  echo "refused rotations asked for an immediate whole-cycle retry" >&2
+  exit 1
+}
+# A drain that ran out of time still does.
+# shellcheck disable=SC2317
+drain() { return 1; }
+if rotate_all_zen_egresses proactive; then
+  echo "deferred rotation did not ask for a retry" >&2
+  exit 1
+fi
+drain() { return 0; }
+unset ZEN_ROTATOR_TEST_FAIL
 
 # An invalid ID fails closed without invoking the rotator.
 if rotate_zen_egress 'not-an-egress' rate-limit; then

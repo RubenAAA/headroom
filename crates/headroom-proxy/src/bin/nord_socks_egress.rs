@@ -5,6 +5,9 @@
 //! compatible with the previous helper so the watcher can rotate either
 //! implementation during a drained migration.
 
+#[path = "nord_socks_egress/servers.rs"]
+mod servers;
+
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -27,24 +30,8 @@ use sha2::{Digest, Sha256};
 use tokio::signal::unix::SignalKind;
 use url::Url;
 
-const SOCKS_SERVERS: &[&str] = &[
-    "socks-us34.nordvpn.com",
-    "socks-us35.nordvpn.com",
-    "socks-us36.nordvpn.com",
-    "socks-us37.nordvpn.com",
-    "socks-us45.nordvpn.com",
-    "socks-us46.nordvpn.com",
-    "socks-us47.nordvpn.com",
-    "socks-us48.nordvpn.com",
-    "socks-us49.nordvpn.com",
-    "socks-us50.nordvpn.com",
-    "socks-us28.nordvpn.com",
-    "socks-us29.nordvpn.com",
-    "socks-us30.nordvpn.com",
-    "socks-us31.nordvpn.com",
-    "socks-us32.nordvpn.com",
-    "socks-us33.nordvpn.com",
-];
+use servers::ServerBook;
+
 const MIN_LANES: usize = 8;
 const MAX_LANES: usize = 10;
 const DEFAULT_BASE_PORT: u16 = 18_600;
@@ -59,7 +46,21 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const ROTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 const ROTATION_CONTROL_TIMEOUT: Duration = Duration::from_secs(300);
-const ROTATE_REASONS: &[&str] = &["rate-limit", "proactive", "manual"];
+const ROTATE_REASONS: &[&str] = &["rate-limit", "proactive", "manual", "heal"];
+/// How often the maintenance loop wakes to look at the lanes.
+const MAINTAIN_TICK: Duration = Duration::from_secs(60);
+/// Fetch Nord's listing, re-measure round trips and re-probe idle servers this often.
+const SWEEP_EVERY: Duration = Duration::from_secs(3600);
+/// Probe every lane's own server this often, traffic or not.
+const LANE_CHECK_EVERY: Duration = Duration::from_secs(300);
+/// Consecutive failed connects on a lane that make its server suspect.
+const SUSPECT_FAILURES: u32 = 3;
+/// A lane whose server keeps failing probes for this long is re-rotated.
+const HEAL_AFTER: Duration = Duration::from_secs(180);
+/// Wait this long before trying to heal the same lane again.
+const HEAL_COOLDOWN: Duration = Duration::from_secs(300);
+/// Idle servers fully probed per sweep. Round trips are measured for all of them.
+const SWEEP_PROBES: usize = 12;
 
 #[derive(Parser)]
 #[command(name = "nord-socks-egress", version, about)]
@@ -96,19 +97,22 @@ struct Credentials {
 
 #[derive(Clone)]
 struct LaneSnapshot {
-    upstream_index: usize,
+    upstream_host: String,
     upstream_address: String,
     exit_ip: String,
     generation: u64,
 }
 
 struct LaneState {
-    upstream_index: usize,
+    upstream_host: String,
     upstream_address: String,
     exit_ip: String,
     generation: u64,
     connects: u64,
     rotating: bool,
+    /// Connects that failed before reaching the tunnel, since the last one that did.
+    failures: u32,
+    last_ok: Option<Instant>,
 }
 
 struct Lane {
@@ -122,6 +126,7 @@ struct Lane {
 
 struct Manager {
     base_port: u16,
+    servers: Mutex<ServerBook>,
     lanes: Mutex<Vec<Arc<Lane>>>,
     rotation_lock: Mutex<()>,
     running: Arc<AtomicBool>,
@@ -282,13 +287,9 @@ fn resolve_server(host: &str) -> Result<String, String> {
         .ok_or_else(|| "Nord SOCKS server has no IPv4 address".to_string())
 }
 
-fn probe_exit(
-    upstream_index: usize,
-    address: &str,
-    credentials: &Credentials,
-) -> Result<String, String> {
+fn probe_exit(host: &str, address: &str, credentials: &Credentials) -> Result<String, String> {
     probe_exit_via_local_lane(
-        upstream_index,
+        host,
         address,
         UPSTREAM_PORT,
         credentials,
@@ -297,7 +298,7 @@ fn probe_exit(
 }
 
 fn probe_exit_via_local_lane(
-    upstream_index: usize,
+    host: &str,
     address: &str,
     upstream_port: u16,
     credentials: &Credentials,
@@ -316,7 +317,7 @@ fn probe_exit_via_local_lane(
     let lane = Arc::new(Lane::new(
         0,
         upstream_port,
-        upstream_index,
+        host.to_string(),
         address.to_string(),
         String::new(),
         credentials.clone(),
@@ -580,7 +581,7 @@ impl Lane {
     fn new(
         slot: usize,
         upstream_port: u16,
-        upstream_index: usize,
+        upstream_host: String,
         upstream_address: String,
         exit_ip: String,
         credentials: Credentials,
@@ -590,12 +591,14 @@ impl Lane {
             upstream_port,
             credentials,
             state: Mutex::new(LaneState {
-                upstream_index,
+                upstream_host,
                 upstream_address,
                 exit_ip,
                 generation: 0,
                 connects: 0,
                 rotating: false,
+                failures: 0,
+                last_ok: None,
             }),
             active: Mutex::new(HashMap::new()),
             next_connection: AtomicU64::new(1),
@@ -613,7 +616,7 @@ impl Lane {
         Ok(Some((
             id,
             LaneSnapshot {
-                upstream_index: state.upstream_index,
+                upstream_host: state.upstream_host.clone(),
                 upstream_address: state.upstream_address.clone(),
                 exit_ip: state.exit_ip.clone(),
                 generation: state.generation,
@@ -653,14 +656,21 @@ impl Lane {
             Err(_) => return,
         };
         let (connection_id, snapshot) = started;
+        let connects_before = lock_unpoisoned(&self.state).connects;
         let result = self.handle_connected(connection_id, &snapshot, &mut client);
         if let Err(error) = result {
+            if error.kind() != io::ErrorKind::Interrupted {
+                let mut state = lock_unpoisoned(&self.state);
+                if state.connects == connects_before {
+                    state.failures = state.failures.saturating_add(1);
+                }
+            }
             // Never print I/O or reqwest errors: they may contain connection
             // details. Lane and error kind are enough to diagnose this relay.
             eprintln!(
                 "relay lane={} host={} failed ({:?})",
                 self.slot,
-                SOCKS_SERVERS[snapshot.upstream_index],
+                snapshot.upstream_host,
                 error.kind()
             );
             send_socks_failure(&mut client, 1);
@@ -791,6 +801,8 @@ impl Lane {
                 ));
             }
             state.connects = state.connects.saturating_add(1);
+            state.failures = 0;
+            state.last_ok = Some(Instant::now());
         }
         client.set_read_timeout(Some(READ_POLL_INTERVAL))?;
         client.set_write_timeout(Some(IDLE_TIMEOUT))?;
@@ -855,8 +867,13 @@ fn copy_stream(
 
 impl Manager {
     fn new(base_port: u16) -> Self {
+        let book = fs::read_to_string(servers_cache_path())
+            .ok()
+            .and_then(|text| ServerBook::from_cache(&text))
+            .unwrap_or_else(ServerBook::seeded);
         Self {
             base_port,
+            servers: Mutex::new(book),
             lanes: Mutex::new(Vec::new()),
             rotation_lock: Mutex::new(()),
             running: Arc::new(AtomicBool::new(true)),
@@ -876,7 +893,8 @@ impl Manager {
                 json!({
                     "slot": lane.slot,
                     "egress_id": egress_id(&pool_url(self.base_port, lane.slot)),
-                    "host": SOCKS_SERVERS[state.upstream_index],
+                    "host": state.upstream_host,
+                    "failures": state.failures,
                     "exit_fingerprint": fingerprint(&state.exit_ip),
                     "socks_connects": state.connects,
                     "rotating": state.rotating,
@@ -917,27 +935,24 @@ impl Manager {
         let old = {
             let state = lock_unpoisoned(&lane.state);
             LaneSnapshot {
-                upstream_index: state.upstream_index,
+                upstream_host: state.upstream_host.clone(),
                 upstream_address: state.upstream_address.clone(),
                 exit_ip: state.exit_ip.clone(),
                 generation: state.generation,
             }
         };
-        let mut active_indices = HashSet::new();
+        let mut active_hosts = HashSet::new();
         let mut active_ips = HashSet::new();
         for other in lanes.iter().filter(|other| other.slot != lane.slot) {
             let state = lock_unpoisoned(&other.state);
-            active_indices.insert(state.upstream_index);
+            active_hosts.insert(state.upstream_host.clone());
             active_ips.insert(state.exit_ip.clone());
         }
 
         let credentials = lane.credentials.clone();
-        for offset in 1..=SOCKS_SERVERS.len() {
-            let next_index = (old.upstream_index + offset) % SOCKS_SERVERS.len();
-            if active_indices.contains(&next_index) {
-                continue;
-            }
-            let host = SOCKS_SERVERS[next_index];
+        let candidates =
+            lock_unpoisoned(&self.servers).candidates(&old.upstream_host, &active_hosts);
+        for host in candidates.iter().map(String::as_str) {
             let address = match resolve_server(host) {
                 Ok(address) => address,
                 Err(reason) => {
@@ -948,7 +963,9 @@ impl Manager {
                     continue;
                 }
             };
-            let candidate_ip = match probe_exit(next_index, &address, &credentials) {
+            let probed = probe_exit(host, &address, &credentials);
+            lock_unpoisoned(&self.servers).mark(host, probed.is_ok());
+            let candidate_ip = match probed {
                 Ok(ip) => ip,
                 Err(reason) => {
                     eprintln!(
@@ -987,13 +1004,13 @@ impl Manager {
 
             {
                 let mut state = lock_unpoisoned(&lane.state);
-                if state.generation != old.generation || state.upstream_index != old.upstream_index
-                {
+                if state.generation != old.generation || state.upstream_host != old.upstream_host {
                     state.rotating = false;
                     let _ = set_proxy_egress_maintenance(proxy_url, requested_id, false);
                     return json!({"ok": false, "error": "lane changed during rotation"});
                 }
-                state.upstream_index = next_index;
+                state.upstream_host = host.to_string();
+                state.failures = 0;
                 state.upstream_address = address;
                 state.exit_ip = candidate_ip.clone();
                 state.generation = state.generation.wrapping_add(1);
@@ -1009,7 +1026,7 @@ impl Manager {
             return json!({
                 "ok": true,
                 "slot": lane.slot,
-                "old_host": SOCKS_SERVERS[old.upstream_index],
+                "old_host": old.upstream_host,
                 "new_host": host,
                 "exit_fingerprint": fingerprint(&candidate_ip),
                 "reason": reason,
@@ -1030,7 +1047,17 @@ impl Manager {
         let credentials = load_credentials()?;
         let mut verified = Vec::new();
         let mut seen_ips = HashSet::new();
-        for (index, host) in SOCKS_SERVERS.iter().enumerate() {
+        // Lowest round trip first, so the lanes start on the nearest servers
+        // that accept the account.
+        let listed = lock_unpoisoned(&self.servers).candidates("", &HashSet::new());
+        {
+            let mut book = lock_unpoisoned(&self.servers);
+            for (host, rtt) in measure_rtts(&listed) {
+                book.note_rtt(&host, rtt);
+            }
+        }
+        let hosts = lock_unpoisoned(&self.servers).candidates("", &HashSet::new());
+        for (index, host) in hosts.iter().enumerate() {
             if index >= MAX_LANES && verified.len() >= MIN_LANES {
                 break;
             }
@@ -1043,7 +1070,9 @@ impl Manager {
                     continue;
                 }
             };
-            let exit_ip = match probe_exit(index, &address, &credentials) {
+            let probed = probe_exit(host, &address, &credentials);
+            lock_unpoisoned(&self.servers).mark(host, probed.is_ok());
+            let exit_ip = match probed {
                 Ok(ip) => ip,
                 Err(reason) => {
                     eprintln!(
@@ -1056,7 +1085,7 @@ impl Manager {
                 eprintln!("startup candidate duplicate host={host}");
                 continue;
             }
-            verified.push((index, address, exit_ip));
+            verified.push((host.clone(), address, exit_ip));
             if verified.len() >= MAX_LANES {
                 break;
             }
@@ -1066,11 +1095,11 @@ impl Manager {
             .into_iter()
             .take(lane_count)
             .enumerate()
-            .map(|(slot, (upstream_index, address, exit_ip))| {
+            .map(|(slot, (upstream_host, address, exit_ip))| {
                 Arc::new(Lane::new(
                     slot,
                     UPSTREAM_PORT,
-                    upstream_index,
+                    upstream_host,
                     address,
                     exit_ip,
                     credentials.clone(),
@@ -1121,6 +1150,11 @@ impl Manager {
                 .map_err(|_| "could not start local SOCKS listener thread")?;
         }
         install_signal_handlers(self.running.clone());
+        let maintainer = self.clone();
+        thread::Builder::new()
+            .name("nord-socks-maintain".to_string())
+            .spawn(move || maintainer.maintain())
+            .map_err(|_| "could not start server maintenance thread")?;
         eprintln!("verified distinct Nord SOCKS exits; active_lanes={lane_count}/{MAX_LANES}");
         if lane_count < MAX_LANES {
             eprintln!(
@@ -1148,6 +1182,216 @@ impl Manager {
         drop(control);
         let _ = fs::remove_file(socket_path);
         Ok(())
+    }
+}
+
+fn servers_cache_path() -> PathBuf {
+    state_dir().join("servers.json")
+}
+
+/// Best of three TCP connects to each server's SOCKS port, in parallel. A
+/// server that does not answer is left out. This is the distance from here to
+/// the server; it says nothing about whether the account is accepted there.
+fn measure_rtts(hosts: &[String]) -> Vec<(String, Duration)> {
+    let workers: Vec<_> = hosts
+        .iter()
+        .cloned()
+        .map(|host| {
+            thread::spawn(move || {
+                let ip: IpAddr = resolve_server(&host).ok()?.parse().ok()?;
+                let target = SocketAddr::new(ip, UPSTREAM_PORT);
+                let best = (0..3)
+                    .filter_map(|_| {
+                        let started = Instant::now();
+                        TcpStream::connect_timeout(&target, Duration::from_secs(3))
+                            .ok()
+                            .map(|_| started.elapsed())
+                    })
+                    .min()?;
+                Some((host, best))
+            })
+        })
+        .collect();
+    workers
+        .into_iter()
+        .filter_map(|worker| worker.join().ok().flatten())
+        .collect()
+}
+
+fn fetch_server_listing() -> Result<Vec<(String, u64)>, String> {
+    let body: Value = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| "could not create listing client")?
+        .get(servers::LISTING_URL)
+        .send()
+        .and_then(Response::error_for_status)
+        .and_then(|response| response.json())
+        .map_err(|_| "Nord server listing request failed")?;
+    Ok(servers::parse_listing(&body))
+}
+
+fn save_servers_cache(book: &ServerBook) -> io::Result<()> {
+    let path = servers_cache_path();
+    let temp = path.with_extension("json.tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temp)?;
+    file.write_all(book.to_cache().as_bytes())?;
+    fs::rename(temp, path)
+}
+
+impl Manager {
+    fn lane_hosts(&self) -> HashSet<String> {
+        self.lane_list()
+            .iter()
+            .map(|lane| lock_unpoisoned(&lane.state).upstream_host.clone())
+            .collect()
+    }
+
+    /// Runs for the life of the daemon: an hourly sweep of the server list, and
+    /// a per-minute look at whether each lane's server still accepts us.
+    fn maintain(self: Arc<Self>) {
+        let mut next_sweep = Instant::now();
+        let mut next_check = Instant::now() + LANE_CHECK_EVERY;
+        let mut failing_since: HashMap<usize, Instant> = HashMap::new();
+        let mut healed_at: HashMap<usize, Instant> = HashMap::new();
+        while self.running.load(Ordering::SeqCst) {
+            if Instant::now() >= next_sweep {
+                self.sweep();
+                next_sweep = Instant::now() + SWEEP_EVERY;
+            }
+            let full_check = Instant::now() >= next_check;
+            if full_check {
+                next_check = Instant::now() + LANE_CHECK_EVERY;
+            }
+            for lane in self.lane_list() {
+                self.check_lane(&lane, full_check, &mut failing_since, &mut healed_at);
+            }
+            let wake = Instant::now() + MAINTAIN_TICK;
+            while self.running.load(Ordering::SeqCst) && Instant::now() < wake {
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+
+    /// Refresh the list from Nord, re-measure every server's round trip, and
+    /// fully probe the idle servers checked longest ago.
+    fn sweep(&self) {
+        let held = self.lane_hosts();
+        match fetch_server_listing() {
+            Ok(listing) => {
+                let mut book = lock_unpoisoned(&self.servers);
+                let changed = book.apply_listing(&listing, &held);
+                eprintln!(
+                    "sweep: nord listed {} socks servers, book has {} (changed={changed})",
+                    listing.len(),
+                    book.len()
+                );
+                if changed && save_servers_cache(&book).is_err() {
+                    eprintln!("sweep: could not save the server list cache");
+                }
+            }
+            Err(reason) => eprintln!("sweep: {reason}; keeping the current list"),
+        }
+        let hosts = lock_unpoisoned(&self.servers).candidates("", &HashSet::new());
+        let measured = measure_rtts(&hosts);
+        {
+            let mut book = lock_unpoisoned(&self.servers);
+            for (host, rtt) in &measured {
+                book.note_rtt(host, *rtt);
+            }
+        }
+        let targets = lock_unpoisoned(&self.servers).sweep_targets(&held, SWEEP_PROBES);
+        let credentials = self
+            .lane_list()
+            .first()
+            .map(|lane| lane.credentials.clone());
+        let (mut accepted, mut rejected) = (0, 0);
+        for host in &targets {
+            let Some(credentials) = &credentials else {
+                break;
+            };
+            let probed =
+                resolve_server(host).and_then(|address| probe_exit(host, &address, credentials));
+            lock_unpoisoned(&self.servers).mark(host, probed.is_ok());
+            if probed.is_ok() {
+                accepted += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+        eprintln!(
+            "sweep: measured {} of {} round trips, probed {} idle servers: {accepted} accepted, {rejected} rejected",
+            measured.len(),
+            hosts.len(),
+            targets.len()
+        );
+    }
+
+    /// Decide whether a lane's server has stopped accepting us, and re-rotate
+    /// the lane once it has kept failing for `HEAL_AFTER`. A lane is only
+    /// probed when its real connects are failing, on the periodic full check,
+    /// or while it is already failing; a failed probe is what counts, not the
+    /// connect failures, which a client hanging up also causes.
+    fn check_lane(
+        &self,
+        lane: &Arc<Lane>,
+        full_check: bool,
+        failing_since: &mut HashMap<usize, Instant>,
+        healed_at: &mut HashMap<usize, Instant>,
+    ) {
+        let (host, address, suspect, rotating) = {
+            let state = lock_unpoisoned(&lane.state);
+            let quiet = state.last_ok.is_none_or(|at| at.elapsed() > MAINTAIN_TICK);
+            (
+                state.upstream_host.clone(),
+                state.upstream_address.clone(),
+                state.failures >= SUSPECT_FAILURES && quiet,
+                state.rotating,
+            )
+        };
+        if rotating || !(suspect || full_check || failing_since.contains_key(&lane.slot)) {
+            return;
+        }
+        match probe_exit(&host, &address, &lane.credentials) {
+            Ok(_) => {
+                lock_unpoisoned(&self.servers).mark(&host, true);
+                if failing_since.remove(&lane.slot).is_some() {
+                    eprintln!("heal: lane={} host={host} accepts again", lane.slot);
+                }
+                lock_unpoisoned(&lane.state).failures = 0;
+                return;
+            }
+            Err(reason) => {
+                lock_unpoisoned(&self.servers).mark(&host, false);
+                failing_since.entry(lane.slot).or_insert_with(|| {
+                    eprintln!("heal: lane={} host={host} rejects us ({reason})", lane.slot);
+                    Instant::now()
+                });
+            }
+        }
+        let long_enough = failing_since
+            .get(&lane.slot)
+            .is_some_and(|since| since.elapsed() >= HEAL_AFTER);
+        let cooled = healed_at
+            .get(&lane.slot)
+            .is_none_or(|at| at.elapsed() >= HEAL_COOLDOWN);
+        if !(long_enough && cooled) {
+            return;
+        }
+        healed_at.insert(lane.slot, Instant::now());
+        let proxy_url = std::env::var("HEADROOM_PROXY_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
+        let id = egress_id(&pool_url(self.base_port, lane.slot));
+        let result = self.rotate(&id, "heal", &proxy_url);
+        if result.get("ok").and_then(Value::as_bool) == Some(true) {
+            failing_since.remove(&lane.slot);
+        }
+        eprintln!("heal: lane={} rotated: {result}", lane.slot);
     }
 }
 
@@ -1567,7 +1811,7 @@ fn run() -> Result<i32, String> {
         }
         CommandKind::Rotate { egress_id, reason } => {
             if !rotate_reason_is_valid(&reason) {
-                return Err("reason must be rate-limit, proactive, or manual".to_string());
+                return Err("reason must be rate-limit, proactive, manual, or heal".to_string());
             }
             let response = control_request(
                 &json!({
@@ -1754,7 +1998,7 @@ mod tests {
         let lane = Arc::new(Lane::new(
             0,
             1080,
-            0,
+            "test".to_string(),
             "127.0.0.1".to_string(),
             "198.51.100.1".to_string(),
             Credentials {
@@ -1809,7 +2053,7 @@ mod tests {
         let lane = Arc::new(Lane::new(
             0,
             upstream_port,
-            0,
+            "test".to_string(),
             "127.0.0.1".to_string(),
             "198.51.100.1".to_string(),
             Credentials {
@@ -1888,7 +2132,7 @@ mod tests {
             password: b"pass".to_vec(),
         };
         let exit_ip = probe_exit_via_local_lane(
-            0,
+            "test",
             "127.0.0.1",
             upstream_port,
             &credentials,

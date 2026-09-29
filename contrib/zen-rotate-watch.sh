@@ -452,7 +452,7 @@ valid_zen_egress_id() {
 # egress. It receives exactly: <opaque-egress-id> <rate-limit|proactive|manual>.
 # No pool URL or provider credential is passed to it.
 rotate_zen_egress() {
-  local egress_id="$1" reason="$2" stamp now last n
+  local egress_id="$1" reason="$2" stamp now last n rotator_out
   if ! valid_zen_egress_id "$egress_id"; then
     log "refusing invalid egress id for per-egress rotation"
     return 2
@@ -490,21 +490,26 @@ rotate_zen_egress() {
       log "egress=$egress_id rotation deferred ($reason): active streams did not drain"
       exit 1
     fi
-    if timeout "$ZEN_EGRESS_ROTATE_TIMEOUT" env \
+    # The rotator prints one JSON result and generic per-candidate reasons,
+    # never credentials or proxy URLs, so its tail is safe to log. Without it
+    # 191 failed rotations over 5 days could not be told apart.
+    if rotator_out=$(timeout "$ZEN_EGRESS_ROTATE_TIMEOUT" env \
       -u HEADROOM_HTTP_PROXY -u HEADROOM_ZEN_HTTP_PROXY_POOL \
       HEADROOM_PROXY_URL="$PROXY_URL" "$ZEN_EGRESS_ROTATE_COMMAND" \
-      "$egress_id" "$reason" >/dev/null 2>&1; then
+      "$egress_id" "$reason" 2>&1); then
       date +%s >"$stamp"
       log "egress=$egress_id rotated ($reason)"
     else
-      log "egress=$egress_id rotation FAILED ($reason); external rotator returned non-zero or timed out"
-      exit 1
+      log "egress=$egress_id rotation FAILED ($reason); external rotator returned non-zero or timed out: $(printf '%s' "$rotator_out" | tail -c 400 | tr '\n' ' ')"
+      # 3, not 1: the rotator answered no. Retrying at once cannot change
+      # that, unlike a drain that ran out of time (1).
+      exit 3
     fi
   ) 9>"$stamp.flock"
 }
 
 rotate_all_zen_egresses() {
-  local reason="$1" ids egress_id result=0 count=0
+  local reason="$1" ids egress_id result=0 count=0 rc
   ids=$(zen_egress_ids) || {
     log "cannot enumerate configured Zen egresses at $PROXY_URL/debug/zen-egresses; scheduled rotation skipped"
     return 1
@@ -512,7 +517,15 @@ rotate_all_zen_egresses() {
   while IFS= read -r egress_id; do
     [[ -n "$egress_id" ]] || continue
     count=$((count + 1))
-    rotate_zen_egress "$egress_id" "$reason" || result=1
+    rotate_zen_egress "$egress_id" "$reason" || {
+      rc=$?
+      # Only a deferral (1) or an unusable request (2) is worth retrying
+      # soon. A rotator that answered no (3) is retried at the next
+      # scheduled tick: re-running the whole cycle every few minutes
+      # drained and gated every healthy lane each time (58 cycles on
+      # 2026-09-29) for a rotation that had nothing to move to.
+      (( rc == 3 )) || result=1
+    }
   done <<<"$ids"
   if (( count == 0 )); then
     log "no configured Zen egresses found; scheduled rotation skipped"

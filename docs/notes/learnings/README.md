@@ -25,3 +25,6 @@ number to its window; do not quote across windows.
 - [`nord-socks-one-way-idle-timeout.md`](nord-socks-one-way-idle-timeout.md):
   a per-direction read timeout can close an otherwise active SSE tunnel; use
   a shared bidirectional idle deadline instead.
+- [`nord-socks-acceptance-flaps.md`](nord-socks-acceptance-flaps.md): the
+  SOCKS servers that accept the account change every ~10 minutes and Nord
+  says nothing about why; keep the list live and re-rotate lanes by probe.
