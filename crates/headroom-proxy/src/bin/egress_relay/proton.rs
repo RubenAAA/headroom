@@ -22,7 +22,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{expand_home, home_dir, is_private, signal_process};
+use super::{expand_home, home_dir, is_private, process_runs, signal_process};
 
 /// How long a fresh `wireproxy` gets to open its SOCKS port.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -163,16 +163,7 @@ impl Tunnel {
         else {
             return;
         };
-        // Only a process that is still wireproxy: the pid may have been reused.
-        let is_wireproxy = Command::new("ps")
-            .args(["-o", "comm=", "-p", &pid.to_string()])
-            .output()
-            .is_ok_and(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .ends_with("wireproxy")
-            });
-        if is_wireproxy {
+        if process_runs(pid, &["wireproxy"]) {
             let _ = signal_process(pid, libc::SIGTERM);
             eprintln!("proton: stopped an orphaned wireproxy left by an earlier relay");
         }

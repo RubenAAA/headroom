@@ -19,7 +19,7 @@ nothing here is on the request path.
 | `headroom-zen-pool.env.example` | not installed | Shape of `~/.headroom-zen-pool.env`, the Zen egress pool both starters source. Generate the real file with `egress-relay env`; see [Egress relay pool](#egress-relay-pool). |
 | `zen-rotate-watch.sh` | `~/.local/bin/` | Watches Zen/Spark rate limits; rotates a device-wide VPN in legacy mode or configured egresses individually in pool mode. Not started by the installer. |
 | `egress-relay` | `~/.local/bin/` | Rust helper binary for the optional local SOCKS5 relay pool: eight verified Nord lanes (ten when all preferred exits pass) plus one Proton lane over `wireproxy` when Proton WireGuard configs are set up. Rotates a lane to an unused endpoint when a spare is available. Called `nord-socks-egress` before the Proton lane; `install.sh` leaves that name as a symlink. |
-| `wireproxy` | `~/.local/bin/` | Third-party, pinned and checksum-verified by `install.sh`: userspace WireGuard served as a loopback SOCKS5 port. The relay starts it for the Proton lane; nothing else uses it. |
+| `wireproxy` | `~/.local/bin/` | Third-party, pinned to 1.1.3 and checksum-verified by `install.sh`: userspace WireGuard served as a loopback SOCKS5 port. The relay starts it for the Proton lane; nothing else uses it. |
 | `headroom-rss-sample` | `~/.local/bin/` | Samples the proxy's RSS once a minute into `~/headroom-rss.log`, so a leak over a long session is visible. |
 | `reconcile_books.py` | not installed | Checks the proxy's token books against a number it did not compute (the Anthropic usage API, or a console export). Run by hand. |
 
@@ -179,6 +179,19 @@ log live in `~/.local/state/headroom/egress-relay` (or
 `HEADROOM_EGRESS_RELAY_STATE_DIR`). `HEADROOM_EGRESS_RELAY_TRACE=1` logs SOCKS
 handshake stages.
 
+Commands (`egress-relay --help` lists them too). `start`, `env`, `pool` and
+`test` start the relay first if it is down:
+
+- `env`: print the shell exports for `~/.headroom-zen-pool.env`.
+- `start`: print one ready line and nothing for the shell.
+- `pool`: print the loopback SOCKS URLs, one per line.
+- `status`: the lanes as JSON: provider, host, exit fingerprint, connects,
+  failures.
+- `test`: probe every lane; prints exit fingerprints, never addresses.
+- `rotate <egress-id> <rate-limit|proactive|manual|heal>`: drain one lane and
+  move it to a new endpoint. The watcher calls this.
+- `stop`: stop the relay and its `wireproxy`. Streams on it are cut.
+
 Once, from any shell, after existing proxy requests have drained:
 
 ```bash
@@ -277,6 +290,16 @@ the next config, so two sessions never overlap; if no other config yields a
 new exit, it puts the old one back. A `heal` may restart the same config, since
 what failed there is the tunnel, not the exit. `HEADROOM_WIREPROXY_BIN` points
 at a `wireproxy` other than `~/.local/bin/wireproxy` or the one on `PATH`.
+
+`install.sh` pins `wireproxy` 1.1.3 from
+[windtf/wireproxy](https://github.com/windtf/wireproxy), the version this lane
+was tested with, and checks each download against a SHA-256 taken from that
+release. `update-headroom.sh` reinstalls it only when the version differs. To
+move to a new release, change `_wp_ver` and the four checksums in
+`install.sh`, rerun it, and check the lane with
+`scripts/e2e-egress-relay-proton.sh`. The script runs its own relay on port
+18700 and refuses to run while a live relay holds the Proton lane, since the
+account allows one connection.
 
 Free-server exits are shared by many users, so expect this lane to meet Zen's
 rate limit sooner than a Nord lane. Most sites see it over IPv6 first.

@@ -1971,9 +1971,21 @@ fn signal_process(pid: i32, signal: libc::c_int) -> io::Result<()> {
     }
 }
 
-fn process_is_alive(pid: i32) -> bool {
-    // Signal 0 only tests that the process exists.
-    signal_process(pid, 0).map_or_else(|error| error.raw_os_error() == Some(libc::EPERM), |()| true)
+/// Whether `pid` is a live process running one of `names`. A pid written to a
+/// file before the machine went down may belong to anything after a reboot,
+/// so being alive is not enough. Linux keeps 15 bytes of the command name and
+/// macOS `ps` prints a path, hence the last path part and the prefix match.
+fn process_runs(pid: i32, names: &[&str]) -> bool {
+    Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|out| {
+            let comm = String::from_utf8_lossy(&out.stdout);
+            let comm = comm.trim().rsplit('/').next().unwrap_or_default();
+            names
+                .iter()
+                .any(|name| *name == comm || (comm.len() == 15 && name.starts_with(comm)))
+        })
 }
 
 impl DaemonLock {
@@ -1995,7 +2007,10 @@ impl DaemonLock {
                     let owner = fs::read_to_string(&path)
                         .ok()
                         .and_then(|text| text.trim().parse::<i32>().ok());
-                    if owner.is_some_and(process_is_alive) {
+                    // A daemon started through the old name runs as it.
+                    if owner.is_some_and(|pid| {
+                        process_runs(pid, &["egress-relay", "nord-socks-egress"])
+                    }) {
                         return Err(
                             "another egress relay startup is already in progress".to_string()
                         );
@@ -2519,6 +2534,21 @@ mod tests {
             password: b"pass".to_vec(),
         };
         assert_eq!(failures_after_refusal(Some(nord)), 0);
+    }
+
+    /// A pid left in the daemon lock or `wireproxy.pid` before a reboot can
+    /// belong to anything; only a process with the expected name counts.
+    #[test]
+    fn process_runs_matches_the_command_name_not_just_a_live_pid() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        assert!(process_runs(pid, &["sleep"]));
+        assert!(!process_runs(pid, &["egress-relay", "nord-socks-egress"]));
+        // A one-letter prefix of a name is not a truncated name.
+        assert!(!process_runs(pid, &["s"]));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!process_runs(pid, &["sleep"]));
     }
 
     #[test]
