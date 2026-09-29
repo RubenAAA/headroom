@@ -4,16 +4,26 @@
 # PreToolUse on Bash (the model composing the API call itself). Never blocks
 # benign work: exits 0 on every path except a diverted filing attempt (exit 2).
 # Installed by install.sh into $HOME/.claude/hooks (copied, or symlinked with --link).
-[ -n "$TICKET_FILE_WORKER" ] && exit 0
+if [ -n "${OFFLOADED_TICKET_WORKER:-}" ] || [ -n "${TICKET_FILE_WORKER:-}" ]; then
+  exit 0
+fi
 INPUT=$(cat)
 EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null)
 TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
 [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ] && exit 0
-OUTDIR="$HOME/.local/state/spark-review"
-TICKET_WORKER="${HEADROOM_REPO:-$HOME/headroom}/contrib/spark-poster/ticket_file.py"
+STATE_ROOT="$HOME/.local/state/offload-workers"
+LEGACY_STATE_ROOT="$HOME/.local/state/spark-review"
+if [ ! -e "$STATE_ROOT" ] && [ -d "$LEGACY_STATE_ROOT" ]; then
+  ln -s spark-review "$STATE_ROOT" 2>/dev/null || true
+fi
+OUTDIR="$STATE_ROOT"
+TICKET_WORKER="$HOME/headroom/contrib/offload-workers/ticket_file.py"
+[ -n "$HEADROOM_REPO" ] && TICKET_WORKER="$HEADROOM_REPO/contrib/offload-workers/ticket_file.py"
+umask 077
 mkdir -p "$OUTDIR" 2>/dev/null
+chmod 700 "$OUTDIR" 2>/dev/null || true
 
 # ── no arming: the phrases below are explicit enough to act on directly ──
 #
@@ -25,7 +35,9 @@ mkdir -p "$OUTDIR" 2>/dev/null
 # finished without filing; the reason is in .failed. diverted without done =
 # worker still running (or crashed; worker_alive says).
 ticket_state() {
-  if [ -f "$OUTDIR/$SESSION_ID.ticket.done" ]; then
+  if [ -f "$OUTDIR/$SESSION_ID.ticket.proof.json" ]; then
+    echo "done"
+  elif [ -f "$OUTDIR/$SESSION_ID.ticket.done" ]; then
     if [ -f "$OUTDIR/$SESSION_ID.ticket.failed" ]; then echo "failed"; else echo "done"; fi
   elif [ -f "$OUTDIR/$SESSION_ID.ticket.diverted" ]; then
     echo "running"
@@ -45,6 +57,10 @@ ticket_alive() {
   tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "ticket-gate"
 }
 
+backend_config_error() {
+  python3 "$TICKET_WORKER" --check-backend
+}
+
 spawn_ticket_worker() {
   # Atomic spawn guard (same race as review-gate's spawn_worker: prompt vs
   # Stop backstop, or two rapid prompts, both passing the alive-check before
@@ -56,6 +72,10 @@ spawn_ticket_worker() {
     return 0
   fi
   trap 'flock -u 9 2>/dev/null; exec 9>&- 2>/dev/null; trap - RETURN' RETURN
+  if [ -f "$OUTDIR/$SESSION_ID.ticket.proof.json" ]; then
+    touch "$OUTDIR/$SESSION_ID.ticket.done"
+    return 0
+  fi
   # Done means finished -- a finished filing always leaves a proof, so a
   # .done with no proof behind it is a crash, not a filing. Restart instead
   # of wedging every later prompt on "already filed".
@@ -78,7 +98,14 @@ spawn_ticket_worker() {
   # can only fail.
   set -a
   [ -f "$HOME/.config/spark-poster/env" ] && . "$HOME/.config/spark-poster/env"
+  [ -f "$HOME/.config/offload-workers/env" ] && . "$HOME/.config/offload-workers/env"
   set +a
+  if BACKEND_ERROR=$(backend_config_error 2>&1); then
+    :
+  else
+    printf '%s\n' "$BACKEND_ERROR" >"$OUTDIR/$SESSION_ID.ticket.failed"
+    return 1
+  fi
   # The bearer token lives in the mode-600 env file (or the ambient
   # environment) and reaches the worker through the hook environment. The
   # worker passes it to curl from that variable only -- never echoed, never
@@ -92,7 +119,7 @@ spawn_ticket_worker() {
   # produces a doomed worker while still blocking the manual call (exit 2).
   # Refuse here with the same message the worker would fail with.
   if [ -z "$YOUTRACK_URL" ]; then
-    echo "ticket filing is not configured: set YOUTRACK_URL in ~/.config/spark-poster/env (exported into the hook/worker environment alongside YOUTRACK_TOKEN)" >"$OUTDIR/$SESSION_ID.ticket.failed"
+    echo "ticket filing is not configured: set YOUTRACK_URL in ~/.config/offload-workers/env (legacy spark-poster/env also works)" >"$OUTDIR/$SESSION_ID.ticket.failed"
     return 1
   fi
   # Resolve the project for this session cwd against the operator's
@@ -101,7 +128,7 @@ spawn_ticket_worker() {
   # the `.ticket.project` this writes. A set YOUTRACK_PROJECT_ID
   # still wins (single-project setups keep working); the map covers the
   # multi-project case with no global default. No personal paths live here --
-  # the table is operator config in ~/.config/spark-poster/env.
+  # the table is operator config in ~/.config/offload-workers/env.
   route_project() {
     local cwd="$1" map="$2" best="" best_len=-1 pair prefix pid
     local old_ifs="$IFS"
@@ -130,7 +157,7 @@ spawn_ticket_worker() {
     YOUTRACK_PROJECT_ID="$(route_project "$CWD" "$YOUTRACK_PROJECT_MAP")"
   fi
   if [ -z "$YOUTRACK_PROJECT_ID" ]; then
-    echo "ticket filing is not configured: set YOUTRACK_PROJECT_ID (or YOUTRACK_PROJECT_MAP=\"prefix=id,...\" for cwd-based routing) in ~/.config/spark-poster/env (exported into the hook/worker environment alongside YOUTRACK_TOKEN)" >"$OUTDIR/$SESSION_ID.ticket.failed"
+    echo "ticket filing is not configured: set YOUTRACK_PROJECT_ID (or YOUTRACK_PROJECT_MAP=\"prefix=id,...\" for cwd-based routing) in ~/.config/offload-workers/env (legacy spark-poster/env also works)" >"$OUTDIR/$SESSION_ID.ticket.failed"
     return 1
   fi
   touch "$OUTDIR/$SESSION_ID.ticket.diverted"
@@ -147,21 +174,27 @@ spawn_ticket_worker() {
     SESSLOG="$OUTDIR/$SESSION_ID.ticket.worker.log"
     {
       echo "=== ticket worker start: session $SESSION_ID ==="
-      # 10 minutes, not 45: one headless call plus a handful of curls.
-      if TICKET_FILE_WORKER=1 timeout 600 \
+      # 10-minute supervisor; ticket_file caps each model/CLI call at 9 minutes.
+      if OFFLOADED_TICKET_WORKER=1 timeout 600 \
           python3 "$TICKET_WORKER" "$SESSION_ID" "$TRANSCRIPT" "$OUTDIR"; then
         touch "$OUTDIR/$SESSION_ID.ticket.done"
         command -v notify-send >/dev/null 2>&1 &&
           notify-send "ticket-gate" "ticket filed; proof saved" 2>/dev/null || true
       else
         rc=$?
+        WORKER_REASON=$(cat "$OUTDIR/$SESSION_ID.ticket.failed" 2>/dev/null)
         {
           if [ $rc -eq 124 ]; then
             echo "ticket worker timed out after 600s (still running or hung); last lines:"
+            tail -8 "$SESSLOG"
+          elif [ -n "$WORKER_REASON" ]; then
+            printf '%s\n' "$WORKER_REASON"
+            echo "last worker log lines:"
+            tail -8 "$SESSLOG"
           else
             echo "ticket worker failed (rc=$rc); last lines:"
+            tail -8 "$SESSLOG"
           fi
-          tail -8 "$SESSLOG"
         } >"$OUTDIR/$SESSION_ID.ticket.failed"
         touch "$OUTDIR/$SESSION_ID.ticket.done"
       fi
@@ -254,15 +287,22 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
         fi
         ;;
       failed)
-        FAILED_MSG=$(head -3 "$OUTDIR/$SESSION_ID.ticket.failed")
+        FAILED_MSG=$(head -3 "$OUTDIR/$SESSION_ID.ticket.failed" | tr '\n' ' ')
         case "$FAILED_MSG" in
           *"timed out"*) KIND="TICKET WORKER TIMED OUT" ;;
           *) KIND="TICKET WORKER FAILED" ;;
         esac
-        echo "$KIND. Reason: $FAILED_MSG. Say 'file the ticket' again to retry."
         rm -f "$OUTDIR/$SESSION_ID.ticket.diverted" "$OUTDIR/$SESSION_ID.ticket.done" \
           "$OUTDIR/$SESSION_ID.ticket.failed" "$OUTDIR/$SESSION_ID.ticket.started" \
           "$OUTDIR/$SESSION_ID.ticket.project"
+        if spawn_ticket_worker; then
+          PROJ_MSG=""
+          [ -f "$OUTDIR/$SESSION_ID.ticket.project" ] && PROJ_MSG=" Project: $(cat "$OUTDIR/$SESSION_ID.ticket.project" 2>/dev/null)."
+          echo "$KIND. Previous attempt: $FAILED_MSG. Retrying now from this session's last 10 turns.$PROJ_MSG"
+        else
+          RETRY_MSG=$(head -3 "$OUTDIR/$SESSION_ID.ticket.failed" 2>/dev/null | tr '\n' ' ')
+          echo "$KIND. Previous attempt: $FAILED_MSG. Retry not started: $RETRY_MSG. You can proceed with your own filing."
+        fi
         ;;
       running)
         PROJ_MSG=""
@@ -317,23 +357,18 @@ if [ "$TOOL" = "Bash" ]; then
   # update-*/add-*/remove-*/delete-* are routine field work on an existing
   # ticket (already exempted above) while get/search/list/types/help stay
   # reads.
-  echo "$LOW" | grep -qE '\-x (post|put|patch)|--data|requests\.post' && WRITES=1
+  # curl sends a POST for a bare -d/--data with no -X, so -d counts too.
+  echo "$LOW" | grep -qE '\-x (post|put|patch)|--data|(^|[[:space:]])-d[[:space:]@"'"'"']|requests\.post' && WRITES=1
   echo "$LOW" | grep -qE 'ai-youtrack(\.py)? +(create|publish)' && WRITES=1
 
-  COMPOSES=""
-  # A heredoc building the issue body: summary/description/project keys are
-  # what a filing payload carries, wherever it is assembled.
-  case "$LOW" in
-    *'<<'*)
-      echo "$LOW" | grep -qE '"summary"|"description"|"project"' && COMPOSES=1 ;;
-  esac
-
-  if [ -n "$SUBJECT" ] && { [ -n "$WRITES" ] || [ -n "$COMPOSES" ]; }; then
+  # A heredoc cannot trigger a divert by itself. Every match below needs an
+  # explicit tracker subject and a write verb, so read-only checks pass.
+  if [ -n "$SUBJECT" ] && [ -n "$WRITES" ]; then
     # A worker that cannot run must not brick the manual call: the spawn
     # refuses (reason in .ticket.failed) when token/URL/project are missing,
     # and then the call goes through instead of exit 2.
     if spawn_ticket_worker >/dev/null 2>&1; then
-      echo "TICKET WRITE DIVERTED: the ticket worker files by itself from the session turns, then pings with the ticket id. Do not compose or send the API call yourself."
+      echo "TICKET WRITE DIVERTED: the ticket worker files by itself from the session turns, then pings with the ticket id. This blocks the entire Bash command; nothing in that command ran, including local file writes. Do not compose or send the API call yourself." >&2
       exit 2
     else
       echo "TICKET WORKER NOT STARTED: $(head -3 "$OUTDIR/$SESSION_ID.ticket.failed" 2>/dev/null). Proceeding with your own API call."

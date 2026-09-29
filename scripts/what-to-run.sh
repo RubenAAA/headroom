@@ -118,6 +118,9 @@ else
         add "$UNIT_CORE_XFORM" "core transform tests"
         add "make test-parity" "parity fixtures"
     fi
+    if hit "contrib/claude/hooks/*" || hit "contrib/offload-workers/*" || hit "scripts/test-hooks.sh"; then
+        add "bash scripts/test-hooks.sh" "hook contract tests (docker, ticket, review gates)"
+    fi
     if hit "contrib/*" || hit "scripts/*"; then
         add "bash scripts/check-drift.sh" "shellcheck + drift"
     fi

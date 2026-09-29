@@ -10,17 +10,68 @@ about auth, proxy or base URL.
 Egress goes through `rtk proxy curl` because the GitLab host is only reachable
 that way from this box.
 
-Which host and project: environment, never this file. A hardcoded host or
-project path ships the author's employer in every checkout, and neither
-works for anyone else. See README's Environment table.
+Which host and project: the environment or the non-secret settings in
+`~/.config/offload-workers/env`, never this file. A hardcoded host or project path
+ships the author's employer in every checkout, and neither works for anyone
+else. See README's Environment table.
 """
 
 import json
 import os
+import shlex
 import subprocess
+import tempfile
 import urllib.parse
 
-TOKEN_FILE = os.path.expanduser("~/.config/spark-poster/token")
+TOKEN_FILES = [
+    os.path.expanduser("~/.config/offload-workers/token"),
+    os.path.expanduser("~/.config/spark-poster/token"),
+]
+ENV_FILES = [
+    os.path.expanduser("~/.config/offload-workers/env"),
+    os.path.expanduser("~/.config/spark-poster/env"),
+]
+LOCAL_SETTINGS = {
+    "OFFLOAD_GITLAB_BASE_URL", "OFFLOAD_GITLAB_PROJECT", "OFFLOAD_REPO",
+    "SPARK_GITLAB_BASE_URL", "SPARK_GITLAB_PROJECT", "SPARK_REPO",
+}
+
+
+def _load_local_settings():
+    """Load only non-secret GitLab/repo settings, without sourcing the file."""
+    for env_file in ENV_FILES:
+        try:
+            fh = open(env_file)
+        except OSError:
+            continue
+        try:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].lstrip()
+                name, sep, raw = line.partition("=")
+                if not sep or name.strip() not in LOCAL_SETTINGS:
+                    continue
+                try:
+                    value = shlex.split(raw, comments=False)
+                except ValueError:
+                    continue
+                if not value:
+                    continue
+                os.environ.setdefault(
+                    name.strip(),
+                    os.path.expandvars(os.path.expanduser(value[0])),
+                )
+        finally:
+            fh.close()
+
+
+def local_repo():
+    """Configured source checkout, if any."""
+    _load_local_settings()
+    return os.environ.get("OFFLOAD_REPO", os.environ.get("SPARK_REPO", "")).strip()
 
 
 def _config():
@@ -29,13 +80,18 @@ def _config():
     Validated on every call rather than at import so `--help`-style entry
     points and unrelated imports never die on configuration.
     """
-    base = os.environ.get("SPARK_GITLAB_BASE_URL", "").strip().rstrip("/")
-    project = os.environ.get("SPARK_GITLAB_PROJECT", "").strip().strip("/")
+    _load_local_settings()
+    base = os.environ.get(
+        "OFFLOAD_GITLAB_BASE_URL", os.environ.get("SPARK_GITLAB_BASE_URL", "")
+    ).strip().rstrip("/")
+    project = os.environ.get(
+        "OFFLOAD_GITLAB_PROJECT", os.environ.get("SPARK_GITLAB_PROJECT", "")
+    ).strip().strip("/")
     if not base or not project:
         raise RuntimeError(
-            "spark-poster is not pointed at a GitLab: set SPARK_GITLAB_BASE_URL "
-            "(e.g. https://gitlab.example.com/api/v4) and SPARK_GITLAB_PROJECT "
-            "(e.g. group/sub/project) in ~/.config/spark-poster/env"
+            "offload worker is not pointed at a GitLab: set OFFLOAD_GITLAB_BASE_URL "
+            "(e.g. https://gitlab.example.com/api/v4) and OFFLOAD_GITLAB_PROJECT "
+            "(e.g. group/sub/project) in ~/.config/offload-workers/env"
         )
     return base, project, urllib.parse.quote(project, safe="")
 
@@ -51,17 +107,19 @@ def token():
     the credential move; once the token leaves `.bashrc` the environment
     branch is dead and Opus's shell has nothing to offer.
     """
-    try:
-        with open(TOKEN_FILE) as fh:
-            tok = fh.read().strip()
-            if tok:
-                return tok
-    except OSError:
-        pass
+    for token_file in TOKEN_FILES:
+        try:
+            with open(token_file) as fh:
+                tok = fh.read().strip()
+                if tok:
+                    return tok
+        except OSError:
+            continue
     tok = os.environ.get("GITLAB_TOKEN", "").strip()
     if not tok:
         raise TokenMissing(
-            f"no credential: {TOKEN_FILE} is absent or empty and GITLAB_TOKEN is unset"
+            "no credential: ~/.config/offload-workers/token (or legacy "
+            "~/.config/spark-poster/token) is absent or empty and GITLAB_TOKEN is unset"
         )
     return tok
 
@@ -75,25 +133,34 @@ def call(method, path, payload=None, timeout=60):
     """
     base, _, _ = _config()
     url = f"{base}{path}"
-    cmd = [
-        "rtk", "proxy", "curl", "-s",
-        "-w", "\n%{http_code}",
-        "-X", method, url,
-        "-H", f"PRIVATE-TOKEN: {token()}",
-    ]
-    tmp = None
-    if payload is not None:
-        tmp = f"/tmp/.spark-payload-{os.getpid()}.json"
-        with open(tmp, "w") as fh:
-            json.dump(payload, fh)
-        os.chmod(tmp, 0o600)
-        cmd += ["-H", "Content-Type: application/json", "--data-binary", f"@{tmp}"]
+    # Private files, created 0600 under a random name: the token goes to curl
+    # as a header file instead of an argument (an argument shows in `ps`), and
+    # the body never sits in /tmp under a guessable name with default modes.
+    temps = []
+
+    def private_file(text):
+        fd, name = tempfile.mkstemp(prefix=".offload-", suffix=".tmp")
+        temps.append(name)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        return name
+
     try:
+        header_file = private_file(f"PRIVATE-TOKEN: {token()}\n")
+        cmd = [
+            "rtk", "proxy", "curl", "-s",
+            "-w", "\n%{http_code}",
+            "-X", method, url,
+            "-H", f"@{header_file}",
+        ]
+        if payload is not None:
+            cmd += ["-H", "Content-Type: application/json",
+                    "--data-binary", f"@{private_file(json.dumps(payload))}"]
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
     finally:
-        if tmp:
+        for name in temps:
             try:
-                os.unlink(tmp)
+                os.unlink(name)
             except OSError:
                 pass
     body, _, status = out.rpartition("\n")

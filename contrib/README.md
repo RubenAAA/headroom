@@ -22,6 +22,13 @@ nothing here is on the request path.
 | `headroom-rss-sample` | `~/.local/bin/` | Samples the proxy's RSS once a minute into `~/headroom-rss.log`, so a leak over a long session is visible. |
 | `reconcile_books.py` | not installed | Checks the proxy's token books against a number it did not compute (the Anthropic usage API, or a console export). Run by hand. |
 
+The review and ticket offload workers can be configured to send session data
+to a loopback model API with `OFFLOAD_MODEL_TRANSPORT=local-direct`, bypassing
+Headroom's provider route and external-data consent setting. Use a server and
+model that run locally and do not forward requests upstream. Setup examples for
+llama.cpp/Qwen and Anthropic-compatible local servers are in the
+[offload worker guide](offload-workers/README.md#model-data-handling).
+
 ## Separate upstream egress lanes
 
 For providers that permit separate egress sessions, each Headroom process can
@@ -265,7 +272,7 @@ exactly like the usage dump on its own.
 
 ## Claude Code hooks (`claude/hooks/`)
 
-All eleven install to `~/.claude/hooks` and are registered idempotently in the
+All hooks install to `~/.claude/hooks` and are registered idempotently in the
 settings file — a re-run never duplicates an entry. Each script carries a
 header comment explaining the failure it exists for; read that before changing
 one. Every hook exits 0 on its own errors, so a broken hook cannot wedge a
@@ -284,9 +291,10 @@ session.
 | `session-map-log.sh` | SessionStart | No — logs session id to transcript path for the review worker |
 | `rotation-notice.sh` | UserPromptSubmit | No — relays VPN-rotation notices once each |
 | `retry-dropped-turn.sh` | Stop, SubagentStop | No — continues a turn parked on a dropped connection, a completed upstream error, a proxy-dropped tool call that left an empty reply, a retrieval splice the model never answered, or a dropped memory lookup |
+| `docker-autostart.sh` | Stop, SubagentStop, UserPromptSubmit | Starts Docker Desktop on macOS/Windows/WSL or the Docker service on Linux when assistant text mentions Docker and the engine is down; continues once with the confirmed result injected |
 
 Two of these need their own worker to be useful (`review-gate.sh` and
-`ticket-gate.sh`); see `spark-poster/README.md`.
+`ticket-gate.sh`); see `offload-workers/README.md`.
 
 ## Claude Code agents and memory text
 
@@ -301,8 +309,8 @@ agent missing from a profile vanishes from the Agent tool there with no error.
 into your `CLAUDE.md` between markers, so a re-install updates it in place
 instead of appending a second copy.
 
-## spark-poster/
+## offload-workers/
 
-The GitLab and YouTrack workers the two diversion hooks hand work to, plus the
-credential helper that keeps the token out of the ambient environment. It has
-its own [README](spark-poster/README.md).
+Provider-neutral GitLab and YouTrack workers for the two diversion hooks, plus
+the credential helper that keeps the token out of the ambient environment.
+It has its own [README](offload-workers/README.md).

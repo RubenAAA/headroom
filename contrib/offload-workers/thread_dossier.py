@@ -22,11 +22,11 @@ import gitlab_api as gl
 ME = gl.me()
 # The repo under review. Deliberately no default: the author's tree used to
 # sit here as a literal path, which shipped a personal directory layout in
-# every checkout and silently broke everyone else. Set SPARK_REPO (the review
-# hook sources ~/.config/spark-poster/env into the worker, so interactive
+# every checkout and silently broke everyone else. Set OFFLOAD_REPO (the review
+# hook sources ~/.config/offload-workers/env into the worker, so interactive
 # sessions keep working with no extra setup).
-REPO = os.environ.get("SPARK_REPO", "").strip()
-HEAD = os.environ.get("SPARK_HEAD", "FETCH_HEAD")
+REPO = os.environ.get("OFFLOAD_REPO", os.environ.get("SPARK_REPO", "")).strip()
+HEAD = os.environ.get("OFFLOAD_HEAD", os.environ.get("SPARK_HEAD", "FETCH_HEAD"))
 CONTEXT = 25
 # Bounds for the branch-wide evidence below. Each dossier is copied into a
 # batched worker prompt, so these multiply by batch size: keep them tight.
@@ -114,8 +114,8 @@ def my_threads(iid, mode="gitlab-review"):
     """
     if not REPO:
         raise SystemExit(
-            "SPARK_REPO is unset: point it at the repo under review "
-            "(the hook loads ~/.config/spark-poster/env for workers)")
+            "OFFLOAD_REPO is unset: point it at the repo under review "
+            "(the hook loads ~/.config/offload-workers/env; SPARK_REPO remains a legacy alias)")
     ds = [d for d in gl.discussions(iid) if not d.get("individual_note")]
     mine = select_threads(ds, ME, mode)
     if not mine:

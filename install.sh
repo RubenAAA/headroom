@@ -563,7 +563,7 @@ for src in "$CONTRIB"/claude/hooks/*.sh; do
     # with "Permission denied" on every prompt until chmodded).
     chmod +x "$src"
     # The two gates are linked in either mode: each runs a worker from the
-    # checkout's spark-poster/ and shares state files with it, and
+    # checkout's offload-workers/ and shares state files with it, and
     # review-gate carries a copy of ticket-gate's trigger. A copied gate
     # drifts out of step with all of that (as the statusline did, 2026-09-24).
     case "$(basename "$src")" in
@@ -631,6 +631,12 @@ const WANT = [
   // transcript_path), and there is nothing to check on any other event.
   ["Stop",             null,                  "retry-dropped-turn.sh", 10],
   ["SubagentStop",     null,                  "retry-dropped-turn.sh", 10],
+  // Start Docker when assistant text mentions it, then continue once with the
+  // confirmed engine state injected. The hook also clears its per-session
+  // continuation marker at the next user prompt.
+  ["Stop",             null,                  "docker-autostart.sh", 180],
+  ["SubagentStop",     null,                  "docker-autostart.sh", 180],
+  ["UserPromptSubmit", null,                  "docker-autostart.sh", 5],
   // VPN-rotation notices: the watcher leaves per-session files, this relays
   // each once on the next prompt. Informational, never blocks.
   ["UserPromptSubmit", null,                  "rotation-notice.sh",  5],
@@ -739,7 +745,7 @@ if (pruneFile && pruneFile !== file) {
     [ -n "$HOOK_PRUNE" ] &&
         say "sessions outside $HOOKS_INTO no longer run the review hooks"
 else
-    say "node not found — add the review-gate.sh / ticket-gate.sh / session-map-log.sh / peer-awareness.sh / stale-branch.sh entries in $HOOK_SETTINGS by hand"
+    say "node not found — add the review-gate.sh / ticket-gate.sh / docker-autostart.sh / session-map-log.sh / peer-awareness.sh / stale-branch.sh entries in $HOOK_SETTINGS by hand"
 fi
 
 # ── CLAUDE.md ─────────────────────────────────────────────────────────────

@@ -23,11 +23,12 @@
 
 set -euo pipefail
 
-DEST_DIR="$HOME/.config/spark-poster"
+DEST_DIR="$HOME/.config/offload-workers"
 DEST="$DEST_DIR/token"
+LEGACY_DEST="$HOME/.config/spark-poster/token"
 BASHRC="$HOME/.bashrc"
 
-if [ -z "${GITLAB_TOKEN:-}" ] && [ ! -s "$DEST" ]; then
+if [ -z "${GITLAB_TOKEN:-}" ] && [ ! -s "$DEST" ] && [ ! -s "$LEGACY_DEST" ]; then
   echo "GITLAB_TOKEN is not set and $DEST is empty; nothing to move." >&2
   echo "Run this once from a shell that still has the token." >&2
   exit 1
@@ -41,20 +42,23 @@ if [ -n "${GITLAB_TOKEN:-}" ]; then
   printf '%s' "$GITLAB_TOKEN" > "$DEST"
   chmod 600 "$DEST"
   echo "wrote credential to $DEST (mode 600, $(wc -c < "$DEST") bytes)"
+elif [ ! -s "$DEST" ] && [ -s "$LEGACY_DEST" ]; then
+  install -m 600 "$LEGACY_DEST" "$DEST"
+  echo "copied existing credential from $LEGACY_DEST to $DEST"
 else
   echo "keeping existing $DEST"
 fi
 
 if grep -qE '^[[:space:]]*export GITLAB_TOKEN=' "$BASHRC"; then
-  cp -n "$BASHRC" "$BASHRC.pre-spark-poster"
+  cp -n "$BASHRC" "$BASHRC.pre-offload-workers"
   # FINDING-047: bare `sed -i` is GNU-only; macOS needs `-i ''`. One-shot
   # installer, runs on both, so branch on `uname`.
   if [ "$(uname)" = "Darwin" ]; then
-    sed -i '' -E 's|^([[:space:]]*export GITLAB_TOKEN=.*)$|# moved to ~/.config/spark-poster/token by contrib/spark-poster/install-credential.sh\n#\1|' "$BASHRC"
+    sed -i '' -E 's|^([[:space:]]*export GITLAB_TOKEN=.*)$|# moved to ~/.config/offload-workers/token by contrib/offload-workers/install-credential.sh\n#\1|' "$BASHRC"
   else
-    sed -i -E 's|^([[:space:]]*export GITLAB_TOKEN=.*)$|# moved to ~/.config/spark-poster/token by contrib/spark-poster/install-credential.sh\n#\1|' "$BASHRC"
+    sed -i -E 's|^([[:space:]]*export GITLAB_TOKEN=.*)$|# moved to ~/.config/offload-workers/token by contrib/offload-workers/install-credential.sh\n#\1|' "$BASHRC"
   fi
-  echo "commented the export in $BASHRC (backup: $BASHRC.pre-spark-poster)"
+  echo "commented the export in $BASHRC (backup: $BASHRC.pre-offload-workers)"
 else
   echo "no active export in $BASHRC; nothing to comment"
 fi

@@ -15,37 +15,40 @@ the per-call overhead -- spawn, queue, stream -- dominates the thinking.
 A group of six dossiers is still a small context, and anything the batch
 call drops or mangles falls back to one single-thread call, so a worker
 that fails on thread 7 costs thread 7 one extra call rather than the batch.
-Group size comes from SPARK_DRAFT_BATCH (default 6).
+Group size comes from OFFLOAD_REVIEW_BATCH (default 6).
 
-Output is the poster's schema, so `spark-goahead.sh` can take it unchanged:
+Output is the poster's schema:
 
     {"iid": "591", "session_id": "...",
      "replies": [{"discussion_id": "...", "body": "...", "resolve": false}]}
 
 Usage:
-    SPARK_REVIEW_WORKER=1 python3 spark_draft.py <iid> [session_id] [mode] [transcript]
+    OFFLOADED_REVIEW_WORKER=1 python3 review_draft.py <iid> [session_id] [mode] [transcript]
 
 Mode is the review command that armed the session: `gitlab-review`
 (default) drafts follow-ups on threads I opened, or -- when I have opened
 none yet -- new threads from the review findings (first-round review);
-`fix-mr-comments` drafts `fix-mr-comments` drafts
-answers to reviewers' still-open threads on my own MR.
+`fix-mr-comments` drafts answers to reviewers' still-open threads on my own MR.
+
+OFFLOAD_MODEL_TRANSPORT selects `headroom` (the default, with provider routing
+configured in Headroom) or `local-direct` (a loopback Anthropic Messages API
+that bypasses Headroom). OFFLOAD_MODEL selects the model id or Headroom alias.
 """
 
 import json
 import os
 import re
-import subprocess
 import sys
 
 import thread_dossier as td
+import model_call as model
 
-OUTDIR = os.path.expanduser("~/.local/state/spark-review")
-MODEL = os.environ.get("SPARK_DRAFT_MODEL", "claude-muse-spark-1.3")
-PROXY = os.environ.get("SPARK_DRAFT_BASE_URL", "http://127.0.0.1:8787")
-TIMEOUT = int(os.environ.get("SPARK_DRAFT_TIMEOUT", "180"))
-BATCH = int(os.environ.get("SPARK_DRAFT_BATCH", "6"))
-BATCH_TIMEOUT = int(os.environ.get("SPARK_DRAFT_BATCH_TIMEOUT", "600"))
+OUTDIR = os.path.expanduser("~/.local/state/offload-workers")
+TIMEOUT = int(os.environ.get(
+    "OFFLOAD_REVIEW_TIMEOUT",
+    os.environ.get("OFFLOAD_MODEL_TIMEOUT", os.environ.get("SPARK_DRAFT_TIMEOUT", "180"))))
+BATCH = int(os.environ.get("OFFLOAD_REVIEW_BATCH", os.environ.get("SPARK_DRAFT_BATCH", "6")))
+BATCH_TIMEOUT = int(os.environ.get("OFFLOAD_REVIEW_BATCH_TIMEOUT", os.environ.get("SPARK_DRAFT_BATCH_TIMEOUT", "600")))
 
 TASK = """You are answering ONE review thread you opened on a merge request.
 
@@ -59,17 +62,23 @@ now stands. Replies may be absent -- a fix can land as a commit and nothing
 else, and silence is not the same as "unaddressed".
 
 Write the reply you would post on the thread. Say, in this order: what
-actually changed, whether that settles the objection, and what follows. If
-you are closing, the reason for closing. If you are not, what is still
-missing and what would close it. Cite files and lines you can see in the
-evidence. Never claim a change you cannot point to.
+actually changed, whether that settles the objection, and what follows. If it
+is still open, say what remains missing and what would address it. Cite files and lines you can see in the
+evidence. Never claim a change you cannot point to. Do not make repository-wide
+"only" or "none elsewhere" claims from a thread dossier; it is not a full-repo
+search. Do not claim tests or mutations passed unless their command and result
+appear in the verified hand-off notes. Attribute note-only checks to the
+session that ran them; do not say "I checked" unless you ran the check here.
+
+Every generated reply must have "resolve": false. Closing a thread is a
+separate operator action after the reply is posted.
 
 Answer in the language the original note is written in.
 
 Output ONLY a JSON object, no prose around it:
-{"resolve": true or false, "body": "the reply text"}
+{"resolve": false, "body": "the reply text"}
 
-resolve is true only if the objection is fully addressed.
+Do not resolve or close the thread.
 
 EVIDENCE:
 """
@@ -83,36 +92,30 @@ anchor.
 
 Decide what the code as it now stands says about the reviewer's point, then
 write the reply you would post on the thread. Say, in this order: what
-actually changed (or what you checked), whether that settles the point, and
-what follows. If you are closing, the reason for closing. If you are not,
-what is still missing and what would close it. Cite files and lines you can
+actually changed (or what the session checked), whether that settles the point,
+and what follows. If it is still open, say what is still missing and what
+would address it. Cite files and lines you can
 see in the evidence. Never claim a change you cannot point to. If the
 reviewer is right and nothing has changed yet, say so plainly and say what
-you will do -- do not argue the thread closed.
+will be done. Leave thread closure to the operator.
 
 An AUTHOR VERDICTS section after the evidence holds the author's latest
-stated positions from the session that armed this run -- the verdicts this
-reply exists to transfer onto the thread. The session did the research and
-the writing; your job is to carry its conclusions over, not to re-review
-the code and not to substitute your own judgement for its. Where the
-section covers this thread, state the author's verdict and the author's
-reason, and set resolve as the verdict directs. Earlier statements on the
-same thread are superseded by later ones: when the author first wrote
-"will fix" and later wrote "fixed in <commit>", the later one is the
-verdict -- never resurrect an interim position the session already moved
-past. Do not re-litigate, contradict, or soften a rejection into a promise
-to fix, and do not downgrade a "fixed, close" into a "still wrong". Use
-the evidence to ground the reply -- cite files and lines you can see, name
-the fixing commit -- but a recheck never overrules the verdict: when the
-evidence seems to disagree, the verdict still stands as written. Threads
-no verdict covers you decide from the evidence as above.
+stated dispositions from the session that armed this run. Use it to represent
+whether the author plans to fix, accepts, or rejects the point. Earlier
+statements are superseded by later ones. The transcript is not proof of factual
+claims: verify them from the dossier or verified hand-off notes before
+repeating them. If notes report a test or measurement, identify it as work done
+by the session; never present it as your own run. If a claim is unsupported,
+omit it or say the session reported it without treating it as established.
+Every generated reply must have "resolve": false, regardless of disposition;
+thread closure is a separate operator action.
 
 Answer in the language the reviewer's note is written in.
 
 Output ONLY a JSON object, no prose around it:
-{"resolve": true or false, "body": "the reply text"}
+{"resolve": false, "body": "the reply text"}
 
-resolve is true only if the reviewer's point is fully addressed.
+Do not resolve or close the thread.
 
 EVIDENCE:
 """
@@ -146,26 +149,8 @@ FINDINGS:
 
 
 def _call(prompt, timeout):
-    """Run the worker once. Returns (stdout, diagnostic).
-
-    The diagnostic is what makes NO VERDICT lines actionable: a nonzero rc
-    with empty stdout looks exactly like a bad answer unless it is named.
-    """
-    env = {**os.environ,
-           "SPARK_REVIEW_WORKER": "1",
-           "ANTHROPIC_BASE_URL": PROXY}
-    try:
-        r = subprocess.run(
-            ["claude", "-p", "--model", MODEL, prompt],
-            capture_output=True, text=True, timeout=timeout, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return None, "worker call timed out"
-    if r.returncode != 0 and not r.stdout.strip():
-        tail = (r.stderr or "").strip().splitlines()[-3:]
-        return None, f"worker rc={r.returncode} empty stdout" + (
-            f" stderr: {' | '.join(tail)}" if tail else "")
-    return r.stdout, None
+    """Run the configured worker backend once; returns (stdout, diagnostic)."""
+    return model.call(prompt, timeout, "OFFLOADED_REVIEW_WORKER")
 
 
 def ask(prompt):
@@ -192,7 +177,7 @@ def parse(out):
         except (json.JSONDecodeError, AttributeError):
             continue
         if isinstance(v, dict) and (v.get("body") or "").strip():
-            return {"body": v["body"].strip(), "resolve": bool(v.get("resolve"))}
+            return {"body": v["body"].strip(), "resolve": False}
     return None
 
 
@@ -208,7 +193,7 @@ def batch_prompt(task, items):
              "Output ONLY a JSON array, no prose around it, one object per "
              "thread in the order given:\n"
              '[{"discussion_id": "<the thread id>", '
-             '"resolve": true or false, "body": "<the reply text>"}]']
+             '"resolve": false, "body": "<the reply text>"}]']
     for did, evidence in items:
         parts.append(f"\n===== THREAD {did} =====\n{evidence}")
     return "\n".join(parts)
@@ -241,7 +226,7 @@ def parse_batch(out, ids):
             did = it.get("discussion_id")
             if did in ids and did not in found and (it.get("body") or "").strip():
                 found[did] = {"body": it["body"].strip(),
-                              "resolve": bool(it.get("resolve"))}
+                              "resolve": False}
         if found:
             return found
     return found
@@ -305,8 +290,7 @@ def read_author_verdicts(transcript, budget=12000):
     to sit in the window instead of the final one. The transcript is JSONL;
     user and assistant text lines are the verdicts, tool results and
     sidechains are not. Returns the tail of that text within budget, or
-    None when there is nothing usable (the caller falls back to the raw
-    tail rather than sending no verdicts at all).
+    None when there is nothing usable.
     """
     try:
         texts = []
@@ -352,16 +336,28 @@ def read_author_verdicts(transcript, budget=12000):
     return "\n\n".join(reversed(out))
 
 
-def first_round(iid, session, transcript):
+def read_handoff_notes(path, budget=12000):
+    """Read the operator's verified facts and command results for this run."""
+    try:
+        with open(path, errors="replace") as fh:
+            return fh.read(budget).strip() or None
+    except OSError:
+        return None
+
+
+def first_round(iid, session, transcript, notes_path):
     """gitlab-review with no threads of mine: open new ones from findings."""
     if not transcript:
         print("first-round review needs the session transcript: "
-              "spark_draft.py <iid> <session> gitlab-review <transcript>",
+              "review_draft.py <iid> <session> gitlab-review <transcript>",
               file=sys.stderr)
         return 1
     head = td.resolve_head(iid)
     print(f"  evidence at MR head {head[:12]}", file=sys.stderr)
     findings = read_findings(transcript)
+    notes = read_handoff_notes(notes_path)
+    if notes:
+        findings = (findings or "") + "\n\n===== VERIFIED HAND-OFF NOTES =====\n" + notes
     if not findings or not findings.strip():
         print("empty transcript tail; nothing to draft from", file=sys.stderr)
         return 1
@@ -394,8 +390,13 @@ def main():
     session = sys.argv[2] if len(sys.argv) > 2 else f"mr{iid}"
     mode = sys.argv[3] if len(sys.argv) > 3 else "gitlab-review"
     transcript = sys.argv[4] if len(sys.argv) > 4 else None
+    notes_path = (sys.argv[5] if len(sys.argv) > 5 else
+                  os.path.join(OUTDIR, f"{session}.notes.md"))
     if mode not in ("gitlab-review", "fix-mr-comments"):
         raise SystemExit(f"unknown mode {mode!r}: want gitlab-review or fix-mr-comments")
+    config_error = model.configuration_error()
+    if config_error:
+        raise SystemExit(config_error)
     task = FIX_TASK if mode == "fix-mr-comments" else TASK
 
     mine, first_review = td.my_threads(iid, mode)
@@ -404,7 +405,7 @@ def main():
             # First-round review: no threads of mine exist because none have
             # been opened yet. Draft new threads from the review findings
             # instead of verdicts on threads.
-            raise SystemExit(first_round(iid, session, transcript))
+            raise SystemExit(first_round(iid, session, transcript, notes_path))
         raise SystemExit(f"MR !{iid}: no open reviewer threads")
     print(f"MR !{iid} [{mode}]: {len(mine)} threads in scope", file=sys.stderr)
     head = td.resolve_head(iid)
@@ -413,37 +414,35 @@ def main():
     os.makedirs(OUTDIR, exist_ok=True)
     path = os.path.join(OUTDIR, f"{session}.draft.json")
 
-    # Fix mode only: the author's latest stated positions from the arming
-    # session. The worker never saw the session, so without this a
-    # deliberately un-fixed thread reads as "valid point, unaddressed" --
-    # and without the LATEST positions it transfers an interim "will fix"
-    # the session already moved past. Read fresh for every group below:
-    # the session keeps writing while the draft runs, and the verdicts
-    # that matter are the last ones said. Short budget on purpose: this
-    # block is copied into every thread's evidence, so it multiplies by
-    # batch size.
+    # Read fresh for each group so notes written while the worker runs can be
+    # included. Keep the budget short because this section is copied per group.
     def author_section():
-        if mode != "fix-mr-comments" or not transcript:
-            return ""
-        tail = read_author_verdicts(transcript)
-        if tail is None:
-            tail = read_findings(transcript, 12000)
-        if tail and tail.strip():
-            return ("\n\n===== AUTHOR VERDICTS: the author's latest stated "
-                    "positions -- transfer these onto the threads, do not "
-                    "re-litigate =====\n"
-                    "(last statements win over earlier ones on the same "
-                    "thread; tool noise already removed)\n"
-                    + tail.strip())
-        return ""
+        sections = []
+        notes = read_handoff_notes(notes_path)
+        if notes:
+            sections.append(
+                "===== VERIFIED HAND-OFF NOTES from the review session =====\n"
+                "Use the recorded facts and results, preserve their source, "
+                "and do not claim you ran these checks yourself.\n" + notes
+            )
+        if mode == "fix-mr-comments" and transcript:
+            tail = read_author_verdicts(transcript)
+            if tail:
+                sections.append(
+                    "===== AUTHOR VERDICTS: latest stated dispositions =====\n"
+                    "Last statements win for intent. Factual claims in this "
+                    "transcript are not evidence unless notes or the dossier "
+                    "support them.\n" + tail
+                )
+        return "\n\n".join(sections)
 
     def flush():
         """Write what we have. The loop below can die on any thread --
         per-thread timeout, supervisor timeout, SIGKILL -- and a draft
         written only at the end turns every finished verdict into waste
         (MR !597: 13 of 14 verdicts discarded one thread short of done).
-        A partial draft posts what exists and names what it does not cover;
-        the poster only ever sends listed replies, so extra keys are safe.
+        A partial draft preserves what exists and names what it does not cover;
+        it still waits for operator review before any reply is posted.
         """
         if not replies:
             return
@@ -471,13 +470,12 @@ def main():
             if did in batch:
                 verdict = batch[did]
                 replies.append({"discussion_id": did, **verdict})
-                print(f"  {did[:12]} {'close' if verdict['resolve'] else 'keep '}",
-                      file=sys.stderr)
+                print(f"  {did[:12]} reply drafted", file=sys.stderr)
                 continue
             verdict, diag = ask(task + evidence)
             if verdict:
                 replies.append({"discussion_id": did, **verdict})
-                print(f"  {did[:12]} {'close' if verdict['resolve'] else 'keep '} (single retry)",
+                print(f"  {did[:12]} reply drafted (single retry)",
                       file=sys.stderr)
             else:
                 failed.append(did)
@@ -493,8 +491,8 @@ def main():
     if failed:
         print(f"WARNING: no verdict for {len(failed)}: "
               f"{', '.join(f[:12] for f in failed)}", file=sys.stderr)
-    print(f"draft: {path} ({len(replies)} replies, "
-          f"{sum(1 for r in replies if r['resolve'])} to close)", file=sys.stderr)
+    print(f"draft: {path} ({len(replies)} replies; all threads left open)",
+          file=sys.stderr)
     print(path)
     return 0
 

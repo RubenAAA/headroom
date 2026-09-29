@@ -3,9 +3,9 @@
 
 Usage: ticket_file.py SESSION_ID TRANSCRIPT OUTDIR
 
-Mirrors the spark review offload: a gate hook (ticket-gate.sh) spawns this in
-the background, this drives one headless `claude -p` call that files through
-the b2b-amg ai-youtrack skill's CLI (/create-task procedure), and the outcome
+Mirrors the review offload: a gate hook (ticket-gate.sh) spawns this in
+the background, this uses the configured model backend to file through the
+b2b-amg ai-youtrack CLI (/create-task procedure), and the outcome
 lands in per-session state
 files next to the review ones: SESSION.ticket.{context,draft.json,proof.json,
 failed,worker.log}. The gate relays the proof on the next user prompt.
@@ -16,7 +16,7 @@ printed, logged, or written anywhere. Without it the worker fails loud
 naming the variable. Dry-run only applies to testing this script by hand --
 never run it to completion outside a real diverted session.
 
-Configuration (all in ~/.config/spark-poster/env, mode 600, next to the
+Configuration (all in ~/.config/offload-workers/env, mode 600, next to the
 token file -- the same file the review chain uses):
   YOUTRACK_URL        YouTrack base URL (required, no default)
   YOUTRACK_PROJECT_ID numeric project id (required, no default --
@@ -36,8 +36,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
-ENV_FILE_NOTE = "~/.config/spark-poster/env"
+import model_call as model
+
+ENV_FILE_NOTE = "~/.config/offload-workers/env"
 
 
 def _req_env(name):
@@ -90,9 +93,13 @@ DEFAULT_TYPE = "📜 User Story"  # only 4 live types; Backend & co are archived
 DEFAULT_PLATFORM = "Match center"
 DEFAULT_PRIORITY = "Normal"
 
-MODEL = os.environ.get("SPARK_DRAFT_MODEL", "claude-muse-spark-1.3")
-PROXY = os.environ.get("SPARK_DRAFT_BASE_URL", "http://127.0.0.1:8787")
-TIMEOUT = int(os.environ.get("SPARK_DRAFT_TIMEOUT", "600"))
+# ticket-gate.sh supervises the worker for 600s. Keep every model/CLI call
+# below that deadline so the worker can record its own timeout and diagnostics.
+SUPERVISOR_TIMEOUT = 600
+TIMEOUT = min(int(os.environ.get(
+    "OFFLOAD_TICKET_TIMEOUT",
+    os.environ.get("OFFLOAD_MODEL_TIMEOUT", os.environ.get("SPARK_DRAFT_TIMEOUT", "600")))),
+    SUPERVISOR_TIMEOUT - 60)
 
 TURNS = 10
 WINDOW_BYTES = 120000  # tail window the turns are parsed from, not a byte tail
@@ -126,7 +133,10 @@ def log(msg):
 def fail(outdir, session, reason):
     with open(os.path.join(outdir, session + ".ticket.failed"), "w") as f:
         f.write(reason + "\n")
-    log("failed: " + reason.split("\n")[0])
+    lines = reason.splitlines() or [""]
+    log("failed: " + lines[0])
+    for line in lines[1:]:
+        log(line)
     return 1
 
 
@@ -229,12 +239,156 @@ CONTEXT
         "TURNS", str(TURNS)).replace("CONTEXT", turns)
 
 
+def build_local_prompt(turns):
+    """Ask a local model for ticket fields; the worker runs the CLI itself."""
+    return f"""Derive one YouTrack ticket from the session turns below.
+Return ONLY one JSON object with these fields:
+{{"summary": "one line without emoji", "description": "markdown",
+ "type": "default|bug|subtask|epic", "assignee": null,
+ "publish": true, "nothing_to_file": false}}
+
+Use type=default unless the turns describe a production defect, name a parent
+issue, or ask for a task container. Set assignee only when the turns explicitly
+name one. Set publish=false only when the turns explicitly ask to leave a draft.
+If there is no filable content, set nothing_to_file=true. Do not perform any
+actions, call tools, or claim a ticket was filed. Do not invent facts or
+acceptance criteria. The worker will file the ticket after validating this JSON.
+
+Session turns (last {TURNS}, oldest first):
+---
+{turns}
+---
+"""
+
+
+def parse_model_json(output):
+    decoder = json.JSONDecoder()
+    candidates = [output]
+    candidates.extend(re.findall(r"```(?:json)?\s*(.*?)```", output, re.S))
+    candidates.extend(re.findall(r"\{.*\}", output, re.S))
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate.strip())
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    for offset, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(output[offset:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _clean_cli_error(text):
+    token = os.environ.get("YOUTRACK_TOKEN", "")
+    text = (text or "").strip()
+    if token:
+        text = text.replace(token, "[redacted]")
+    return text[-500:]
+
+
+def file_ticket_locally(plan, outdir, bin_path, project):
+    """Validate model fields and run create/publish with argv, never a shell.
+
+    Returns (id, error, published). A draft the turns asked to leave unpublished
+    is a success with published=False: reporting it as a failure made the next
+    "file the ticket" create a second draft.
+    """
+    summary = plan.get("summary")
+    description = plan.get("description")
+    kinds = {
+        "default": DEFAULT_TYPE,
+        "bug": "🚨 Production Bug",
+        "subtask": "📋 Subtask",
+        "epic": "🏆 Epic",
+    }
+    kind = plan.get("type", "default")
+    if not isinstance(summary, str) or not summary.strip() or "\n" in summary:
+        return None, "local model returned an invalid ticket summary", False
+    if not isinstance(description, str) or not description.strip():
+        return None, "local model returned an invalid ticket description", False
+    if not isinstance(kind, str) or kind not in kinds:
+        return None, "local model returned an unsupported ticket type", False
+    if not isinstance(plan.get("publish"), bool):
+        return None, "local model returned a non-boolean publish choice", False
+    assignee = plan.get("assignee")
+    if assignee is not None and (not isinstance(assignee, str) or not assignee.strip()):
+        return None, "local model returned an invalid assignee", False
+
+    description_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=outdir,
+                prefix=".ticket-description-", delete=False) as fh:
+            description_path = fh.name
+            fh.write(description)
+        os.chmod(description_path, 0o600)
+        args = [
+            "create-draft", f"--project={project}", f"--summary={summary.strip()}",
+            f"--description=@{description_path}", f"--type={kinds[kind]}",
+            f"--priority={DEFAULT_PRIORITY}", f"--platform={DEFAULT_PLATFORM}",
+        ]
+        if assignee:
+            args.append(f"--assignee={assignee.strip()}")
+        created = subprocess.run(
+            [bin_path, *args], capture_output=True, text=True,
+            timeout=TIMEOUT, env=os.environ.copy())
+        if created.returncode != 0:
+            return None, "create-draft failed: " + _clean_cli_error(created.stderr), False
+        created_json = parse_model_json(created.stdout)
+        internal_id = created_json.get("id") if created_json else None
+        if not isinstance(internal_id, str) or not internal_id.strip():
+            return None, "create-draft returned no internal id", False
+        if plan.get("publish", True) is False:
+            return internal_id, None, False
+        published = subprocess.run(
+            [bin_path, "publish-draft", f"--id={internal_id}"],
+            capture_output=True, text=True, timeout=TIMEOUT,
+            env=os.environ.copy())
+        if published.returncode != 0:
+            return None, "publish-draft failed: " + _clean_cli_error(published.stderr), False
+        # The CLI's JSON names the ticket. Scanning text is the fallback, and
+        # only stdout: stderr carries "UTF-8"-shaped noise that matches an id.
+        published_json = parse_model_json(published.stdout) or {}
+        readable = published_json.get("idReadable")
+        if isinstance(readable, str) and re.fullmatch(r"[A-Z][A-Z0-9]*-[0-9]+", readable):
+            return readable, None, True
+        matches = re.findall(r"\b[A-Z][A-Z0-9]*-[0-9]+\b", published.stdout)
+        if not matches:
+            return None, "publish-draft returned no readable ticket id", False
+        return matches[-1], None, True
+    except subprocess.TimeoutExpired:
+        return None, f"YouTrack CLI timed out after {TIMEOUT}s", False
+    except OSError as error:
+        return None, f"could not run YouTrack CLI: {error}", False
+    finally:
+        if description_path:
+            try:
+                os.unlink(description_path)
+            except OSError:
+                pass
+
+
+def backend_config_error():
+    """Return the model routing/consent error before the hook diverts a call."""
+    return model.configuration_error()
+
+
 def main():
     session, transcript, outdir = sys.argv[1], sys.argv[2], sys.argv[3]
     draft_path = os.path.join(outdir, session + ".ticket.draft.json")
     proof_path = os.path.join(outdir, session + ".ticket.proof.json")
     context_path = os.path.join(outdir, session + ".ticket.context")
 
+    config_error = backend_config_error()
+    if config_error:
+        return fail(outdir, session, config_error)
     if not os.environ.get("YOUTRACK_TOKEN"):
         return fail(outdir, session,
                     "YOUTRACK_TOKEN is not set in the worker environment")
@@ -253,32 +407,53 @@ def main():
         f.write(turns)
     log("context at %s (%d bytes)" % (context_path, len(turns.encode())))
 
-    prompt = build_prompt(turns, cfg_bin, cfg_project)
-    env = dict(os.environ, TICKET_FILE_WORKER="1", ANTHROPIC_BASE_URL=PROXY)
-    log("filing via headless model %s" % MODEL)
-    try:
-        proc = subprocess.run(
-            ["claude", "-p", "--model", MODEL, prompt],
-            capture_output=True, text=True, timeout=TIMEOUT, env=env)
-    except subprocess.TimeoutExpired:
-        return fail(outdir, session,
-                    "headless call timed out after %ds" % TIMEOUT)
-    if proc.returncode != 0:
-        tail = proc.stderr.strip().split("\n")[-3:]
-        return fail(outdir, session,
-                    "headless call failed (rc=%d): %s"
-                    % (proc.returncode, " | ".join(tail)))
-
-    ticket_id = ""
-    for line in reversed(proc.stdout.strip().split("\n")):
-        line = line.strip()
-        if line.startswith("TICKET ") and " " in line:
-            ticket_id = line.split(None, 1)[1].strip()
-            break
-    if not ticket_id or ticket_id in ("NOTHING_TO_FILE", "TOKEN_MISSING", "TOKEN_INVALID"):
-        return fail(outdir, session,
-                    "no ticket filed; worker said: %s"
-                    % (ticket_id or proc.stdout.strip()[-300:]))
+    if model.TRANSPORT == "local-direct":
+        log("drafting ticket fields with configured local model")
+        output, diagnostic = model.call(
+            build_local_prompt(turns), TIMEOUT, "OFFLOADED_TICKET_WORKER")
+        if output is None:
+            return fail(outdir, session, diagnostic or "local model call failed")
+        plan = parse_model_json(output)
+        if not plan:
+            return fail(outdir, session, "local model returned invalid ticket JSON")
+        if plan.get("nothing_to_file") is True:
+            return fail(outdir, session, "no filable content in session turns")
+        log("filing the validated ticket through the YouTrack CLI")
+        ticket_id, diagnostic, published = file_ticket_locally(
+            plan, outdir, cfg_bin, cfg_project)
+        if not ticket_id:
+            return fail(outdir, session, diagnostic or "local ticket filing failed")
+        if not published:
+            # The turns asked for a draft. Record it as the outcome, so the
+            # gate reports it and a repeat request does not create another.
+            proof = {"session_id": session, "idReadable": "draft " + ticket_id,
+                     "url": None, "draft_id": ticket_id,
+                     "summary": "draft created and left unpublished, as the turns asked; "
+                                "publish it in YouTrack"}
+            for path in (draft_path, proof_path):
+                with open(path, "w") as f:
+                    json.dump(proof, f, indent=2)
+            log("draft %s left unpublished; proof at %s" % (ticket_id, proof_path))
+            print("proof: " + proof_path)
+            return 0
+    else:
+        prompt = build_prompt(turns, cfg_bin, cfg_project)
+        log("filing via configured proxy model")
+        output, diagnostic = model.call(
+            prompt, TIMEOUT, "OFFLOADED_TICKET_WORKER")
+        if output is None:
+            return fail(outdir, session, diagnostic or "proxy model call failed")
+        ticket_id = ""
+        for line in reversed(output.strip().split("\n")):
+            line = line.strip()
+            if line.startswith("TICKET ") and " " in line:
+                ticket_id = line.split(None, 1)[1].strip()
+                break
+        if (not ticket_id
+                or ticket_id in ("NOTHING_TO_FILE", "TOKEN_MISSING", "TOKEN_INVALID")):
+            return fail(outdir, session,
+                        "no ticket filed; worker said: %s"
+                        % (ticket_id or _clean_cli_error(output)))
 
     # Filing means published: only a readable MC-XXXX id counts. A bare
     # draft id means the publish step never ran -- fail loud, do not
@@ -286,7 +461,7 @@ def main():
     if not re.match(r"^[A-Z]+-[0-9]+$", ticket_id):
         return fail(outdir, session,
                     "draft created but not published; worker said: %s"
-                    % (ticket_id or proc.stdout.strip()[-300:]))
+                    % _clean_cli_error(ticket_id))
     url = cfg_url + "/issue/" + ticket_id
     draft = {"session_id": session, "idReadable": ticket_id, "url": url}
     with open(draft_path, "w") as f:
@@ -300,4 +475,10 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--check-backend"]:
+        error = backend_config_error()
+        if error:
+            print(error, file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
     sys.exit(main())

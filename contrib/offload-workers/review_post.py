@@ -23,7 +23,9 @@ them is worse than no poster:
   find out what happened.
 
 Usage:
-    python3 spark_post.py <draft.json> [--dry-run]
+    python3 review_post.py --approve <draft.json> [--dry-run]
+    python3 review_post.py --note <iid> <discussion_id> <text>
+    python3 review_post.py --resolve <iid> <discussion_id>
 
 Draft shape:
     {"iid": "591", "session_id": "...",
@@ -46,8 +48,25 @@ import time
 
 import gitlab_api as gl
 
-PROOF_DIR = os.path.expanduser("~/.local/state/spark-review")
-MARKER_PREFIX = "spark-poster"
+PROOF_DIR = os.path.expanduser("~/.local/state/offload-workers")
+MARKER_PREFIX = "offload-worker"
+LEGACY_MARKER_PREFIX = "spark-poster"
+
+
+class Tee:
+    """Copy poster progress to the invoking tool and the session log."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
 
 
 def marker_for(discussion_id, body):
@@ -58,7 +77,15 @@ def marker_for(discussion_id, body):
 
 
 def already_posted(discussion, marker):
-    return any(marker in (n.get("body") or "") for n in discussion.get("notes") or [])
+    return any(marker_matches(n.get("body") or "", marker)
+               for n in discussion.get("notes") or [])
+
+
+def marker_matches(body, marker):
+    """Recognize markers written before the worker rename."""
+    digest = marker.rsplit(":", 1)[-1].split(" ", 1)[0].rstrip(">")
+    return (marker in body
+            or f"<!-- {LEGACY_MARKER_PREFIX}:{digest} -->" in body)
 
 
 def marker_for_new(identity, body):
@@ -76,7 +103,7 @@ def find_marker(discussions, marker):
     """(discussion_id, note) of the first note carrying marker, else None."""
     for did, d in discussions.items():
         for n in d.get("notes") or []:
-            if marker in (n.get("body") or ""):
+            if marker_matches(n.get("body") or "", marker):
                 return did, n
     return None
 
@@ -131,21 +158,113 @@ def load_draft(path):
     return draft
 
 
+def state_path(session, suffix):
+    return os.path.join(PROOF_DIR, f"{session}.{suffix}")
+
+
+def post_note(args):
+    if len(args) != 3:
+        raise SystemExit("usage: review_post.py --note <iid> <discussion_id> <text>")
+    iid, did, body = args
+    body = body.strip()
+    if not body:
+        raise SystemExit("note text is empty")
+    if "\n" in body:
+        raise SystemExit("--note accepts one line; use --approve for a reviewed draft")
+    before = gl.discussion(iid, did)
+    if not before:
+        raise SystemExit(f"discussion {did} is not on MR !{iid} or is unreadable")
+    marker = marker_for(did, body)
+    existing = already_posted(before, marker)
+    note = None
+    if not existing:
+        status, note = gl.reply(iid, did, f"{body}\n\n{marker}")
+        if status != 201 or not isinstance(note, dict):
+            raise SystemExit(f"note failed with status {status}: {note}")
+    after = gl.discussion(iid, did)
+    verified = bool(after and already_posted(after, marker))
+    proof = {"ts": time.time(), "iid": iid, "action": "note",
+             "discussion_id": did, "marker": marker,
+             "note_id": (note or {}).get("id"), "verified": verified,
+             "ok": verified}
+    os.makedirs(PROOF_DIR, exist_ok=True)
+    proof_path = state_path(f"note-{iid}-{marker.rsplit(':', 1)[-1][:12]}", "proof.json")
+    with open(proof_path, "w") as fh:
+        json.dump(proof, fh, indent=2)
+    if not verified:
+        raise SystemExit(f"note could not be verified; proof: {proof_path}")
+    result = "already present and verified" if existing else "posted and verified"
+    print(f"note {result} on MR !{iid}, thread {did}; proof: {proof_path}")
+    return 0
+
+
+def resolve_thread(args):
+    if len(args) != 2:
+        raise SystemExit("usage: review_post.py --resolve <iid> <discussion_id>")
+    iid, did = args
+    before = gl.discussion(iid, did)
+    if not before:
+        raise SystemExit(f"discussion {did} is not on MR !{iid} or is unreadable")
+    already_resolved = bool(before.get("resolved"))
+    status = 200
+    if not already_resolved:
+        status, _ = gl.resolve(iid, did)
+    after = gl.discussion(iid, did)
+    verified = bool(after and after.get("resolved"))
+    proof = {"ts": time.time(), "iid": iid, "action": "resolve",
+             "discussion_id": did, "already_resolved": already_resolved,
+             "status": status, "verified": verified, "ok": verified}
+    os.makedirs(PROOF_DIR, exist_ok=True)
+    key = hashlib.sha256(f"{iid}\x00{did}\x00resolve".encode()).hexdigest()[:12]
+    proof_path = state_path(f"resolve-{iid}-{key}", "proof.json")
+    with open(proof_path, "w") as fh:
+        json.dump(proof, fh, indent=2)
+    if not verified:
+        raise SystemExit(f"thread resolution could not be verified; proof: {proof_path}")
+    print(f"thread resolved and verified on MR !{iid}; proof: {proof_path}")
+    return 0
+
+
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    dry = "--dry-run" in sys.argv
+    os.umask(0o077)
+    raw = sys.argv[1:]
+    if raw and raw[0] == "--note":
+        return post_note(raw[1:])
+    if raw and raw[0] == "--resolve":
+        return resolve_thread(raw[1:])
+    dry = "--dry-run" in raw
+    approve = bool(raw and raw[0] == "--approve")
+    args = [a for a in raw if a != "--dry-run" and a != "--approve"]
     if not args:
         raise SystemExit(__doc__)
-    draft = load_draft(args[0])
+    if not approve and not dry:
+        raise SystemExit("posting requires an explicit --approve <draft.json>")
+    draft_path = args[0]
+    draft = load_draft(draft_path)
     iid = str(draft.get("iid") or "").strip()
     session = draft.get("session_id") or "nosession"
     if not iid:
         raise SystemExit("draft has no iid")
+    if approve and not dry:
+        os.makedirs(PROOF_DIR, exist_ok=True)
+        log = open(state_path(session, "worker.log"), "a", buffering=1)
+        sys.stdout = Tee(sys.stdout, log)
+        sys.stderr = Tee(sys.stderr, log)
+        print(f"poster started for MR !{iid}; draft: {draft_path}")
+    if not dry:
+        os.makedirs(PROOF_DIR, exist_ok=True)
+        with open(state_path(session, "posting"), "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        for suffix in ("posted", "failed"):
+            try:
+                os.unlink(state_path(session, suffix))
+            except FileNotFoundError:
+                pass
 
     # The draft is evidence against one commit. If the MR moved since the
     # draft was written, the verdicts describe code that is no longer there
     # -- posting them repeats MR !597, where a fix pushed 20 minutes before
-    # the run drew 14 "nothing changed" replies and two wrong resolves.
+    # the run drew 14 "nothing changed" replies and two premature resolutions.
     # Refuse loudly instead; the operator re-runs and the new draft sees
     # the new head. Drafts predating head_sha skip the check.
     # An unreadable head refuses too: an API error must never read as
@@ -162,6 +281,12 @@ def main():
                        "ok": False, "refused": reason}, fh, indent=2)
         print(f"REFUSED: {reason}")
         print(f"proof: {proof_path}")
+        with open(state_path(session, "failed"), "w") as fh:
+            fh.write(reason + "\n")
+        try:
+            os.unlink(state_path(session, "posting"))
+        except FileNotFoundError:
+            pass
         return 1
 
     if draft.get("head_sha"):
@@ -189,7 +314,7 @@ def main():
         mk = marker_for(did, body)
         (skipped if already_posted(before[did], mk) else planned).append(
             {"discussion_id": did, "body": body, "marker": mk,
-             "resolve": bool(r.get("resolve"))}
+             "resolve": False}
         )
 
     # New threads have no discussion yet, so each marker is searched across
@@ -293,55 +418,6 @@ def main():
         else:
             created_missing.append(p)
 
-    # Resolve only what verified. A thread closed on the strength of a note
-    # that never landed is the worst of both: the objection looks answered and
-    # the answer is nowhere.
-    # Each resolve is confirmed against a FRESH single-thread read, not the
-    # batch verdict: the drafter may have mixed up threads, the MR may have
-    # moved under it, or a human may have objected since. Resolve fires only
-    # when the thread is still open, our marker note is on it, and nobody
-    # spoke after us. Anything else lands in resolve_failed with a reason
-    # instead of closing someone's thread.
-    verified_ids = {v["discussion_id"] for v in verified}
-    resolved, resolve_failed = [], []
-
-    def confirm_for_resolve(did, marker):
-        """Fresh single-thread read; None when the close is safe, else why not."""
-        disc = gl.discussion(iid, did)
-        if not disc:
-            return "thread unreadable on confirm"
-        notes = [n for n in (disc.get("notes") or []) if not n.get("system")]
-        mine = [n for n in notes if marker in (n.get("body") or "")]
-        if not mine:
-            return "our note no longer on thread"
-        if disc.get("resolved", False):
-            return "already-resolved"
-        last = notes[-1] if notes else {}
-        if marker not in (last.get("body") or ""):
-            return "new activity after our note"
-        return None
-
-    for p in planned + skipped:
-        if not p.get("resolve") or p["discussion_id"] not in verified_ids:
-            continue
-        did = p["discussion_id"]
-        reason = confirm_for_resolve(did, p["marker"])
-        if reason == "already-resolved":
-            resolved.append(did)
-            print(f"already resolved {did[:12]}")
-            continue
-        if reason is not None:
-            resolve_failed.append({"discussion_id": did, "reason": reason})
-            print(f"RESOLVE REFUSED ({reason}) on {did[:12]}")
-            continue
-        status, _ = gl.resolve(iid, did)
-        if status == 200:
-            resolved.append(did)
-            print(f"resolved {did[:12]}")
-        else:
-            resolve_failed.append({"discussion_id": did, "status": status})
-            print(f"RESOLVE FAILED {status} on {did[:12]}")
-
     os.makedirs(PROOF_DIR, exist_ok=True)
     proof_path = os.path.join(PROOF_DIR, f"{session}.proof.json")
     web_base, project = gl.project()
@@ -356,8 +432,8 @@ def main():
         "posted": len(posted),
         "failed": failed,
         "verified": verified,
-        "resolved": resolved,
-        "resolve_failed": resolve_failed,
+        "resolved": [],
+        "resolve_failed": [],
         "unverified": [
             {"discussion_id": m["discussion_id"], "marker": m["marker"]}
             for m in missing
@@ -371,8 +447,8 @@ def main():
             {"identity": m["identity"], "marker": m["marker"]}
             for m in created_missing
         ],
-        "ok": not failed and not missing and not resolve_failed
-        and not create_failed and not created_missing,
+        "ok": not failed and not missing and not create_failed
+        and not created_missing,
     }
     with open(proof_path, "w") as fh:
         json.dump(proof, fh, indent=2)
@@ -382,9 +458,37 @@ def main():
     print(f"proof: {proof_path}")
     if not proof["ok"]:
         print("NOT OK: see failed/unverified/resolve_failed in the proof")
+        with open(state_path(session, "failed"), "w") as fh:
+            fh.write(f"poster returned an incomplete or unverified result; proof: {proof_path}\n")
+        try:
+            os.unlink(state_path(session, "posting"))
+        except FileNotFoundError:
+            pass
         return 1
+    open(state_path(session, "posted"), "a").close()
+    for suffix in ("posting", "failed"):
+        try:
+            os.unlink(state_path(session, suffix))
+        except FileNotFoundError:
+            pass
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BaseException as error:
+        raw = sys.argv[1:]
+        if raw and raw[0] == "--approve" and len(raw) > 1:
+            try:
+                draft = load_draft(raw[1])
+                session = draft.get("session_id") or "nosession"
+                posting = state_path(session, "posting")
+                if os.path.exists(posting):
+                    os.makedirs(PROOF_DIR, exist_ok=True)
+                    with open(state_path(session, "failed"), "w") as fh:
+                        fh.write(f"poster stopped before verification: {error}\n")
+                    os.unlink(posting)
+            except Exception:
+                pass
+        raise
