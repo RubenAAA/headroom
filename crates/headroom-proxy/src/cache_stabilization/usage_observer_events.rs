@@ -578,8 +578,9 @@ mod prefix_on_recache_event_tests {
             let obs = UsageObserver::new();
             obs.begin_request("ccr-1", "conv-ccr".into(), None, None, None);
             obs.note_wire_bytes("ccr-1", 100_000, 90_000, "all_messages");
-            // Client turn read 200k; the continuation round read another 150k.
-            obs.note_billed_totals("ccr-1", 20, 350_000, 4_000);
+            // Client turn read 200k and wrote 4k; the continuation round read
+            // another 150k and wrote another 5k.
+            obs.note_billed_totals("ccr-1", 20, 350_000, 9_000);
             obs.complete("ccr-1", 10, 200_000, 4_000, None);
         });
         let joined = cap.lock().unwrap().fields.join("\n");
@@ -592,8 +593,9 @@ mod prefix_on_recache_event_tests {
         // Hidden-round split: billed totals minus the client baseline.
         assert!(line.contains("rounds_input_tokens=10"), "{line}");
         assert!(line.contains("rounds_cache_read_tokens=150000"), "{line}");
-        // 20 + 350000*0.1 + 4000*1.25 = 40020
-        assert!(line.contains("billed_fresh_equivalents=40020"), "{line}");
+        assert!(line.contains("rounds_cache_write_tokens=5000"), "{line}");
+        // 20 + 350000*0.1 + 9000*1.25 = 46270
+        assert!(line.contains("billed_fresh_equivalents=46270"), "{line}");
     }
 
     /// The ledger exists because every other savings figure here is produced

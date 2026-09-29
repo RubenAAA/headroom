@@ -858,6 +858,62 @@ mod tests {
         assert_eq!(a.chars().filter(|&ch| ch == '-').count(), 4);
     }
 
+    /// The Codex CLI sends `prompt_cache_key` equal to its session id and the
+    /// same value in the `session-id` header. The translator keyed the cache on
+    /// the raw `metadata.user_id` JSON instead, so the backend saw two identities
+    /// and got the device and account ids. On the ChatGPT-subscription route the
+    /// key is now the header's value; other routes keep the translator's key.
+    #[test]
+    fn chatgpt_codex_route_carries_the_session_id_as_prompt_cache_key() {
+        use crate::routed::quirks::classify_upstream;
+        use crate::routed::translation::translate_routed_request;
+
+        let user_id = r#"{"device_id":"d","account_uuid":"a","session_id":"s-1"}"#;
+        let parsed = serde_json::json!({
+            "model": "claude-codex-6-luna",
+            "metadata": {"user_id": user_id},
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let headers = axum::http::HeaderMap::new();
+        let openai = |upstream: &str, chatgpt: bool, parsed: &serde_json::Value| {
+            let upstream: url::Url = upstream.parse().unwrap();
+            translate_routed_request(
+                parsed,
+                &headers,
+                Some("gpt-5.6-luna"),
+                &upstream,
+                chatgpt,
+                "claude-codex-6-luna",
+                "req-cache-key",
+            )
+            .expect("translation succeeds")
+            .openai_body
+        };
+
+        let body = openai("https://api.openai.com/v1", true, &parsed);
+        let mut sent = axum::http::HeaderMap::new();
+        classify_upstream(&"https://api.openai.com/v1".parse().unwrap(), true)
+            .apply_session_headers(&mut sent, &parsed);
+        assert_eq!(
+            body["prompt_cache_key"].as_str(),
+            sent.get("session-id").and_then(|v| v.to_str().ok()),
+            "the key is the session-id header's value"
+        );
+
+        assert_eq!(
+            openai("https://api.openai.com/v1", false, &parsed)["prompt_cache_key"].as_str(),
+            Some(user_id),
+            "an API-key caller on the generic route keeps the translator's key"
+        );
+        let mut other_session = parsed.clone();
+        other_session["metadata"]["user_id"] = serde_json::json!("other-session");
+        let other = openai("https://api.openai.com/v1", true, &other_session);
+        assert_ne!(
+            other["prompt_cache_key"], body["prompt_cache_key"],
+            "distinct sessions get distinct keys"
+        );
+    }
+
     /// Upstream `427fa76f` wiring: the translated Responses body carries the
     /// whole transcript under `input`, so the conversation key derives from
     /// it plus the session header; a Chat-shape translation yields no key

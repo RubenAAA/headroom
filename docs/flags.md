@@ -433,6 +433,14 @@ Options:
           [default: true]
           [possible values: true, false]
 
+      --ccr-keep-client-boundary-rounds <CCR_KEEP_CLIENT_BOUNDARY_ROUNDS>
+          Hidden CCR continuation rounds that leave the newest message breakpoint where the client's own request put it.
+          
+          Default `0`: every round moves the marker onto the appended messages. A retrieval round appends messages the client never sees, so a marker moved onto them writes a cache entry the next client turn cannot read. Whether that costs more than it saves is not settled: the ledger totals of streamed CCR turns are exactly twice round 0's usage, so the final round is not visible there, and the per-round `ccr_round_usage` events are the evidence to read before raising this. `1` keeps the marker put for the first round only. Memory continuations always move it.
+          
+          [env: HEADROOM_PROXY_CCR_KEEP_CLIENT_BOUNDARY_ROUNDS=]
+          [default: 0]
+
       --split-cache-ttl <SPLIT_CACHE_TTL>
           Split the cache TTL: 1h on the tools and system prefix, 5m on messages.
           

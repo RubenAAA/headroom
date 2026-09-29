@@ -510,7 +510,6 @@ mod tests {
     /// novel total (150), not the per-turn sum (250).
     #[test]
     fn routed_conversation_turns_accumulate_novel_savings_only() {
-        headroom_core::conversation_savings::reset_conversation_ledger();
         let dir = tempfile::tempdir().expect("temp dir");
         let mut ctx = context(None, dir.path());
         ctx.conversation_key = Some("routed-novel-test-conv".to_string());
@@ -529,7 +528,6 @@ mod tests {
             150,
             "second turn adds only what is novel: {lifetime}"
         );
-        headroom_core::conversation_savings::reset_conversation_ledger();
     }
 
     /// `d7c1f413` moved the Claude path's project resolution off the

@@ -161,6 +161,56 @@ pub(super) fn preamble_digests(body: &[u8]) -> Option<(u64, u64)> {
     Some((digest(parsed.get("system")), digest(parsed.get("tools"))))
 }
 
+/// The request settings, besides model, system and tools, that the provider
+/// documents as voiding cached messages when they change: thinking, tool
+/// choice, effort and output format, context management, speed and service
+/// tier, sampling. Rendered readably (scalars one level deep, arrays as their
+/// length) so two turns' fingerprints can be compared by eye. Never carries
+/// message text. Empty when the body is not JSON or sets none of them.
+pub(super) fn request_params_summary(body: &[u8]) -> String {
+    const KEYS: [&str; 10] = [
+        "thinking",
+        "tool_choice",
+        "output_config",
+        "context_management",
+        "speed",
+        "service_tier",
+        "temperature",
+        "top_p",
+        "top_k",
+        "stop_sequences",
+    ];
+    fn scalar(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::String(s) => s.chars().take(24).collect(),
+            serde_json::Value::Array(a) => format!("[{}]", a.len()),
+            serde_json::Value::Object(_) => "{..}".to_string(),
+            other => other.to_string(),
+        }
+    }
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return String::new();
+    };
+    KEYS.iter()
+        .filter_map(|key| {
+            let value = parsed.get(key)?;
+            let shown = match value {
+                serde_json::Value::Object(map) => {
+                    let mut fields: Vec<_> = map
+                        .iter()
+                        .map(|(k, v)| format!("{k}:{}", scalar(v)))
+                        .collect();
+                    fields.sort();
+                    format!("{{{}}}", fields.join(","))
+                }
+                other => scalar(other),
+            };
+            Some(format!("{key}={shown}"))
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 pub(super) fn message_digests(body: &[u8]) -> Option<Vec<u64>> {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;

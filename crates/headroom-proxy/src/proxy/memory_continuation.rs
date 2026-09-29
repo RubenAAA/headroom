@@ -1075,7 +1075,7 @@ pub(crate) async fn handle_memory_response(
         .await
         {
             super::forward::MemorySendDone::Sent(resp) => {
-                round_usage.add_response(&current_response);
+                round_usage.add_response_logged(&current_response, request_id, "superseded");
                 match read_memory_round_body(resp, provider, &mut mem_cut_attempts, request_id)
                     .await
                 {

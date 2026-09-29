@@ -1642,7 +1642,7 @@ async fn resolve_retrieval(
     // continuation behind it carries no usage block, so the add is a no-op
     // there rather than a double count.
     if let Ok(final_turn) = serde_json::from_slice::<Value>(&resolved_bytes) {
-        usage.add_response(&final_turn);
+        usage.add_response_logged(&final_turn, &ctx.request_id, "terminal");
     }
 
     if let Ok(mut guard) = round_usage.lock() {

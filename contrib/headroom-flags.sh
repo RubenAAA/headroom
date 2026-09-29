@@ -710,6 +710,12 @@ HEADROOM_FLAGS=(
   # loop while clearing the observed traffic. Costs nothing on the 233
   # turns that finish in one or two rounds.
   --ccr-max-retrieval-rounds 6
+  # The first hidden retrieval round keeps the cache marker on the client's last
+  # block. Relocated onto the hidden tool result, it wrote 8-22k tokens per CCR
+  # turn that the next client turn never reads: 9 of 9 aftershock recaches
+  # (2026-09-29 13:22-13:59, 39.8k tokens) read the terminal round's read and
+  # none of its write. See docs/notes/ideas/ccr-continuation-cache-boundary.md.
+  --ccr-keep-client-boundary-rounds 1
 
   # Transport and retry
   --retry true

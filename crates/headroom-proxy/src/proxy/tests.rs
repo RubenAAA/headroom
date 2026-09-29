@@ -2312,6 +2312,146 @@ fn hidden_ccr_continuation_does_not_become_next_client_cache_baseline() {
     assert!(observer.snapshot().last_event.is_none());
 }
 
+/// Where every `cache_control` sits on `messages`, as `(message, block)`.
+fn ccr_marker_positions(body: &[u8]) -> Vec<(usize, usize)> {
+    let v: serde_json::Value = serde_json::from_slice(body).expect("continuation body is JSON");
+    let mut out = Vec::new();
+    for (i, m) in v["messages"].as_array().unwrap().iter().enumerate() {
+        for (j, b) in m["content"].as_array().unwrap().iter().enumerate() {
+            if b.get("cache_control").is_some() {
+                out.push((i, j));
+            }
+        }
+    }
+    out
+}
+
+/// The first hidden CCR round leaves the newest marker on the client's own
+/// last block, so the provider's newest entry is one the next client turn
+/// can read. A later round still follows the tail, and `0` restores the old
+/// placement. Message content is identical across all three.
+#[test]
+fn ccr_continuation_keeps_the_client_boundary_for_the_first_round() {
+    let request = || {
+        serde_json::json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "b"}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "c", "cache_control": {"type": "ephemeral"}}]},
+        ]})
+    };
+    let assistant = || {
+        serde_json::json!({"role": "assistant", "content": [
+        {"type": "tool_use", "id": "t1", "name": "headroom_retrieve", "input": {}}]})
+    };
+    let results = || {
+        serde_json::json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "full text"}]})
+    };
+    let mut config =
+        crate::config::Config::for_test("https://api.anthropic.com".parse().expect("upstream URL"));
+    config.cache_tail_breakpoint = true;
+    let run = |config: &crate::config::Config, round: usize| {
+        let mut req = request();
+        // A second hidden round starts from the body the first one sent.
+        let rounds = (0..=round).map(|r| {
+            let body = ccr_response::build_ccr_continuation(
+                &mut req,
+                "messages",
+                assistant(),
+                results(),
+                "anthropic",
+                config,
+                "ccr-marker",
+                r,
+            )
+            .expect("continuation builds");
+            ccr_marker_positions(&body)
+        });
+        rounds.last().unwrap()
+    };
+
+    config.ccr_keep_client_boundary_rounds = 1;
+    assert_eq!(
+        run(&config, 0),
+        vec![(0, 0), (2, 0)],
+        "round 1 keeps the boundary"
+    );
+    assert_eq!(
+        run(&config, 1),
+        vec![(0, 0), (6, 0)],
+        "round 2 follows the tail"
+    );
+
+    config.ccr_keep_client_boundary_rounds = 0;
+    assert_eq!(
+        run(&config, 0),
+        vec![(0, 0), (4, 0)],
+        "0 restores the old placement"
+    );
+}
+
+/// 2026-09-29: a turn that ran a server-side tool call reported its usage
+/// summed over the provider's iterations (read 119,815 where the trend was
+/// 58k to 60k). Scored as the baseline, it made the next, normal turn look
+/// like it had lost half its cache: 12 of 12 residual recaches that day.
+/// The same three turns without the mark still trip the detector, so the
+/// assertion is not vacuous.
+#[test]
+fn a_summed_usage_turn_is_not_the_baseline_for_the_next_turn() {
+    use crate::cache_stabilization::usage_observer::UsageObserver;
+
+    let run = |summed: bool| {
+        let observer = UsageObserver::new();
+        let turn = |id: &str, read: u64, write: u64, summed: bool| {
+            observer.begin_request(id, "conv".into(), None, None, None);
+            if summed {
+                observer.complete_summed(id, 2, read, write, None);
+                None
+            } else {
+                observer.complete(id, 2, read, write, None)
+            }
+        };
+        turn("t1", 58_155, 1_366, false);
+        turn("t2", 119_815, 773, summed);
+        turn("t3", 60_294, 4_331, false)
+    };
+
+    assert_eq!(run(true), None, "the summed turn is not the baseline");
+    assert!(
+        run(false).is_some(),
+        "unmarked, the doubled read is scored and the next turn flags"
+    );
+}
+
+/// The request settings the provider's docs list as voiding cached messages
+/// (thinking, tool choice, effort, context management, speed) are named in the
+/// fingerprint, so a turn whose read collapses to the system and tools prefix
+/// can be joined against the turn before it. Message text never appears.
+#[test]
+fn request_params_summary_names_cache_relevant_settings_only() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 32000,
+        "messages": [{"role": "user", "content": "secret text"}],
+        "thinking": {"type": "enabled", "budget_tokens": 16000},
+        "tool_choice": {"type": "auto"},
+        "output_config": {"effort": "high", "format": {"schema": {"a": 1}}},
+        "context_management": {"edits": [{"type": "clear_thinking"}]},
+    }))
+    .unwrap();
+    let summary = replay::request_params_summary(&body);
+    assert_eq!(
+        summary,
+        "thinking={budget_tokens:16000,type:enabled};tool_choice={type:auto};\
+         output_config={effort:high,format:{..}};context_management={edits:[1]}"
+    );
+    let other = serde_json::to_vec(&serde_json::json!({"thinking": {"type": "disabled"}})).unwrap();
+    assert_ne!(summary, replay::request_params_summary(&other));
+    assert_eq!(replay::request_params_summary(b"not json"), "");
+}
+
 #[test]
 fn replay_decline_logs_hashed_session_and_chain_identity() {
     use crate::cache_stabilization::drift_detector::session_key_log_prefix;

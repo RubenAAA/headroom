@@ -166,6 +166,21 @@ fn translate_shaped_body(
                     obj.remove("parallel_tool_calls");
                 }
             }
+            // The translator keys the cache on the raw `metadata.user_id`, which
+            // carries the device and account ids. The Codex CLI sends its session
+            // id as both the key and the `session-id` header; do the same, so the
+            // backend sees one identity and no account ids leave for OpenAI.
+            if kind == crate::routed::quirks::UpstreamKind::ChatGptSubscription
+                && is_responses
+                && let Some(user_id) = parsed
+                    .get("metadata")
+                    .and_then(|m| m.get("user_id"))
+                    .and_then(Value::as_str)
+                && v.get("prompt_cache_key").and_then(Value::as_str) == Some(user_id)
+            {
+                v["prompt_cache_key"] =
+                    serde_json::json!(crate::codex::derive_session_uuid(user_id));
+            }
             kind.strip_unreplayable_reasoning(&mut v);
             // Zen's free-tier gate reads tool names: they must be
             // OpenCode-native lowercase (`read`, not `Read`). Rename the

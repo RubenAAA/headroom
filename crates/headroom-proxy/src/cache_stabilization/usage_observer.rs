@@ -73,6 +73,8 @@ mod first_turn;
 mod keys;
 #[path = "usage_observer_replay.rs"]
 mod replay;
+#[path = "usage_observer_summed.rs"]
+mod summed;
 #[path = "usage_observer_turn.rs"]
 mod turn;
 #[path = "usage_observer_write_split.rs"]
@@ -2702,11 +2704,12 @@ impl UsageObserver {
         // billed totals minus the client baseline `complete` was given.
         // Zero on the common single-round path. Existing fields stay as
         // they are.
-        let (rounds_input_tokens, rounds_cache_read_tokens) =
-            pending.billed_totals.map_or((0, 0), |(bi, bcr, _)| {
+        let (rounds_input_tokens, rounds_cache_read_tokens, rounds_cache_write_tokens) =
+            pending.billed_totals.map_or((0, 0, 0), |(bi, bcr, bcw)| {
                 (
                     bi.saturating_sub(input_tokens),
                     bcr.saturating_sub(cache_read_input_tokens),
+                    bcw.saturating_sub(cache_creation_input_tokens),
                 )
             });
         // Same window as the hit rate above, and the same reason: the
@@ -2740,6 +2743,11 @@ impl UsageObserver {
             // so the ledger joins to `ccr_continuation_usage` directly.
             rounds_input_tokens = rounds_input_tokens,
             rounds_cache_read_tokens = rounds_cache_read_tokens,
+            // The 5m/1h split below covers the client-visible round only, while
+            // the totals above cover every round. This is the write the split
+            // leaves out: `cache_write_5m + cache_write_1h + this` equals the
+            // billed creation total when the provider reports a split.
+            rounds_cache_write_tokens = rounds_cache_write_tokens,
             // Which TTL the provider actually billed the write at. The
             // proxy asks for the 1-hour tier on the prefix, but asking is
             // not granting, and the flat creation count above cannot tell

@@ -939,6 +939,24 @@ pub struct CliArgs {
     )]
     pub cache_tail_breakpoint: bool,
 
+    /// Hidden CCR continuation rounds that leave the newest message
+    /// breakpoint where the client's own request put it.
+    ///
+    /// Default `0`: every round moves the marker onto the appended messages.
+    /// A retrieval round appends messages the client never sees, so a marker
+    /// moved onto them writes a cache entry the next client turn cannot read.
+    /// Whether that costs more than it saves is not settled: the ledger
+    /// totals of streamed CCR turns are exactly twice round 0's usage, so the
+    /// final round is not visible there, and the per-round `ccr_round_usage`
+    /// events are the evidence to read before raising this. `1` keeps the marker put for the first round only.
+    /// Memory continuations always move it.
+    #[arg(
+        long = "ccr-keep-client-boundary-rounds",
+        env = "HEADROOM_PROXY_CCR_KEEP_CLIENT_BOUNDARY_ROUNDS",
+        default_value_t = 0
+    )]
+    pub ccr_keep_client_boundary_rounds: u8,
+
     /// Split the cache TTL: 1h on the tools and system prefix, 5m on messages.
     ///
     /// Takes precedence over `--force-1h-cache-ttl`, which pins everything to
@@ -2444,6 +2462,9 @@ pub struct Config {
     /// precedence over `force_1h_cache_ttl`; see
     /// [`crate::cache_stabilization::cache_ttl::tail_5m_prefix_1h`].
     pub cache_tail_breakpoint: bool,
+    /// Hidden CCR continuation rounds that keep the client's breakpoint in
+    /// place; see the flag docs on the CLI side.
+    pub ccr_keep_client_boundary_rounds: u8,
     pub split_cache_ttl: bool,
     /// Leave all-`5m` bodies on the tier they asked for. Default `false`;
     /// see the flag docs on the CLI side.
@@ -2782,6 +2803,7 @@ impl Config {
             split_cache_ttl: args.split_cache_ttl,
             respect_client_5m_ttl: args.respect_client_5m_ttl,
             cache_tail_breakpoint: args.cache_tail_breakpoint,
+            ccr_keep_client_boundary_rounds: args.ccr_keep_client_boundary_rounds,
             hold_working_directory: args.hold_working_directory,
             hold_role_sentence: args.hold_role_sentence,
             cache_stampede_gate: args.cache_stampede_gate,
@@ -3065,6 +3087,7 @@ impl Config {
             split_cache_ttl: false,
             respect_client_5m_ttl: false,
             cache_tail_breakpoint: false,
+            ccr_keep_client_boundary_rounds: 0,
             hold_working_directory: false,
             hold_role_sentence: false,
             cache_stampede_gate: false,

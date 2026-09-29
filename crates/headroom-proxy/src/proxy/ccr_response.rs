@@ -595,6 +595,22 @@ pub(super) fn check_ccr_round_fate(
     false
 }
 
+/// Where the message-level `cache_control` markers sit, as `m<message>.<block>`
+/// joined by commas, in the same notation as `turn_cache_fingerprint`.
+fn message_marker_positions(request: &serde_json::Value) -> String {
+    let mut out = Vec::new();
+    let messages = request.get("messages").and_then(|v| v.as_array());
+    for (i, m) in messages.into_iter().flatten().enumerate() {
+        let blocks = m.get("content").and_then(|c| c.as_array());
+        for (j, b) in blocks.into_iter().flatten().enumerate() {
+            if b.get("cache_control").is_some() {
+                out.push(format!("m{i}.{j}"));
+            }
+        }
+    }
+    out.join(",")
+}
+
 /// Build the continuation request: append assistant message + tool
 /// results (extending sentinel-keyed wrappers instead of pushing them
 /// whole), retail the tail breakpoint, and serialize. Returns `None`
@@ -639,7 +655,26 @@ pub(super) fn build_ccr_continuation(
         return None;
     }
 
-    retail_continuation_breakpoint(current_request, provider, config, request_id, round + 1);
+    // The first hidden round keeps the marker on the client's last block. A
+    // marker moved onto the appended messages writes an entry the next client
+    // turn, which never sees them, cannot read: 3 of 3 CCR turns on
+    // 2026-09-29 read only the older boundary in the hidden round and again
+    // on the client turn after it.
+    if round >= usize::from(config.ccr_keep_client_boundary_rounds) {
+        retail_continuation_breakpoint(current_request, provider, config, request_id, round + 1);
+    }
+    tracing::info!(
+        event = "ccr_continuation_markers",
+        request_id = %request_id,
+        round = round + 1,
+        kept_client_boundary = round < usize::from(config.ccr_keep_client_boundary_rounds),
+        markers = %message_marker_positions(current_request),
+        messages = current_request
+            .get(items_field)
+            .and_then(|v| v.as_array())
+            .map_or(0, Vec::len),
+        "cache markers on a hidden continuation request"
+    );
 
     // Re-send to upstream.
     match serde_json::to_vec(current_request) {
@@ -1056,7 +1091,7 @@ pub(super) async fn read_ccr_round_body(
     };
     // The response about to be dropped was still billed — including a
     // cut body that then retries the same round.
-    round_usage.add_response(current_response);
+    round_usage.add_response_logged(current_response, request_id, "superseded");
     match continuation_turn_from_body(&bytes, Some(&content_type), provider) {
         Some(next) => CcrRoundRead::Advance(next),
         None => {

@@ -1181,7 +1181,8 @@ mod tests {
         // the second turn not 76_020. Accumulators (tracker totals, cost)
         // must see the novel figure; the durable ledger event keeps the
         // wire truth for this request.
-        crate::conversation_savings::reset_conversation_ledger();
+        // The ledger is process-wide and tests run in parallel: a unique key
+        // isolates this test, where a reset would wipe every other test's turns.
         let sink = FigureSink::default();
         let key = Some("emit_novel_test_conv".to_string());
         for (saved, total) in [(62_806i64, 62_806i64), (76_020, 76_020)] {
@@ -1199,12 +1200,10 @@ mod tests {
         assert_eq!(*sink.requested.borrow(), vec![62_806, 13_214]);
         assert_eq!(*sink.tokened.borrow(), vec![62_806, 13_214]);
         assert_eq!(*sink.ledgered.borrow(), vec![62_806, 76_020]);
-        crate::conversation_savings::reset_conversation_ledger();
     }
 
     #[test]
     fn emit_without_conversation_key_books_per_request_unchanged() {
-        crate::conversation_savings::reset_conversation_ledger();
         let sink = FigureSink::default();
         for saved in [100i64, 150] {
             emit_request_outcome(
@@ -1219,7 +1218,6 @@ mod tests {
         // No key: the funnel falls back to `tokens_saved` unchanged.
         assert_eq!(*sink.requested.borrow(), vec![100, 150]);
         assert_eq!(*sink.tokened.borrow(), vec![100, 150]);
-        crate::conversation_savings::reset_conversation_ledger();
     }
 
     #[test]

@@ -174,6 +174,42 @@ impl CcrRoundUsage {
         self.cache_write_tokens += get("cache_creation_input_tokens");
     }
 
+    /// [`add_response`](Self::add_response), and log what that response's own
+    /// usage block said. `kind` is `superseded` for a response a continuation
+    /// replaced and `terminal` for the one that returned as the turn.
+    ///
+    /// Streamed CCR turns book exactly twice round 0's cache counts in
+    /// `turn_cost_ledger`, so the final round's usage is not visible there;
+    /// `has_usage=false` on a `terminal` line is the direct confirmation, and a
+    /// `terminal` line with counts shows what the final round really read and
+    /// wrote.
+    pub(crate) fn add_response_logged(
+        &mut self,
+        response: &serde_json::Value,
+        request_id: &str,
+        kind: &str,
+    ) {
+        let usage = response.get("usage");
+        let get = |key: &str| {
+            usage
+                .and_then(|u| u.get(key))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1)
+        };
+        tracing::info!(
+            event = "ccr_round_usage",
+            request_id = %request_id,
+            kind = kind,
+            round = self.rounds,
+            has_usage = usage.is_some(),
+            input_tokens = get("input_tokens"),
+            cache_read_input_tokens = get("cache_read_input_tokens"),
+            cache_creation_input_tokens = get("cache_creation_input_tokens"),
+            "usage of one hidden-round response"
+        );
+        self.add_response(response);
+    }
+
     /// Fold another set of rounds in. A turn can spend rounds on more than one
     /// proxy-owned tool family, and both were billed.
     pub fn absorb(&mut self, other: CcrRoundUsage) {

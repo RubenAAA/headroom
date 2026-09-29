@@ -194,6 +194,21 @@ pub(super) fn complete_anthropic_watchdog(close: &AnthropicClose<'_>) {
         close
             .usage_observer
             .note_output_tokens(close.request_id, close.state.usage.output_tokens);
+        // A server-side tool call means the provider sampled again inside
+        // this request and summed the iterations' usage into one figure.
+        if close.state.server_tool_inventory().calls_total > 0 {
+            close.usage_observer.complete_summed(
+                close.request_id,
+                close.cache_baseline_input,
+                close.cache_baseline_read,
+                close.cache_baseline_write,
+                Some((
+                    close.state.usage.cache_creation_5m_input_tokens,
+                    close.state.usage.cache_creation_1h_input_tokens,
+                )),
+            );
+            return;
+        }
         let class = close.usage_observer.complete(
             close.request_id,
             close.cache_baseline_input,

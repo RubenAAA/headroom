@@ -54,13 +54,13 @@
 
 > **Moved to [`ideas/implemented/recache-accumulation-watch-reread.md`](ideas/implemented/recache-accumulation-watch-reread.md)** — 29,321-turn baseline readings.
 
-> **Moved to [`ideas/implemented/recache-provider-reasons.md`](ideas/implemented/recache-provider-reasons.md)** — closure analysis + 09-02 rename update.
+> **Moved to [`ideas/recache-provider-reasons.md`](ideas/recache-provider-reasons.md)** — closure analysis + 09-02 rename update.
 
 > **Moved to [`ideas/implemented/recache-concurrent-naming.md`](ideas/implemented/recache-concurrent-naming.md)** — timing proof that the flag earns its name.
 
 > **Moved to [`ideas/implemented/recache-role-predicate.md`](ideas/implemented/recache-role-predicate.md)** — pre-restart baseline + predictions (other buckets ride along as context).
 
-> **Moved to [`ideas/implemented/recache-provider-reasons.md`](ideas/implemented/recache-provider-reasons.md)** — window framing for the 09-02 audit.
+> **Moved to [`ideas/recache-provider-reasons.md`](ideas/recache-provider-reasons.md)** — window framing for the 09-02 audit.
 
 > **Moved to [`ideas/implemented/recache-role-predicate.md`](ideas/implemented/recache-role-predicate.md)** — both predictions met (diverged 70x down).
 

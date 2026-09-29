@@ -609,6 +609,11 @@ pub(crate) fn observe_forward_fingerprint(
             // smallest one that moved bounds the churn.
             tail_ladder = %tail_digest_ladder(body_to_send).unwrap_or_default(),
             beta_digest = %short_hash(beta),
+            // Settings outside model/system/tools that void cached messages
+            // when they change. A read that falls to the system+tools prefix
+            // (15,090 of 182,333 on 2026-09-28) with every digest above
+            // unchanged is what this line is for.
+            request_params = %request_params_summary(body_to_send),
             // Which account sent the turn. The provider's cache is per
             // credential, so a `/login` account switch recaches every
             // live conversation — legitimate, but indistinguishable
