@@ -565,15 +565,30 @@ pub(super) fn compress_one_block(
                 // populate the store with hashes whose markers
                 // never reach the wire (still correct, but wastes
                 // storage capacity).
-                if let (Some(store), Some(hash)) = (ccr_store, ccr_hash_emitted.as_deref())
-                    && !store.put(hash, content_text)
-                {
-                    tracing::warn!(
-                        event = "ccr_put_failed",
-                        target = "ccr.live_zone",
-                        hash = %hash,
-                        "ccr_put_failed; marker will point at an unretrievable hash"
-                    );
+                if let (Some(store), Some(hash)) = (ccr_store, ccr_hash_emitted.as_deref()) {
+                    if store.put(hash, content_text) {
+                        // One line per marker that reaches the wire. Joined to
+                        // `ccr_retrieval_call` on `hash`, it gives the rate at
+                        // which the model asks for each strategy's blocks back
+                        // and the tokens those retrievals undo
+                        // (`scripts/ccr-marker-rate.py`).
+                        tracing::info!(
+                            event = "ccr_marker_offered",
+                            target = "ccr.live_zone",
+                            hash = %hash,
+                            strategy = strategy,
+                            original_tokens = original_tokens,
+                            compressed_tokens = compressed_tokens,
+                            "ccr marker offered"
+                        );
+                    } else {
+                        tracing::warn!(
+                            event = "ccr_put_failed",
+                            target = "ccr.live_zone",
+                            hash = %hash,
+                            "ccr_put_failed; marker will point at an unretrievable hash"
+                        );
+                    }
                 }
                 let replacement_bytes = serde_json::to_vec(&compressed_for_replacement)
                     .expect("string is always JSON-encodable");

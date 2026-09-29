@@ -138,6 +138,8 @@ const STRATEGY_DIFF_COMPRESSOR: &str = "diff_compressor";
 const STRATEGY_CODE_COMPRESSOR: &str = "code_aware_compressor";
 /// Strategy tag emitted when Kompress rewrote a plain-text block.
 const STRATEGY_KOMPRESS: &str = "kompress";
+/// Strategy tag emitted when SmartCrusher rewrote JSON embedded in a text block.
+const STRATEGY_EMBEDDED_JSON: &str = "embedded_json";
 /// Tier 1 of Python's `config_compressor`: the self-verified reversible fold.
 /// The comment-elision tier (which mints a CCR marker) and the schema fold are
 /// NOT ported — `headroom/transforms/config_compressor.py` still owns those.
@@ -253,6 +255,7 @@ const HOT_ZONE_BLOCK_TYPES: &[&str] = &[
 mod anthropic;
 mod compressors;
 mod dispatch;
+mod embedded_json;
 mod openai_chat;
 mod openai_responses;
 mod outcome;

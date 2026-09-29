@@ -45,6 +45,9 @@ mod integration_prefix_adoption;
 #[path = "suites/cache/integration_shared_scaffolding_prefix.rs"]
 mod integration_shared_scaffolding_prefix;
 
+#[path = "suites/cache/integration_embedded_json_prefix.rs"]
+mod integration_embedded_json_prefix;
+
 #[path = "suites/cache/integration_output_holdout.rs"]
 mod integration_output_holdout;
 

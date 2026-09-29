@@ -142,6 +142,7 @@ pub(super) fn intern_dispatch_strategy(strategy: &str) -> Option<&'static str> {
         STRATEGY_CODE_COMPRESSOR,
         STRATEGY_CONFIG_LOSSLESS,
         STRATEGY_KOMPRESS,
+        STRATEGY_EMBEDDED_JSON,
     ]
     .into_iter()
     .find(|known| *known == strategy)
@@ -233,6 +234,18 @@ pub(super) fn dispatch_compressor_uncached(
         return DispatchResult::NoOp {
             content_type: content_type.as_str(),
             declined_by: None,
+        };
+    }
+
+    // JSON inside prose reads as `PlainText`, so SmartCrusher would never see
+    // it. Crush the spans first: Kompress on a block that holds JSON would
+    // rewrite the JSON as prose. Falls through when no span shrank.
+    if content_type == ContentType::PlainText
+        && let Some(compressed) = embedded_json::route_embedded_json(text)
+    {
+        return DispatchResult::Compressed {
+            strategy: STRATEGY_EMBEDDED_JSON,
+            compressed,
         };
     }
 
@@ -578,6 +591,7 @@ mod dispatch_cache_tests {
             STRATEGY_CODE_COMPRESSOR,
             STRATEGY_CONFIG_LOSSLESS,
             STRATEGY_KOMPRESS,
+            STRATEGY_EMBEDDED_JSON,
         ] {
             assert_eq!(intern_dispatch_strategy(known), Some(known));
         }

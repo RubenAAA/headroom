@@ -35,7 +35,25 @@ N/A, 6 left, all changing forwarded bytes.
 - `e9000863`: fail-open deadline on one cache-miss compression. Do it with
   `7f2766ca` from `upstream-triage-0.39.md`, not separately.
 - `10e48292`: widen cross-turn dedup to list-content tool results and
-  `function` role (`cross_turn_dedup.rs:463-482`). Only if dedup is ever on
-  by default.
-- `57bf720d`: compress embedded JSON spans. A new feature that changes
-  bytes widely; a design decision, not parity.
+  `function` role (`cross_turn_dedup.rs:463-482`). Dedup is on live
+  (`--enable-cross-turn-dedup`), so the "if dedup is ever on" condition is met.
+  Checked 2026-09-29 on 41 replay-prefix captures: list-shaped tool results
+  are 302 blocks / 226KB against 6,012 string results / 9.04MB (2.4% of
+  tool-result bytes), so the ceiling is small. Not worth the byte change
+  unless MCP-heavy sessions show up.
+- The `ad56dd38` Kompress gate is idle here: Kompress is off
+  (`--disable-kompress true`).
+- `57bf720d`: compress embedded JSON spans. Ported 2026-09-29 as
+  `live_zone/embedded_json.rs` (strategy `embedded_json`, `PlainText` blocks
+  only, before Kompress). Checked on 7,741 unique historical tool results
+  (replay prefixes and capture dirs): 85 hits (1.1%), 1.03MB to 0.58MB, which
+  is 1.3% of the 34MB of tool-result bytes. 74 of the 85 are whole-JSON
+  objects (MCP results, `cat`ed JSON) that the detector sends to `PlainText`,
+  so the port does not skip whole-block JSON as the Python does. Text around
+  spans stayed byte-exact in all 85 and no non-ASCII was escaped. Only about
+  5% of offered CCR markers are ever retrieved (14 retrievals against 277
+  markers, 2026-09-29 13:18-14:35Z), so the extra markers add little CCR
+  traffic. Watch it live with `scripts/ccr-marker-rate.py` (joins the new
+  `ccr_marker_offered` event to `ccr_retrieval_call` on the hash, per strategy;
+  needs a proxy built after 2026-09-29). Multi-turn prefix stability is pinned by
+  `tests/suites/cache/integration_embedded_json_prefix.rs`.
