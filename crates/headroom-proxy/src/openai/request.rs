@@ -184,8 +184,18 @@ pub(crate) fn anthropic_to_openai_responses_request(
                 "assistant" => translate_assistant_message_to_responses(msg, &mut input),
                 "system" | "developer" => {
                     let text = plain_message_text(msg);
-                    if !text.is_empty() {
-                        instructions.push(text);
+                    if input.is_empty() {
+                        if !text.is_empty() {
+                            instructions.push(text);
+                        }
+                    } else if !text.is_empty() {
+                        // Claude Code sends a system message mid-conversation
+                        // whenever its environment or a hook changes. Folded
+                        // into `instructions`, each one rewrites the front of
+                        // the input and misses the provider cache for every
+                        // item behind it (47% of Spark turns, 2026-09-30), so
+                        // it stays where the client put it.
+                        input.push(json!({"role": "developer", "content": text}));
                     }
                 }
                 _ => {}

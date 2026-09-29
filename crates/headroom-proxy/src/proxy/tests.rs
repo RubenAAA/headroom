@@ -228,10 +228,13 @@ async fn ten_concurrent_stream_lanes_use_distinct_sticky_socks_egresses() {
         assert!(egress_id.starts_with("proxy-"));
         if index == 0 {
             assert!(state.set_zen_egress_maintenance(egress_id, true));
-            assert!(matches!(
-                state.zen_client_for_lane(Some(&lane_key)),
-                Err(blocked_id) if blocked_id == egress_id
-            ));
+            // A rotating egress turns the lane's next turn to another one;
+            // the lane's own assignment is what the check below still sees.
+            let (_, moved_slot, moved_id, _) = state
+                .zen_client_for_lane(Some(&lane_key))
+                .expect("another egress is open");
+            assert_ne!(moved_slot, slot);
+            assert_ne!(moved_id, egress_id);
             assert!(state.set_zen_egress_maintenance(egress_id, false));
         }
         let (_, sticky_slot, sticky_id, _) = state

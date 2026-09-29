@@ -132,7 +132,7 @@ async fn an_appended_turn_keeps_its_prefix_and_an_edited_one_breaks_it() {
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .map(|v| v["fields"].clone())
-        .filter(|f| f["event"] == "routed_forward_continuity")
+        .filter(|f| f["event"] == "routed_forward_continuity" && f["model"] == "spark-test-model")
         .collect();
     assert_eq!(events.len(), 3, "one event per routed turn: {events:?}");
 
@@ -146,6 +146,90 @@ async fn an_appended_turn_keeps_its_prefix_and_an_edited_one_breaks_it() {
         events[2]["common_prefix"].as_u64().unwrap() < events[2]["prev_items"].as_u64().unwrap()
     );
     assert_eq!(events[2]["head_changed"], false);
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_system_message_mid_conversation_leaves_the_prefix_and_head_alone() {
+    let _capture = common::tracing_capture::serial().await;
+    let buf = common::tracing_capture::buffer();
+    buf.lock().unwrap().clear();
+
+    let (addr, _task) = upstream().await;
+    let upstream_url = format!("http://{addr}");
+    let route_upstream = upstream_url.clone();
+    let proxy = start_proxy_with_state(
+        &upstream_url,
+        move |config| {
+            config.model_routes = vec![headroom_proxy::config::ProviderRoute {
+                model_prefix: "claude-spark-sys".to_string(),
+                prefix_match: false,
+                upstream: Some(route_upstream.parse().expect("upstream url")),
+                translate: true,
+                cursor_agent: None,
+                target_model: Some("spark-sys-model".to_string()),
+                auth_env: Some("none".to_string()),
+            }];
+        },
+        |state| state,
+    )
+    .await;
+
+    // Claude Code appends a system message whenever its environment or a hook
+    // changes. Each turn below adds one; none may disturb what came before.
+    let user = |t: &str| json!({"role": "user", "content": t});
+    let assistant = |t: &str| json!({"role": "assistant", "content": t});
+    let system = |t: &str| json!({"role": "system", "content": t});
+    let turns = [
+        vec![user("system task")],
+        vec![
+            user("system task"),
+            assistant("a1"),
+            system("env one"),
+            user("u2"),
+        ],
+        vec![
+            user("system task"),
+            assistant("a1"),
+            system("env one"),
+            user("u2"),
+            assistant("a2"),
+            system("env two"),
+            user("u3"),
+        ],
+    ];
+    let client = reqwest::Client::new();
+    let mut forwarded = Vec::new();
+    for messages in turns {
+        let body = json!({"model": "claude-spark-sys", "stream": true, "messages": messages});
+        client
+            .post(format!("{}/v1/messages", proxy.url()))
+            .header("content-type", "application/json")
+            .json(&body)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .expect("proxy answers")
+            .text()
+            .await
+            .unwrap();
+        forwarded.push(body);
+    }
+
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let events: Vec<Value> = logs
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| v["fields"].clone())
+        .filter(|f| f["event"] == "routed_forward_continuity" && f["model"] == "spark-sys-model")
+        .collect();
+    assert_eq!(events.len(), forwarded.len(), "{events:?}");
+    for event in &events[1..] {
+        assert_eq!(event["prefix_broken"], false, "{event}");
+        assert_eq!(event["head_changed"], false, "{event}");
+        assert_eq!(event["common_prefix"], event["prev_items"], "{event}");
+    }
 
     proxy.shutdown().await;
 }

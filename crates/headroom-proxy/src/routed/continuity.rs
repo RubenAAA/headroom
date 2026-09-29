@@ -14,7 +14,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
 
 const SESSIONS: usize = 1024;
-/// Sessions whose first item is kept as text, for [`first_item_drift`]. That
+/// Sessions whose first item is kept as text, for [`log_first_item_drift`]. That
 /// item is the whole system prompt (hundreds of KB), so the bound is small.
 const TEXT_SESSIONS: usize = 32;
 /// Bytes of context printed on each side of the first differing byte.
@@ -100,10 +100,12 @@ pub(crate) fn note(session: &str, body: &Value, body_bytes: usize, request_id: &
     });
     let prev_first = swap_first_item(key, items_of(body).first());
     let cache_key = body.get("prompt_cache_key").and_then(Value::as_str);
+    let model = body.get("model").and_then(Value::as_str);
     let Some(prev) = prev else {
         tracing::info!(
             event = "routed_forward_continuity",
             request_id,
+            model,
             session_hash = format_args!("{key:016x}"),
             items = items.len(),
             body_bytes,
@@ -122,6 +124,7 @@ pub(crate) fn note(session: &str, body: &Value, body_bytes: usize, request_id: &
     tracing::info!(
         event = "routed_forward_continuity",
         request_id,
+        model,
         session_hash = format_args!("{key:016x}"),
         items = items.len(),
         prev_items = prev.items.len(),
