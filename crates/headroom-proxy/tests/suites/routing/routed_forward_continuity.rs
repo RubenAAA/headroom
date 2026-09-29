@@ -3,7 +3,7 @@
 //!
 //! That is the number that explains a provider cache miss: an appended turn
 //! keeps every earlier item as prefix, an edited earlier item breaks it at that
-//! item. The test drives three turns through a routed model and reads the
+//! item. The tests drive turns through a routed model and read the
 //! events back.
 
 use super::common;
@@ -134,18 +134,19 @@ async fn an_appended_turn_keeps_its_prefix_and_an_edited_one_breaks_it() {
         .map(|v| v["fields"].clone())
         .filter(|f| f["event"] == "routed_forward_continuity" && f["model"] == "spark-test-model")
         .collect();
-    assert_eq!(events.len(), 3, "one event per routed turn: {events:?}");
-
-    assert_eq!(events[0]["first_turn"], true);
-    // Append: every previous item is still there, nothing broke.
-    assert_eq!(events[1]["prefix_broken"], false, "{}", events[1]);
-    assert_eq!(events[1]["common_prefix"], events[1]["prev_items"]);
-    // Edit at message 2: the prefix ends at the item before it.
-    assert_eq!(events[2]["prefix_broken"], true, "{}", events[2]);
-    assert!(
-        events[2]["common_prefix"].as_u64().unwrap() < events[2]["prev_items"].as_u64().unwrap()
+    // Only the edit is worth a line: the first turn and the append are not.
+    assert_eq!(
+        events.len(),
+        1,
+        "only the broken turn is logged: {events:?}"
     );
-    assert_eq!(events[2]["head_changed"], false);
+    // Edit at message 2: the prefix ends at the item before it.
+    assert_eq!(events[0]["prefix_broken"], true, "{}", events[0]);
+    assert!(
+        events[0]["common_prefix"].as_u64().unwrap() < events[0]["prev_items"].as_u64().unwrap()
+    );
+    assert_eq!(events[0]["first_moved_kind"], "message:user");
+    assert_eq!(events[0]["head_changed"], false);
 
     proxy.shutdown().await;
 }
@@ -200,7 +201,6 @@ async fn a_system_message_mid_conversation_leaves_the_prefix_and_head_alone() {
         ],
     ];
     let client = reqwest::Client::new();
-    let mut forwarded = Vec::new();
     for messages in turns {
         let body = json!({"model": "claude-spark-sys", "stream": true, "messages": messages});
         client
@@ -214,7 +214,6 @@ async fn a_system_message_mid_conversation_leaves_the_prefix_and_head_alone() {
             .text()
             .await
             .unwrap();
-        forwarded.push(body);
     }
 
     let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -224,12 +223,10 @@ async fn a_system_message_mid_conversation_leaves_the_prefix_and_head_alone() {
         .map(|v| v["fields"].clone())
         .filter(|f| f["event"] == "routed_forward_continuity" && f["model"] == "spark-sys-model")
         .collect();
-    assert_eq!(events.len(), forwarded.len(), "{events:?}");
-    for event in &events[1..] {
-        assert_eq!(event["prefix_broken"], false, "{event}");
-        assert_eq!(event["head_changed"], false, "{event}");
-        assert_eq!(event["common_prefix"], event["prev_items"], "{event}");
-    }
+    // Nothing is logged when every turn appends to the last. Before the
+    // translation kept a mid-conversation system message in place, each one
+    // changed the head (or item 0 on Zen) and logged here.
+    assert!(events.is_empty(), "{events:?}");
 
     proxy.shutdown().await;
 }
