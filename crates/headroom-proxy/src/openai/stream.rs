@@ -10,6 +10,28 @@ use crate::handlers::reasoning_signature::{PendingReasoning, encode_reasoning_si
 use crate::routed::outcome::{RoutedOutcomeContext, book_routed_outcome};
 use serde_json::{Value, json};
 
+/// Sightings of one untranslated event name between log lines.
+const UNHANDLED_LOG_EVERY: u64 = 500;
+/// Distinct names counted. A provider inventing names cannot grow the map.
+const UNHANDLED_NAMES: usize = 64;
+
+/// Running count of `name` since the proxy started; `u64::MAX` once the name
+/// table is full, which never logs.
+fn count_unhandled_event(name: &str) -> u64 {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    let Ok(mut seen) = SEEN.get_or_init(Default::default).lock() else {
+        return u64::MAX;
+    };
+    if !seen.contains_key(name) && seen.len() >= UNHANDLED_NAMES {
+        return u64::MAX;
+    }
+    let n = seen.entry(name.to_string()).or_insert(0);
+    *n += 1;
+    *n
+}
+
 /// A client alias for a translated route (Spark, Codex) rather than a native
 /// Anthropic turn. Both bill from a different cache universe than the
 /// Anthropic footprint the usage observer scores — translated prefix, no
@@ -1152,16 +1174,20 @@ impl StreamTranslator {
     }
 
     /// Untranslated event: silence here is content the client never sees, so
-    /// log the name — the next one is a grep, not an investigation.
+    /// name it. The first sighting of each name logs at info, then every
+    /// [`UNHANDLED_LOG_EVERY`]th, with the running count, so the next one is a
+    /// grep and a chatty one does not flood the log.
     /// Extracted from `process_responses_frame` without behavior change.
     fn on_unhandled_event(other: &str) {
-        // Silence here is how the message-item gap stayed hidden: an
-        // event we do not translate is content the client never sees.
-        // Log the name so the next one is a grep, not an investigation.
-        if other.starts_with("response.") {
-            tracing::debug!(
+        if !other.starts_with("response.") {
+            return;
+        }
+        let count = count_unhandled_event(other);
+        if count == 1 || count.is_multiple_of(UNHANDLED_LOG_EVERY) {
+            tracing::info!(
                 event = "codex_unhandled_stream_event",
                 stream_event = other,
+                count,
                 "no translation for this Responses event; nothing emitted"
             );
         }
@@ -2837,5 +2863,19 @@ mod tests {
             1,
             "text lost or doubled without deltas: {joined}"
         );
+    }
+
+    /// An untranslated event is counted per name, so the log line can say how
+    /// often it happened, and the table stops growing at its cap.
+    #[test]
+    fn unhandled_events_are_counted_per_name_and_the_table_is_bounded() {
+        assert_eq!(count_unhandled_event("response.test_a.first"), 1);
+        assert_eq!(count_unhandled_event("response.test_a.first"), 2);
+        assert_eq!(count_unhandled_event("response.test_a.second"), 1);
+        for i in 0..UNHANDLED_NAMES {
+            count_unhandled_event(&format!("response.test_flood.{i}"));
+        }
+        assert_eq!(count_unhandled_event("response.test_never_seen"), u64::MAX);
+        assert_eq!(count_unhandled_event("response.test_a.first"), 3);
     }
 }
