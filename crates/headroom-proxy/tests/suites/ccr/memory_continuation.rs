@@ -120,6 +120,12 @@ fn sse(event: &str, data: Value) -> String {
 }
 
 async fn run_turn(dir: &TempDir) -> (String, Vec<String>, usize) {
+    let tools =
+        json!([{"name": "Read", "description": "read a file", "input_schema": {"type": "object"}}]);
+    run_turn_with_tools(dir, Some(tools)).await
+}
+
+async fn run_turn_with_tools(dir: &TempDir, tools: Option<Value>) -> (String, Vec<String>, usize) {
     let rounds = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (addr, _task) = upstream(Arc::clone(&rounds), Arc::clone(&seen)).await;
@@ -142,12 +148,14 @@ async fn run_turn(dir: &TempDir) -> (String, Vec<String>, usize) {
     )
     .await;
 
-    let body = json!({
+    let mut body = json!({
         "model": "claude-opus-5",
         "stream": true,
         "messages": [{"role": "user", "content": "what did we learn about the split TTL?"}],
-        "tools": [{"name": "Read", "description": "read a file", "input_schema": {"type": "object"}}]
     });
+    if let Some(tools) = tools {
+        body["tools"] = tools;
+    }
     let text = reqwest::Client::new()
         .post(format!("{}/v1/messages", proxy.url()))
         .header("content-type", "application/json")
@@ -187,6 +195,26 @@ async fn the_memory_tools_reach_the_request_body() {
         first.contains("\"Read\""),
         "the client's own tools must survive"
     );
+}
+
+/// Claude Code's permission classifier sends no tools. It gets no memory
+/// definitions either: its request is a safety check, and nothing it asks
+/// could be answered from memory.
+#[tokio::test]
+async fn a_request_with_no_tools_gets_no_memory_tools() {
+    let dir = TempDir::new().unwrap();
+    for tools in [None, Some(json!([]))] {
+        let (_client_saw, upstream_saw, _) = run_turn_with_tools(&dir, tools.clone()).await;
+        let first: Value = serde_json::from_str(&upstream_saw[0]).unwrap();
+        let names: Vec<&str> = first["tools"]
+            .as_array()
+            .map(|t| t.iter().filter_map(|t| t["name"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !names.iter().any(|n| n.starts_with("memory_")),
+            "tools {tools:?} must not gain memory tools, got {names:?}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -9,7 +9,8 @@ use super::*;
 
 /// Injects memory tool definitions into the request value.
 ///
-/// Creates the tools array on demand; sets changed on injection.
+/// Leaves a request alone when the client sent no tools; sets changed on
+/// injection.
 /// Extracted from forward_http without behavior change.
 pub(crate) fn inject_memory_tool_definitions(
     value: &mut serde_json::Value,
@@ -18,8 +19,17 @@ pub(crate) fn inject_memory_tool_definitions(
     request_id: &str,
     changed: &mut bool,
 ) {
+    // A Claude Code request that sends no tools is its permission classifier
+    // (195 of 24,702 injections in the 2026-09-25..30 logs, all Sonnet, none
+    // answered a memory call). Five memory definitions add about 4 KB to a
+    // safety check that has no use for them, so they are left out.
+    let client_sent_tools = value
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tools| !tools.is_empty());
     if let Some(handler) = state.memory_handler.as_ref()
         && handler.is_initialized()
+        && client_sent_tools
     {
         let provider = match endpoint {
             compression::CompressibleEndpoint::AnthropicMessages => {
@@ -30,8 +40,6 @@ pub(crate) fn inject_memory_tool_definitions(
                 crate::memory::tool_adapter::Provider::Openai
             }
         };
-        // Requests without a tools array still get the
-        // memory tools - create the array on demand.
         let existing: Vec<serde_json::Value> = value
             .get("tools")
             .and_then(|v| v.as_array())
