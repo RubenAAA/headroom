@@ -985,7 +985,6 @@ Options:
           
           [env: HEADROOM_COMPRESS_USER_MESSAGES=]
           [default: true]
-          [possible values: true, false]
 
       --compress-system-messages <COMPRESS_SYSTEM_MESSAGES>
           Gate compression of system-role messages.
@@ -994,21 +993,19 @@ Options:
           
           [env: HEADROOM_COMPRESS_SYSTEM_MESSAGES=]
           [default: true]
-          [possible values: true, false]
 
       --protect-recent <PROTECT_RECENT>
-          Protect recent reads from compression
+          Number of most recent messages to protect from compression.
+          
+          **Not wired. Setting this changes nothing.** Accepted so the `agent-savings` profile exports (`2`, `4`, `0`) parse; as a bool it refused them and the proxy would not start. Python reads it as an int.
           
           [env: HEADROOM_PROTECT_RECENT=]
-          [default: false]
-          [possible values: true, false]
 
       --protect-analysis-context <PROTECT_ANALYSIS_CONTEXT>
           Protect analysis context from compression
           
           [env: HEADROOM_PROTECT_ANALYSIS_CONTEXT=]
           [default: false]
-          [possible values: true, false]
 
       --accuracy-guard <ACCURACY_GUARD>
           Accuracy guard string for compression safety

@@ -1854,22 +1854,26 @@ pub struct CliArgs {
     /// `live_zone::DispatchConfig` declares one that is neither read nor
     /// written. `skip_user_messages`, which the doc comments say this overrides,
     /// is itself only declared and defaulted.
-    #[arg(long = "compress-user-messages", env = "HEADROOM_COMPRESS_USER_MESSAGES", default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long = "compress-user-messages", env = "HEADROOM_COMPRESS_USER_MESSAGES", default_value_t = true, action = clap::ArgAction::Set, value_parser = parse_bool_flag)]
     pub compress_user_messages: bool,
 
     /// Gate compression of system-role messages.
     ///
     /// **Not wired. Setting this changes nothing.** Same three dead layers as
     /// `compress_user_messages` above.
-    #[arg(long = "compress-system-messages", env = "HEADROOM_COMPRESS_SYSTEM_MESSAGES", default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long = "compress-system-messages", env = "HEADROOM_COMPRESS_SYSTEM_MESSAGES", default_value_t = true, action = clap::ArgAction::Set, value_parser = parse_bool_flag)]
     pub compress_system_messages: bool,
 
-    /// Protect recent reads from compression.
-    #[arg(long = "protect-recent", env = "HEADROOM_PROTECT_RECENT", default_value_t = false, action = clap::ArgAction::Set)]
-    pub protect_recent: bool,
+    /// Number of most recent messages to protect from compression.
+    ///
+    /// **Not wired. Setting this changes nothing.** Accepted so the
+    /// `agent-savings` profile exports (`2`, `4`, `0`) parse; as a bool it
+    /// refused them and the proxy would not start. Python reads it as an int.
+    #[arg(long = "protect-recent", env = "HEADROOM_PROTECT_RECENT")]
+    pub protect_recent: Option<u32>,
 
     /// Protect analysis context from compression.
-    #[arg(long = "protect-analysis-context", env = "HEADROOM_PROTECT_ANALYSIS_CONTEXT", default_value_t = false, action = clap::ArgAction::Set)]
+    #[arg(long = "protect-analysis-context", env = "HEADROOM_PROTECT_ANALYSIS_CONTEXT", default_value_t = false, action = clap::ArgAction::Set, value_parser = parse_bool_flag)]
     pub protect_analysis_context: bool,
 
     /// Accuracy guard string for compression safety.
@@ -2722,7 +2726,7 @@ pub struct Config {
     pub smart_crusher_with_compaction: bool,
     pub compress_user_messages: bool,
     pub compress_system_messages: bool,
-    pub protect_recent: bool,
+    pub protect_recent: Option<u32>,
     pub protect_analysis_context: bool,
     pub accuracy_guard: String,
     pub lossless: bool,
@@ -3257,7 +3261,7 @@ impl Config {
             smart_crusher_with_compaction: true,
             compress_user_messages: true,
             compress_system_messages: true,
-            protect_recent: false,
+            protect_recent: None,
             protect_analysis_context: false,
             accuracy_guard: String::new(),
             lossless: false,
