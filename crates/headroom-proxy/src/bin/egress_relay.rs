@@ -64,8 +64,11 @@ const LANE_CHECK_EVERY: Duration = Duration::from_secs(300);
 const SUSPECT_FAILURES: u32 = 3;
 /// A lane whose server keeps failing probes for this long is re-rotated.
 const HEAL_AFTER: Duration = Duration::from_secs(180);
-/// Wait this long before trying to heal the same lane again.
+/// Wait this long before trying to heal the same lane again. It doubles with
+/// each heal in a row, up to `HEAL_COOLDOWN_MAX`: a heal is several logins, and
+/// Nord rejected most logins from this account on 2026-09-30.
 const HEAL_COOLDOWN: Duration = Duration::from_secs(300);
+const HEAL_COOLDOWN_MAX: Duration = Duration::from_secs(3600);
 /// Idle servers fully probed per sweep. Round trips are measured for all of them.
 const SWEEP_PROBES: usize = 12;
 
@@ -1506,7 +1509,7 @@ impl Manager {
         let mut next_sweep = Instant::now();
         let mut next_check = Instant::now() + LANE_CHECK_EVERY;
         let mut failing_since: HashMap<usize, Instant> = HashMap::new();
-        let mut healed_at: HashMap<usize, Instant> = HashMap::new();
+        let mut healed_at: HashMap<usize, (Instant, u32)> = HashMap::new();
         while self.running.load(Ordering::SeqCst) {
             if Instant::now() >= next_sweep {
                 self.sweep();
@@ -1591,7 +1594,7 @@ impl Manager {
         lane: &Arc<Lane>,
         full_check: bool,
         failing_since: &mut HashMap<usize, Instant>,
-        healed_at: &mut HashMap<usize, Instant>,
+        healed_at: &mut HashMap<usize, (Instant, u32)>,
     ) {
         let (host, address, suspect, rotating) = {
             let state = lock_unpoisoned(&lane.state);
@@ -1640,11 +1643,18 @@ impl Manager {
             .is_some_and(|since| since.elapsed() >= HEAL_AFTER);
         let cooled = healed_at
             .get(&lane.slot)
-            .is_none_or(|at| at.elapsed() >= HEAL_COOLDOWN);
+            .is_none_or(|(at, streak)| at.elapsed() >= heal_cooldown(*streak));
         if !(long_enough && cooled) {
             return;
         }
-        healed_at.insert(lane.slot, Instant::now());
+        let streak = healed_at.get(&lane.slot).map_or(0, |(at, streak)| {
+            if at.elapsed() >= HEAL_COOLDOWN_MAX {
+                0
+            } else {
+                streak + 1
+            }
+        });
+        healed_at.insert(lane.slot, (Instant::now(), streak));
         let proxy_url = std::env::var("HEADROOM_PROXY_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
         let id = egress_id(&pool_url(self.base_port, lane.slot));
@@ -1654,6 +1664,13 @@ impl Manager {
         }
         eprintln!("heal: lane={} rotated: {result}", lane.slot);
     }
+}
+
+/// How long to wait after the `streak`th heal in a row before the next one.
+fn heal_cooldown(streak: u32) -> Duration {
+    HEAL_COOLDOWN
+        .saturating_mul(1 << streak.min(4))
+        .min(HEAL_COOLDOWN_MAX)
 }
 
 fn accept_loop(lane: Arc<Lane>, listener: TcpListener, running: Arc<AtomicBool>) {
@@ -2619,5 +2636,11 @@ mod tests {
         .unwrap();
         assert_eq!(exit_ip, "198.51.100.9");
         upstream.join().unwrap();
+    }
+
+    #[test]
+    fn heal_cooldown_doubles_per_heal_in_a_row_and_stops_at_the_cap() {
+        let secs: Vec<u64> = (0..7).map(|n| heal_cooldown(n).as_secs()).collect();
+        assert_eq!(secs, [300, 600, 1200, 2400, 3600, 3600, 3600]);
     }
 }

@@ -284,6 +284,16 @@ vpn_locations() {
   esac
 }
 COOLDOWN_SECS=120
+# Rotation budget, per egress. Nord rejected most logins from our one account
+# on 2026-09-30 (573 auth rejections on one lane, 2 of 12 probes accepted) and
+# a rotation is several logins, so a lane that keeps failing waits longer each
+# time instead of retrying at every cooldown. Manual rotation skips the budget.
+ROTATE_MAX_PER_HOUR=6
+ROTATE_BACKOFF_BASE_SECS=240
+ROTATE_BACKOFF_MAX_SECS=3600
+# An unauthenticated request to Zen, sent through the rotated lane. A limited
+# exit answers 429 before any client check; one with allowance left answers 403.
+ZEN_PROBE_URL="${HEADROOM_ZEN_PROBE_URL:-https://opencode.ai/zen/v1/responses}"
 # Proactive cycling: rotate on a schedule, not just on rate limits, so the
 # exit moves before a bucket fills — at a moment we choose, drained, instead
 # of mid-turn after a refusal. Interval ± jitter (no exact hourly pattern).
@@ -448,11 +458,67 @@ valid_zen_egress_id() {
   [[ "${1:-}" =~ ^proxy-[0-9a-f]{12}$ ]]
 }
 
+# 0 when `egress_id` may rotate now. Reads the attempt and backoff files that
+# rotation_started / rotation_failed write under $ZEN_EGRESS_STAMP_DIR.
+rotation_allowed() {
+  local id="$1" now backoff_until attempts
+  now=$(date +%s)
+  backoff_until=$(cut -d' ' -f1 "$ZEN_EGRESS_STAMP_DIR/$id.backoff" 2>/dev/null) || backoff_until=0
+  backoff_until=${backoff_until:-0}
+  if (( now < backoff_until )); then
+    log "egress=$id backing off after a failed rotation for $((backoff_until - now))s, skipping"
+    return 1
+  fi
+  attempts=$(awk -v cut=$((now - 3600)) '$1 > cut' "$ZEN_EGRESS_STAMP_DIR/$id.attempts" 2>/dev/null | wc -l)
+  if (( attempts >= ROTATE_MAX_PER_HOUR )); then
+    log "egress=$id rotation budget spent ($attempts in the last hour), skipping"
+    return 1
+  fi
+}
+
+rotation_started() {
+  local file="$ZEN_EGRESS_STAMP_DIR/$1.attempts"
+  { tail -n 49 "$file" 2>/dev/null; date +%s; } >"$file.new" && mv "$file.new" "$file"
+}
+
+# The wait doubles with each failure in a row: 240 s, 480 s, ... up to the cap.
+rotation_failed() {
+  local file="$ZEN_EGRESS_STAMP_DIR/$1.backoff" streak delay
+  streak=$(cut -d' ' -f2 "$file" 2>/dev/null) || streak=0
+  streak=$(( ${streak:-0} + 1 ))
+  delay=$(( ROTATE_BACKOFF_BASE_SECS << (streak > 5 ? 4 : streak - 1) ))
+  delay=$(( delay > ROTATE_BACKOFF_MAX_SECS ? ROTATE_BACKOFF_MAX_SECS : delay ))
+  echo "$(( $(date +%s) + delay )) $streak" >"$file"
+}
+
+rotation_worked() { rm -f "$ZEN_EGRESS_STAMP_DIR/$1.backoff"; }
+
+# HTTP status Zen gives a request sent through the lane (000 when the lane
+# cannot reach Zen), or nothing when the rotator cannot name the lane's port.
+zen_probe_status() {
+  local id="$1" port
+  port=$("$ZEN_EGRESS_ROTATE_COMMAND" status 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for lane in data.get("lanes", []):
+        if lane.get("egress_id") == sys.argv[1]:
+            print(int(data["base_port"]) + int(lane["slot"]))
+except (ValueError, TypeError, KeyError):
+    pass
+' "$id") || return 0
+  [[ -n "$port" ]] || return 0
+  curl -s -m 30 -o /dev/null -w '%{http_code}' -x "socks5h://127.0.0.1:$port" \
+    -H 'content-type: application/json' \
+    -d '{"model":"muse-spark-1.3-contributor-free","input":"say ok","max_output_tokens":16,"stream":false}' \
+    "$ZEN_PROBE_URL" 2>/dev/null || true
+}
+
 # The configured executable owns the VPN-specific details for one independent
 # egress. It receives exactly: <opaque-egress-id> <rate-limit|proactive|manual>.
 # No pool URL or provider credential is passed to it.
 rotate_zen_egress() {
-  local egress_id="$1" reason="$2" stamp now last n rotator_out
+  local egress_id="$1" reason="$2" stamp now last n rotator_out probed
   if ! valid_zen_egress_id "$egress_id"; then
     log "refusing invalid egress id for per-egress rotation"
     return 2
@@ -476,6 +542,7 @@ rotate_zen_egress() {
         log "egress=$egress_id cooldown active, skipping ($reason)"
         exit 0
       fi
+      rotation_allowed "$egress_id" || exit 0
     fi
 
     # Drain only this egress's turns; other egresses keep streaming. Fail
@@ -490,6 +557,7 @@ rotate_zen_egress() {
       log "egress=$egress_id rotation deferred ($reason): active streams did not drain"
       exit 1
     fi
+    rotation_started "$egress_id"
     # The rotator prints one JSON result and generic per-candidate reasons,
     # never credentials or proxy URLs, so its tail is safe to log. Without it
     # 191 failed rotations over 5 days could not be told apart.
@@ -498,8 +566,16 @@ rotate_zen_egress() {
       HEADROOM_PROXY_URL="$PROXY_URL" "$ZEN_EGRESS_ROTATE_COMMAND" \
       "$egress_id" "$reason" 2>&1); then
       date +%s >"$stamp"
+      probed=$(zen_probe_status "$egress_id")
+      if [[ "$probed" == 429 || "$probed" == 000 ]]; then
+        log "egress=$egress_id rotated ($reason) but Zen answers $probed on the new exit; counted as failed"
+        rotation_failed "$egress_id"
+        exit 3
+      fi
+      rotation_worked "$egress_id"
       log "egress=$egress_id rotated ($reason)"
     else
+      rotation_failed "$egress_id"
       log "egress=$egress_id rotation FAILED ($reason); external rotator returned non-zero or timed out: $(printf '%s' "$rotator_out" | tail -c 400 | tr '\n' ' ')"
       # 3, not 1: the rotator answered no. Retrying at once cannot change
       # that, unlike a drain that ran out of time (1).
@@ -538,7 +614,10 @@ zen_egress_id_from_line() {
   python3 -c '
 import json, sys
 try:
-    value = json.loads(sys.stdin.read()).get("egress_id", "")
+    line = json.loads(sys.stdin.read())
+    # The proxy logs tracing JSON: event fields sit under "fields".
+    fields = line.get("fields")
+    value = (fields if isinstance(fields, dict) else line).get("egress_id", "")
     if isinstance(value, str):
         print(value)
 except (ValueError, TypeError):
