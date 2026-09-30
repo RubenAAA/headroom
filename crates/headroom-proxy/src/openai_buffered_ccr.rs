@@ -21,8 +21,11 @@
 //!
 //! * Chat-completions streaming keeps its current behaviour (no injection,
 //!   no buffering). Python's `_should_inject_openai_chat_ccr_tool` is
-//!   `inject && !stream`, which is exactly what the proxy already does, so
-//!   there is nothing to port there.
+//!   `inject && !stream`. The proxy does not inject on non-streaming chat
+//!   either: `inject_ccr_retrieve_tool` has a chat branch, but its only
+//!   caller (`proxy/forward/ctx.rs`) runs for Anthropic `/v1/messages`
+//!   alone. Porting it means porting Python's session-sticky injection too;
+//!   tracked in `docs/notes/upstream-triage-0.39.x.md`.
 //! * The ASGI grace-window/heartbeat wrapper (`buffered_ccr_response.py`)
 //!   exists to hold a request open while a *streaming* generation runs. Here
 //!   the upstream call is already non-streaming, so the full body (and its
