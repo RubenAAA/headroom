@@ -1345,7 +1345,15 @@ async fn connect_upstream_with_retry(
             .upstream_connect_timeout
             .saturating_mul(3)
             .max(Duration::from_secs(30));
-        let connect = tokio_tungstenite::connect_async_with_config(req, Some(config), false);
+        // Explicit TLS config, as in `websocket.rs`: corporate roots from the
+        // OS store and HEADROOM_CA_BUNDLE, and a named crypto provider.
+        let connector = tokio_tungstenite::Connector::Rustls(crate::tls::websocket_tls_config());
+        let connect = tokio_tungstenite::connect_async_tls_with_config(
+            req,
+            Some(config),
+            false,
+            Some(connector),
+        );
         match tokio::time::timeout(open_timeout, connect).await {
             Ok(Ok((stream, resp))) => return Ok((stream, resp)),
             outcome => {

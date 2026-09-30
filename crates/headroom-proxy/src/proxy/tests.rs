@@ -2925,3 +2925,13 @@ fn apply_prefix_replay_pipes_inbound_tail_evidence_to_usage_observer() {
     assert_eq!(event.origin.as_deref(), Some("inbound"));
     assert_eq!(event.scope.as_deref(), Some("final_message"));
 }
+
+#[test]
+fn url_build_refuses_to_escape_base_path() {
+    // `url::Url::set_path` would resolve this to `/tenant-b/v1/messages`.
+    let base: url::Url = "http://gw/tenant-a".parse().unwrap();
+    let uri: Uri = "/../tenant-b/v1/messages".parse().unwrap();
+    let err = build_upstream_url(&base, &uri).unwrap_err();
+    assert!(matches!(err, ProxyError::InvalidPath(_)), "{err:?}");
+    assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+}

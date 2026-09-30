@@ -49,6 +49,7 @@ use futures_util::StreamExt as _;
 use http::HeaderName;
 use url::Url;
 
+use crate::ProxyError;
 use crate::bedrock::envelope::BedrockEnvelope;
 use crate::bedrock::sigv4::{SigningInputs, sign_request};
 use crate::compression::{
@@ -57,6 +58,7 @@ use crate::compression::{
 use crate::headers::filter_response_headers;
 use crate::observability::{observe_bedrock_invoke_latency, record_bedrock_invoke};
 use crate::proxy::AppState;
+use crate::upstream_path::append_segments;
 // Phase F PR-F1 + PR-D3: the bedrock auth-mode layer
 // (`classify_and_attach_auth_mode`) populates `request.extensions()`
 // with `AuthMode` BEFORE this handler runs. We extract it via
@@ -342,7 +344,25 @@ fn build_invoke_upstream_url(
 ) -> Result<url::Url, Response> {
     match build_bedrock_upstream(state, model_id, uri, action) {
         Ok(u) => Ok(u),
-        Err(msg) => {
+        // The client sent a model id the proxy would have to rewrite
+        // (dot segments, control characters): its fault, 400, and the
+        // signer never sees the request.
+        Err(ProxyError::InvalidPath(msg)) => {
+            tracing::warn!(
+                event = "bedrock_path_rejected",
+                request_id = %request_id,
+                model_id = %model_id,
+                error = %msg,
+                "bedrock invoke: refusing to forward a model id that would rewrite the upstream path"
+            );
+            Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "bedrock_path_rejected",
+                &msg,
+            ))
+        }
+        Err(e) => {
+            let msg = e.to_string();
             tracing::error!(
                 event = "bedrock_endpoint_invalid",
                 request_id = %request_id,
@@ -694,37 +714,30 @@ fn report_invoke_compression_outcome(
 }
 
 /// Build the upstream URL for the Bedrock route. Honours the
-/// operator-supplied `bedrock_endpoint` first, falling back to the
-/// region-derived default. The path/query portion is taken from the
-/// original URI verbatim — Bedrock's path schema (`/model/{id}/{action}`)
-/// is identical to the proxy's external path.
+/// operator-supplied `bedrock_endpoint` first (including any path prefix
+/// on it), falling back to the region-derived default. The path is rebuilt
+/// segment by segment — `/model/{model_id}/{action}` — from the decoded
+/// route parameter, so a model id containing `/` (an inference-profile
+/// ARN) is re-encoded as one `%2F` segment, and a model id that would
+/// change the path's shape (`..`, empty, control characters) is rejected
+/// with `ProxyError::InvalidPath` (400). See `crate::upstream_path`.
 fn build_bedrock_upstream(
     state: &AppState,
     model_id: &str,
     uri: &Uri,
     action: &str,
-) -> Result<Url, String> {
+) -> Result<Url, ProxyError> {
     let base = match state.config.bedrock_endpoint.as_ref() {
         Some(u) => u.clone(),
         None => {
             let host =
                 BEDROCK_RUNTIME_HOST_TEMPLATE.replace("{region}", &state.config.bedrock_region);
-            Url::parse(&format!("https://{host}/"))
-                .map_err(|e| format!("bedrock derived base URL parse error: {e}"))?
+            Url::parse(&format!("https://{host}/")).map_err(|e| {
+                ProxyError::InvalidUpstream(format!("bedrock derived base URL parse error: {e}"))
+            })?
         }
     };
-    // Compose the path as discrete segments so the model_id is
-    // percent-encoded per-segment. This matters for application
-    // inference profile ARN overrides (`arn:aws:…/…`): the ARN's
-    // embedded `/` must be encoded to `%2F` to stay within the single
-    // `{model_id}` segment. Colons (e.g. `-v1:0`) are left literal, so
-    // plain Bedrock model ids build the same path as before.
-    let mut joined = base;
-    joined
-        .path_segments_mut()
-        .map_err(|_| "bedrock base URL cannot be a base".to_string())?
-        .clear()
-        .extend(["model", model_id, action]);
+    let mut joined = append_segments(&base, ["model", model_id, action])?;
     if let Some(q) = uri.query() {
         joined.set_query(Some(q));
     }

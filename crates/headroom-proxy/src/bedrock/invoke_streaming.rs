@@ -56,6 +56,7 @@ use http::HeaderName;
 use std::pin::Pin;
 use url::Url;
 
+use crate::ProxyError;
 use crate::bedrock::eventstream::{EventStreamParser, ParseError};
 use crate::bedrock::eventstream_to_sse::{
     OutputMode, TranslateError, TranslateOutcome, translate_message,
@@ -69,6 +70,7 @@ use crate::observability::{
     observe_bedrock_invoke_latency, record_bedrock_eventstream_message, record_bedrock_invoke,
 };
 use crate::proxy::AppState;
+use crate::upstream_path::append_segments;
 // Phase F PR-F1 + PR-D3: pre-classified by `classify_and_attach_auth_mode`
 // middleware on the bedrock router; we read it back via the
 // `Extension<AuthMode>` extractor.
@@ -332,7 +334,25 @@ fn build_streaming_upstream_url(
 ) -> Result<url::Url, Response> {
     match build_bedrock_streaming_upstream(state, model_id, uri, action) {
         Ok(u) => Ok(u),
-        Err(msg) => {
+        // The client sent a model id the proxy would have to rewrite
+        // (dot segments, control characters): its fault, 400, and the
+        // signer never sees the request.
+        Err(ProxyError::InvalidPath(msg)) => {
+            tracing::warn!(
+                event = "bedrock_path_rejected",
+                request_id = %request_id,
+                model_id = %model_id,
+                error = %msg,
+                "bedrock invoke-streaming: refusing to forward a model id that would rewrite the upstream path"
+            );
+            Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "bedrock_path_rejected",
+                &msg,
+            ))
+        }
+        Err(e) => {
+            let msg = e.to_string();
             tracing::error!(
                 event = "bedrock_endpoint_invalid",
                 request_id = %request_id,
@@ -1165,31 +1185,27 @@ fn report_bedrock_compression_outcome(
     }
 }
 
+/// Streaming twin of `invoke::build_bedrock_upstream`: same base
+/// resolution, same segment-safe path construction (see
+/// `crate::upstream_path`), so an ARN model id stays one `%2F` segment
+/// and a traversal attempt is rejected with `ProxyError::InvalidPath`.
 fn build_bedrock_streaming_upstream(
     state: &AppState,
     model_id: &str,
     uri: &Uri,
     action: &str,
-) -> Result<Url, String> {
+) -> Result<Url, ProxyError> {
     let base = match state.config.bedrock_endpoint.as_ref() {
         Some(u) => u.clone(),
         None => {
             let host =
                 BEDROCK_RUNTIME_HOST_TEMPLATE.replace("{region}", &state.config.bedrock_region);
-            Url::parse(&format!("https://{host}/"))
-                .map_err(|e| format!("bedrock derived base URL parse error: {e}"))?
+            Url::parse(&format!("https://{host}/")).map_err(|e| {
+                ProxyError::InvalidUpstream(format!("bedrock derived base URL parse error: {e}"))
+            })?
         }
     };
-    // Segment-based path construction so ARN overrides (embedded `/`)
-    // are percent-encoded within the single `{model_id}` segment while
-    // plain model ids (colons kept literal) build the same path as
-    // before. See `bedrock::invoke::build_bedrock_upstream`.
-    let mut joined = base;
-    joined
-        .path_segments_mut()
-        .map_err(|_| "bedrock base URL cannot be a base".to_string())?
-        .clear()
-        .extend(["model", model_id, action]);
+    let mut joined = append_segments(&base, ["model", model_id, action])?;
     if let Some(q) = uri.query() {
         joined.set_query(Some(q));
     }

@@ -116,30 +116,21 @@ pub(super) async fn header_upstream_override(
 /// Build the upstream URL by joining the configured base with the incoming
 /// path-and-query. Preserves '?' and the query string verbatim.
 pub(crate) fn build_upstream_url(base: &url::Url, uri: &Uri) -> Result<url::Url, ProxyError> {
-    Ok(join_upstream_path(base, uri.path(), uri.query()))
+    join_upstream_path(base, uri.path(), uri.query())
 }
 
 /// Shared path-join helper used by HTTP and WebSocket handlers.
-/// Appends `path` to `base`, preserving any base path prefix, then sets `query`.
-pub(crate) fn join_upstream_path(base: &url::Url, path: &str, query: Option<&str>) -> url::Url {
-    let mut joined = base.clone();
-    // Strip trailing slash from base path so "http://x:1/api" + "/v1/foo"
-    // yields "http://x:1/api/v1/foo" rather than "http://x:1/v1/foo".
-    let base_path = joined.path().trim_end_matches('/').to_string();
-    let combined = if path.is_empty() || path == "/" {
-        if base_path.is_empty() {
-            "/".to_string()
-        } else {
-            base_path
-        }
-    } else if base_path.is_empty() {
-        path.to_string()
-    } else {
-        format!("{base_path}{path}")
-    };
-    joined.set_path(&combined);
-    joined.set_query(query);
-    joined
+/// Appends `path` to `base`, preserving any base path prefix, then sets
+/// `query`. Rejects (400) any path the URL parser would rewrite — dot
+/// segments, backslashes — so the upstream always receives exactly the path
+/// the client sent, under exactly the configured prefix. See
+/// [`crate::upstream_path`].
+pub(crate) fn join_upstream_path(
+    base: &url::Url,
+    path: &str,
+    query: Option<&str>,
+) -> Result<url::Url, ProxyError> {
+    Ok(crate::upstream_path::join_request_path(base, path, query)?)
 }
 
 /// Assemble the client-bound upstream byte stream: re-prepend bytes peeked while

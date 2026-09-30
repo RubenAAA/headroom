@@ -740,6 +740,12 @@ impl AppState {
     }
 
     pub fn new(mut config: Config) -> Result<Self, ProxyError> {
+        // Two rustls crypto providers are linked into this binary (ring via
+        // reqwest, aws-lc-rs via the AWS SDK), so anything that reaches for
+        // the process default — tokio-tungstenite, any future dependency —
+        // would panic without one. Pin it before the first TLS client is
+        // built. Idempotent; see `crate::tls`.
+        crate::tls::install_process_crypto_provider();
         let client = Self::build_upstream_client(&config)?;
         let zen_egresses = Self::build_zen_egresses(&config)?;
         let default_egress_id = provider_egress_id(config.http_proxy.as_deref());
