@@ -127,7 +127,7 @@ fn redact_memory_results(
 /// What one memory round read decided: the next turn JSON, a same-round
 /// retry, or the end of the loop.
 /// Extracted from `handle_memory_response` without behavior change.
-enum MemoryRoundRead {
+pub(super) enum MemoryRoundRead {
     Advance(serde_json::Value),
     Retry,
     Done,
@@ -192,7 +192,7 @@ async fn defer_mixed_memory_turn(
 /// names what it disliked — resending the same bytes can only fail the
 /// same way), `Failed` covers timeouts and transport errors.
 #[allow(clippy::too_many_arguments)]
-async fn send_memory_continuation(
+pub(super) async fn send_memory_continuation(
     client: &reqwest::Client,
     upstream_url: &url::Url,
     outgoing_headers: &http::HeaderMap,
@@ -358,7 +358,7 @@ fn responses_terminal_reason(bytes: &bytes::Bytes) -> Option<String> {
 /// transport-cut body or an unusable fold (bounded; exhaustion breaks with
 /// the calls standing, loudly, as before).
 /// Extracted from `handle_memory_response` without behavior change.
-async fn read_memory_round_body(
+pub(super) async fn read_memory_round_body(
     resp: reqwest::Response,
     provider: &str,
     mem_cut_attempts: &mut u32,
@@ -386,7 +386,7 @@ async fn read_memory_round_body(
 /// the splice does not serialize (caller ends the loop).
 /// Extracted from `handle_memory_response` without behavior change.
 #[allow(clippy::too_many_arguments)]
-fn append_round_messages(
+pub(super) fn append_round_messages(
     current_request: &mut serde_json::Value,
     items_field: &str,
     assistant_msg: serde_json::Value,
@@ -1171,7 +1171,7 @@ fn answered_mixed_turn_in_place(
 /// True when the built continuation carries a call upstream will refuse;
 /// logs what dangles. Extracted from `handle_memory_response` without
 /// behavior change.
-fn continuation_is_doomed(
+pub(super) fn continuation_is_doomed(
     continuation_body: &[u8],
     provider: &str,
     items_field: &str,
@@ -1199,7 +1199,7 @@ fn continuation_is_doomed(
 /// Log the send and check the continuation still extends the first round's
 /// cached prefix. Extracted from `handle_memory_response` without behavior
 /// change.
-fn note_continuation_send(
+pub(super) fn note_continuation_send(
     current_request: &serde_json::Value,
     base: Option<(
         &crate::cache_stabilization::drift_detector::StructuralHash,

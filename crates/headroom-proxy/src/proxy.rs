@@ -13,6 +13,7 @@ mod outcome;
 mod reasoning;
 mod replay;
 mod request_transforms;
+mod shadow_continuation;
 mod sse;
 mod sse_anthropic;
 mod sse_openai;
@@ -32,6 +33,7 @@ pub use self::{
 pub(crate) use memory_continuation::{
     MemoryToolContext, handle_memory_response, memory_tool_context,
 };
+pub(crate) use shadow_continuation::handle_shadow_response;
 
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;

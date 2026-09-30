@@ -122,9 +122,15 @@ ignores the note. A real tool-less request (title, summary) did not get
 measured: Zen held every request from about 20:30 to 21:00 local, so the title
 and files prompts timed out on both binaries.
 
-The fix that would finish it: treat a shadow call on a turn with no client
-tools as a proxy-handled call, answer it with "no such tool, reply in text" and
-continue the turn, the way `headroom_retrieve` is continued
-(`routed/ccr.rs`, `proxy/ccr_response.rs`). It has to work on the streaming
-path after thinking has been sent, which is why it was not done here.
-
+The rest is the proxy answering the call (`proxy/shadow_continuation.rs`,
+event `zen_shadow_call_answered`). On a turn whose client sent no tools, a turn
+made up only of shadow calls gets a `function_call_output` saying no tools
+exist and one more round, so the model writes its reply. One round per turn: a
+second shadow call in that reply stays standing and the stream rewriter drops
+it like any unresolved proxy tool. A turn that also calls a real tool,
+`headroom_retrieve` or a memory tool is left alone. It runs in the stream
+rewriter (`sse/ccr_stream.rs`) and the buffered arm (`routed/ccr.rs`), Responses
+shape only. Covered by `tests/suites/routing/routed_shadow_call.rs`. Not yet
+measured live: how often it fires and whether the second round always produces
+text. Count `zen_shadow_call_answered` per day, and watch for a tool-less Spark
+turn that still ends in `tool_use` or an empty reply.

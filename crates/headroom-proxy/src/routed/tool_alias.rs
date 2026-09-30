@@ -135,8 +135,15 @@ pub(crate) fn ensure_gate_tools(openai_body: &mut Value) -> usize {
     missing.len()
 }
 
+/// Whether `name` is one of the gate's shadow tools. On a turn whose client
+/// sent no tools, a call to one can only be the model reaching for a tool that
+/// does not exist.
+pub(crate) fn is_gate_shadow_name(name: &str) -> bool {
+    ZEN_GATE_CORE_TOOLS.contains(&name)
+}
+
 /// What a turn is told when the gate's shadow tools are its only tools.
-const NO_CLIENT_TOOLS_NOTE: &str =
+pub(crate) const NO_CLIENT_TOOLS_NOTE: &str =
     "No tools are available in this conversation. Reply in text and do not call any function.";
 
 /// Tell the model, on a turn whose client sent no tools, that the shadow

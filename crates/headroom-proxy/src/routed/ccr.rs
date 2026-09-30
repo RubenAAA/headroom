@@ -85,13 +85,22 @@ pub(crate) async fn resolve_routed_proxy_tools(
     } else {
         crate::proxy::MAX_RESOLVER_ALTERNATIONS
     };
+    // Answering a shadow call gets the model one more round, once per turn.
+    let mut shadow_answered = false;
     for _ in 0..alternations {
         let before = body.clone();
 
         let (next, ccr_rounds) = resolve_routed_ccr(&body, ccr).await;
         rounds.absorb(ccr_rounds);
-        let (next, mem_rounds) = resolve_routed_memory(&next, ccr).await;
+        let (mut next, mem_rounds) = resolve_routed_memory(&next, ccr).await;
         rounds.absorb(mem_rounds);
+        if ccr.client_toolless && ccr.responses_shape && !shadow_answered {
+            let before_shadow = next.clone();
+            let (answered, shadow_rounds) = resolve_routed_shadow(&next, ccr).await;
+            rounds.absorb(shadow_rounds);
+            shadow_answered = answered != before_shadow;
+            next = answered;
+        }
         body = next;
 
         if body == before {
@@ -99,6 +108,34 @@ pub(crate) async fn resolve_routed_proxy_tools(
         }
     }
     (body, rounds)
+}
+
+/// Answer a call to a gate shadow tool on a tool-less Responses turn. The
+/// twin of [`resolve_routed_ccr`] for the third tool the proxy answers itself.
+async fn resolve_routed_shadow(
+    response: &Value,
+    ccr: &RoutedCcr,
+) -> (Value, crate::proxy::CcrRoundUsage) {
+    let Ok(url) = url::Url::parse(&ccr.upstream_url) else {
+        return (response.clone(), crate::proxy::CcrRoundUsage::default());
+    };
+    let Ok(body) = serde_json::to_vec(response) else {
+        return (response.clone(), crate::proxy::CcrRoundUsage::default());
+    };
+    let (resolved, usage) = crate::proxy::handle_shadow_response(
+        &Bytes::from(body),
+        &ccr.request_body,
+        &url,
+        &ccr.client,
+        &ccr.resolver_config(),
+        &ccr.request_id,
+        &ccr.headers,
+    )
+    .await;
+    match serde_json::from_slice(&resolved) {
+        Ok(v) => (v, usage),
+        Err(_) => (response.clone(), usage),
+    }
 }
 
 /// Run any `memory_*` call the model made, in the upstream's own shape.
@@ -180,6 +217,10 @@ pub(crate) struct RoutedCcr {
     /// upstream-bound continuation. `None` when the outbound body needed no
     /// redaction — or the flag is off — and continuations pass through.
     pub redact: Option<crate::redact::RedactRef>,
+    /// The client sent no tools, so the gate's shadow tools are the only ones
+    /// on the turn and a call to one is the proxy's to answer
+    /// (`proxy::handle_shadow_response`).
+    pub client_toolless: bool,
 }
 
 impl RoutedCcr {
@@ -241,6 +282,10 @@ impl RoutedCcr {
             config: state.config.clone(),
             request_id: request_id.to_string(),
             responses_shape,
+            client_toolless: parsed
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_none_or(|tools| tools.is_empty()),
             // Continuations inherit the turn's redaction: memory and cold-tier
             // content fetched mid-turn is redacted before it goes back upstream.
             // Gated on the flag, not on outbound spans — a clean prompt can
@@ -343,6 +388,7 @@ mod resolver_alternation_tests {
             .await;
 
         let ccr = RoutedCcr {
+            client_toolless: false,
             stores: None,
             store: Arc::new(store),
             memory: Some(memory_ctx()),
@@ -390,6 +436,7 @@ mod resolver_alternation_tests {
     async fn a_turn_needing_neither_resolver_makes_no_upstream_call() {
         let server = MockServer::start().await;
         let ccr = RoutedCcr {
+            client_toolless: false,
             stores: None,
             store: Arc::new(InMemoryCcrStore::new()),
             memory: Some(memory_ctx()),
@@ -458,6 +505,7 @@ mod resolver_alternation_tests {
         let opening = crate::sse::ccr_stream::anthropic_turn_as_responses_output(&rebuilt);
 
         let ccr = RoutedCcr {
+            client_toolless: false,
             stores: None,
             store: Arc::new(InMemoryCcrStore::new()),
             memory: Some(memory_ctx()),
@@ -557,6 +605,7 @@ mod resolver_alternation_tests {
         let opening = crate::sse::ccr_stream::anthropic_turn_as_responses_output(&rebuilt);
 
         let ccr = RoutedCcr {
+            client_toolless: false,
             stores: None,
             store: Arc::new(store),
             memory: Some(memory_ctx()),
@@ -642,6 +691,7 @@ mod resolver_alternation_tests {
         let opening = crate::sse::ccr_stream::anthropic_turn_as_responses_output(&rebuilt);
 
         let ccr = RoutedCcr {
+            client_toolless: false,
             stores: None,
             store: Arc::new(InMemoryCcrStore::new()),
             memory: Some(memory_ctx()),
@@ -757,6 +807,7 @@ mod resolver_alternation_tests {
 
         let redact_store = crate::redact::RedactStore::with_key([0xA5; 32]);
         let ccr = RoutedCcr {
+            client_toolless: false,
             stores: None,
             store: Arc::new(InMemoryCcrStore::new()),
             memory: Some(memory),

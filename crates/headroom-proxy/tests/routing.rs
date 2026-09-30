@@ -13,6 +13,8 @@ mod common;
 mod routed_early_stream_retry;
 #[path = "suites/routing/routed_forward_continuity.rs"]
 mod routed_forward_continuity;
+#[path = "suites/routing/routed_shadow_call.rs"]
+mod routed_shadow_call;
 
 #[path = "suites/routing/integration_sidecar.rs"]
 mod integration_sidecar;

@@ -98,6 +98,21 @@ pub(crate) enum CcrShape {
     RoutedResponses { anthropic_request: Value },
 }
 
+impl CcrShape {
+    /// Whether a call to one of the Zen gate's shadow tools is the proxy's to
+    /// answer: only on a Responses turn whose client sent no tools, where
+    /// the shadows are the only tools there are.
+    fn owns_shadow_calls(&self) -> bool {
+        match self {
+            CcrShape::RoutedResponses { anthropic_request } => anthropic_request
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_none_or(|tools| tools.is_empty()),
+            _ => false,
+        }
+    }
+}
+
 /// Anthropic stream events this proxy folds into a turn. Anything else is
 /// opaque to it and has no place in the turn JSON.
 const FOLDED_EVENTS: [&str; 8] = [
@@ -624,7 +639,7 @@ fn collect_extras(extras: &mut ContinuationExtras, event: &SseEvent) {
 /// in [`resolve_routed_proxy_tools`](crate::routed::ccr::resolve_routed_proxy_tools), and a tool injected into a request must appear
 /// here. Advertising a tool the client cannot run is the bug both halves
 /// exist to prevent.
-fn proxy_owned_tool(block: &Value, memory_enabled: bool) -> bool {
+fn proxy_owned_tool(block: &Value, memory_enabled: bool, shadow_calls: bool) -> bool {
     if block.get("type").and_then(Value::as_str) != Some("tool_use") {
         return false;
     }
@@ -633,6 +648,7 @@ fn proxy_owned_tool(block: &Value, memory_enabled: bool) -> bool {
     };
     name == CCR_TOOL_NAME
         || (memory_enabled && crate::memory::tool_adapter::MEMORY_TOOL_NAMES.contains(&name))
+        || (shadow_calls && crate::routed::tool_alias::is_gate_shadow_name(name))
 }
 
 /// Whether a resolved block is reasoning the continuation call produced.
@@ -808,8 +824,13 @@ fn deferred_answer_held(block: &Value) -> bool {
 }
 
 /// The splice's filter. `None` means the block is safe to send on.
-fn drop_reason(block: &Value, memory_enabled: bool, live: &[Value]) -> Option<DropReason> {
-    if proxy_owned_tool(block, memory_enabled) {
+fn drop_reason(
+    block: &Value,
+    memory_enabled: bool,
+    shadow_calls: bool,
+    live: &[Value],
+) -> Option<DropReason> {
+    if proxy_owned_tool(block, memory_enabled, shadow_calls) {
         if deferred_answer_held(block) {
             Some(DropReason::DeferredMemoryAnswer)
         } else {
@@ -1002,6 +1023,9 @@ struct Rewriter {
     /// Whether memory tools count as proxy-owned on this turn. False when
     /// memory is off, so those names stay the client's business.
     memory_enabled: bool,
+    /// Whether the Zen gate's shadow tools count as proxy-owned on this turn
+    /// (see [`CcrShape::owns_shadow_calls`]).
+    shadow_calls: bool,
     state: AnthropicStreamState,
     /// Upstream block index → the index the client was given. They diverge
     /// once a block has been suppressed.
@@ -1030,6 +1054,7 @@ impl Rewriter {
     fn new(memory_enabled: bool) -> Self {
         Self {
             memory_enabled,
+            shadow_calls: false,
             state: AnthropicStreamState::new(),
             index_map: HashMap::new(),
             suppressed: HashSet::new(),
@@ -1063,7 +1088,7 @@ impl Rewriter {
             "content_block_start" => {
                 let index = parsed.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let block = parsed.get("content_block").cloned().unwrap_or(Value::Null);
-                if proxy_owned_tool(&block, self.memory_enabled) {
+                if proxy_owned_tool(&block, self.memory_enabled, self.shadow_calls) {
                     self.suppressed.insert(index);
                     self.saw_ccr = true;
                     return Vec::new();
@@ -1156,6 +1181,7 @@ where
         // that only the proxy can run, and the client answered with
         // "No such tool available: memory_search".
         let mut rw = Rewriter::new(ctx.memory.is_some());
+        rw.shadow_calls = ctx.shape.owns_shadow_calls();
 
         while let Some(chunk) = upstream.next().await {
             let chunk = match chunk {
@@ -1240,7 +1266,7 @@ where
         let content_len = content.len();
         let mut emit_extras: Vec<Option<&BlockExtras>> = Vec::with_capacity(content_len);
         for (position, block) in content.into_iter().enumerate() {
-            match drop_reason(&block, memory_enabled, &live_blocks) {
+            match drop_reason(&block, memory_enabled, rw.shadow_calls, &live_blocks) {
                 Some(reason) => {
                     dropped[reason as usize] += 1;
                     if matches!(reason, DropReason::UnresolvedProxyTool)
@@ -1590,6 +1616,8 @@ async fn resolve_retrieval(
     // changes nothing. See `MAX_RESOLVER_ALTERNATIONS`.
     let mut resolved_bytes = turn_bytes.clone();
     let mut usage = crate::proxy::CcrRoundUsage::default();
+    // Answering a shadow call gets the model one more round, once per turn.
+    let mut shadow_answered = false;
     for _ in 0..crate::proxy::MAX_RESOLVER_ALTERNATIONS {
         let before = resolved_bytes.clone();
 
@@ -1625,6 +1653,22 @@ async fn resolve_retrieval(
             )
             .await;
             usage.absorb(extra);
+            resolved_bytes = bytes;
+        }
+
+        if ctx.shape.owns_shadow_calls() && !shadow_answered {
+            let (bytes, extra) = crate::proxy::handle_shadow_response(
+                &resolved_bytes,
+                &continuation_request,
+                &ctx.upstream_url,
+                &ctx.client,
+                &ctx.config,
+                &ctx.request_id,
+                &ctx.outgoing_headers,
+            )
+            .await;
+            usage.absorb(extra);
+            shadow_answered = bytes != resolved_bytes;
             resolved_bytes = bytes;
         }
 
@@ -2065,7 +2109,7 @@ mod tests {
     fn spliceable(content: Vec<Value>, live: &[Value]) -> Vec<Value> {
         content
             .into_iter()
-            .filter(|b| drop_reason(b, false, live).is_none())
+            .filter(|b| drop_reason(b, false, false, live).is_none())
             .collect()
     }
 
@@ -2230,7 +2274,7 @@ mod deferred_drop_reason_tests {
         ));
 
         assert!(matches!(
-            drop_reason(&block, true, &[]),
+            drop_reason(&block, true, false, &[]),
             Some(DropReason::DeferredMemoryAnswer)
         ));
         clear();
@@ -2241,7 +2285,7 @@ mod deferred_drop_reason_tests {
         let _g = lock();
         clear();
         assert!(matches!(
-            drop_reason(&memory_call("toolu_stranded"), true, &[]),
+            drop_reason(&memory_call("toolu_stranded"), true, false, &[]),
             Some(DropReason::UnresolvedProxyTool)
         ));
     }
@@ -2257,7 +2301,7 @@ mod deferred_drop_reason_tests {
         ));
 
         assert!(matches!(
-            drop_reason(&memory_call("toolu_stranded"), true, &[]),
+            drop_reason(&memory_call("toolu_stranded"), true, false, &[]),
             Some(DropReason::UnresolvedProxyTool)
         ));
         clear();

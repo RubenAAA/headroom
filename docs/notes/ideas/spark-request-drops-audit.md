@@ -115,8 +115,10 @@
     probe; in a later six-run sample at `max`, 16-37 s and 870-2053 tokens. So
     `max` costs about 1.7 times the time of `xhigh` on a small prompt, with no
     visible gain there. Quality on hard turns was not scored.
-  - **Shadow-tool calls, looked at 2026-09-30.** Not fixed; the obvious fix
-    fails. Forbidding calls with `tool_choice: "none"` on tool-less turns gets a
+  - **Shadow-tool calls, looked at 2026-09-30.** Fixed for tool-less turns the
+    same day (developer-item note, then the proxy answers the call and
+    continues; see `learnings/spark-stream-drops-and-503s-2026-09-30.md`). The
+    analysis below is what led there; the obvious fix fails. Forbidding calls with `tool_choice: "none"` on tool-less turns gets a
     400 from Zen for every request: "only `\"auto\"` is supported for
     `tool_choice`" (12 of 12). So the gate's shadow tools stay callable.
     Measured cost: (a) a no-tool turn that invites computing ended in `tool_use`
