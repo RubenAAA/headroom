@@ -135,6 +135,36 @@ pub(crate) fn ensure_gate_tools(openai_body: &mut Value) -> usize {
     missing.len()
 }
 
+/// What a turn is told when the gate's shadow tools are its only tools.
+const NO_CLIENT_TOOLS_NOTE: &str =
+    "No tools are available in this conversation. Reply in text and do not call any function.";
+
+/// Tell the model, on a turn whose client sent no tools, that the shadow
+/// tools the gate needs are not real. Zen accepts only `tool_choice:
+/// "auto"`, so the request cannot forbid a call; without this a model
+/// asked to compute something sometimes calls `bash`, and the client, which
+/// has no such tool, gets a `tool_use` and no text. The note goes on the
+/// first developer item (or becomes one), so the prefix stays the same from
+/// turn to turn.
+pub(crate) fn note_no_client_tools(openai_body: &mut Value) {
+    let Some(input) = openai_body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if let Some(text) = input
+        .first_mut()
+        .filter(|item| item.get("role").and_then(Value::as_str) == Some("developer"))
+        .and_then(|item| item.get_mut("content"))
+        && let Some(current) = text.as_str()
+    {
+        *text = Value::String(format!("{current}\n\n{NO_CLIENT_TOOLS_NOTE}"));
+        return;
+    }
+    input.insert(
+        0,
+        serde_json::json!({"role": "developer", "content": NO_CLIENT_TOOLS_NOTE}),
+    );
+}
+
 impl ToolAlias {
     /// Derive the mapping from an Anthropic `tools` array (`[{name, …}]`).
     /// Inactive when the list is missing/empty. On a lowercasing collision
@@ -537,6 +567,25 @@ mod tests {
         for core in ZEN_GATE_CORE_TOOLS {
             assert!(names.contains(&core.to_string()), "missing {core}");
         }
+    }
+
+    #[test]
+    fn the_no_tools_note_joins_the_developer_item_or_makes_one() {
+        let mut with_system = json!({"input": [
+            {"role": "developer", "content": "Be brief."},
+            {"role": "user", "content": "hi"},
+        ]});
+        note_no_client_tools(&mut with_system);
+        assert_eq!(with_system["input"].as_array().unwrap().len(), 2);
+        let text = with_system["input"][0]["content"].as_str().unwrap();
+        assert!(text.starts_with("Be brief.\n\n"), "{text}");
+        assert!(text.ends_with(NO_CLIENT_TOOLS_NOTE), "{text}");
+
+        let mut bare = json!({"input": [{"role": "user", "content": "hi"}]});
+        note_no_client_tools(&mut bare);
+        assert_eq!(bare["input"].as_array().unwrap().len(), 2);
+        assert_eq!(bare["input"][0]["role"], json!("developer"));
+        assert_eq!(bare["input"][0]["content"], json!(NO_CLIENT_TOOLS_NOTE));
     }
 
     #[test]

@@ -205,6 +205,13 @@ fn translate_shaped_body(
                 // up the missing core names with marked shadow copies.
                 // Already-present names are never duplicated.
                 let shadowed = crate::routed::tool_alias::ensure_gate_tools(&mut v);
+                let client_sent_tools = parsed
+                    .get("tools")
+                    .and_then(|t| t.as_array())
+                    .is_some_and(|t| !t.is_empty());
+                if shadowed > 0 && !client_sent_tools {
+                    crate::routed::tool_alias::note_no_client_tools(&mut v);
+                }
                 if renamed > 0 || shadowed > 0 {
                     tracing::debug!(
                         event = "zen_tool_alias_applied",
