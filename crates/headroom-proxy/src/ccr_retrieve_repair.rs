@@ -151,6 +151,17 @@ pub fn strip_unsupported_ccr_blocks(messages: Vec<Value>, tools: &[Value]) -> Cc
             }
         }
         if touched {
+            // Anthropic requires a user turn's tool_result blocks to lead its
+            // content. When headroom_retrieve ran in parallel with another
+            // tool, neutralizing its result in place leaves
+            // [text, tool_result(sibling)] and the request 400s. Stable-partition
+            // so surviving tool_results stay first; a no-op for assistant
+            // turns, which carry none.
+            let (results, rest): (Vec<Value>, Vec<Value>) = std::mem::take(content)
+                .into_iter()
+                .partition(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"));
+            content.extend(results);
+            content.extend(rest);
             changed = true;
         }
         out.push(message);
@@ -273,5 +284,33 @@ mod tests {
         let out = strip_unsupported_ccr_blocks(messages, &[]);
         assert_eq!(out.neutralized, 0);
         assert_eq!(out.messages, before);
+    }
+
+    #[test]
+    fn surviving_tool_results_stay_first_after_a_parallel_retrieve() {
+        let messages = vec![
+            json!({"role": "assistant", "content": [
+                retrieve_use("r1"),
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {}}
+            ]}),
+            json!({"role": "user", "content": [
+                retrieve_result("r1", json!("payload")),
+                {"type": "tool_result", "tool_use_id": "b1", "content": "ok"},
+                {"type": "text", "text": "next"}
+            ]}),
+        ];
+        let out = strip_unsupported_ccr_blocks(messages, &[]);
+        assert_eq!(out.neutralized, 2);
+        let types: Vec<&str> = out.messages[1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["tool_result", "text", "text"]);
+        assert_eq!(out.messages[1]["content"][0]["tool_use_id"], "b1");
+        assert_eq!(out.messages[1]["content"][1]["text"], "payload");
+        // The assistant turn keeps its order: text stub, then the sibling call.
+        assert_eq!(out.messages[0]["content"][1]["name"], "Bash");
     }
 }
