@@ -986,7 +986,7 @@ fn pytest_cap_reserve(log_lines: &[LogLine], scan: &PytestShortSummary) -> BTree
     let mut reserved = scan.totals_lines.clone();
     let first_error_detail = log_lines
         .iter()
-        .take_while(|line| scan.first_header.map_or(true, |h| line.line_number < h))
+        .take_while(|line| scan.first_header.is_none_or(|h| line.line_number < h))
         .find(|line| line.content.starts_with("E "));
     if let Some(line) = first_error_detail {
         reserved.insert(line.line_number);
@@ -1306,6 +1306,44 @@ impl LogCompressor {
         score_log_line(line)
     }
 
+    /// Keep up to `max_stack_traces` traces, collapsing runtime frames in long
+    /// ones. Returns the indices of frames collapsed away, so context
+    /// expansion does not bring them back.
+    fn select_stack_traces(
+        &self,
+        stack_traces: &[Vec<LogLine>],
+        selected: &mut BTreeSet<LogLine>,
+        stats: &mut LogCompressorStats,
+    ) -> BTreeSet<usize> {
+        let mut collapsed_frame_indices: BTreeSet<usize> = BTreeSet::new();
+        for stack in stack_traces.iter().take(self.config.max_stack_traces) {
+            stats.stack_traces_kept += 1;
+            if self.config.collapse_runtime_frames
+                && stack.len() > self.config.stack_trace_max_lines
+            {
+                let collapsed = collapse_trace_frames(
+                    stack,
+                    self.config.trace_head_frames,
+                    self.config.trace_app_frames,
+                );
+                stats.runtime_frames_collapsed += collapsed.dropped_indices.len();
+                collapsed_frame_indices.extend(collapsed.dropped_indices);
+                for line in collapsed
+                    .kept
+                    .into_iter()
+                    .take(self.config.stack_trace_max_lines)
+                {
+                    selected.insert(line);
+                }
+            } else {
+                for line in stack.iter().take(self.config.stack_trace_max_lines) {
+                    selected.insert(line.clone());
+                }
+            }
+        }
+        collapsed_frame_indices
+    }
+
     pub fn select_lines(
         &self,
         log_lines: &[LogLine],
@@ -1371,32 +1409,7 @@ impl LogCompressor {
             selected.insert(line);
         }
 
-        let mut collapsed_frame_indices: BTreeSet<usize> = BTreeSet::new();
-        for stack in stack_traces.iter().take(self.config.max_stack_traces) {
-            stats.stack_traces_kept += 1;
-            if self.config.collapse_runtime_frames
-                && stack.len() > self.config.stack_trace_max_lines
-            {
-                let collapsed = collapse_trace_frames(
-                    stack,
-                    self.config.trace_head_frames,
-                    self.config.trace_app_frames,
-                );
-                stats.runtime_frames_collapsed += collapsed.dropped_indices.len();
-                collapsed_frame_indices.extend(collapsed.dropped_indices);
-                for line in collapsed
-                    .kept
-                    .into_iter()
-                    .take(self.config.stack_trace_max_lines)
-                {
-                    selected.insert(line);
-                }
-            } else {
-                for line in stack.iter().take(self.config.stack_trace_max_lines) {
-                    selected.insert(line.clone());
-                }
-            }
-        }
+        let collapsed_frame_indices = self.select_stack_traces(&stack_traces, &mut selected, stats);
 
         if self.config.keep_summary_lines {
             for line in summaries {

@@ -48,6 +48,7 @@ mod observer;
 mod orchestration;
 mod outliers;
 mod planning;
+mod recurse;
 mod statistics;
 mod stats_math;
 mod traits;

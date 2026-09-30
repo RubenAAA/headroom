@@ -3,6 +3,6 @@
 # smart_crusher/crusher.rs is pinned, not split: upstream still edits it, and
 # a local split would conflict with every upstream merge.
 crates/headroom-core/src/transforms/code_compressor.rs 3645
-crates/headroom-core/src/transforms/smart_crusher/crusher.rs 3144
+crates/headroom-core/src/transforms/smart_crusher/crusher.rs 3143
 crates/headroom-proxy/src/cache_stabilization/usage_observer.rs 4509
 crates/headroom-proxy/src/config.rs *
