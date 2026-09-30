@@ -705,7 +705,7 @@ HEADROOM_FLAGS=(
   # --ctx-offload-cross-session-seed true
 
   # Protection knobs — all off, all untried
-  --protect-recent false
+  --protect-recent 0
   --protect-analysis-context false
   # 'hold fresh reads out of prefix cache' — do not pay a cache write for
   # content that may never be read again. Real cache economics, never
