@@ -43,6 +43,8 @@ pub(crate) struct ProviderEgressPool {
     pub(super) unhealthy_until_ms: Vec<std::sync::atomic::AtomicU64>,
     /// Per slot, 429s in a row since the lane last answered a request.
     pub(super) limited_streak: Vec<std::sync::atomic::AtomicU32>,
+    /// Counts failovers, so successive ones start at different lanes.
+    pub(super) failover_cursor: std::sync::atomic::AtomicUsize,
     pub(super) born: std::time::Instant,
 }
 
@@ -89,6 +91,7 @@ impl ProviderEgressPool {
             limited_streak: (0..egress_ids.len())
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            failover_cursor: std::sync::atomic::AtomicUsize::new(0),
             born: std::time::Instant::now(),
             egress_ids,
         }
@@ -185,26 +188,33 @@ impl ProviderEgressPool {
         self.unhealthy_until_ms[slot].load(std::sync::atomic::Ordering::Relaxed) > self.now_ms()
     }
 
-    /// The next lane after `after`, in ring order, that this turn has not
-    /// tried and that is not rotating. Lanes not marked unhealthy come first;
-    /// an unhealthy one is still better than none. The in-flight guard comes
-    /// with it, taken under the same check as [`Self::acquire`].
+    /// A lane this turn has not tried and that is not rotating. Lanes not
+    /// marked unhealthy come first; an unhealthy one is still better than none.
+    /// Within a group, successive calls start at different lanes: taking the
+    /// next one in ring order sent every turn pinned to a limited lane to the
+    /// same healthy one (2026-10-01 01:35, lane 6 answered 419 of 473 requests
+    /// while lanes 0 and 7 had room), and a fresh exit carries only about 150
+    /// requests. The in-flight guard comes with it, taken under the same check
+    /// as [`Self::acquire`].
     pub(crate) fn failover(
         self: &Arc<Self>,
         after: usize,
         tried: &[usize],
     ) -> Option<(usize, EgressInflightGuard)> {
         let n = self.clients.len();
-        let ring = || {
-            (1..n)
-                .map(|offset| (after + offset) % n)
-                .filter(|s| !tried.contains(s))
-        };
+        let start = self
+            .failover_cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for want_healthy in [true, false] {
-            for slot in ring() {
-                if self.is_unhealthy(slot) == want_healthy {
-                    continue;
-                }
+            let mut group: Vec<usize> = (1..n)
+                .map(|offset| (after + offset) % n)
+                .filter(|s| !tried.contains(s) && self.is_unhealthy(*s) != want_healthy)
+                .collect();
+            if !group.is_empty() {
+                let shift = start % group.len();
+                group.rotate_left(shift);
+            }
+            for slot in group {
                 if let Ok(guard) = self.acquire(slot) {
                     return Some((slot, guard));
                 }

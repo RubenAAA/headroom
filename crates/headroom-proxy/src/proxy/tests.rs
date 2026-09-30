@@ -125,6 +125,27 @@ async fn egress_guard_follows_the_response_body_and_respects_maintenance() {
     assert_eq!(count("proxy-a"), 0, "released when the body is dropped");
 }
 
+/// Turns pinned to limited lanes spread over the healthy ones. Taking the
+/// next lane in ring order sent all of them to the first healthy lane.
+#[test]
+fn failover_spreads_turns_over_the_healthy_lanes() {
+    let pool = Arc::new(ProviderEgressPool::new(
+        (0..6).map(|_| reqwest::Client::new()).collect(),
+        (0..6).map(|i| format!("proxy-{i}")).collect(),
+    ));
+    for limited in 0..4 {
+        pool.mark_limited(limited);
+    }
+    let mut picks = [0_usize; 6];
+    for turn in 0..40 {
+        let sticky = turn % 4;
+        let (slot, _guard) = pool.failover(sticky, &[sticky]).expect("a healthy lane");
+        picks[slot] += 1;
+    }
+    assert_eq!(picks[..4], [0, 0, 0, 0], "limited lanes are passed over");
+    assert_eq!(picks[4..], [20, 20], "both healthy lanes share the turns");
+}
+
 #[tokio::test]
 async fn ten_concurrent_stream_lanes_use_distinct_sticky_socks_egresses() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
