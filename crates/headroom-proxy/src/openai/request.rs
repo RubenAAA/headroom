@@ -491,6 +491,11 @@ fn render_tool_result_parts(content: Option<&Value>) -> Vec<ToolResultPart> {
         Some(Value::Array(blocks)) => blocks
             .iter()
             .map(|block| match block.get("type").and_then(|v| v.as_str()) {
+                // Some clients put a bare string in the list instead of a
+                // text block (upstream `8ff46dc9`); it is still the result.
+                _ if block.is_string() => {
+                    ToolResultPart::Text(block.as_str().unwrap_or_default().to_string())
+                }
                 Some("text") => ToolResultPart::Text(
                     block
                         .get("text")
@@ -1074,6 +1079,15 @@ mod tests {
             json!("a\nb")
         );
         assert_eq!(tool_result_output_value(None, false), json!(""));
+    }
+
+    /// A bare string inside the list is result text, not an unknown block.
+    #[test]
+    fn a_bare_string_in_a_tool_result_list_is_kept_as_text() {
+        assert_eq!(
+            tool_result_output_value(Some(&json!(["raw", {"type": "text", "text": "b"}])), false),
+            json!("raw\nb")
+        );
     }
 
     /// Same bug, Chat Completions path — both the single-block fast path and
