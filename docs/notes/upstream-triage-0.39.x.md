@@ -4,7 +4,8 @@ Done 2026-09-30 with the merge `ca2a6fd1`. Each commit touching `headroom/`
 was checked against `crates/` with `git show` and a file:line. Classes as in
 [`upstream-triage-0.39.md`](upstream-triage-0.39.md).
 
-Totals: **6 MERGED, 3 ported, 4 open, 4 optional, 5 ALREADY-THERE, 28 N/A.**
+Totals: **6 MERGED, 6 ported, 1 open, 4 optional, 5 ALREADY-THERE, 28 N/A** (the
+three ports after the first three came the same day; see "Landed ports").
 Plus one gap with no upstream commit behind it (last row of Open).
 
 ## Merged as Rust
@@ -23,14 +24,23 @@ Plus one gap with no upstream commit behind it (last row of Open).
   typed search tool.
 - `8ff46dc9` → `765faa0d`: a bare string in a `tool_result` list survives the
   Responses translation.
+- `46755b5f` → `cd860f0b`, narrowed: upstream skips memory tools for any
+  client not known to carry tools, because its client must run the calls. Here
+  the proxy answers them, so the rule is only "the client sent no tools, so
+  none are added" on `/v1/messages`. In the 2026-09-25..30 logs that was 195 of
+  24,702 injections, all Sonnet with a ~130 KB system prompt and two messages
+  (Claude Code's permission classifier), none of which called a memory tool.
+- `117ff72e`: the holdout key reads every text block of the first user
+  message in full (`headroom-core/src/output_savings.rs`). The 512-character
+  cut gave every conversation in a project one key, so one arm.
+- `afaaaa88`: a date suffix is not a minor version
+  (`headroom-core/src/transforms/thinking_compactor.rs`). Nothing calls
+  `bills_prior_thinking` yet.
 
 ## Open
 
 | sha | class | cache | what | Rust evidence | size |
 |---|---|---|---|---|---|
-| `46755b5f` | PORT | yes | Don't inject memory tools into requests that sent no tools | `proxy/forward/memory.rs:33-40` injects on purpose; reverses a fork choice, needs a decision | S |
-| `117ff72e` | PORT | once | Holdout key over the whole first user message | Session id keys Claude Code (`output_shaper.rs:241`); fallbacks cut at 512 in `headroom-core/src/output_savings.rs:79-113` | S |
-| `afaaaa88` | PORT | no | Date suffix read as a minor version | `headroom-core/src/transforms/thinking_compactor.rs:128-145`; no caller yet | S |
 | `2f076687` | PORT-NEW | Hermes only | Unwrap Hermes `tool_call` so exclusions still apply | No unwrap anywhere; `tool_exclusion.rs:99` | M |
 | (none) | PORT-NEW | yes | `headroom_retrieve` on non-streaming chat completions, with Python's session-sticky injection | `inject_ccr_retrieve_tool` has a chat branch but its only caller is Anthropic-only (`proxy/forward/ctx.rs:620`) | M |
 

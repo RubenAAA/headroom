@@ -69,13 +69,17 @@ pub fn stratum_key(turn_kind: &str, input_tokens: i64, model: &str, has_tools: b
     )
 }
 
-/// Take the first `n` characters (code points) of `s`, matching Python slicing.
-fn first_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
-}
-
 /// Derive a conversation-stable key (model + first user message text) for
 /// holdout assignment.
+///
+/// Every text block of the first user message feeds the seed, in full. The
+/// seed used to be the first 512 characters of the first block, and agent
+/// clients open a conversation with injected context (CLAUDE.md, IDE state,
+/// memory digests) that is identical across a project's conversations and far
+/// longer than that, so whole populations shared one key. The assignment is
+/// deterministic, so one key is one arm for good: upstream measured fable at
+/// 22,222 treatment requests against 1 control that way. User turns are never
+/// compressed, so the first message stays fixed for the conversation.
 pub fn conversation_key_from_body(body: &serde_json::Value) -> String {
     let model = body
         .get("model")
@@ -91,16 +95,21 @@ pub fn conversation_key_from_body(body: &serde_json::Value) -> String {
             match msg.get("content") {
                 Some(serde_json::Value::String(s)) => {
                     seed.push('\u{0}');
-                    seed.push_str(&first_chars(s, 512));
+                    seed.push_str(s);
                 }
                 Some(serde_json::Value::Array(blocks)) => {
+                    let mut any_text = false;
                     for block in blocks {
                         if block.get("type").and_then(|v| v.as_str()) == Some("text") {
                             let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
                             seed.push('\u{0}');
-                            seed.push_str(&first_chars(text, 512));
-                            break;
+                            seed.push_str(text);
+                            any_text = true;
                         }
+                    }
+                    // A message with no text block still contributes its separator.
+                    if !any_text {
+                        seed.push('\u{0}');
                     }
                 }
                 _ => {}
@@ -947,6 +956,32 @@ mod tests {
         assert_eq!(
             conversation_key_from_body(&turn1),
             conversation_key_from_body(&turn2)
+        );
+    }
+
+    /// Agent clients open every conversation with the same long injected
+    /// context; the user's own words come after it. Both the string form and
+    /// the block form must tell two such conversations apart.
+    #[test]
+    fn conversation_key_reads_past_a_shared_opening() {
+        let context = "x".repeat(2000);
+        let as_string = |ask: &str| {
+            json!({"model": "m", "messages": [
+                {"role": "user", "content": format!("{context}{ask}")}]})
+        };
+        assert_ne!(
+            conversation_key_from_body(&as_string("fix the parser")),
+            conversation_key_from_body(&as_string("write the docs"))
+        );
+
+        let as_blocks = |ask: &str| {
+            json!({"model": "m", "messages": [{"role": "user", "content": [
+                {"type": "text", "text": context},
+                {"type": "text", "text": ask}]}]})
+        };
+        assert_ne!(
+            conversation_key_from_body(&as_blocks("fix the parser")),
+            conversation_key_from_body(&as_blocks("write the docs"))
         );
     }
 

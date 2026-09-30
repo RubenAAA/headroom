@@ -129,9 +129,11 @@ pub fn bills_prior_thinking(model: &str) -> bool {
     let lowered = model.to_lowercase();
     let mut nums: Vec<u32> = Vec::new();
     for part in lowered.split('-') {
-        if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
-            // Saturate rather than overflow on an absurd date-like segment; the
-            // comparison below only cares about small version numbers.
+        // Version components are one or two digits. A longer run is the release
+        // date (`YYYYMMDD`): read as a minor version it made `claude-sonnet-4-
+        // 20250514` compare as (4, 20250514) >= (4, 6), inverting the gate for
+        // Claude 4.0, which strips prior thinking server-side.
+        if !part.is_empty() && part.len() <= 2 && part.chars().all(|c| c.is_ascii_digit()) {
             nums.push(part.parse::<u32>().unwrap_or(u32::MAX));
         } else if !nums.is_empty() {
             // Version digits are contiguous; stop at the family/date boundary.
@@ -629,6 +631,8 @@ mod tests {
             "claude-haiku-4-5-20251001",
             "claude-3-5-sonnet-20241022",
             "claude-opus-4-1-20250805",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
             "gpt-4o",
             "some-model",
             "",
