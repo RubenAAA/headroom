@@ -1355,12 +1355,47 @@ pub struct CliArgs {
     /// by resending the whole conversation on the working model. The proxy
     /// answers that request on its own: a few tail messages, no tools, 64
     /// output tokens, and this model. Point it at a larger model only if the
-    /// summaries read badly; there is no reason to.
+    /// summaries read badly; there is no reason to. A model that names a
+    /// route is served from there: a Responses route (with a target model)
+    /// or a streamed Chat Completions route (without one).
     ///
     /// Source priority: CLI flag -> `HEADROOM_PROXY_SIDECAR_MODEL` env var ->
     /// default (`claude-haiku-4-5-20251001`).
     #[arg(long = "sidecar-model", env = "HEADROOM_PROXY_SIDECAR_MODEL")]
     pub sidecar_model: Option<String>,
+
+    /// Fixed line that answers Claude Code's spinner-text sidecar with no
+    /// Claude call.
+    ///
+    /// Claude Code has no setting that stops the request, so the proxy
+    /// answers it itself. When `--sidecar-model` names a routed model, that
+    /// model answers first and this line covers its failures; otherwise the
+    /// line answers every request and no model is called. Unset (the default)
+    /// falls back to the direct Haiku path.
+    ///
+    /// Source priority: CLI flag -> `HEADROOM_PROXY_SIDECAR_LOCAL_ANSWER` env
+    /// var -> default (None).
+    #[arg(
+        long = "sidecar-local-answer",
+        env = "HEADROOM_PROXY_SIDECAR_LOCAL_ANSWER"
+    )]
+    pub sidecar_local_answer: Option<String>,
+
+    /// Hand Zen's encrypted reasoning back on the next turn instead of
+    /// stripping it. Zen binds the blob to the caller that fetched it, so a
+    /// blob replayed from another exit 400s ("not issued to this caller") and
+    /// dead-ends the conversation; the strip exists for that. Off (the default)
+    /// keeps the strip. On is for measuring what Zen accepts.
+    ///
+    /// Source priority: CLI flag -> `HEADROOM_PROXY_ZEN_REASONING_REPLAY` env
+    /// var -> default (`false`).
+    #[arg(
+        long = "zen-reasoning-replay",
+        env = "HEADROOM_PROXY_ZEN_REASONING_REPLAY",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub zen_reasoning_replay: bool,
 
     /// Bound on one spinner-sidecar attempt against a routed Responses
     /// upstream. The routed sidecar never retries: on timeout (or any other
@@ -2576,6 +2611,10 @@ pub struct Config {
     /// Model the spinner-text sidecar is answered on. `None` means
     /// [`crate::sidecar::DEFAULT_SIDECAR_MODEL`].
     pub sidecar_model: Option<String>,
+    /// Fixed line the sidecar is answered with; no model is called.
+    pub sidecar_local_answer: Option<String>,
+    /// Keep Zen's encrypted reasoning in the replayed input. Default `false`.
+    pub zen_reasoning_replay: bool,
     /// Bound on one spinner-sidecar attempt against a routed Responses
     /// upstream before it falls back to the direct sidecar path.
     pub sidecar_route_timeout: Duration,
@@ -2878,6 +2917,8 @@ impl Config {
             vertex_adc_scope: args.vertex_adc_scope,
             local_model: args.local_model,
             sidecar_model: args.sidecar_model,
+            sidecar_local_answer: args.sidecar_local_answer,
+            zen_reasoning_replay: args.zen_reasoning_replay,
             sidecar_route_timeout: args.sidecar_route_timeout,
             local_upstream: args.local_upstream,
             model_routes: args
@@ -3153,6 +3194,8 @@ impl Config {
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
             local_model: None,
             sidecar_model: None,
+            sidecar_local_answer: None,
+            zen_reasoning_replay: false,
             sidecar_route_timeout: Duration::from_secs(15),
             local_upstream: None,
             model_routes: Vec::new(),

@@ -37,6 +37,14 @@ const ORIGINAL: &str = "the original uncompressed tool result";
 /// Upstream that streams a retrieval request, then answers the continuation.
 /// `rounds` counts continuation requests so the test can prove one happened.
 async fn ccr_upstream(rounds: Arc<AtomicUsize>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    ccr_upstream_asking(rounds, HASH).await
+}
+
+/// [`ccr_upstream`] with the value the fake model puts in the `hash` field.
+async fn ccr_upstream_asking(
+    rounds: Arc<AtomicUsize>,
+    asked: &'static str,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral");
@@ -135,7 +143,7 @@ async fn ccr_upstream(rounds: Arc<AtomicUsize>) -> (SocketAddr, tokio::task::Joi
                                         b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"VISIBLE_PREFIX\"}}\n\n".to_vec(),
                                         b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_vec(),
                                         b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"headroom_retrieve\",\"input\":{}}}\n\n".to_vec(),
-                                        format!("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"hash\\\":\\\"{HASH}\\\"}}\"}}}}\n\n").into_bytes(),
+                                        format!("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"hash\\\":\\\"{asked}\\\"}}\"}}}}\n\n").into_bytes(),
                                         b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n".to_vec(),
                                         b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n".to_vec(),
                                         b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec(),
@@ -551,4 +559,73 @@ async fn the_splice_keeps_what_the_continuation_sent_that_the_proxy_does_not_kno
         "{delta}"
     );
     assert!(frame("content_block_stop").contains("STOP_EXTRA"));
+}
+
+/// A worker that passes a word where a hash belongs (TapBuy fleet, 2026-09-30:
+/// a filename, a truncated hash) used to get only a note and end its run. The
+/// value is now searched as keywords first, so the worker gets the content.
+#[tokio::test]
+async fn a_malformed_hash_is_searched_as_keywords_before_it_is_refused() {
+    const PROJECT: &str = "/home/dev/fleet";
+    let dir = TempDir::new().unwrap();
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let (addr, _upstream) = ccr_upstream_asking(rounds.clone(), "uncompressed").await;
+    let store_dir = dir.path().to_path_buf();
+    let proxy = start_proxy_with_state(
+        &format!("http://{addr}"),
+        move |c| {
+            c.compression = true;
+            c.compression_mode = headroom_proxy::config::CompressionMode::Off;
+            c.ctx_offload = true;
+            c.ctx_store_dir = Some(store_dir);
+            c.ccr_handle_responses = true;
+            c.memory_project_root = Some(PROJECT.into());
+        },
+        |s| {
+            s.ctx_offload
+                .as_ref()
+                .expect("ctx_offload runtime")
+                .store
+                .stores()
+                .content(PROJECT)
+                .expect("content store opens")
+                .index_content(
+                    "the tool call that produced it",
+                    ORIGINAL,
+                    &headroom_core::ctx::IndexOpts {
+                        plain_text_lines: Some(50),
+                        ..Default::default()
+                    },
+                )
+                .expect("index write");
+            s
+        },
+    )
+    .await;
+    let body = json!({
+        "model": "claude-3-haiku-20240307",
+        "stream": true,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "what did that say"}]
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(serde_json::to_vec(&body).unwrap())
+        .send()
+        .await
+        .expect("proxy responds");
+    assert_eq!(resp.status(), 200);
+    let sse = String::from_utf8_lossy(&resp.bytes().await.expect("stream body")).to_string();
+    proxy.shutdown().await;
+    assert_eq!(
+        rounds.load(Ordering::SeqCst),
+        1,
+        "the search hit should feed a continuation round:\n{sse}"
+    );
+    assert!(
+        sse.contains("ANSWER_AFTER_RETRIEVAL"),
+        "the model should have been given the indexed content:\n{sse}"
+    );
 }

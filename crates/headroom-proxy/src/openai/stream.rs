@@ -32,6 +32,62 @@ fn count_unhandled_event(name: &str) -> u64 {
     *n
 }
 
+/// Characters of a string value kept in a logged event shape.
+const SHAPE_STRING: usize = 40;
+/// Longest shape line logged.
+const SHAPE_LINE: usize = 700;
+
+/// `value` with long strings cut and every array reduced to its first element:
+/// what fields an event carries, without its text.
+fn shape_of(value: &Value) -> Value {
+    match value {
+        Value::String(s) if s.chars().count() > SHAPE_STRING => {
+            Value::String(s.chars().take(SHAPE_STRING).collect::<String>() + "...")
+        }
+        Value::Array(items) => Value::Array(items.first().map(shape_of).into_iter().collect()),
+        Value::Object(map) => {
+            Value::Object(map.iter().map(|(k, v)| (k.clone(), shape_of(v))).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// True the first time `key` is seen since the proxy started; false once
+/// [`UNHANDLED_NAMES`] keys are held, so a provider cannot grow the set.
+fn first_sighting(key: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let Ok(mut seen) = SEEN.get_or_init(Default::default).lock() else {
+        return false;
+    };
+    seen.len() < UNHANDLED_NAMES && seen.insert(key.to_string())
+}
+
+/// Log the shape of the first event of each kind (its name, plus the item type
+/// for `output_item.*`), handled or not, so a field the translator ignores in
+/// an event it does handle is visible too.
+fn sample_event_shape(event_name: &str, chunk: &Value) {
+    let item_type = chunk
+        .get("item")
+        .and_then(|i| i.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let key = format!("{event_name}/{item_type}");
+    if !first_sighting(&key) {
+        return;
+    }
+    let mut shape = shape_of(chunk).to_string();
+    shape.truncate(shape.floor_char_boundary(SHAPE_LINE));
+    tracing::info!(
+        event = "responses_stream_event_shape",
+        stream_event = event_name,
+        item_type,
+        shape,
+        "first event of this kind since the proxy started"
+    );
+}
+
 /// A client alias for a translated route (Spark, Codex) rather than a native
 /// Anthropic turn. Both bill from a different cache universe than the
 /// Anthropic footprint the usage observer scores — translated prefix, no
@@ -751,6 +807,7 @@ impl StreamTranslator {
             Ok(v) => v,
             Err(_) => return events,
         };
+        sample_event_shape(event_name, &chunk);
 
         // Quota can ride in the stream as well as the headers, and which one
         // carries it has changed before. Take it from wherever it shows up.
@@ -1457,6 +1514,13 @@ fn translate_with_translator(
                                 .as_ref()
                                 .map(|ctx| ctx.request_id.as_str())
                                 .unwrap_or("unknown"),
+                            // -1 when the lane is unknown (not Zen).
+                            egress_slot = state
+                                .translator
+                                .outcome
+                                .as_ref()
+                                .and_then(|ctx| ctx.egress_slot)
+                                .map_or(-1, |slot| slot as i64),
                             error = %e,
                             cause = ?e,
                             "routed upstream stream failed after the client had events"
@@ -1543,6 +1607,7 @@ mod tests {
             forwarded_tokens_estimate: 777,
             outbound_bytes: 0,
             upstream_attempts: 1,
+            egress_slot: None,
             redact_store: None,
             conversation_key: None,
         };
@@ -2877,5 +2942,23 @@ mod tests {
         }
         assert_eq!(count_unhandled_event("response.test_never_seen"), u64::MAX);
         assert_eq!(count_unhandled_event("response.test_a.first"), 3);
+    }
+    /// A logged shape keeps every field name but not the text behind it.
+    #[test]
+    fn an_event_shape_keeps_fields_and_drops_text() {
+        let long = "x".repeat(500);
+        let chunk = json!({
+            "item": {"type": "message", "content": [{"text": long}, {"text": "second"}]},
+            "usage": {"input_tokens": 7, "details": {"cached": 3}},
+        });
+        assert_eq!(
+            shape_of(&chunk),
+            json!({
+                "item": {"type": "message", "content": [{"text": format!("{}...", "x".repeat(SHAPE_STRING))}]},
+                "usage": {"input_tokens": 7, "details": {"cached": 3}},
+            })
+        );
+        assert!(first_sighting("response.test_shape/once"));
+        assert!(!first_sighting("response.test_shape/once"));
     }
 }

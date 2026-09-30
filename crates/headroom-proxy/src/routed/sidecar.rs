@@ -1,9 +1,10 @@
-//! Spinner-sidecar offload onto a routed Responses upstream.
+//! Spinner-sidecar offload onto a routed upstream: a Responses route (a target
+//! model id) or a Chat Completions route (no target, streamed replies only).
 //!
 //! One bounded attempt per sidecar; any failure falls back to the direct
 //! path, leaving no per-conversation state either way.
 
-use crate::openai::request::anthropic_to_openai_responses_request;
+use crate::openai::request::{anthropic_to_openai_request, anthropic_to_openai_responses_request};
 use crate::openai::response::responses_stream_to_turn;
 use crate::openai::stream::translate_openai_stream_to_anthropic;
 use crate::proxy::AppState;
@@ -30,6 +31,23 @@ pub(crate) fn sidecar_responses_route<'a>(
         r.matches(sidecar_model)
             && r.translate
             && r.target_model.is_some()
+            && r.cursor_agent.is_none()
+            && r.upstream.is_some()
+    })
+}
+
+/// A translate route with no target model, which speaks Chat Completions.
+///
+/// The sidecar model's own name is the upstream model id, so the route is named
+/// for the upstream model (`space-bunny-free`), not a `claude-*` alias.
+pub(crate) fn sidecar_chat_route<'a>(
+    routes: &'a [crate::config::ProviderRoute],
+    sidecar_model: &str,
+) -> Option<&'a crate::config::ProviderRoute> {
+    routes.iter().find(|r| {
+        r.matches(sidecar_model)
+            && r.translate
+            && r.target_model.is_none()
             && r.cursor_agent.is_none()
             && r.upstream.is_some()
     })
@@ -111,8 +129,9 @@ pub(crate) async fn try_routed_sidecar(
     // placeholders, never raw secrets, so the routed sidecar stays live
     // while redaction is on. The direct sidecar path remains the fallback
     // for every failure below.
-    let route = sidecar_responses_route(&state.config.model_routes, &sidecar_model)?;
-    let target = route.target_model.clone()?;
+    let route = sidecar_responses_route(&state.config.model_routes, &sidecar_model)
+        .or_else(|| sidecar_chat_route(&state.config.model_routes, &sidecar_model))?;
+    let target = route.target_model.clone();
     let upstream = route.upstream.clone()?;
 
     let (shrunk, redact_table) = shrink_and_redact_sidecar(
@@ -128,7 +147,23 @@ pub(crate) async fn try_routed_sidecar(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let openai_bytes = sidecar_request_bytes(&shrunk, &target, &upstream)?;
+    // A chat route is served as a stream only; a buffered request goes on.
+    if target.is_none() && !downstream_stream {
+        return None;
+    }
+    let (upstream_url, openai_bytes) = match target.as_deref() {
+        Some(target) => (
+            format!(
+                "{}/v1/responses",
+                crate::routed::quirks::strip_v1_base(&upstream)
+            ),
+            sidecar_request_bytes(&shrunk, target, &upstream)?,
+        ),
+        None => (
+            classify_upstream(&upstream, false).chat_url(&upstream),
+            sidecar_chat_request_bytes(&shrunk)?,
+        ),
+    };
 
     let (upstream_headers, _) = auth_headers(
         route.auth_env.as_deref(),
@@ -141,16 +176,13 @@ pub(crate) async fn try_routed_sidecar(
     )
     .ok()?;
 
-    let base = crate::routed::quirks::strip_v1_base(&upstream);
-    let upstream_url = format!("{base}/v1/responses");
-
     tracing::info!(
         event = "sidecar_routed_attempt",
         request_id = %request_id,
         model = %sidecar_model,
-        target = %target,
+        target = target.as_deref().unwrap_or("(same as model)"),
         upstream = %upstream_url,
-        "trying the spinner sidecar on a routed Responses upstream"
+        "trying the spinner sidecar on a routed upstream"
     );
 
     let upstream_resp = send_sidecar_request(
@@ -260,6 +292,18 @@ fn shrink_and_redact_sidecar(
         None
     };
     (shrunk, redact_table)
+}
+
+/// The Chat Completions request for a shrunk sidecar turn.
+///
+/// The client's 64-token cap is replaced by [`SIDECAR_ROUTED_MAX_TOKENS`]: a
+/// reasoning model spends the budget on thinking first, and `space-bunny-free`
+/// returned empty text at 64 in 3 of 5 tries (2026-09-30).
+fn sidecar_chat_request_bytes(shrunk: &Value) -> Option<Vec<u8>> {
+    let mut body = anthropic_to_openai_request(shrunk, false, false).ok()?;
+    body.as_object_mut()?
+        .insert("max_tokens".to_string(), json!(SIDECAR_ROUTED_MAX_TOKENS));
+    serde_json::to_vec(&body).ok()
 }
 
 /// Translate the shrunk sidecar turn into the Responses request bytes to send,
@@ -388,6 +432,11 @@ pub(crate) async fn handle_sidecar(
     }
     if let Some(resp) = try_routed_sidecar(state, headers, client_addr, parsed, request_id).await {
         return Some(resp);
+    }
+    // No routed sidecar model, or it failed: the fixed line, when set, comes
+    // before Haiku so the fallback spends no Claude quota.
+    if let Some(text) = state.config.sidecar_local_answer.as_deref() {
+        return Some(crate::sidecar::local_answer(parsed, text, request_id));
     }
     // A routed alias must never go direct: the direct upstream does not serve
     // it (2,487 spinner 404s over 2026-09-14/15). But when the routed attempt

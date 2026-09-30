@@ -7,6 +7,7 @@ pub(crate) mod early_stream_retry;
 pub(crate) mod outcome;
 pub(crate) mod prepare;
 pub(crate) mod quirks;
+pub(crate) mod reasoning_blobs;
 pub(crate) mod redaction;
 pub(crate) mod response_arms;
 pub(crate) mod retry;

@@ -153,7 +153,7 @@ fn translate_shaped_body(
         Ok(v) => {
             let mut v = apply_target_model_override(v, target_model, is_responses, is_responses);
             if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen && is_responses {
-                lift_zen_output_ceiling(&mut v, parsed, request_id);
+                lift_zen_output_ceiling(&mut v, request_id);
                 move_zen_instructions_to_developer(&mut v, request_id);
                 // Match OpenCode's Responses request defaults. Its AI SDK
                 // sends the real OpenCode session as the cache key and leaves
@@ -181,7 +181,13 @@ fn translate_shaped_body(
                 v["prompt_cache_key"] =
                     serde_json::json!(crate::codex::derive_session_uuid(user_id));
             }
-            kind.strip_unreplayable_reasoning(&mut v);
+            if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen
+                && crate::routed::reasoning_blobs::enabled()
+            {
+                crate::routed::reasoning_blobs::drop_refused(&mut v);
+            } else {
+                kind.strip_unreplayable_reasoning(&mut v);
+            }
             // Zen's free-tier gate reads tool names: they must be
             // OpenCode-native lowercase (`read`, not `Read`). Rename the
             // translated body (definitions, history calls, forced choice)
@@ -225,6 +231,9 @@ fn translate_shaped_body(
     }
 }
 
+/// The reasoning effort every Zen turn is sent at.
+const ZEN_EFFORT: &str = "max";
+
 /// Zen gets the whole budget and the top effort tier.
 ///
 /// Two ceilings bounded a Zen turn and neither was deliberate. The client's
@@ -236,20 +245,18 @@ fn translate_shaped_body(
 /// ceiling folded `xhigh` and `max` down to `high`, which is right for the
 /// OpenAI Responses API and wrong for Zen.
 ///
-/// So the output budget goes, and the effort the client asked for reaches the
-/// backend at full strength. With no effort from the client, `xhigh` — Zen's
-/// own default is `high`.
+/// So the output budget goes, and the effort is always `max`, whatever the
+/// client asked for: Spark is a weaker model and should spend all it has.
+/// Zen accepts `minimal`, `low`, `medium`, `high`, `xhigh` and `max` for it
+/// (probed 2026-09-30; `none` is refused, and an unknown name is a 400). Zen's
+/// own default is `high`. On a small puzzle `max` took about 1.7 times as long
+/// as `xhigh` for the same answer.
 ///
 /// The spinner sidecar is untouched: it builds its request in
 /// [`crate::routed::sidecar`], not here, and still pins `minimal` and a small
 /// budget for the reason documented there.
-fn lift_zen_output_ceiling(body: &mut Value, anthropic: &Value, request_id: &str) {
-    // `max` is Claude Code vocabulary; Zen's top tier is `xhigh`, which it is
-    // measured to accept. Anything else the client names goes through as sent.
-    let effort = match crate::output_shaper::requested_effort(anthropic) {
-        Some("max") | None => "xhigh",
-        Some(other) => other,
-    };
+fn lift_zen_output_ceiling(body: &mut Value, request_id: &str) {
+    let effort = ZEN_EFFORT;
     body["reasoning"] = serde_json::json!({"effort": effort, "summary": "auto"});
     body["stream_options"] = serde_json::json!({"reasoning_summary_delivery": "sequential_cutoff"});
 
@@ -257,7 +264,7 @@ fn lift_zen_output_ceiling(body: &mut Value, anthropic: &Value, request_id: &str
         event = "zen_output_ceiling_lifted",
         request_id = %request_id,
         effort = effort,
-        "zen: no output ceiling, effort passed through"
+        "zen: no output ceiling, effort pinned to max"
     );
 }
 
@@ -422,13 +429,13 @@ mod tests {
         );
     }
 
-    /// A Zen turn carries no output ceiling, and `xhigh` by default.
+    /// A Zen turn carries no output ceiling, and `max` effort.
     ///
     /// The client's `max_tokens` used to become `max_output_tokens`, which on
     /// the Responses API is reasoning *plus* visible output — so a reasoning
     /// model could spend it all thinking and answer with nothing.
     #[test]
-    fn zen_route_sends_no_output_ceiling_and_defaults_to_xhigh() {
+    fn zen_route_sends_no_output_ceiling_and_max_effort() {
         let parsed = json!({
             "model": "claude-muse-spark-1.3",
             "max_tokens": 600,
@@ -446,7 +453,7 @@ mod tests {
         )
         .expect("translates");
         assert!(out.openai_body.get("max_output_tokens").is_none());
-        assert_eq!(out.openai_body["reasoning"]["effort"], json!("xhigh"));
+        assert_eq!(out.openai_body["reasoning"]["effort"], json!("max"));
         assert!(
             out.openai_body["prompt_cache_key"]
                 .as_str()
@@ -455,12 +462,11 @@ mod tests {
         assert!(out.openai_body.get("parallel_tool_calls").is_none());
     }
 
-    /// The effort the client picked reaches Zen as picked. `max` is the one
-    /// rewrite: it is Claude Code's word for the top tier, Zen's is `xhigh`.
+    /// Zen gets `max` whatever effort the client picked.
     #[test]
-    fn zen_route_passes_the_clients_effort_through() {
+    fn zen_route_pins_the_effort_to_max() {
         let zen: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
-        for (asked, sent) in [("low", "low"), ("high", "high"), ("max", "xhigh")] {
+        for asked in ["minimal", "low", "high", "xhigh", "max"] {
             let parsed = json!({
                 "model": "claude-muse-spark-1.3",
                 "max_tokens": 600,
@@ -479,7 +485,7 @@ mod tests {
             .expect("translates");
             assert_eq!(
                 out.openai_body["reasoning"]["effort"],
-                json!(sent),
+                json!("max"),
                 "client asked for {asked}"
             );
         }

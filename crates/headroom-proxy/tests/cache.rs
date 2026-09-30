@@ -51,6 +51,9 @@ mod integration_embedded_json_prefix;
 #[path = "suites/cache/integration_output_holdout.rs"]
 mod integration_output_holdout;
 
+#[path = "suites/cache/integration_output_shaper_openai.rs"]
+mod integration_output_shaper_openai;
+
 #[path = "suites/cache/confirmed_prefix_floor.rs"]
 mod confirmed_prefix_floor;
 

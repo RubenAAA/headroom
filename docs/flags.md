@@ -658,11 +658,29 @@ Options:
       --sidecar-model <SIDECAR_MODEL>
           Model that answers Claude Code's spinner-text sidecar.
           
-          The client asks for the line beside its spinner ("Reading runAgent.ts") by resending the whole conversation on the working model. The proxy answers that request on its own: a few tail messages, no tools, 64 output tokens, and this model. Point it at a larger model only if the summaries read badly; there is no reason to.
+          The client asks for the line beside its spinner ("Reading runAgent.ts") by resending the whole conversation on the working model. The proxy answers that request on its own: a few tail messages, no tools, 64 output tokens, and this model. Point it at a larger model only if the summaries read badly; there is no reason to. A model that names a route is served from there: a Responses route (with a target model) or a streamed Chat Completions route (without one).
           
           Source priority: CLI flag -> `HEADROOM_PROXY_SIDECAR_MODEL` env var -> default (`claude-haiku-4-5-20251001`).
           
           [env: HEADROOM_PROXY_SIDECAR_MODEL=]
+
+      --sidecar-local-answer <SIDECAR_LOCAL_ANSWER>
+          Fixed line that answers Claude Code's spinner-text sidecar with no Claude call.
+          
+          Claude Code has no setting that stops the request, so the proxy answers it itself. When `--sidecar-model` names a routed model, that model answers first and this line covers its failures; otherwise the line answers every request and no model is called. Unset (the default) falls back to the direct Haiku path.
+          
+          Source priority: CLI flag -> `HEADROOM_PROXY_SIDECAR_LOCAL_ANSWER` env var -> default (None).
+          
+          [env: HEADROOM_PROXY_SIDECAR_LOCAL_ANSWER=]
+
+      --zen-reasoning-replay <ZEN_REASONING_REPLAY>
+          Hand Zen's encrypted reasoning back on the next turn instead of stripping it. Zen binds the blob to the caller that fetched it, so a blob replayed from another exit 400s ("not issued to this caller") and dead-ends the conversation; the strip exists for that. Off (the default) keeps the strip. On is for measuring what Zen accepts.
+          
+          Source priority: CLI flag -> `HEADROOM_PROXY_ZEN_REASONING_REPLAY` env var -> default (`false`).
+          
+          [env: HEADROOM_PROXY_ZEN_REASONING_REPLAY=]
+          [default: false]
+          [possible values: true, false]
 
       --sidecar-route-timeout <SIDECAR_ROUTE_TIMEOUT>
           Bound on one spinner-sidecar attempt against a routed Responses upstream. The routed sidecar never retries: on timeout (or any other failure) it falls back to the direct sidecar path, so this is the longest a free-tier detour may hold a status line before Haiku answers it instead

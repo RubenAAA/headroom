@@ -559,6 +559,18 @@ DRAIN_SECS=90
 # extensions: a landing trickle gets room, a stuck turn still dies on time.
 DRAIN_PROGRESS_EXTEND_SECS=30
 DRAIN_MAX_EXTEND_SECS=180
+# A restart leaves the old proxy alive, draining the streams it already had,
+# while the new one starts with an in-flight count of zero. That count cannot
+# see the old streams, so a rotation that trusts it RSTs them: every one of
+# 2026-09-30's ten restart casualties fell in the same second as a lane
+# rotation. Two processes running the proxy's own listen address mean the old
+# one is still draining.
+old_proxy_draining() {
+  local port="${HEADROOM_PROXY_URL##*:}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  (( $(pgrep -fc -- "--listen 127\\.0\\.0\\.1:${port}( |\$)" || true) > 1 ))
+}
+
 drain() {
   local egress_id="${1:-}"
   local deadline=$(( $(date +%s) + DRAIN_SECS ))
@@ -568,12 +580,16 @@ drain() {
   local n last_n
   n=$(inflight "$egress_id")
   if [[ "$n" == "-1" ]]; then
+    if old_proxy_draining; then
+      log "drain: no inflight endpoint and an older proxy is still draining; not rotating"
+      return 1
+    fi
     log "drain: no inflight endpoint (old proxy); rotating without drain"
     return 0
   fi
   last_n="$n"
   while (( $(date +%s) < deadline )); do
-    if [[ "$n" == "0" ]]; then
+    if [[ "$n" == "0" ]] && ! old_proxy_draining; then
       log "drain: no turns in flight, rotating"
       return 0
     fi

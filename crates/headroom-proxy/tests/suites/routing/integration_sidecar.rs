@@ -175,6 +175,75 @@ async fn a_sidecar_is_forwarded_shrunk() {
     proxy.shutdown().await;
 }
 
+/// With `--sidecar-local-answer` the spinner request never leaves the proxy,
+/// and the client still gets a complete reply in the shape it asked for.
+#[tokio::test]
+async fn a_fixed_answer_replaces_the_model_call() {
+    let upstream = MockServer::start().await;
+    let captured = mount_capture(&upstream).await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.sidecar_local_answer = Some("Working".to_string());
+    })
+    .await;
+    let client = common::shared_client();
+    let send = |body: Value| {
+        let client = client.clone();
+        let url = format!("{}/v1/messages", proxy.url());
+        async move {
+            let resp = client
+                .post(url)
+                .header("content-type", "application/json")
+                .header("x-api-key", "sk-ant-sidecar-test")
+                .body(serde_json::to_vec(&body).unwrap())
+                .send()
+                .await
+                .expect("proxy reachable");
+            assert_eq!(resp.status(), 200);
+            let content_type = resp.headers()["content-type"].to_str().unwrap().to_string();
+            (content_type, resp.text().await.expect("response body"))
+        }
+    };
+
+    let (content_type, streamed) = send(sidecar_body()).await;
+    assert_eq!(content_type, "text/event-stream");
+    for event in [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ] {
+        assert!(
+            streamed.contains(&format!("event: {event}\n")),
+            "{streamed}"
+        );
+    }
+    assert!(streamed.contains("\"text\":\"Working\""), "{streamed}");
+    assert!(
+        streamed.contains("\"stop_reason\":\"end_turn\""),
+        "{streamed}"
+    );
+
+    let mut plain = sidecar_body();
+    plain["stream"] = json!(false);
+    let (content_type, body) = send(plain).await;
+    assert_eq!(content_type, "application/json");
+    let message: Value = serde_json::from_str(&body).expect("JSON reply");
+    assert_eq!(message["content"][0]["text"], "Working");
+    assert_eq!(message["stop_reason"], "end_turn");
+    assert_eq!(message["model"], "claude-opus-5");
+
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "no upstream call for a fixed answer"
+    );
+    assert!(headroom_proxy::observability::sidecar::detected_get("local") >= 2);
+
+    proxy.shutdown().await;
+}
+
 /// The same 12 messages without the block must reach the upstream whole.
 #[tokio::test]
 async fn a_normal_request_is_untouched() {
@@ -875,6 +944,126 @@ async fn a_routed_sidecar_is_served_from_the_responses_upstream() {
     assert!(
         fwd.get("messages").is_none(),
         "Responses shape carries input, not messages"
+    );
+
+    proxy.shutdown().await;
+}
+
+fn chat_route(upstream: &MockServer) -> ProviderRoute {
+    ProviderRoute {
+        model_prefix: "chat-sidecar".to_string(),
+        prefix_match: false,
+        upstream: Some(Url::parse(&upstream.uri()).unwrap()),
+        translate: true,
+        cursor_agent: None,
+        target_model: None,
+        auth_env: Some("none".to_string()),
+    }
+}
+
+fn chat_sse() -> String {
+    [
+        r#"{"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"delta":{"content":"Reading chat.rs"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    ]
+    .iter()
+    .map(|c| format!("data: {c}\n\n"))
+    .chain(["data: [DONE]\n\n".to_string()])
+    .collect()
+}
+
+async fn mount_chat(upstream: &MockServer, status: u16) -> Arc<Mutex<Vec<Vec<u8>>>> {
+    let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            sink.lock().unwrap().push(req.body.clone());
+            if status == 200 {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(chat_sse())
+            } else {
+                ResponseTemplate::new(status).set_body_string("upstream trouble")
+            }
+        })
+        .mount(upstream)
+        .await;
+    captured
+}
+
+async fn streamed_text(proxy_url: &str, body: &Value) -> String {
+    let resp = common::shared_client()
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "sk-ant-sidecar-test")
+        .body(serde_json::to_vec(body).unwrap())
+        .send()
+        .await
+        .expect("proxy reachable");
+    assert_eq!(resp.status(), 200);
+    resp.text().await.expect("response body")
+}
+
+/// A sidecar model that names a Chat Completions route (no target model) is
+/// served from `/v1/chat/completions` with its own name as the model id, a
+/// raised token cap and no tools; the default upstream never sees it.
+#[tokio::test]
+async fn a_chat_route_serves_the_sidecar() {
+    let default = MockServer::start().await;
+    let default_captured = mount_capture(&default).await;
+    let chat = MockServer::start().await;
+    let chat_captured = mount_chat(&chat, 200).await;
+
+    let proxy = start_proxy_with(&default.uri(), |c| {
+        c.compression = true;
+        c.sidecar_model = Some("chat-sidecar".to_string());
+        c.model_routes = vec![chat_route(&chat)];
+    })
+    .await;
+
+    let streamed = streamed_text(&proxy.url(), &sidecar_body()).await;
+    assert!(
+        streamed.contains("\"text\":\"Reading chat.rs\""),
+        "{streamed}"
+    );
+    assert!(default_captured.lock().unwrap().is_empty());
+    let bodies = chat_captured.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "one attempt, no retry");
+    let fwd: Value = serde_json::from_slice(&bodies[0]).expect("JSON body");
+    assert_eq!(fwd["model"], "chat-sidecar");
+    assert_eq!(fwd["max_tokens"], 512);
+    assert_eq!(fwd["stream"], true);
+    assert!(fwd.get("tools").is_none());
+    assert!(fwd["messages"].as_array().unwrap().len() <= 5);
+
+    proxy.shutdown().await;
+}
+
+/// When the chat route fails and a fixed line is set, the line answers and
+/// Haiku (the default upstream) is never called.
+#[tokio::test]
+async fn a_failed_chat_route_falls_back_to_the_fixed_line_not_haiku() {
+    let default = MockServer::start().await;
+    let default_captured = mount_capture(&default).await;
+    let chat = MockServer::start().await;
+    mount_chat(&chat, 500).await;
+
+    let proxy = start_proxy_with(&default.uri(), |c| {
+        c.compression = true;
+        c.sidecar_model = Some("chat-sidecar".to_string());
+        c.sidecar_local_answer = Some("Working".to_string());
+        c.model_routes = vec![chat_route(&chat)];
+    })
+    .await;
+
+    let streamed = streamed_text(&proxy.url(), &sidecar_body()).await;
+    assert!(streamed.contains("\"text\":\"Working\""), "{streamed}");
+    assert_eq!(chat.received_requests().await.unwrap().len(), 1);
+    assert!(
+        default_captured.lock().unwrap().is_empty(),
+        "the fallback must not reach Haiku"
     );
 
     proxy.shutdown().await;

@@ -39,3 +39,12 @@
   `response.completed` in `message_delta` behind a flag and watch whether
   compaction fires and how often. (3) Run `/compact` on a real Spark session and
   log the request size, outcome and the resume that follows.
+
+## Addendum 2026-09-30: what Zen does report
+
+`response.completed.usage` from Zen carries `input_tokens`, `output_tokens`,
+`total_tokens` and `input_tokens_details.cached_tokens` (one sampled turn:
+76,415 input, 75,889 cached, 156 out; from the `responses_stream_event_shape`
+log line). So the true input count is available at the proxy and is dropped
+before the client; nothing needs estimating. The open question is still what
+Claude Code does with it (auto-compaction), not whether it can be given.

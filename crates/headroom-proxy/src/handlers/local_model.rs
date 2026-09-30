@@ -365,17 +365,24 @@ pub async fn handle_messages(
         is_zen,
     )
     .await;
-    let (upstream_resp, upstream_headers, attempt, replay_stripped_bytes, slow_probe) = match send {
-        Ok(send) => (
-            send.resp,
-            send.headers,
-            send.attempts,
-            send.retried_without_replay,
-            send.slow_probe,
-        ),
-        Err(resp) => return resp,
-    };
-    note_send_outcome(&mut outcome_ctx, replay_stripped_bytes, attempt);
+    let (upstream_resp, upstream_headers, attempt, replay_stripped_bytes, slow_probe, egress_slot) =
+        match send {
+            Ok(send) => (
+                send.resp,
+                send.headers,
+                send.attempts,
+                send.retried_without_replay,
+                send.slow_probe,
+                send.egress_slot,
+            ),
+            Err(resp) => return resp,
+        };
+    note_send_outcome(
+        &mut outcome_ctx,
+        replay_stripped_bytes,
+        attempt,
+        egress_slot,
+    );
 
     quirks.capture_turn_state(&upstream_resp, session_key.as_deref());
 
@@ -750,6 +757,7 @@ fn note_send_outcome(
     outcome_ctx: &mut Option<crate::routed::outcome::RoutedOutcomeContext>,
     replay_stripped_bytes: Option<u64>,
     attempt: u32,
+    egress_slot: Option<usize>,
 ) {
     if let (Some(ctx), Some(stripped)) = (outcome_ctx.as_mut(), replay_stripped_bytes) {
         // The 413 retry below re-sent without the replay prefix: the refused
@@ -758,6 +766,7 @@ fn note_send_outcome(
     }
     if let Some(ctx) = outcome_ctx.as_mut() {
         ctx.upstream_attempts = i64::from(attempt.max(1));
+        ctx.egress_slot = egress_slot;
     }
 }
 

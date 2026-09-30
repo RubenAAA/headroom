@@ -51,6 +51,8 @@ pub const DESCRIBE_ACTION_PREFIX: &str = "Describe your most recent action in 3-
 
 /// Label values for `proxy_sidecar_total`. A closed set, never request input.
 const DESCRIBE_ACTION_KIND: &str = "describe_action";
+/// Counted when the operator's fixed line answered the request.
+const LOCAL_KIND: &str = "local";
 /// Counted when the shrunk request failed and the original was sent instead.
 const FALLBACK_KIND: &str = "fallback";
 
@@ -681,6 +683,78 @@ async fn forward(
             &format!("building sidecar response: {e}"),
         ),
     }
+}
+
+/// Answer the sidecar with `text` and call no model (`--sidecar-local-answer`).
+///
+/// Shaped like a finished Messages reply, streamed when the client asked for a
+/// stream: the client parses it the same way as one from the provider.
+pub fn local_answer(parsed: &Value, text: &str, request_id: &str) -> Response {
+    let model = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    // The client discards anything past a few words, so this is a rough count.
+    let tokens = text.split_whitespace().count().max(1);
+    let id = format!("msg_local_{request_id}");
+    tracing::info!(
+        event = "sidecar_answered_locally",
+        request_id,
+        model,
+        "spinner-text sidecar answered with the fixed line"
+    );
+    crate::observability::sidecar::observe_detected(LOCAL_KIND);
+    let usage = json!({"input_tokens": 0, "output_tokens": tokens});
+    if parsed.get("stream").and_then(Value::as_bool) != Some(true) {
+        let message = json!({
+            "id": id, "type": "message", "role": "assistant", "model": model,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn", "stop_sequence": null, "usage": usage,
+        });
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(message.to_string()))
+            .expect("static response");
+    }
+    let event = |name: &str, data: Value| format!("event: {name}\ndata: {data}\n\n");
+    let stream = [
+        event(
+            "message_start",
+            json!({"type": "message_start", "message": {
+                "id": id, "type": "message", "role": "assistant", "model": model,
+                "content": [], "stop_reason": null, "stop_sequence": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }}),
+        ),
+        event(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text", "text": ""}}),
+        ),
+        event(
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": text}}),
+        ),
+        event(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        event(
+            "message_delta",
+            json!({"type": "message_delta",
+                   "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                   "usage": {"output_tokens": tokens}}),
+        ),
+        event("message_stop", json!({"type": "message_stop"})),
+    ]
+    .concat();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(stream))
+        .expect("static response")
 }
 
 /// Log the failure, count it, and hand the turn back to the normal pipeline.

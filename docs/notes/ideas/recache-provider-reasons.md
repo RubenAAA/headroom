@@ -401,3 +401,29 @@ inbound_tail_replaced                2           0        0
   unchallenged (no new evidence either way); the 09-02 sidecar subset cannot
   be re-tested by name anymore. If this class is ever worked, it starts here,
   not at the 09-02 sidecar numbers.
+
+## Measured after the deploy (2026-09-30)
+
+Commit `8217fca0` (summed-usage turns no longer scored as recaches, plus the
+CCR client boundary) went live about 17:03Z on 2026-09-29. `cache_recache_observed`
+in the five rotated logs, Claude turns only (`PERF model=claude*`):
+
+| | Before (2026-09-21 to 09-29 17:03Z) | After (to 2026-09-30 10:33Z) |
+|---|---:|---:|
+| Claude turns | 34,676 (94 active hours) | 3,451 (12 active hours) |
+| `unexplained_after_replay` | 1,202 events | 0 |
+| `aftershock_of_continuation` | 87 events | 0 |
+| Wasted tokens, all reasons | 9,115,265 | 38,267 |
+
+The rates are comparable (368 vs 288 turns per active hour), so the drop is not
+volume. What remains after: `forwarded_beta_rotated` 76, `prefix_content_diverged`
+30, `prefix_head_changed` 5, `early_messages` 4, `aftershock_of_diverged_prefix` 1.
+**Not separable:** both fixes shipped together, and the earlier correction says
+most aftershock and unexplained events were server-tool turns scored against
+summed usage, which the first fix removes. The CCR marker policy's own effect
+cannot be read from these counts.
+
+**Sizes after deploy** (12 active hours): `forwarded_beta_rotated` 76 events,
+25,703 tokens (about 340 each, `scope: cache_key`, `origin: client`);
+`prefix_content_diverged` 30 events, 7,526 tokens; `prefix_head_changed` 5
+events, 3,800 tokens. 38,267 tokens in all. None is worth chasing.

@@ -633,6 +633,13 @@ pub(crate) async fn forward_http(
             &mut shaper_labels,
         )
         .await;
+        let buffered = forward::run_openai_output_shaper(
+            buffered,
+            endpoint,
+            &state,
+            &request_id,
+            &mut shaper_labels,
+        );
 
         // Plan 2 step 1: `parse` gap ends where the ctx block closes. Covers
         // buffer end through ctx/memory transforms; subtract `memory` to

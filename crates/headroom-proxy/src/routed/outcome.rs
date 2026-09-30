@@ -83,6 +83,7 @@ pub(crate) fn build_routed_outcome_context(
         forwarded_tokens_estimate,
         outbound_bytes,
         upstream_attempts: 1,
+        egress_slot: None,
         // Filled in by the handler, which is where the routing decision is.
         reroute: None,
         // Filled in by the handler when it redacts; see above.
@@ -140,6 +141,8 @@ pub(crate) struct RoutedOutcomeContext {
     /// the user hunt for images that were never there.
     pub(crate) outbound_bytes: u64,
     pub(crate) upstream_attempts: i64,
+    /// The Zen lane that answered this turn, for the stream-abort log line.
+    pub(crate) egress_slot: Option<usize>,
     /// `Some` when the prefix-replay stage parked this turn. The store needs
     /// the response's cache-token counts to decide how much of the prefix the
     /// provider actually held, so a parked turn must be completed.
@@ -438,6 +441,7 @@ mod tests {
             forwarded_tokens_estimate: 7,
             outbound_bytes: 0,
             upstream_attempts: 1,
+            egress_slot: None,
             replay_store: None,
             session_key: "sess-test".to_string(),
             usage_observer: None,

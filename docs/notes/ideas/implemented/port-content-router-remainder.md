@@ -1,12 +1,14 @@
 # Idea: close the content-router remainder gap
 
-- **Status:** open, narrowed 2026-09-28 — 5 of 54 commits left, most small.
+- **Status:** done 2026-09-30. Nothing left to port: `aceff2ea`, `57bf720d` and
+  `10e48292` are in the tree; `ad56dd38`, `a97b8241` and `e9000863` are
+  declined below with reasons.
 - **Source:** `docs/notes/upstream-port-backlog.md` group A
 - **Summary:** Python rewrote router dispatch (`content_router.py` +1518/-313);
   local `7dd551ac` + `e539a3b0` closed part (router/gemini fixes, PHP, tool
   exclusion). What remains is the decision-logic delta vs Rust
   `content_router.rs`.
-- **Next:** re-diff and port only what's left.
+- **Next:** none. Re-open only if Kompress is turned on, or a Hermes client shows up.
 
 ## Re-diff 2026-09-28 (`42ebbc6c..964671d8`, 54 commits)
 
@@ -57,3 +59,35 @@ N/A, 6 left, all changing forwarded bytes.
   `ccr_marker_offered` event to `ccr_retrieval_call` on the hash, per strategy;
   needs a proxy built after 2026-09-29). Multi-turn prefix stability is pinned by
   `tests/suites/cache/integration_embedded_json_prefix.rs`.
+
+## Resolution 2026-09-30
+
+- `10e48292`: shipped. `cross_turn_dedup::dedup_messages` folds a tool result
+  whose `content` is a list holding one text part, leaves multi-part lists as
+  sent, and treats `role: "function"` like `"tool"`. Pinned by
+  `dedup_messages_folds_list_content_tool_result`,
+  `dedup_messages_leaves_multi_part_list_content_alone` and
+  `dedup_messages_function_role_string_content` (22 `cross_turn_dedup` lib
+  tests pass). The earlier "not worth it" estimate (2.4% of tool-result bytes)
+  stands as the ceiling on the saving.
+- `ad56dd38`: declined. Not a few-line change: upstream's fix swaps `len()/4`
+  for `_estimate_tokens`, which is the `EstimatingTokenCounter` auto-detect
+  path (JSON parses at 3.2 chars/token, code at 3.5, URL/UUID overhead). The
+  Rust `EstimatingCounter` has only the fixed-ratio path, so a port means
+  writing that path first. Meanwhile the gate is unreachable: the live-zone
+  dispatcher returns `kompress_disabled` for `PlainText` under
+  `--disable-kompress true` before it reaches `kompress_size_gate_exceeded`.
+  Port the estimator and the gate together if Kompress is enabled (see
+  `kompress-enable-ab.md`). Note the Rust gate compares byte length, not chars.
+- `a97b8241`: declined. It only matters for Hermes' deferred `tool_call`
+  wrapper. This proxy serves Claude Code, Codex, Cursor and Spark; no Hermes
+  provider exists (`rejected/port-providers-on-demand.md`), so no request
+  carries the wrapper.
+- `e9000863`: declined, and `7f2766ca` with it. It is a Python watchdog thread
+  around a single cache-miss compression, there because a Python thread cannot
+  be preempted and a stuck ONNX call holds the request. Kompress is off, so
+  nothing on the serving path runs long enough to need it. The Rust side
+  already bounds compression with `tokio::time::timeout` where it can hang
+  (`websocket_codex::compress_frame_bounded`; rationale in
+  `compression_quarantine.rs`). A deadline also makes output depend on timing,
+  which breaks prefix stability on a cache miss.

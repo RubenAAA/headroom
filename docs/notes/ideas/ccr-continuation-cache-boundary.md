@@ -1,8 +1,9 @@
 # Idea: keep hidden CCR continuations behind the client-visible cache boundary
 
 - **Status:** first-round policy shipped behind `--ccr-keep-client-boundary-rounds`
-  (default 1) 2026-09-29, unmeasured live. Keep open until the check below
-  reads the after-deploy window.
+  (default 1) 2026-09-29. After-deploy window read 2026-09-30 (last section):
+  0 aftershock events, but the summed-usage fix shipped with it, so the policy's
+  own effect is not separable. Keep open only for a CCR-only comparison.
 - **Source:** live recache audit in
   `recache-provider-reasons.md` (2026-09-29 window); code in
   `crates/headroom-proxy/src/proxy/ccr_response.rs` and
@@ -176,3 +177,25 @@ So the relocated marker writes a tail the client never resends. The
 `--ccr-keep-client-boundary-rounds 1` policy targets exactly that. Not enabled
 in `contrib/headroom-flags.sh` yet; after enabling, the check is aftershock
 count and wasted tokens per CCR turn against this window (9 in ~45 min).
+
+## Measured after the deploy (2026-09-30)
+
+Commit `8217fca0` (summed-usage turns no longer scored as recaches, plus the
+CCR client boundary) went live about 17:03Z on 2026-09-29. `cache_recache_observed`
+in the five rotated logs, Claude turns only (`PERF model=claude*`):
+
+| | Before (2026-09-21 to 09-29 17:03Z) | After (to 2026-09-30 10:33Z) |
+|---|---:|---:|
+| Claude turns | 34,676 (94 active hours) | 3,451 (12 active hours) |
+| `unexplained_after_replay` | 1,202 events | 0 |
+| `aftershock_of_continuation` | 87 events | 0 |
+| Wasted tokens, all reasons | 9,115,265 | 38,267 |
+
+The rates are comparable (368 vs 288 turns per active hour), so the drop is not
+volume. What remains after: `forwarded_beta_rotated` 76, `prefix_content_diverged`
+30, `prefix_head_changed` 5, `early_messages` 4, `aftershock_of_diverged_prefix` 1.
+**Not separable:** both fixes shipped together, and the earlier correction says
+most aftershock and unexplained events were server-tool turns scored against
+summed usage, which the first fix removes. The CCR marker policy's own effect
+cannot be read from these counts. Also unread: `forwarded_beta_rotated`
+(76 in 12 active hours, the largest remaining reason).

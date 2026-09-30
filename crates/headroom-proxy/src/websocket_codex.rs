@@ -1364,6 +1364,20 @@ async fn connect_upstream_with_retry(
     Err(last_err)
 }
 
+/// Verbosity steering on a `response.create` frame, ahead of compression.
+/// No-op unless `--output-shaper` is on.
+fn shape_create_frame(raw: String, state: &AppState, request_id: &str) -> String {
+    if !state.config.output_shaper_enabled {
+        return raw;
+    }
+    crate::output_shaper::shape_response_create_frame(
+        raw,
+        state.config.verbosity_level,
+        state.config.output_holdout,
+        request_id,
+    )
+}
+
 /// Compression outcome of the async wrapper.
 enum CompressAttempt {
     Done(FrameCompression),
@@ -1684,6 +1698,7 @@ async fn run_codex_session_inner(
                                     break;
                                 }
                                 let out = if is_create && !bypass {
+                                    let text = shape_create_frame(text, &ctx_state, &request_id);
                                     let comp_started = Instant::now();
                                     let exclude_tools = exclude_tools.clone();
                                     match compress_frame_bounded(
@@ -1984,6 +1999,7 @@ async fn compress_first_frame(
         );
         return Ok((first_msg_raw, upstream));
     }
+    let first_msg_raw = shape_create_frame(first_msg_raw, &ctx.state, &ctx.request_id);
     let comp_started = Instant::now();
     let attempt = compress_frame_bounded(
         first_msg_raw.clone(),

@@ -573,9 +573,25 @@ HEADROOM_FLAGS=(
   # fails at Zen with its own error rather than mismatching a route table
   # entry; nothing selects it anymore.
 
-  # Keep spinner summaries on the default direct Haiku path. Zen's free tier
-  # rejects the reduced sidecar shape as not originating in OpenCode, so
-  # routing it through Spark only adds a failed request before the fallback.
+  # Spinner summaries (the per-agent description in the statusline agent list)
+  # come from space-bunny-free on Zen's Chat Completions endpoint: free,
+  # ~1-2 s, and its provider keeps no data and does not train on it. The
+  # route is named for the upstream model (no target model, so the chat shape).
+  # longcat-2.5-preview-free was tried and is refused by Zen's free-tier gate.
+  # The fixed line below answers when Zen fails, so the fallback spends no
+  # Claude quota (it was Haiku before 2026-09-30).
+  --extra-model-route space-bunny-free=https://opencode.ai/zen/v1:openai:auth=none
+  --sidecar-model space-bunny-free
+  --sidecar-local-answer Working
+
+  # Hand Zen's encrypted reasoning back on the next turn. Zen binds each blob
+  # to the caller it issued it to, so one from another exit is refused with a
+  # 400; the proxy then drops the blobs, remembers them and resends once (see
+  # `routed/reasoning_blobs.rs`). Off since 2026-09-14, when a rotation made
+  # that 400 repeat on every turn. On from 2026-09-30 as a trial: watch
+  # `zen_reasoning_blobs_dropped` (each one is a wasted request) and revert if
+  # Spark turns get slower with no better answers.
+  --zen-reasoning-replay true
 
   # ─── Defaults, written out ──────────────────────────────────────────
   #

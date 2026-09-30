@@ -146,6 +146,9 @@ async fn an_appended_turn_keeps_its_prefix_and_an_edited_one_breaks_it() {
         events[0]["common_prefix"].as_u64().unwrap() < events[0]["prev_items"].as_u64().unwrap()
     );
     assert_eq!(events[0]["first_moved_kind"], "message:user");
+    // The line shows what changed: the edited text now, the original before.
+    assert!(events[0]["moved_now"].as_str().unwrap().contains("EDITED"));
+    assert!(events[0]["moved_before"].as_str().unwrap().contains("u2"));
     assert_eq!(events[0]["head_changed"], false);
 
     proxy.shutdown().await;
@@ -227,6 +230,98 @@ async fn a_system_message_mid_conversation_leaves_the_prefix_and_head_alone() {
     // translation kept a mid-conversation system message in place, each one
     // changed the head (or item 0 on Zen) and logged here.
     assert!(events.is_empty(), "{events:?}");
+
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_side_request_between_two_turns_is_not_a_break() {
+    let _capture = common::tracing_capture::serial().await;
+    let buf = common::tracing_capture::buffer();
+    buf.lock().unwrap().clear();
+
+    let (addr, _task) = upstream().await;
+    let upstream_url = format!("http://{addr}");
+    let route_upstream = upstream_url.clone();
+    let proxy = start_proxy_with_state(
+        &upstream_url,
+        move |config| {
+            config.model_routes = vec![headroom_proxy::config::ProviderRoute {
+                model_prefix: "claude-spark-side".to_string(),
+                prefix_match: false,
+                upstream: Some(route_upstream.parse().expect("upstream url")),
+                translate: true,
+                cursor_agent: None,
+                target_model: Some("spark-side-model".to_string()),
+                auth_env: Some("none".to_string()),
+            }];
+        },
+        |state| state,
+    )
+    .await;
+
+    // Two real turns, a side request built on the first (the way Claude Code's
+    // spinner request replaces the last message), then the next real turn. The
+    // provider caches every prefix, so only a turn that follows none of the
+    // earlier ones is a break.
+    let user = |t: &str| json!({"role": "user", "content": t});
+    let assistant = |t: &str| json!({"role": "assistant", "content": t});
+    let turns = [
+        vec![user("side task"), assistant("a1"), user("u2")],
+        vec![
+            user("side task"),
+            assistant("a1"),
+            user("u2"),
+            assistant("a2"),
+            user("u3"),
+        ],
+        vec![
+            user("side task"),
+            assistant("a1"),
+            user("u2"),
+            assistant("a2"),
+            user("side request"),
+        ],
+        vec![
+            user("side task"),
+            assistant("a1"),
+            user("u2"),
+            assistant("a2"),
+            user("u3"),
+            assistant("a3"),
+            user("u4"),
+        ],
+        vec![user("side task"), assistant("other"), user("u2")],
+    ];
+    let client = reqwest::Client::new();
+    for messages in turns {
+        let body = json!({"model": "claude-spark-side", "stream": true, "messages": messages});
+        client
+            .post(format!("{}/v1/messages", proxy.url()))
+            .header("content-type", "application/json")
+            .json(&body)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .expect("proxy answers")
+            .text()
+            .await
+            .unwrap();
+    }
+
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let events: Vec<Value> = logs
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| v["fields"].clone())
+        .filter(|f| f["event"] == "routed_forward_continuity" && f["model"] == "spark-side-model")
+        .collect();
+    // The side request differs from the turn before it, and the fourth turn
+    // differs from the side request, yet each follows an earlier turn whole.
+    // Only the last turn, an edit to an earlier reply, follows none of them.
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["items"], 3);
+    assert_eq!(events[0]["first_moved_kind"], "message:assistant");
 
     proxy.shutdown().await;
 }

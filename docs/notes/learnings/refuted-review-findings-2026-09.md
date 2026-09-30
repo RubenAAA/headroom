@@ -6,13 +6,15 @@ review-methodology claim). Kept so future reviews do not re-flag them.
 
 ## 1. `lift_zen_output_ceiling` overwrites `reasoning` — NOT a bug
 
-Flag was "clobbers client summary/detail". Wrong: the client's effort is
-preserved via `output_shaper::requested_effort(anthropic)` (`max` maps to
-Zen's `xhigh`, anything else passes through). Only `summary: auto` and
-`stream_options.sequential_cutoff` are forced, which is the documented Zen
-requirement, not client data loss. See the function doc comment and
-`zen_route_passes_the_clients_effort_through` test in
-`crates/headroom-proxy/src/routed/translation.rs`.
+Flag was "clobbers client summary/detail". Wrong at the time: the client's
+effort was preserved via `output_shaper::requested_effort(anthropic)` (`max`
+mapped to Zen's `xhigh`, anything else passed through). **Changed 2026-09-30:**
+the effort is now always `max` whatever the client asks
+(`zen_route_pins_the_effort_to_max`). Zen accepts `max` for Spark; the old
+`max`-to-`xhigh` rewrite was never needed. `summary: auto` and
+`stream_options.sequential_cutoff` are still forced. The "documented Zen
+requirement" wording for the latter is unproven: OpenCode's own request omits
+it and is served (see `ideas/spark-request-drops-audit.md`).
 
 ## 2. Zen sends no `max_output_tokens`, defaults to `xhigh` — NOT a bug
 

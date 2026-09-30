@@ -31,3 +31,11 @@ number to its window; do not quote across windows.
 - [`proton-free-wireproxy-lane.md`](proton-free-wireproxy-lane.md): Proton's
   free plan adds one lane, not a pool (one connection, no SOCKS service);
   `wireproxy` serves it as loopback SOCKS without touching routes.
+- [`spark-side-requests-look-like-cache-breaks.md`](spark-side-requests-look-like-cache-breaks.md):
+  Claude Code's spinner request shares a session key with real turns, so
+  comparing with the last turn alone logged false prefix breaks; compare with
+  the last four.
+- [`spark-stream-drops-and-503s-2026-09-30.md`](spark-stream-drops-and-503s-2026-09-30.md):
+  TapBuy fleet kills sorted by cause: 503s fixed by lane failover, mid-stream
+  drops are peer closes (10 of 19 near proxy restarts), malformed CCR hashes
+  now fall back to keyword search.

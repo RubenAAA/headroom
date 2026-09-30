@@ -699,3 +699,80 @@ async fn spent_budget_refuses_the_upgrade_and_closes_an_open_socket() {
     }
     proxy.shutdown().await;
 }
+
+/// Verbosity steering lands on the `instructions` tail of a `response.create`
+/// frame, in both envelope shapes, on the first frame and on later ones, and
+/// a control-arm conversation forwards its frames byte-equal.
+#[tokio::test]
+async fn response_create_frames_get_verbosity_steering() {
+    const SENTINEL: &str = "<headroom_output_shaping>";
+    async fn sent_frames(holdout: f64, frames: &[String]) -> Vec<String> {
+        let upstream = spawn_mock_upstream(vec![], false, vec![]).await;
+        let proxy = start_proxy_with(&format!("http://{}", upstream.addr), |c| {
+            live_zone_config(c);
+            c.output_shaper_enabled = true;
+            c.verbosity_level = 2;
+            c.output_holdout = holdout;
+        })
+        .await;
+        let mut req = format!("{}/v1/responses", proxy.ws_url())
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            "authorization",
+            http::HeaderValue::from_static("Bearer sk-test-payg"),
+        );
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        for f in frames {
+            ws.send(Message::Text(f.clone().into())).await.unwrap();
+        }
+        wait_for_frames(&upstream.frames, frames.len()).await;
+        let got = upstream
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| match m {
+                Message::Text(t) => t.to_string(),
+                other => panic!("expected text frame, got {other:?}"),
+            })
+            .collect();
+        let _ = ws.close(None).await;
+        proxy.shutdown().await;
+        got
+    }
+
+    let inner = json!({
+        "model": "gpt-5.4-codex",
+        "instructions": "You are Codex.",
+        "prompt_cache_key": "session-ws",
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "run tests"}
+        ]}],
+        "stream": true
+    });
+    let wrapped = json!({"type": "response.create", "response": inner}).to_string();
+    let mut bare_inner = inner.clone();
+    bare_inner["type"] = json!("response.create");
+    let bare = bare_inner.to_string();
+    let cancel = json!({"type": "response.cancel", "response_id": "resp_1"}).to_string();
+    let frames = [wrapped.clone(), cancel.clone(), bare, wrapped];
+
+    let got = sent_frames(0.0, &frames).await;
+    let first: Value = serde_json::from_str(&got[0]).unwrap();
+    let instructions = first["response"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.starts_with("You are Codex.\n\n"),
+        "{instructions}"
+    );
+    assert!(instructions.contains(SENTINEL), "{instructions}");
+    assert_eq!(first["response"]["input"], inner["input"]);
+    assert_eq!(got[1], cancel, "non-create frames stay byte-equal");
+    let second: Value = serde_json::from_str(&got[2]).unwrap();
+    assert!(second.get("response").is_none(), "bare shape stays bare");
+    assert_eq!(second["instructions"].as_str().unwrap(), instructions);
+    assert_eq!(got[3], got[0], "a later frame carries identical bytes");
+
+    let control = sent_frames(1.0, &frames).await;
+    assert_eq!(control, frames, "control arm forwards client bytes");
+}

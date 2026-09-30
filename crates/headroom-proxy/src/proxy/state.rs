@@ -255,6 +255,20 @@ impl AppState {
         }
     }
 
+    /// Pass a Zen lane over for new turns after it answered 429.
+    pub(crate) fn mark_zen_lane_limited(&self, slot: usize) {
+        if let Some(pool) = self.zen_egresses.as_ref() {
+            pool.mark_limited(slot);
+        }
+    }
+
+    /// A Zen lane answered a request: its run of 429s is over.
+    pub(crate) fn mark_zen_lane_answered(&self, slot: usize) {
+        if let Some(pool) = self.zen_egresses.as_ref() {
+            pool.mark_answered(slot);
+        }
+    }
+
     /// Re-take the in-flight guard for a Zen egress already selected, as a
     /// held turn does before each probe. `Err` carries the egress ID while it
     /// is rotating; without a pool there is nothing to count.
@@ -848,6 +862,8 @@ impl AppState {
             config.cache_stampede_wait_cap,
             observed_cache_ttl,
         );
+
+        crate::routed::reasoning_blobs::set_enabled(config.zen_reasoning_replay);
 
         Ok(Self {
             config: Arc::new(config),

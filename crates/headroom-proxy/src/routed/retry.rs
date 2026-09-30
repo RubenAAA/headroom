@@ -115,6 +115,8 @@ pub(crate) struct UpstreamSend {
     pub resp: reqwest::Response,
     pub headers: HeaderMap,
     pub attempts: u32,
+    /// The Zen lane that answered; `None` off Zen and on the 413 resend.
+    pub egress_slot: Option<usize>,
     /// Set when a 413 was answered by re-sending the same turn with the
     /// replay prefix stripped. The handler refreshes the outcome context's
     /// `outbound_bytes` from this so the measured diagnosis reports the
@@ -138,7 +140,7 @@ pub(crate) async fn send_with_retry(
     state: &AppState,
     upstream_url: &str,
     mut headers: HeaderMap,
-    body: Bytes,
+    mut body: Bytes,
     request_id: &str,
     session_key: Option<&str>,
     lane_key: Option<&str>,
@@ -146,6 +148,8 @@ pub(crate) async fn send_with_retry(
     is_zen: bool,
 ) -> Result<UpstreamSend, Response> {
     let (max_attempts, max_delay_ms) = retry_bounds(state);
+    let turn_started = std::time::Instant::now();
+    let mut blobs_dropped = false;
     // `egress_guard` counts this turn against its Zen egress until the last
     // byte of the answer (it rides in the response body) — except while the
     // turn is parked in the 429 hold, which is waiting on that egress's
@@ -211,9 +215,35 @@ pub(crate) async fn send_with_retry(
                     &upstream_host,
                     attempt_started,
                     attempt,
+                    lane.slot,
                 );
+                // `--zen-reasoning-replay`: Zen refused a blob that is not this
+                // caller's. Resend once without any blob and remember them.
+                let r = match resend_without_refused_blobs(
+                    state,
+                    is_zen && !blobs_dropped,
+                    r,
+                    &body,
+                    (lane.slot, request_id),
+                )
+                .await
+                {
+                    BlobRetry::Resend(clean) => {
+                        blobs_dropped = true;
+                        body = clean;
+                        drop(probe);
+                        // The resend is not an attempt against the budget.
+                        attempt -= 1;
+                        continue;
+                    }
+                    BlobRetry::Pass(r) => r,
+                };
+                note_lane_answered(state, is_zen, status, lane.slot);
                 if is_zen && status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     log_zen_rate_limited(lane.id, lane.slot, status, request_id);
+                    // New turns pinned to this lane start elsewhere for a
+                    // few seconds instead of each learning it is limited.
+                    state.mark_zen_lane_limited(lane.slot);
                     // The limit is per egress, so another lane answers now
                     // where this one would hold for the watcher's rotation.
                     // The limited lane stays parked for the turns behind it.
@@ -387,13 +417,46 @@ pub(crate) async fn send_with_retry(
             }
         }
     };
+    log_zen_turn_failed_over(is_zen, &lane, turn_started, attempt, request_id);
     Ok(UpstreamSend {
         resp: crate::proxy::attach_egress_guard(upstream_resp, lane.guard),
         headers,
         attempts: attempt,
+        egress_slot: is_zen.then_some(lane.slot),
         slow_probe,
         retried_without_replay: None,
     })
+}
+
+/// A Zen lane that answered ends its run of 429s, so the next one starts the
+/// pass-over at its shortest again.
+fn note_lane_answered(state: &AppState, is_zen: bool, status: reqwest::StatusCode, slot: usize) {
+    if is_zen && status.is_success() {
+        state.mark_zen_lane_answered(slot);
+    }
+}
+
+/// One line per Zen turn that changed lane: how long passed before the
+/// answer's headers arrived, moves and gate waits included.
+fn log_zen_turn_failed_over(
+    is_zen: bool,
+    lane: &Lane<'_>,
+    turn_started: std::time::Instant,
+    attempts: u32,
+    request_id: &str,
+) {
+    if !is_zen || lane.failovers == 0 {
+        return;
+    }
+    tracing::info!(
+        event = "zen_turn_failed_over",
+        request_id = %request_id,
+        final_slot = lane.slot,
+        failovers = lane.failovers,
+        attempts,
+        wait_ms = turn_started.elapsed().as_secs_f64() * 1000.0,
+        "Zen turn answered after changing lane"
+    );
 }
 
 /// The Zen lane a send is on, and what the turn has tried since its last
@@ -587,6 +650,49 @@ async fn hold_for_overload(
     true
 }
 
+enum BlobRetry {
+    /// The body to send again, without the refused blobs.
+    Resend(Bytes),
+    /// Nothing to retry: the response as it came.
+    Pass(reqwest::Response),
+}
+
+/// Reads a Zen 400 to see whether it refused a reasoning blob. The response
+/// comes back with the same status, headers and body when there is nothing to
+/// resend, so an unrelated 400 reaches the client untouched.
+async fn resend_without_refused_blobs(
+    state: &AppState,
+    first_try: bool,
+    r: reqwest::Response,
+    body: &Bytes,
+    (egress_slot, request_id): (usize, &str),
+) -> BlobRetry {
+    use crate::routed::reasoning_blobs::{drop_all_remembering, is_refusal};
+    if !first_try
+        || !state.config.zen_reasoning_replay
+        || r.status() != reqwest::StatusCode::BAD_REQUEST
+    {
+        return BlobRetry::Pass(r);
+    }
+    let (status, headers) = (r.status(), r.headers().clone());
+    let text = r.bytes().await.unwrap_or_default();
+    if is_refusal(&text)
+        && let Some(clean) = drop_all_remembering(body)
+    {
+        tracing::warn!(
+            event = "zen_reasoning_blobs_dropped",
+            egress_slot,
+            request_id = %request_id,
+            "Zen refused the replayed reasoning; resending without it"
+        );
+        return BlobRetry::Resend(clean);
+    }
+    let mut rebuilt = http::Response::new(text);
+    *rebuilt.status_mut() = status;
+    *rebuilt.headers_mut() = headers;
+    BlobRetry::Pass(reqwest::Response::from(rebuilt))
+}
+
 /// Take another lane for a Zen turn, and log the move.
 fn switch_lane<'a>(
     state: &'a AppState,
@@ -659,11 +765,14 @@ fn log_response_headers(
     upstream_host: &str,
     attempt_started: std::time::Instant,
     attempt: u32,
+    egress_slot: usize,
 ) {
     tracing::info!(
         target: "headroom.proxy",
         event = "routed_upstream_response_headers",
         request_id = %request_id,
+        // Only a Zen lane has a real slot; other hosts read 0.
+        egress_slot,
         upstream_host = %upstream_host,
         upstream_wait_ms = attempt_started.elapsed().as_secs_f64() * 1000.0,
         configured_http_proxy = state.config.http_proxy.is_some(),
@@ -937,6 +1046,7 @@ async fn try_replay_stripped_resend(
                 resp: r,
                 headers: headers.clone(),
                 attempts: attempt + 1,
+                egress_slot: None,
                 retried_without_replay: Some(stripped.len() as u64),
                 slow_probe,
             })
@@ -1138,8 +1248,8 @@ async fn handle_transport_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// Transport exhaustion on the routed path must answer 503 + Retry-After
     /// (not a bare 502): rotation RSTs, wifi flaps, and corpse-pool misses
@@ -1887,6 +1997,50 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(state.zen_egress_in_flight()["proxy-b"].as_u64(), Some(1));
         assert_eq!(state.zen_egress_in_flight()["proxy-a"].as_u64(), Some(0));
+        assert_eq!(send.egress_slot, Some(1), "the lane that answered");
+    }
+
+    /// The turns behind a 429 used to walk into the limited lane one by one
+    /// (1,346 429s on 2026-09-30, each a round trip). The lane is passed over
+    /// for a few seconds instead: the next turn of a session pinned to it
+    /// reaches the other lane with no request to the limited one.
+    #[tokio::test]
+    async fn a_lane_that_just_answered_429_is_skipped_by_the_next_turn() {
+        let pool = Arc::new(crate::proxy::ProviderEgressPool::new(
+            vec![reqwest::Client::new(), reqwest::Client::new()],
+            vec!["proxy-a".to_string(), "proxy-b".to_string()],
+        ));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mock = wiremock::MockServer::start().await;
+        let seen = hits.clone();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    wiremock::ResponseTemplate::new(429)
+                } else {
+                    wiremock::ResponseTemplate::new(200).set_body_string("ok")
+                }
+            })
+            .mount(&mock)
+            .await;
+        let state = zen_state(&pool, &mock, 0).await;
+        let first = zen_send(&state, &mock.uri(), "t-429-skip-1")
+            .await
+            .expect("served");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one 429, then the answer");
+        drop(first);
+        // A turn with no lane key is pinned to slot 0, the lane that 429ed.
+        let second = zen_send(&state, &mock.uri(), "t-429-skip-2")
+            .await
+            .expect("served");
+        assert_eq!(second.resp.status(), 200);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "the second turn went straight to the other lane"
+        );
+        assert_eq!(state.zen_egress_in_flight()["proxy-b"].as_u64(), Some(1));
+        assert_eq!(state.zen_egress_in_flight()["proxy-a"].as_u64(), Some(0));
     }
 
     /// Every lane dead: the turn pauses for the configured hold, then gets
@@ -1961,5 +2115,90 @@ mod tests {
                 (true, Err(resp)) => panic!("hold {hold_ms}ms returned {}", resp.status()),
             }
         }
+    }
+
+    /// A Zen turn that replays reasoning blobs: `blobs` in the body, and a
+    /// mock that answers `refusal` with a 400 while any blob is present.
+    async fn blob_turn(
+        replay: bool,
+        refusal: &'static str,
+    ) -> (Result<UpstreamSend, Response>, Arc<Mutex<Vec<String>>>) {
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = bodies.clone();
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let text = String::from_utf8_lossy(&req.body).into_owned();
+                let has_blob = text.contains("encrypted_content");
+                seen.lock().unwrap().push(text);
+                if has_blob {
+                    wiremock::ResponseTemplate::new(400).set_body_string(refusal)
+                } else {
+                    wiremock::ResponseTemplate::new(200).set_body_string("ok")
+                }
+            })
+            .mount(&mock)
+            .await;
+        let pool = Arc::new(crate::proxy::ProviderEgressPool::new(
+            vec![reqwest::Client::new()],
+            vec!["proxy-ok".to_string()],
+        ));
+        let mut state = zen_state(&pool, &mock, 0).await;
+        let mut config = (*state.config).clone();
+        config.zen_reasoning_replay = replay;
+        state.config = Arc::new(config);
+        let body = r#"{"input":[{"type":"reasoning","id":"rs_1","encrypted_content":"blob-retry-test","summary":[]},{"type":"message","role":"user","content":"hi"}]}"#;
+        let sent = send_with_retry(
+            &state,
+            &mock.uri(),
+            HeaderMap::new(),
+            Bytes::from(body),
+            "t-blobs",
+            None,
+            None,
+            false,
+            true,
+        )
+        .await;
+        (sent, bodies)
+    }
+
+    const NOT_YOURS: &str = "reasoning `encrypted_content` was not issued to this caller";
+
+    /// Zen refuses a blob from another caller: the turn resends once with no
+    /// blob and the client sees the 200, never the 400.
+    #[tokio::test]
+    async fn a_refused_blob_is_dropped_and_the_turn_resent_once() {
+        let (sent, bodies) = blob_turn(true, NOT_YOURS).await;
+        let send = sent.expect("resent turn is answered");
+        assert_eq!(send.resp.status(), StatusCode::OK);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "one refused send, one resend");
+        assert!(bodies[0].contains("encrypted_content"));
+        assert!(!bodies[1].contains("encrypted_content"), "{}", bodies[1]);
+        assert!(
+            bodies[1].contains(r#""content":"hi""#),
+            "the turn itself survives"
+        );
+    }
+
+    /// A 400 that is not the wrong-caller refusal belongs to the client: same
+    /// status, same body, and no resend.
+    #[tokio::test]
+    async fn another_400_reaches_the_client_untouched() {
+        let (sent, bodies) = blob_turn(true, "input too long").await;
+        let send = sent.expect("a 400 is still a response");
+        assert_eq!(send.resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(send.resp.text().await.unwrap(), "input too long");
+        assert_eq!(bodies.lock().unwrap().len(), 1, "no resend");
+    }
+
+    /// With the flag off the retry does nothing: the 400 goes straight back.
+    #[tokio::test]
+    async fn without_the_flag_a_refusal_is_not_retried() {
+        let (sent, bodies) = blob_turn(false, NOT_YOURS).await;
+        let send = sent.expect("a 400 is still a response");
+        assert_eq!(send.resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(bodies.lock().unwrap().len(), 1);
     }
 }

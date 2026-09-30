@@ -38,8 +38,11 @@ pub(crate) struct ProviderEgressPool {
     /// lane it rotates instead of waiting for the whole proxy to go idle.
     pub(super) in_flight: Vec<std::sync::atomic::AtomicUsize>,
     /// Per slot, the moment (ms since `born`) until which new turns skip it
-    /// because a connect through it just failed. `0` means healthy.
+    /// because a connect through it just failed or it just answered 429. `0`
+    /// means healthy.
     pub(super) unhealthy_until_ms: Vec<std::sync::atomic::AtomicU64>,
+    /// Per slot, 429s in a row since the lane last answered a request.
+    pub(super) limited_streak: Vec<std::sync::atomic::AtomicU32>,
     pub(super) born: std::time::Instant,
 }
 
@@ -47,6 +50,19 @@ pub(crate) struct ProviderEgressPool {
 /// enough that a burst does not keep re-trying a dead relay, short enough
 /// that a lane the watcher just fixed is back within a rotation.
 pub(super) const LANE_UNHEALTHY_MS: u64 = 30_000;
+
+/// How long a lane that just answered 429 is passed over for new turns. A
+/// limited lane answers 429 again within 10 s about half the time and within
+/// a minute nearly always (2026-09-30 log: 1,346 429s, median 1.2 s each to
+/// learn), while every turn pinned to it kept trying it first. Shorter than
+/// [`LANE_UNHEALTHY_MS`]: a limit clears sooner than a dead relay is fixed.
+pub(super) const LANE_LIMITED_MS: u64 = 15_000;
+
+/// Ceiling for the escalating mark: each probe that finds the lane still
+/// limited doubles the pass-over (15, 30, 60, 120 s). Since the restart at
+/// 19:06 local on 2026-09-30, lanes 1, 3 and 5 answered 40 429s and no 200 in
+/// 17 minutes, so a flat 15 s kept probing lanes that stayed limited.
+pub(super) const LANE_LIMITED_MAX_MS: u64 = 120_000;
 
 pub(super) struct ProviderEgressAssignments {
     pub(super) lanes: lru::LruCache<String, usize>,
@@ -69,6 +85,9 @@ impl ProviderEgressPool {
                 .collect(),
             unhealthy_until_ms: (0..egress_ids.len())
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            limited_streak: (0..egress_ids.len())
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             born: std::time::Instant::now(),
             egress_ids,
@@ -139,6 +158,27 @@ impl ProviderEgressPool {
             self.now_ms() + LANE_UNHEALTHY_MS,
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// Pass `slot` over for new turns after a 429: [`LANE_LIMITED_MS`], doubled
+    /// for each 429 in a row since the lane last answered, up to
+    /// [`LANE_LIMITED_MAX_MS`]. A lane already passed over is left alone, so a
+    /// burst of turns that were in flight when the limit hit counts once, and
+    /// a longer mark from a failed connect is never shortened.
+    pub(crate) fn mark_limited(&self, slot: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = self.now_ms();
+        if self.unhealthy_until_ms[slot].load(Relaxed) > now {
+            return;
+        }
+        let streak = self.limited_streak[slot].fetch_add(1, Relaxed);
+        let pass_over = (LANE_LIMITED_MS << streak.min(3)).min(LANE_LIMITED_MAX_MS);
+        self.unhealthy_until_ms[slot].store(now + pass_over, Relaxed);
+    }
+
+    /// `slot` answered a request: forget its run of 429s.
+    pub(crate) fn mark_answered(&self, slot: usize) {
+        self.limited_streak[slot].store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(super) fn is_unhealthy(&self, slot: usize) -> bool {
@@ -366,4 +406,60 @@ pub(super) fn caller_upstream_client(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .put(key, client.clone());
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn pool() -> ProviderEgressPool {
+        ProviderEgressPool::new(
+            vec![reqwest::Client::new(), reqwest::Client::new()],
+            vec!["a".into(), "b".into()],
+        )
+    }
+
+    /// Milliseconds `slot` is still passed over for.
+    fn pass_over_ms(pool: &ProviderEgressPool, slot: usize) -> u64 {
+        pool.unhealthy_until_ms[slot]
+            .load(Relaxed)
+            .saturating_sub(pool.now_ms())
+    }
+
+    fn expire(pool: &ProviderEgressPool, slot: usize) {
+        pool.unhealthy_until_ms[slot].store(0, Relaxed);
+    }
+
+    /// A lane that stays limited is probed less often each time, up to the
+    /// ceiling, and one answer starts it over.
+    #[test]
+    fn a_lane_that_stays_limited_is_passed_over_for_longer_each_time() {
+        let pool = pool();
+        for want in [15_000u64, 30_000, 60_000, 120_000, 120_000] {
+            pool.mark_limited(0);
+            let got = pass_over_ms(&pool, 0);
+            assert!(
+                got <= want && got + 500 > want,
+                "passed over for {got} ms, wanted {want}"
+            );
+            expire(&pool, 0);
+        }
+        pool.mark_answered(0);
+        pool.mark_limited(0);
+        assert!(pass_over_ms(&pool, 0) <= 15_000, "an answer resets the run");
+        assert_eq!(pass_over_ms(&pool, 1), 0, "the other lane is untouched");
+    }
+
+    /// Turns in flight when a limit lands all report 429 within moments of
+    /// each other. They count once, and none of them shortens the mark.
+    #[test]
+    fn a_burst_of_429s_counts_once() {
+        let pool = pool();
+        for _ in 0..8 {
+            pool.mark_limited(0);
+        }
+        assert_eq!(pool.limited_streak[0].load(Relaxed), 1);
+        assert!(pass_over_ms(&pool, 0) <= 15_000);
+    }
 }

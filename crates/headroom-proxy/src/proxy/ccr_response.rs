@@ -316,11 +316,64 @@ pub(super) async fn sweep_cross_project(
     }
 }
 
+/// A value that is not a hash (a filename, a truncated hash) ends a worker's
+/// run when it gets only a note back (TapBuy fleet, 2026-09-30: 4+ zero-write
+/// kills). Search the index with it as keywords first; `None` means nothing
+/// matched and the caller returns the note.
+#[allow(clippy::too_many_arguments)]
+async fn answer_malformed_hash_as_query(
+    call: &CcrToolCall,
+    stores: Option<&Arc<crate::ctx::projects::ProjectStores>>,
+    outgoing_headers: &http::HeaderMap,
+    current_request: &serde_json::Value,
+    config: &Config,
+    redact: &Option<crate::redact::RedactRef>,
+    request_id: &str,
+    round: usize,
+) -> Option<CcrToolResult> {
+    if call.hash_key.is_empty()
+        || headroom_core::ccr::response_handler::is_plausible_ccr_hash(&call.hash_key)
+    {
+        return None;
+    }
+    let found = answer_query_call(
+        &call.hash_key,
+        call,
+        stores,
+        outgoing_headers,
+        current_request,
+        config,
+        redact,
+        request_id,
+        round,
+    )
+    .await;
+    if !found.success {
+        return None;
+    }
+    tracing::info!(
+        event = "ccr_malformed_hash_query_hit",
+        request_id = %request_id,
+        hash = %call.hash_key,
+        "ccr: malformed hash answered as a keyword query"
+    );
+    let note = format!(
+        "'{}' is not a CCR hash, so it was searched as keywords. \
+         Use a 24-hex hash from a <<ccr:...>> marker, or 'query', next time.",
+        call.hash_key
+    );
+    Some(CcrToolResult {
+        content: format!("{note}\n\n{}", found.content),
+        ..found
+    })
+}
+
 /// Full miss path: local-tier recovery, then the cross-project sweep,
 /// then a continue-friendly miss note (the old `Error: ... may have
 /// been evicted` wording stalled agentic sessions — the model treated
 /// it as terminal and retried the hash instead of re-reading the
 /// source or using a keyword query).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn recover_ccr_miss(
     call: &CcrToolCall,
     stores: Option<&Arc<crate::ctx::projects::ProjectStores>>,
@@ -329,6 +382,7 @@ pub(super) async fn recover_ccr_miss(
     config: &Config,
     redact: &Option<crate::redact::RedactRef>,
     request_id: &str,
+    round: usize,
 ) -> CcrToolResult {
     let project_from = resolve_ctx_project(
         Some(outgoing_headers),
@@ -366,6 +420,22 @@ pub(super) async fn recover_ccr_miss(
             // `malformed_ccr_hash_note` regression test
             // `miss_notes_stay_continue_friendly`.
             use headroom_core::ccr::response_handler as ccr_rh;
+            // A value that is not a hash ends a worker's run when it gets
+            // only a note back; try it as keywords first.
+            if let Some(found) = answer_malformed_hash_as_query(
+                call,
+                stores,
+                outgoing_headers,
+                current_request,
+                config,
+                redact,
+                request_id,
+                round,
+            )
+            .await
+            {
+                return found;
+            }
             let content = if ccr_rh::is_plausible_ccr_hash(&call.hash_key) {
                 ccr_rh::missing_ccr_content_note(&call.hash_key)
             } else {
@@ -528,6 +598,7 @@ pub(super) async fn fetch_one_ccr_call(
                 config,
                 redact,
                 request_id,
+                round,
             )
             .await
         }

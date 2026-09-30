@@ -1,7 +1,7 @@
 # Idea: port the OpenAI handler + cold-prefix hooks delta
 
-- **Status:** open, narrowed 2026-09-28 — 2 items left of 110 commits, neither on traffic seen here; the
-  rest is in Rust or Python-only.
+- **Status:** rejected 2026-09-30 — the 2 items left of 110 commits serve model
+  families this fork never routes; the rest is in Rust or Python-only.
 - **Source:** `docs/notes/upstream-port-backlog.md` group B
 - **Summary:** `proxy/handlers/openai.py` (+2451/-687, 7 commits) —
   model-aware cold-prefix hooks (Kimi/GLM reasoning compaction), streaming
@@ -45,3 +45,24 @@ Chat/Responses output steering (`1b8c11eb`, `71cbb6aa`) moves to
 `port-output-shaper-policies.md`. Items 1 and 2 serve Kimi/GLM/DeepSeek on
 `/v1/chat/completions`; none of those families is in `pricing.rs`, and the
 maintainer's traffic has none.
+
+## Decision 2026-09-30
+
+Items 1 and 2 are declined; nothing was ported.
+
+- The only models that reach the chat path here are the ones in
+  `MODELS-SUPPORTED-WITHIN-CLAUDE-CODE-PROXY.md`: Codex (Responses), Grok
+  (Cursor), Muse Spark and Union Alpha (Zen). None emits Kimi
+  `reasoning_content` or GLM/DeepSeek `<think>` blocks, so
+  `compact_reasoning_openai_chat` would find nothing to shrink. Its only
+  callers today are its own tests, and they can stay that way.
+- Item 1 also ships default off and warm only, so it would be dead code
+  plus a flag (and a `docs/flags.md` regeneration) with no traffic to
+  measure or test against.
+- Item 2 (`HEADROOM_COLD_RECOMPACT` on chat) needs a per-session idle clock
+  the chat path lacks, and it would serve the same absent families. The
+  Anthropic-side fork at `forward/stages.rs` stays as is.
+
+Reopen if a Kimi, GLM or DeepSeek route is added to
+`contrib/headroom-flags.sh`; then wire item 1 first, since the core function
+already exists.

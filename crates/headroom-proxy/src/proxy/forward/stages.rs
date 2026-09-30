@@ -481,6 +481,11 @@ pub(crate) async fn maybe_handle_sidecar(
         && memchr::memmem::find(buffered, DESCRIBE).is_some()
         && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(buffered)
     {
+        if let Some(text) = state.config.sidecar_local_answer.as_deref()
+            && crate::sidecar::is_describe_action_sidecar(&parsed)
+        {
+            return Some(crate::sidecar::local_answer(&parsed, text, request_id));
+        }
         let empty = http::HeaderMap::new();
         if let Some(sidecar_model) = crate::sidecar::direct_sidecar_model(&state.config)
             && let Some(resp) = crate::sidecar::try_handle(
@@ -582,6 +587,54 @@ pub(crate) fn run_output_shaper(
         );
         labels.extend(shape_result.labels);
     }
+}
+
+/// Verbosity steering on OpenAI-shaped request bodies (chat/completions and
+/// Responses). The Anthropic shaper never sees these; the ctx gate skips them.
+///
+/// Hands back `buffered` untouched unless the shaper is on, the endpoint is
+/// an OpenAI one, the body parses, and steering changed it. The holdout labels
+/// join `labels` either way.
+pub(crate) fn run_openai_output_shaper(
+    buffered: bytes::Bytes,
+    endpoint: compression::CompressibleEndpoint,
+    state: &AppState,
+    request_id: &str,
+    labels: &mut Vec<String>,
+) -> bytes::Bytes {
+    let format = match endpoint {
+        compression::CompressibleEndpoint::OpenAiChatCompletions => {
+            crate::output_shaper::OpenAiFormat::Chat
+        }
+        compression::CompressibleEndpoint::OpenAiResponses => {
+            crate::output_shaper::OpenAiFormat::Responses
+        }
+        compression::CompressibleEndpoint::AnthropicMessages => return buffered,
+    };
+    if !state.config.output_shaper_enabled {
+        return buffered;
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&buffered) else {
+        return buffered;
+    };
+    let shaped = crate::output_shaper::shape_openai_with_holdout(
+        &mut value,
+        format,
+        state.config.verbosity_level,
+        state.config.output_holdout,
+    );
+    tracing::info!(
+        request_id = %request_id,
+        event = "output_shaper_arm",
+        steered = shaped.changed,
+        labels = ?shaped.labels,
+        "output_shaper applied"
+    );
+    labels.extend(shaped.labels);
+    if !shaped.changed {
+        return buffered;
+    }
+    serde_json::to_vec(&value).map_or(buffered, bytes::Bytes::from)
 }
 
 /// Resolves which upstream base and client this request goes to.
