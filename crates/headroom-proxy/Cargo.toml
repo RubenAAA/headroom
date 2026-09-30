@@ -213,7 +213,10 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 proptest = { workspace = true }
 # Throwaway certificate for the `wss://` relay test (tests/integration_ws_tls.rs),
 # generated at test time so no private key is ever committed.
-rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = [
+  "ring",
+  "pem",
+] }
 tokio = { workspace = true, features = [
   "macros",
   "rt-multi-thread",
