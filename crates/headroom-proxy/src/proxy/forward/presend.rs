@@ -379,12 +379,17 @@ pub(crate) fn run_finalize_pipeline(
         endpoint,
         compression::CompressibleEndpoint::AnthropicMessages
     ) {
-        let (bytes, neutralized) = maybe_repair_tool_search_history(body_to_send, request_id);
-        if neutralized > 0
-            && let Some(ctx) = outcome_ctx.as_mut()
-        {
-            ctx.transforms_applied
-                .push(format!("router:tool_search_repair:{neutralized}blocks"));
+        let (bytes, neutralized, refs_dropped) =
+            maybe_repair_tool_search_history(body_to_send, request_id);
+        if let Some(ctx) = outcome_ctx.as_mut() {
+            if refs_dropped > 0 {
+                ctx.transforms_applied
+                    .push(format!("router:tool_search_ref_repair:{refs_dropped}refs"));
+            }
+            if neutralized > 0 {
+                ctx.transforms_applied
+                    .push(format!("router:tool_search_repair:{neutralized}blocks"));
+            }
         }
         bytes
     } else {

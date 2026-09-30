@@ -466,6 +466,52 @@ fn tool_search_reference_names(content: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Drop `tool_reference` entries in `tools` that name a typed search tool.
+///
+/// Anthropic occasionally returns `tool_search_tool_regex` as a hit inside its
+/// own match-all result (empty `input`). Claude Code adds every hit to the
+/// session's loaded-tool set and replays it as a `tool_reference` in `tools`
+/// on later turns, so upstream then 400s with "Tool reference
+/// 'tool_search_tool_regex' not found in available tools". A typed search tool
+/// is the search mechanism, never a reference target. [`strip_unsupported_blocks`]
+/// cannot reach this: the poison is in the tools array, not the history.
+///
+/// Scoped to the mechanisms this request carries: a reference is dropped only
+/// when its name exactly matches a tool whose `type` has the typed-search
+/// prefix. A typeless client tool that happens to be called
+/// `tool_search_tool_*` stays a normal reference target. Returns `None` when
+/// nothing was removed. Upstream `b73adaa0`.
+pub fn strip_unsupported_references(tools: &[Value]) -> Option<(Vec<Value>, usize)> {
+    fn entry_name(t: &Value) -> Option<&str> {
+        t.get("tool_name")
+            .or_else(|| t.get("name"))
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+    }
+    let mechanisms: std::collections::HashSet<&str> = tools
+        .iter()
+        .filter(|t| {
+            t.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|ty| ty.starts_with(TOOL_SEARCH_TYPE_PREFIX))
+        })
+        .filter_map(entry_name)
+        .collect();
+    if mechanisms.is_empty() {
+        return None;
+    }
+    let kept: Vec<Value> = tools
+        .iter()
+        .filter(|t| {
+            !(t.get("type").and_then(Value::as_str) == Some("tool_reference")
+                && entry_name(t).is_some_and(|n| mechanisms.contains(n)))
+        })
+        .cloned()
+        .collect();
+    let removed = tools.len() - kept.len();
+    (removed > 0).then_some((kept, removed))
+}
+
 /// Tools a server-side search already loaded in this transcript.
 ///
 /// The provider expands every `tool_reference` in history into the full

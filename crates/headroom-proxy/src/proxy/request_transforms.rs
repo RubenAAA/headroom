@@ -289,43 +289,60 @@ pub(crate) fn maybe_inject_tool_search(
 ///
 /// Unconditional and last: runs after turn hooks (which may rewrite tools)
 /// and after every other tools/messages mutator, validating against the
-/// final outbound array. Returns the neutralized-block count; zero means the
-/// original bytes are forwarded untouched.
+/// final outbound array. The tools array is repaired first (upstream
+/// `b73adaa0`): it shrinks what a history reference can resolve against, so
+/// the block repair must validate against the result. Returns the
+/// neutralized-block count and the dropped tool_reference count; both zero
+/// means the original bytes are forwarded untouched.
 pub(crate) fn maybe_repair_tool_search_history(
     body: bytes::Bytes,
     request_id: &str,
-) -> (bytes::Bytes, usize) {
+) -> (bytes::Bytes, usize, usize) {
     use crate::tool_search_deferral as tsd;
 
     let mut value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return (body, 0),
+        Err(_) => return (body, 0, 0),
     };
-    let tools: Vec<serde_json::Value> = value
+    let mut tools: Vec<serde_json::Value> = value
         .get("tools")
         .and_then(|t| t.as_array())
         .cloned()
         .unwrap_or_default();
-    let messages: Vec<serde_json::Value> = match value.get("messages").and_then(|m| m.as_array()) {
-        Some(m) => m.clone(),
-        None => return (body, 0),
-    };
-    let repair = tsd::strip_unsupported_blocks(messages, &tools);
-    if repair.neutralized == 0 {
-        return (body, 0);
+    let mut refs_dropped = 0;
+    if let Some((kept, removed)) = tsd::strip_unsupported_references(&tools) {
+        tools = kept;
+        refs_dropped = removed;
+        value["tools"] = serde_json::Value::Array(tools.clone());
+        tracing::info!(
+            event = "tool_search_reference_repair",
+            request_id = %request_id,
+            dropped_references = removed,
+            "dropped tool_reference entries in tools that name a typed search tool"
+        );
     }
-    value["messages"] = serde_json::Value::Array(repair.messages);
-    match serde_json::to_vec(&value) {
-        Ok(bytes) => {
-            tracing::info!(
-                event = "tool_search_history_repair",
-                request_id = %request_id,
-                neutralized_blocks = repair.neutralized,
-                "repaired tool-search history blocks the tools array cannot support (replaced with text in place)"
-            );
-            (bytes::Bytes::from(bytes), repair.neutralized)
+    let neutralized = match value.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => {
+            let repair = tsd::strip_unsupported_blocks(m.clone(), &tools);
+            if repair.neutralized > 0 {
+                value["messages"] = serde_json::Value::Array(repair.messages);
+                tracing::info!(
+                    event = "tool_search_history_repair",
+                    request_id = %request_id,
+                    neutralized_blocks = repair.neutralized,
+                    "repaired tool-search history blocks the tools array cannot support (replaced with text in place)"
+                );
+            }
+            repair.neutralized
         }
-        Err(_) => (body, 0),
+        None => 0,
+    };
+    if neutralized == 0 && refs_dropped == 0 {
+        return (body, 0, 0);
+    }
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => (bytes::Bytes::from(bytes), neutralized, refs_dropped),
+        Err(_) => (body, 0, 0),
     }
 }
 
@@ -1421,8 +1438,44 @@ mod tool_search_wiring_tests {
     #[test]
     fn repair_is_byte_identical_without_search_blocks() {
         let body = body_with(fourteen_tools(), json!([{"role": "user", "content": "hi"}]));
-        let (out, neutralized) = maybe_repair_tool_search_history(body.clone(), "req-test");
+        let (out, neutralized, _) = maybe_repair_tool_search_history(body.clone(), "req-test");
         assert_eq!(neutralized, 0);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn repair_drops_a_tool_reference_naming_the_search_tool() {
+        let body = body_with(
+            vec![
+                json!({"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}),
+                tool("read"),
+                json!({"type": "tool_reference", "tool_name": "tool_search_tool_regex"}),
+                json!({"type": "tool_reference", "tool_name": "read"}),
+            ],
+            json!([{"role": "user", "content": "hi"}]),
+        );
+        let (out, neutralized, refs_dropped) = maybe_repair_tool_search_history(body, "req-test");
+        assert_eq!((neutralized, refs_dropped), (0, 1));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[2]["tool_name"], "read");
+    }
+
+    #[test]
+    fn repair_keeps_a_reference_to_a_typeless_tool_with_a_search_like_name() {
+        // No typed search mechanism on the request: the name alone is a
+        // normal deferred client tool, so its reference must survive.
+        let body = body_with(
+            vec![
+                tool("tool_search_tool_custom"),
+                json!({"type": "tool_reference", "tool_name": "tool_search_tool_custom"}),
+            ],
+            json!([{"role": "user", "content": "hi"}]),
+        );
+        let (out, neutralized, refs_dropped) =
+            maybe_repair_tool_search_history(body.clone(), "req-test");
+        assert_eq!((neutralized, refs_dropped), (0, 0));
         assert_eq!(out, body);
     }
 
@@ -1439,7 +1492,7 @@ mod tool_search_wiring_tests {
                 ],
             }]),
         );
-        let (out, neutralized) = maybe_repair_tool_search_history(body, "req-test");
+        let (out, neutralized, _) = maybe_repair_tool_search_history(body, "req-test");
         assert_eq!(neutralized, 2);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         // Message slot kept, pair replaced with text — never dropped, so
