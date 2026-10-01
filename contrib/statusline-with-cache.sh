@@ -27,11 +27,13 @@ codex=$("$here/statusline-codex-limits.sh" --segment "$model")
 
 # Spark context. Claude Code sends no usable `context_window` for a routed
 # spark model, so the `ctx:` segment above never fires there; this reads the
-# last spark turn the proxy saw instead. Skipped when the base line already
-# carries a `ctx:` reading (Claude's own counting wins when present).
+# last spark turn the proxy saw for this session's own id, so parallel sessions
+# and subagents do not show each other's size. Skipped when the base line
+# already carries a `ctx:` reading (Claude's own counting wins when present).
 spark=""
 if [[ "$base" != *ctx:* ]]; then
-  spark=$("$here/statusline-spark-context.sh" --segment "$model")
+  session=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
+  spark=$("$here/statusline-spark-context.sh" --segment "$model" "$session")
 fi
 perf=$("$here/statusline-cache-perf.sh")
 

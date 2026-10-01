@@ -71,6 +71,16 @@ pub(crate) fn build_routed_outcome_context(
         // differently for the same caller.
         client: None,
         project,
+        session_id: headers
+            .get("x-claude-code-session-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        agent_id: headers
+            .get("x-claude-code-agent-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         tokens_saved: report.tokens_saved,
         transforms_applied: report.transforms_applied,
         num_messages: parsed
@@ -126,6 +136,12 @@ pub(crate) struct RoutedOutcomeContext {
     pub(crate) provider: String,
     pub(crate) client: Option<String>,
     pub(crate) project: Option<String>,
+    /// Claude Code session that sent the turn (`X-Claude-Code-Session-Id`). Booked as
+    /// the `session_id` tag so `/spark-context?session=` can tell sessions apart.
+    pub(crate) session_id: Option<String>,
+    /// Set only on a subagent turn (`X-Claude-Code-Agent-Id`); a subagent shares its
+    /// parent's session id but has its own, smaller context.
+    pub(crate) agent_id: Option<String>,
     pub(crate) tokens_saved: i64,
     pub(crate) transforms_applied: Vec<String>,
     pub(crate) num_messages: i64,
@@ -302,6 +318,16 @@ pub(crate) fn book_routed_outcome_with_ccr(
         num_messages: ctx.num_messages,
         client: ctx.client.clone(),
         project: ctx.project.clone(),
+        tags: ctx
+            .session_id
+            .iter()
+            .map(|s| ("session_id".to_string(), s.clone()))
+            .chain(
+                ctx.agent_id
+                    .iter()
+                    .map(|a| ("agent_id".to_string(), a.clone())),
+            )
+            .collect(),
         ..Default::default()
     };
     headroom_core::request_outcome::emit_request_outcome(ctx.sink.as_ref(), &outcome);
@@ -433,6 +459,8 @@ mod tests {
             provider: "openai_responses".to_string(),
             client: None,
             project: None,
+            session_id: None,
+            agent_id: None,
             tokens_saved: 0,
             transforms_applied: Vec::new(),
             num_messages: 1,
@@ -575,6 +603,41 @@ mod tests {
             ctx.project.is_some(),
             "a stated cwd in msg0 must resolve a project, not fall back to the default bucket"
         );
+    }
+
+    /// The statusline asks `/spark-context?session=<id>`, which matches the
+    /// `session_id` tag on the logged turn. That tag comes from Claude Code's
+    /// `X-Claude-Code-Session-Id` header; without it two parallel Spark
+    /// sessions overwrite each other's reading.
+    #[test]
+    fn routed_turn_is_booked_under_the_claude_code_session_id() {
+        let state = crate::test_support::test_state(|_| {});
+        let parsed = json!({"model": "claude-codex-5.5", "messages": []});
+        let build = |headers: &axum::http::HeaderMap| {
+            build_routed_outcome_context(
+                &state,
+                &parsed,
+                headers,
+                None,
+                false,
+                "codex-5.5",
+                crate::routed::transforms::CtxTransformReport::default(),
+                0.0,
+                std::time::Instant::now(),
+                "req-test".to_string(),
+                None,
+                7,
+                0,
+            )
+            .expect("context builds")
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(build(&headers).session_id, None);
+        headers.insert("x-claude-code-session-id", "sess-a".parse().unwrap());
+        assert_eq!(build(&headers).session_id.as_deref(), Some("sess-a"));
+        assert_eq!(build(&headers).agent_id, None);
+        headers.insert("x-claude-code-agent-id", "agent-1".parse().unwrap());
+        assert_eq!(build(&headers).agent_id.as_deref(), Some("agent-1"));
     }
 
     /// C6 usage-preservation lock: the booked model is the UPSTREAM model,

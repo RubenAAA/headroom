@@ -1599,6 +1599,8 @@ mod tests {
             provider: "openai_responses".to_string(),
             client: None,
             project: None,
+            session_id: None,
+            agent_id: None,
             tokens_saved,
             transforms_applied: vec!["ctx_offload".to_string()],
             num_messages: 3,

@@ -17,6 +17,12 @@
 # nothing prints unless it looks like a spark model. Without it the segment
 # falls back to snapshot freshness, which is a good enough proxy for "the last
 # thing you sent went to spark".
+#
+# Optional second argument is the Claude Code session id (the statusline JSON's
+# `session_id`). The proxy then returns only that session's newest Spark turn,
+# so parallel sessions and subagents do not overwrite each other's reading. Without
+# it the snapshot is the newest Spark turn of any session. Standalone, the id is
+# read from the statusline JSON on stdin.
 set -u
 
 CONTEXT_URL="${HEADROOM_SPARK_CONTEXT_URL:-http://127.0.0.1:8787/spark-context}"
@@ -29,6 +35,12 @@ if [ "${1:-}" = "--segment" ]; then
     shift
 fi
 active_model="${1:-}"
+session_id="${2:-}"
+input=""
+if [ "$segment_only" -eq 0 ]; then
+    input=$(cat 2>/dev/null || true)
+    [ -n "$session_id" ] || session_id=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
+fi
 
 # An explicit non-spark model means this segment has nothing to say.
 if [ -n "$active_model" ] && ! printf '%s' "$active_model" | grep -qi spark; then
@@ -36,7 +48,7 @@ if [ -n "$active_model" ] && ! printf '%s' "$active_model" | grep -qi spark; the
 fi
 
 command -v jq >/dev/null 2>&1 || exit 0
-snapshot=$(curl -s --max-time 1 "$CONTEXT_URL" 2>/dev/null) || exit 0
+snapshot=$(curl -s --max-time 1 -G --data-urlencode "session=$session_id" "$CONTEXT_URL" 2>/dev/null) || exit 0
 [ -n "$snapshot" ] || exit 0
 
 observed=$(printf '%s' "$snapshot" | jq -r '.observed_at // empty' 2>/dev/null)
@@ -64,7 +76,6 @@ segment="spark ctx:$(fmt_tokens "$used")/$(fmt_tokens "$size")"
 if [ "$segment_only" -eq 1 ]; then
     printf '%s\n' "$segment"
 else
-    input=$(cat 2>/dev/null || true)
     model=$(printf '%s' "$input" | jq -r '.model.display_name // empty' 2>/dev/null)
     [ -n "$model" ] && printf '%s | ' "$model"
     printf '%s\n' "$segment"

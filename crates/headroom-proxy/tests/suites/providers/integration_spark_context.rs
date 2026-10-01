@@ -105,3 +105,67 @@ async fn spark_context_ignores_errored_turns() {
     assert!(body["observed_at"].is_null());
     proxy.shutdown().await;
 }
+
+fn in_session(session: &str, mut e: RequestLogEntry) -> RequestLogEntry {
+    e.tags.insert("session_id".into(), session.into());
+    e
+}
+
+async fn context_for(proxy: &common::ProxyHandle, query: &str) -> serde_json::Value {
+    reqwest::get(format!("{}/spark-context{query}", proxy.url()))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn spark_context_session_filter_returns_only_that_sessions_turn() {
+    let spark = "muse-spark-1.3-contributor-free";
+    let proxy = seed(vec![
+        in_session("sess-a", entry(spark, 149_000, None)),
+        in_session("sess-b", entry(spark, 24_000, None)),
+        in_session("sess-a", entry(spark, 150_000, None)),
+        in_session("sess-b", entry(spark, 25_000, None)),
+    ])
+    .await;
+    assert_eq!(
+        context_for(&proxy, "?session=sess-a").await["input_tokens"],
+        150_000
+    );
+    assert_eq!(
+        context_for(&proxy, "?session=sess-b").await["input_tokens"],
+        25_000
+    );
+    // No parameter keeps the old global behaviour: newest turn of any session.
+    assert_eq!(context_for(&proxy, "").await["input_tokens"], 25_000);
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn spark_context_session_filter_skips_subagent_turns() {
+    let spark = "muse-spark-1.3-contributor-free";
+    let mut sub = in_session("sess-a", entry(spark, 20_000, None));
+    sub.tags.insert("agent_id".into(), "agent-1".into());
+    let proxy = seed(vec![in_session("sess-a", entry(spark, 114_000, None)), sub]).await;
+    // The subagent turn is newer, but it is not the session's own context.
+    assert_eq!(
+        context_for(&proxy, "?session=sess-a").await["input_tokens"],
+        114_000
+    );
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn spark_context_session_filter_never_falls_back_to_another_session() {
+    let spark = "muse-spark-1.3-contributor-free";
+    let proxy = seed(vec![
+        in_session("sess-a", entry(spark, 150_000, None)),
+        entry(spark, 99_000, None),
+    ])
+    .await;
+    let body = context_for(&proxy, "?session=sess-unknown").await;
+    assert!(body["observed_at"].is_null());
+    proxy.shutdown().await;
+}

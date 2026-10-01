@@ -169,12 +169,24 @@ pub const SPARK_CONTEXT_WINDOW: u32 = 1_048_576;
 /// statusline script as `spark ctx:used/window`.
 ///
 /// Pure observer over the bounded request log; empty until a Spark turn lands.
-/// Single-session heuristic: with parallel Spark sessions this reports the
-/// most recent turn globally, so the script ages the snapshot out via
-/// `age_seconds`.
-pub async fn handle_spark_context(State(state): State<AppState>) -> Json<serde_json::Value> {
+/// With `?session=<id>` it reports only that Claude Code session's newest
+/// turn (the `session_id` tag, from the `X-Claude-Code-Session-Id` header),
+/// skipping subagent turns (`agent_id` tag), and never falls back to another
+/// session's. Without it, it reports the most recent turn globally, which
+/// interleaves parallel sessions and subagents, so the script ages the
+/// snapshot out via `age_seconds`.
+pub async fn handle_spark_context(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let session = params.get("session").filter(|s| !s.is_empty());
     let hit = state.request_logger.latest_matching(|e| {
-        e.error.is_none() && e.input_tokens_original > 0 && e.model.to_lowercase().contains("spark")
+        e.error.is_none()
+            && e.input_tokens_original > 0
+            && e.model.to_lowercase().contains("spark")
+            && session.is_none_or(|s| {
+                e.tags.get("session_id") == Some(s) && !e.tags.contains_key("agent_id")
+            })
     });
     let Some(entry) = hit else {
         return Json(serde_json::json!({"observed_at": null}));
