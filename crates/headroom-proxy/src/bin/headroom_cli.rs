@@ -26,6 +26,8 @@ use clap::{Parser, Subcommand};
 // its own binary target.
 #[path = "headroom_cli/agent_savings.rs"]
 mod agent_savings;
+#[path = "headroom_cli/classify.rs"]
+mod classify;
 #[path = "headroom_cli/copilot_auth.rs"]
 mod copilot_auth;
 #[path = "headroom_cli/network_diff.rs"]
@@ -82,6 +84,9 @@ enum Command {
         #[arg(long, default_value_t = 0.90)]
         min_accuracy: f64,
     },
+    /// Ask Jev (OpenCode Zen) yes/no, pick or grade questions about a text.
+    /// The text is sent to opencode.ai.
+    Classify(classify::ClassifyArgs),
     /// Capture and compare network traffic for Headroom investigations.
     Capture {
         #[command(subcommand)]
@@ -317,6 +322,7 @@ fn main() {
                 &pair_by,
             ),
         },
+        Command::Classify(args) => classify::cmd_classify(args),
         Command::CopilotAuth { command } => match command {
             CopilotAuthCommand::Login { domain } => cmd_copilot_login(&domain),
             CopilotAuthCommand::Status => cmd_copilot_status(),

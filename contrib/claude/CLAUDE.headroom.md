@@ -32,6 +32,24 @@ Don't save: task state, anything in the repo already, or a number that changes w
 
 Default is project scope. Use `scope: "global"` for facts about the user, their tooling, or cross-project infrastructure. A fact about one repo's schema is project-scoped; a fact about an SSH host serving several repos is global.
 
+## Classification (Jev)
+
+`headroom classify` asks Jev, a classification model on OpenCode Zen, yes/no
+questions about a text. It returns a likelihood per question, not prose.
+Use it when code or a script needs a quick judgement: is this log line an
+error, does this passage answer the question. About 1 s a call, free.
+
+```bash
+headroom classify --state "$text" --noul "Is this an outage?" --noul "Does it need a human?"
+# q1: 0.92
+# q2: 0.29
+```
+
+Ask one narrow question each; Jev answers the wording as written. It cannot
+count, compare dates or write text. For `choice` and `score` questions, pass
+`--request FILE` (format in `docs/jev-model.md`). The state goes to opencode.ai:
+send no secrets or client code.
+
 ## Muse Spark fan-out budget
 
 The egress relay runs eight Nord lanes, or all ten when every preferred exit
