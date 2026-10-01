@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Focused contract test for the watcher's per-egress callback path.
+# The stubs below (zen_probe_status, curl) are called by the sourced watcher.
+# shellcheck disable=SC2317
 set -euo pipefail
 
 # When this file is invoked as the configured rotator, record its exact args
