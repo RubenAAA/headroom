@@ -91,6 +91,16 @@ add_peer() {
   printf '%s|%s\n' "$_key" "$_desc" >>"$SCAN_TMP"
 }
 
+# Last "key":"value" in a transcript. The newest line is at the end, so read
+# the tail first; a transcript runs to hundreds of MB and grepping all of it was
+# the slowest line of the scan. Falls back to the whole file when the tail has
+# no match (one huge tool result can fill the window).
+last_json_field() {
+  _v=$(tail -c 262144 "$1" 2>/dev/null | grep -o "\"$2\":\"[^\"]*\"" | tail -1 | cut -d'"' -f4)
+  [ -n "$_v" ] || _v=$(grep -o "\"$2\":\"[^\"]*\"" "$1" 2>/dev/null | tail -1 | cut -d'"' -f4)
+  printf '%s' "$_v"
+}
+
 # ── 1. live claude processes in the same toplevel ──
 if [ -d /proc ]; then
   # Build one self identity for every process-based detector below. The hook's
@@ -147,7 +157,7 @@ if [ "$_n" -lt "$MAX_PEERS" ]; then
       case "$t" in */subagents/*) continue ;; esac
       base=$(basename "$t" .jsonl)
       [ "$base" = "$SESSION" ] && continue
-      tcwd=$(grep -o '"cwd":"[^"]*"' "$t" 2>/dev/null | tail -1 | cut -d'"' -f4) || continue
+      tcwd=$(last_json_field "$t" cwd)
       [ -n "$tcwd" ] || continue
       case "$tcwd" in
         "$TOPLEVEL" | "$TOPLEVEL"/*) ;;
@@ -158,7 +168,7 @@ if [ "$_n" -lt "$MAX_PEERS" ]; then
       [ "$age_min" -lt 0 ] && age_min=0
       if [ "$age_min" -lt 60 ]; then age_txt="${age_min}m ago"
       else age_txt="$((age_min / 60))h$((age_min % 60))m ago"; fi
-      tbranch=$(grep -o '"gitBranch":"[^"]*"' "$t" 2>/dev/null | tail -1 | cut -d'"' -f4)
+      tbranch=$(last_json_field "$t" gitBranch)
       [ -n "$tbranch" ] && tbranch=" (branch $tbranch)" || tbranch=""
       add_peer "sess:$base" "session ${base:0:8} cwd $tcwd$tbranch, active $age_txt"
       _n=$(wc -l <"$SCAN_TMP" 2>/dev/null | tr -d ' ') || _n=0
@@ -192,20 +202,25 @@ if [ "$_n" -lt "$MAX_PEERS" ] && [ -f "$MAP" ]; then
   MAP_TMP="$STATE_DIR/$SESSION.peer.map.tmp"
   rm -f "$MAP_TMP"
   tail -c 200000 "$MAP" 2>/dev/null | grep -E '"(session_id|ts|cwd)"' 2>/dev/null |
-  paste - - - 2>/dev/null | head -60 | while IFS= read -r line; do
-    msid=$(echo "$line" | grep -o '"session_id": *"[^"]*"' | head -1 | cut -d'"' -f4)
-    mcwd=$(echo "$line" | grep -o '"cwd": *"[^"]*"' | head -1 | cut -d'"' -f4)
-    mts=$(echo "$line" | grep -o '"ts": *[0-9.]*' | head -1 | grep -o '[0-9.]*')
-    [ -n "$msid" ] && [ -n "$mcwd" ] || continue
-    [ "$msid" = "$SESSION" ] && continue
-    case "$mcwd" in "$TOPLEVEL" | "$TOPLEVEL"/*) ;; *) continue ;; esac
-    mts_i=$(echo "$mts" | cut -d. -f1)
-    age_min=$(((now - mts_i) / 60)) 2>/dev/null || continue
-    [ "$age_min" -lt 0 ] && continue
-    [ "$age_min" -gt 240 ] && continue
-    # Subshell: stash key|desc for the parent to merge.
-    printf '%s|%s\n' "sess:$msid" "session ${msid:0:8} cwd $mcwd, seen ${age_min}m ago (session-map)" >>"$MAP_TMP"
-  done
+  # One awk for all rows: the loop it replaced forked ~8 processes a row.
+  # Stashes key|desc for the parent to merge.
+  paste - - - 2>/dev/null | head -60 | TOP="$TOPLEVEL" awk -v self="$SESSION" -v now="$now" '
+    function field(re, strip,   s) {
+      if (!match($0, re)) return ""
+      s = substr($0, RSTART, RLENGTH); sub(strip, "", s); sub(/"$/, "", s); return s
+    }
+    {
+      sid = field("\"session_id\": *\"[^\"]*\"", "^\"session_id\": *\"")
+      cwd = field("\"cwd\": *\"[^\"]*\"", "^\"cwd\": *\"")
+      ts = field("\"ts\": *[0-9.]*", "^\"ts\": *")
+      if (sid == "" || cwd == "" || ts == "" || sid == self) next
+      top = ENVIRON["TOP"]
+      if (cwd != top && index(cwd, top "/") != 1) next
+      split(ts, t, ".")
+      age = int((now - t[1]) / 60)
+      if (age < 0 || age > 240) next
+      printf "sess:%s|session %s cwd %s, seen %dm ago (session-map)\n", sid, substr(sid, 1, 8), cwd, age
+    }' >"$MAP_TMP"
   if [ -f "$MAP_TMP" ]; then
     while IFS= read -r entry; do
       _k=$(echo "$entry" | cut -d'|' -f1)
@@ -252,30 +267,36 @@ if [ "$_n" -lt "$MAX_PEERS" ] && [ -d /proc ]; then
   # ([ /]|$) boundaries keep `jest` out of `suggests` and `go test` out of
   # `mongo test`; plain advisory output tolerates the residue.
   TEST_RE='(^|[/ ])(cargo (test|nextest)|pytest|py\.test|vitest|jest|mocha|rspec|phpunit|ctest)([ /]|$)|(playwright test|go test|dotnet test|make test)|(npm|yarn|pnpm|bun) (test|run test)|(mvn (test|verify)|(gradle|gradlew) test)'
-  ps -eo pid,ppid,etime,args 2>/dev/null | while IFS= read -r line; do
-    _pid=$(echo "$line" | awk '{print $1}')
-    case "$_pid" in ''|*[!0-9]*|$$) continue ;; esac
-    _cmd=$(echo "$line" | awk '{$1=$2=$3=""; sub(/^ +/, ""); print}')
-    [ -n "$_cmd" ] || continue
-    case "$_cmd" in *peer-awareness*) continue ;; esac
-    echo "$_cmd" | grep -qE "$TEST_RE" || continue
-    # Mine (my tree) or unmappable: never report.
-    _p=$_pid
-    _mine=0
-    [ "$_p" = "$PPID" ] && _mine=1
-    _d=0
-    while [ "$_mine" -eq 0 ] && [ -n "$_p" ] && [ "$_p" != "0" ] && [ "$_d" -lt 30 ]; do
-      if [ -n "$MYROOT" ] && [ "$_p" = "$MYROOT" ]; then _mine=1; break; fi
-      _d=$((_d + 1))
-      _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
-    done
-    [ "$_mine" -eq 1 ] && continue
+  # One awk pass over the process table picks the runners that are not in my
+  # tree. It used to fork `awk`/`grep` per process and `ps -o ppid= -p` per
+  # ancestor of every match: 18s of an 18s run on a loaded box, past the hook's
+  # 10s timeout, and the cost grew with every test run any session had going,
+  # in this repo or not. The tree is walked in memory now. Pattern goes in
+  # through ENVIRON because `awk -v` would eat the backslashes.
+  ps -eo pid,ppid,etime,args 2>/dev/null | RE="$TEST_RE" awk -v me="$$" -v pp="$PPID" -v root="$MYROOT" '
+    $1 ~ /^[0-9]+$/ {
+      pid = $1; ppid[pid] = $2; etime[pid] = $3
+      c = $0; sub(/^ *[0-9]+ +[0-9]+ +[^ ]+ */, "", c)
+      cmd[pid] = c; order[++n] = pid
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        pid = order[i]; c = cmd[pid]
+        if (pid == me || c == "" || index(c, "peer-awareness") || c !~ ENVIRON["RE"]) continue
+        # Mine (my tree) or unmappable: never report.
+        mine = (pid == pp); p = pid; d = 0
+        while (!mine && p != "" && p != 0 && d < 30) {
+          if (root != "" && p == root) { mine = 1; break }
+          d++; p = ppid[p]
+        }
+        if (!mine) print pid "\t" etime[pid] "\t" c
+      }
+    }' | while IFS=$'\t' read -r _pid _etime _cmd; do
     _pcwd=$(readlink "/proc/$_pid/cwd" 2>/dev/null) || continue
     case "$_pcwd" in
       "$TOPLEVEL" | "$TOPLEVEL"/*) ;;
       *) continue ;;
     esac
-    _etime=$(echo "$line" | awk '{print $3}')
     # Full-run guess on the arguments AFTER the runner keyword (argv[0]
     # paths contain slashes, so the whole line always looks scoped).
     # Scoped runs name a file, path, or filter; bare invocations run the
