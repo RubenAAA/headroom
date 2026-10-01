@@ -457,7 +457,9 @@ impl InjectEngine {
         }
         // Resume marker but nothing linkable → fall through to fresh recall.
 
-        let queries = derive_queries(&first_text);
+        let (typed, _) =
+            crate::cache_stabilization::ephemeral_spans::split_ephemeral_spans(&first_text);
+        let queries = derive_queries(&typed);
         let opts = SearchOpts {
             limit: RECALL_LIMIT,
             ..Default::default()
@@ -500,8 +502,12 @@ impl InjectEngine {
     }
 }
 
-/// Derive BM25 recall queries from the first user message text. Minimal: a
-/// single collapsed, capped query (deterministic — pure function of the text).
+/// Derive BM25 recall queries from the text the user typed in the first user
+/// message, with the client's `<system-reminder>` spans already lifted out.
+/// Cut from the message head instead, the 120 characters are the CLAUDE.md
+/// digest every session of a project opens with, so every session got the same
+/// recall. Minimal: a single collapsed, capped query (deterministic — pure
+/// function of the text).
 fn derive_queries(first_text: &str) -> Vec<String> {
     let q: String = first_text
         .split_whitespace()
@@ -976,6 +982,42 @@ mod tests {
             "recall goes after the reminders, before the typed text: {texts:?}"
         );
         assert_eq!(texts[3], "build a parser");
+    }
+
+    /// The recall query is what the user typed, not the opening reminder.
+    ///
+    /// Every session of a project opens with the same CLAUDE.md reminder, so a
+    /// query cut from the head of the message was the same boilerplate for all
+    /// of them: 5 captured sessions, 4 distinct entries between them, the same
+    /// 4 in each. Here the reminder matches one entry and the typed text
+    /// another; only the second may come back.
+    #[test]
+    fn recall_searches_for_the_typed_text_not_the_reminder() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine(&dir);
+        let store = eng.stores.content(PROJECT).unwrap();
+        let opts = headroom_core::ctx::IndexOpts::default();
+        store
+            .index_content(
+                "claude-md-digest",
+                "the digest sets codebase instructions",
+                &opts,
+            )
+            .unwrap();
+        store
+            .index_content(
+                "parser-notes",
+                "the parser grammar is recursive descent",
+                &opts,
+            )
+            .unwrap();
+
+        let mut r = scaffolded_req(&["codebase instructions digest"], "build a parser grammar");
+        assert!(eng.maybe_inject(&mut r, "sk", PROJECT, &big_budget()));
+
+        let recall = &texts_of(&r)[1];
+        assert!(recall.contains("parser-notes"), "{recall}");
+        assert!(!recall.contains("claude-md-digest"), "{recall}");
     }
 
     #[test]
