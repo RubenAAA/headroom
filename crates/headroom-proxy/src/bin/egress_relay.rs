@@ -6,6 +6,18 @@
 //! compatible with the previous helper so the watcher can rotate either
 //! implementation during a drained migration.
 
+/// `eprintln!` with a UTC timestamp. The daemon's stderr is `relay.log`; without
+/// the stamp a heal or rotation there cannot be matched to the proxy log.
+macro_rules! log_line {
+    ($($arg:tt)*) => {
+        eprintln!(
+            "{} {}",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            format_args!($($arg)*)
+        )
+    };
+}
+
 #[path = "egress_relay/nord.rs"]
 mod nord;
 #[path = "egress_relay/proton.rs"]
@@ -546,7 +558,7 @@ fn read_exact_vec<R: Read>(reader: &mut R, length: usize) -> io::Result<Vec<u8>>
 fn trace_upstream<T>(lane: usize, stage: &'static str, result: io::Result<T>) -> io::Result<T> {
     result.inspect_err(|error| {
         if std::env::var_os("HEADROOM_EGRESS_RELAY_TRACE").is_some() {
-            eprintln!(
+            log_line!(
                 "upstream SOCKS I/O failed lane={lane} stage={stage} kind={:?}",
                 error.kind()
             );
@@ -697,7 +709,7 @@ impl Lane {
             }
             // Never print I/O or reqwest errors: they may contain connection
             // details. Lane and error kind are enough to diagnose this relay.
-            eprintln!(
+            log_line!(
                 "relay lane={} host={} failed ({:?})",
                 self.slot,
                 snapshot.upstream_host,
@@ -713,7 +725,7 @@ impl Lane {
         trace_upstream(self.slot, "method-write", upstream.write_all(&[5, 1, 2]))?;
         if trace_upstream(self.slot, "method-read", read_exact_vec(upstream, 2))? != [5, 2] {
             if std::env::var_os("HEADROOM_EGRESS_RELAY_TRACE").is_some() {
-                eprintln!(
+                log_line!(
                     "upstream SOCKS authentication method unavailable lane={}",
                     self.slot
                 );
@@ -734,7 +746,7 @@ impl Lane {
         auth.fill(0);
         if trace_upstream(self.slot, "auth-read", read_exact_vec(upstream, 2))? != [1, 0] {
             if std::env::var_os("HEADROOM_EGRESS_RELAY_TRACE").is_some() {
-                eprintln!("upstream SOCKS authentication rejected lane={}", self.slot);
+                log_line!("upstream SOCKS authentication rejected lane={}", self.slot);
             }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -810,7 +822,7 @@ impl Lane {
             read_socks_address(&mut upstream, response_head[3]),
         )?;
         if std::env::var_os("HEADROOM_EGRESS_RELAY_TRACE").is_some() {
-            eprintln!(
+            log_line!(
                 "upstream SOCKS CONNECT response lane={} reply={} reserved={} atyp={} address_bytes={} normalized_bound_address=true",
                 self.slot,
                 response_head[1],
@@ -830,9 +842,11 @@ impl Lane {
                 let destination = socks_destination(&request)
                     .map(|(host, port)| format!("{host}:{port}"))
                     .unwrap_or_else(|| "invalid".to_string());
-                eprintln!(
+                log_line!(
                     "upstream SOCKS CONNECT rejected lane={} destination={} reply={}",
-                    self.slot, destination, response_head[1]
+                    self.slot,
+                    destination,
+                    response_head[1]
                 );
             }
             // A dead WireGuard tunnel still answers SOCKS: wireproxy resolves
@@ -1054,7 +1068,7 @@ impl Manager {
             let address = match resolve_server(host) {
                 Ok(address) => address,
                 Err(reason) => {
-                    eprintln!(
+                    log_line!(
                         "rotation candidate unavailable lane={} stage=dns host={host} reason={reason}",
                         lane.slot,
                     );
@@ -1066,7 +1080,7 @@ impl Manager {
             let candidate_ip = match probed {
                 Ok(ip) => ip,
                 Err(reason) => {
-                    eprintln!(
+                    log_line!(
                         "rotation candidate unavailable lane={} stage=public-egress-probe host={host} reason={reason}",
                         lane.slot,
                     );
@@ -1074,7 +1088,7 @@ impl Manager {
                 }
             };
             if candidate_ip == old.exit_ip || active_ips.contains(&candidate_ip) {
-                eprintln!(
+                log_line!(
                     "rotation candidate duplicate lane={} host={host}",
                     lane.slot
                 );
@@ -1148,7 +1162,7 @@ impl Manager {
         let mut exit = None;
         for index in ring {
             if let Err(why) = tunnel.start(index) {
-                eprintln!(
+                log_line!(
                     "rotation candidate unavailable lane={} stage=wireproxy reason={why}",
                     lane.slot
                 );
@@ -1160,11 +1174,11 @@ impl Manager {
                     exit = Some(ip);
                     break;
                 }
-                Ok(_) => eprintln!(
+                Ok(_) => log_line!(
                     "rotation candidate duplicate lane={} host={host}",
                     lane.slot
                 ),
-                Err(why) => eprintln!(
+                Err(why) => log_line!(
                     "rotation candidate unavailable lane={} stage=public-egress-probe host={host} reason={why}",
                     lane.slot
                 ),
@@ -1225,7 +1239,7 @@ impl Manager {
         if let Ok(listing) = fetch_server_listing() {
             let mut book = lock_unpoisoned(&self.servers);
             if book.apply_listing(&listing, &HashSet::new()) && save_servers_cache(&book).is_err() {
-                eprintln!("startup: could not save the server list cache");
+                log_line!("startup: could not save the server list cache");
             }
         }
         // Lowest round trip first, so the lanes start on the nearest servers
@@ -1245,7 +1259,7 @@ impl Manager {
             let address = match resolve_server(host) {
                 Ok(address) => address,
                 Err(reason) => {
-                    eprintln!(
+                    log_line!(
                         "startup candidate unavailable stage=dns host={host} reason={reason}"
                     );
                     continue;
@@ -1256,14 +1270,14 @@ impl Manager {
             let exit_ip = match probed {
                 Ok(ip) => ip,
                 Err(reason) => {
-                    eprintln!(
+                    log_line!(
                         "startup candidate unavailable stage=public-egress-probe host={host} reason={reason}"
                     );
                     continue;
                 }
             };
             if !seen_ips.insert(exit_ip.clone()) {
-                eprintln!("startup candidate duplicate host={host}");
+                log_line!("startup candidate duplicate host={host}");
                 continue;
             }
             verified.push((host.clone(), address, exit_ip));
@@ -1287,7 +1301,7 @@ impl Manager {
         let mut tunnel = proton::Tunnel::new(wireproxy, configs, ensure_state_dir()?)?;
         for index in 0..tunnel.config_count() {
             if let Err(why) = tunnel.start(index) {
-                eprintln!("startup candidate unavailable stage=wireproxy reason={why}");
+                log_line!("startup candidate unavailable stage=wireproxy reason={why}");
                 continue;
             }
             let host = tunnel.name();
@@ -1297,8 +1311,8 @@ impl Manager {
                     *lock_unpoisoned(&self.proton) = Some(tunnel);
                     return Ok((host, port, ip));
                 }
-                Ok(_) => eprintln!("startup candidate duplicate host={host}"),
-                Err(why) => eprintln!(
+                Ok(_) => log_line!("startup candidate duplicate host={host}"),
+                Err(why) => log_line!(
                     "startup candidate unavailable stage=public-egress-probe host={host} reason={why}"
                 ),
             }
@@ -1346,7 +1360,7 @@ impl Manager {
                     exit_ip,
                     None,
                 ))),
-                Err(reason) => eprintln!("warning: starting without the Proton lane: {reason}"),
+                Err(reason) => log_line!("warning: starting without the Proton lane: {reason}"),
             }
         }
         if lanes.is_empty() {
@@ -1408,11 +1422,11 @@ impl Manager {
             .spawn(move || maintainer.maintain())
             .map_err(|_| "could not start server maintenance thread")?;
         if lane_count < max_lanes {
-            eprintln!(
+            log_line!(
                 "warning: using {lane_count} distinct exits; up to {max_lanes} are configured"
             );
         }
-        eprintln!("egress relay ready ({lane_count}/{max_lanes} lanes)");
+        log_line!("egress relay ready ({lane_count}/{max_lanes} lanes)");
 
         while self.running.load(Ordering::SeqCst) {
             match control.accept() {
@@ -1545,16 +1559,16 @@ impl Manager {
             Ok(listing) => {
                 let mut book = lock_unpoisoned(&self.servers);
                 let changed = book.apply_listing(&listing, &held);
-                eprintln!(
+                log_line!(
                     "sweep: nord listed {} socks servers, book has {} (changed={changed})",
                     listing.len(),
                     book.len()
                 );
                 if changed && save_servers_cache(&book).is_err() {
-                    eprintln!("sweep: could not save the server list cache");
+                    log_line!("sweep: could not save the server list cache");
                 }
             }
-            Err(reason) => eprintln!("sweep: {reason}; keeping the current list"),
+            Err(reason) => log_line!("sweep: {reason}; keeping the current list"),
         }
         let hosts = lock_unpoisoned(&self.servers).candidates("", &HashSet::new());
         let measured = measure_rtts(&hosts);
@@ -1576,7 +1590,7 @@ impl Manager {
                 rejected += 1;
             }
         }
-        eprintln!(
+        log_line!(
             "sweep: measured {} of {} round trips, probed {} idle servers: {accepted} accepted, {rejected} rejected",
             measured.len(),
             hosts.len(),
@@ -1623,7 +1637,7 @@ impl Manager {
                     lock_unpoisoned(&self.servers).mark(&host, true);
                 }
                 if failing_since.remove(&lane.slot).is_some() {
-                    eprintln!("heal: lane={} host={host} accepts again", lane.slot);
+                    log_line!("heal: lane={} host={host} accepts again", lane.slot);
                 }
                 lock_unpoisoned(&lane.state).failures = 0;
                 return;
@@ -1633,7 +1647,7 @@ impl Manager {
                     lock_unpoisoned(&self.servers).mark(&host, false);
                 }
                 failing_since.entry(lane.slot).or_insert_with(|| {
-                    eprintln!("heal: lane={} host={host} rejects us ({reason})", lane.slot);
+                    log_line!("heal: lane={} host={host} rejects us ({reason})", lane.slot);
                     Instant::now()
                 });
             }
@@ -1662,7 +1676,7 @@ impl Manager {
         if result.get("ok").and_then(Value::as_bool) == Some(true) {
             failing_since.remove(&lane.slot);
         }
-        eprintln!("heal: lane={} rotated: {result}", lane.slot);
+        log_line!("heal: lane={} rotated: {result}", lane.slot);
     }
 }
 
@@ -2095,7 +2109,7 @@ fn run() -> Result<i32, String> {
             );
             let max_lanes = status_max_lanes(&status);
             if (count as u64) < max_lanes {
-                eprintln!(
+                log_line!(
                     "egress-relay: using {count}/{max_lanes} verified exits; cap concurrent Spark fan-out at {count}"
                 );
             }

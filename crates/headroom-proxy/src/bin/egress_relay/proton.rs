@@ -165,7 +165,7 @@ impl Tunnel {
         };
         if process_runs(pid, &["wireproxy"]) {
             let _ = signal_process(pid, libc::SIGTERM);
-            eprintln!("proton: stopped an orphaned wireproxy left by an earlier relay");
+            log_line!("proton: stopped an orphaned wireproxy left by an earlier relay");
         }
         let _ = fs::remove_file(self.pid_path());
     }
