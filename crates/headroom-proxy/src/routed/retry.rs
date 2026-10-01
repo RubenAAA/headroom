@@ -650,7 +650,7 @@ async fn hold_for_overload(
     true
 }
 
-enum BlobRetry {
+pub(super) enum BlobRetry {
     /// The body to send again, without the refused blobs.
     Resend(Bytes),
     /// Nothing to retry: the response as it came.
@@ -660,7 +660,7 @@ enum BlobRetry {
 /// Reads a Zen 400 to see whether it refused a reasoning blob. The response
 /// comes back with the same status, headers and body when there is nothing to
 /// resend, so an unrelated 400 reaches the client untouched.
-async fn resend_without_refused_blobs(
+pub(super) async fn resend_without_refused_blobs(
     state: &AppState,
     first_try: bool,
     r: reqwest::Response,
@@ -1333,6 +1333,66 @@ mod tests {
         .expect("hold must recover into Ok");
         assert_eq!(send.resp.status(), 200);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "one 429 then recovery");
+    }
+
+    /// 2026-10-01: a Spark turn 429'd on every lane, parked in the hold, and
+    /// the hold's re-send met Zen's "not issued to this caller" 400. The hold
+    /// counted any non-429 as recovered, so the 400 reached the client, which
+    /// keeps the stale blobs and hit it on every turn. The hold's re-send must
+    /// drop the blobs and resend, as the fast loop does.
+    #[tokio::test]
+    async fn zen_hold_resend_drops_a_refused_blob() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = bodies.clone();
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let text = String::from_utf8_lossy(&req.body).into_owned();
+                let has_blob = text.contains("encrypted_content");
+                seen.lock().unwrap().push(text);
+                if hits_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                    wiremock::ResponseTemplate::new(429).set_body_string("rate limited")
+                } else if has_blob {
+                    wiremock::ResponseTemplate::new(400).set_body_string(NOT_YOURS)
+                } else {
+                    wiremock::ResponseTemplate::new(200).set_body_string("ok")
+                }
+            })
+            .mount(&mock)
+            .await;
+        let upstream: url::Url = mock.uri().parse().unwrap();
+        let mut config = crate::config::Config::for_test(upstream);
+        config.retry_enabled = true;
+        config.retry_max_attempts = 1;
+        config.retry_base_delay_ms = 1;
+        config.retry_max_delay_ms = 1;
+        config.retry_zen_hold_enabled = true;
+        config.retry_zen_hold_budget_ms = 30_000;
+        config.zen_reasoning_replay = true;
+        let state = AppState::new(config).expect("app state");
+        let body = r#"{"input":[{"type":"reasoning","id":"rs_1","encrypted_content":"blob-hold-test","summary":[]},{"type":"message","role":"user","content":"hi"}]}"#;
+        let send = send_with_retry(
+            &state,
+            &mock.uri(),
+            HeaderMap::new(),
+            Bytes::from(body),
+            "test-zen-hold-blob",
+            None,
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("hold must recover into Ok");
+        assert_eq!(send.resp.status(), 200);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "429, refused blob, clean resend");
+        assert!(!bodies[2].contains("encrypted_content"), "{}", bodies[2]);
+        assert!(bodies[2].contains(r#""content":"hi""#));
     }
 
     /// A turn parked in the 429 hold gives its egress back, so the rotation

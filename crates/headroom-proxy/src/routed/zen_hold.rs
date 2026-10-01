@@ -149,13 +149,36 @@ async fn run_hold_probe(
     // The 429 refused the turn, so the buffered body replays freely —
     // this is a real re-send, not a cheap probe, so recovery lands the
     // turn immediately instead of needing another loop iteration.
-    match client
+    let sent = client
         .post(upstream_url)
         .headers(headers.clone())
         .body(body.clone())
         .send()
-        .await
-    {
+        .await;
+    // The hold is a re-send on a lane that may differ from the one that issued
+    // the transcript's reasoning blobs, so Zen can refuse them here too. Without
+    // this the 400 counted as "recovered" and went to the client, which keeps
+    // the stale blobs and hits it again on every turn.
+    let sent = match sent {
+        Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST => {
+            use crate::routed::retry::{BlobRetry, resend_without_refused_blobs};
+            match resend_without_refused_blobs(state, true, r, body, (egress_slot, request_id))
+                .await
+            {
+                BlobRetry::Resend(clean) => {
+                    client
+                        .post(upstream_url)
+                        .headers(headers.clone())
+                        .body(clean)
+                        .send()
+                        .await
+                }
+                BlobRetry::Pass(r) => Ok(r),
+            }
+        }
+        other => other,
+    };
+    match sent {
         Ok(r) if r.status().as_u16() != 429 => {
             log_hold_recovered(&r, started, *attempts_made, request_id);
             ProbeOutcome::Recovered(Box::new(HeldSend {
