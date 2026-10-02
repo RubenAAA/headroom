@@ -181,7 +181,9 @@ pub fn detect_waste_signals(text: &str, tokenizer: &dyn Tokenizer) -> WasteSigna
         .collect();
     if !ws_matches.is_empty() {
         let ws_text = ws_matches.concat();
-        let normalized = ws_matches.join(" ");
+        // Each run collapses to one space. Joining the runs with a space kept
+        // them whole, so the saving always came out 0 (upstream `f19bc9a9`).
+        let normalized = " ".repeat(ws_matches.len());
         signals.whitespace_tokens = tokenizer
             .count_text(&ws_text)
             .saturating_sub(tokenizer.count_text(&normalized));
@@ -266,11 +268,26 @@ mod tests {
         );
     }
 
+    /// Counts characters, so whitespace runs have a cost to measure.
+    #[derive(Debug)]
+    struct CharTokenizer;
+
+    impl Tokenizer for CharTokenizer {
+        fn count_text(&self, text: &str) -> usize {
+            text.chars().count()
+        }
+
+        fn backend(&self) -> crate::tokenizer::Backend {
+            crate::tokenizer::Backend::Estimation
+        }
+    }
+
     #[test]
     fn runs_of_whitespace_are_counted() {
-        // Four+ spaces and three+ newlines are the two run shapes.
-        let signals = detect("a\n\n\n\nb        c");
-        assert!(signals.whitespace_tokens > 0 || signals.total() == 0);
+        // Four+ spaces and three+ newlines are the two run shapes: 4 + 8
+        // characters collapse to one space each.
+        let signals = detect_waste_signals("a\n\n\n\nb        c", &CharTokenizer);
+        assert_eq!(signals.whitespace_tokens, 10);
     }
 
     /// A JSON block has to clear both the 500-character regex floor and the
