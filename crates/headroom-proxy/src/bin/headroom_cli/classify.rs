@@ -54,15 +54,7 @@ pub fn cmd_classify(args: ClassifyArgs) -> Result<(), Error> {
         .ok()
         .filter(|k| !k.is_empty() && !model.ends_with("-free"));
 
-    let client = headroom_proxy::ssl_context::blocking_client_builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent(concat!("headroom-cli/", env!("CARGO_PKG_VERSION")))
-        .build()?;
-    let mut req = client.post(&args.endpoint).json(&body);
-    if let Some(key) = key {
-        req = req.bearer_auth(key);
-    }
-    let resp = req.send()?;
+    let resp = send_via_lanes(&args.endpoint, &body, key.as_deref())?;
     let status = resp.status();
     let text = resp.text()?;
     if !status.is_success() {
@@ -81,6 +73,78 @@ pub fn cmd_classify(args: ClassifyArgs) -> Result<(), Error> {
         println!("{}", render_text(&parsed, &body));
     }
     Ok(())
+}
+
+/// Zen's free limit follows the exit IP: on 2026-10-01 this machine's own
+/// address answered 429 to Jev all day while every egress lane answered 200.
+/// So the call goes out through the same lanes the proxy uses for Spark, one
+/// after another on a 429 or a transport error, and from the machine's own
+/// address only after the lanes. Without a pool it is the direct call as before.
+fn send_via_lanes(
+    endpoint: &str,
+    body: &Value,
+    key: Option<&str>,
+) -> Result<reqwest::blocking::Response, Error> {
+    let lanes = lane_urls();
+    // Start at a different lane per process, so parallel callers spread out.
+    let start = std::process::id() as usize % lanes.len().max(1);
+    let mut targets: Vec<Option<&str>> = (0..lanes.len())
+        .map(|i| Some(lanes[(start + i) % lanes.len()].as_str()))
+        .collect();
+    targets.push(None);
+    let mut last: Option<Error> = None;
+    for target in targets {
+        let mut builder = headroom_proxy::ssl_context::blocking_client_builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(concat!("headroom-cli/", env!("CARGO_PKG_VERSION")));
+        if let Some(lane) = target {
+            builder = builder.proxy(reqwest::Proxy::all(lane)?);
+        }
+        let mut req = builder.build()?.post(endpoint).json(body);
+        if let Some(key) = key {
+            req = req.bearer_auth(key);
+        }
+        match req.send() {
+            Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                last = Some(format!("jev: HTTP 429 via {}", target.unwrap_or("direct")).into());
+                // Keep the 429 itself if nothing else answers.
+                if target.is_none() {
+                    return Ok(resp);
+                }
+            }
+            Ok(resp) => return Ok(resp),
+            Err(e) => last = Some(e.into()),
+        }
+    }
+    Err(last.unwrap_or_else(|| "jev: no route".into()))
+}
+
+/// The egress lanes: `HEADROOM_ZEN_HTTP_PROXY_POOL` (one URL per line or
+/// space; set but empty means none), else the SOCKS URLs in
+/// `~/.headroom-zen-pool.env`, which `cclaude` sources for the proxy.
+fn lane_urls() -> Vec<String> {
+    let from_env = std::env::var("HEADROOM_ZEN_HTTP_PROXY_POOL").ok();
+    let file = std::env::var("HOME")
+        .ok()
+        .and_then(|h| std::fs::read_to_string(format!("{h}/.headroom-zen-pool.env")).ok());
+    parse_lanes(from_env.as_deref(), file.as_deref())
+}
+
+fn parse_lanes(env: Option<&str>, file: Option<&str>) -> Vec<String> {
+    let clean = |t: &str| t.trim_matches(|c| c == '\'' || c == '"').to_string();
+    // Set but empty means "no lanes", so a caller can opt out of the file.
+    if let Some(v) = env {
+        return v
+            .split_whitespace()
+            .map(clean)
+            .filter(|t| t.contains("://"))
+            .collect();
+    }
+    file.unwrap_or_default()
+        .split_whitespace()
+        .map(|t| clean(t.rsplit('=').next().unwrap_or(t)))
+        .filter(|t| t.starts_with("socks5"))
+        .collect()
 }
 
 fn read_stdin() -> Result<String, Error> {
@@ -177,4 +241,32 @@ fn render_text(resp: &Value, request: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_lanes;
+
+    /// The shape `egress-relay env` writes: one quoted, multi-line value and
+    /// other variables that are not lanes.
+    #[test]
+    fn lanes_are_read_from_the_pool_file_and_nothing_else() {
+        let file = "export HEADROOM_ZEN_HTTP_PROXY_POOL='socks5h://127.0.0.1:18620\n\
+socks5h://127.0.0.1:18621'\nexport HEADROOM_ZEN_EGRESS_ROTATE_COMMAND='/home/u/.local/bin/egress-relay'\n";
+        assert_eq!(
+            parse_lanes(None, Some(file)),
+            vec!["socks5h://127.0.0.1:18620", "socks5h://127.0.0.1:18621"]
+        );
+    }
+
+    #[test]
+    fn the_env_beats_the_file_and_an_empty_env_means_no_lanes() {
+        let file = "export HEADROOM_ZEN_HTTP_PROXY_POOL='socks5h://127.0.0.1:18620'";
+        assert_eq!(
+            parse_lanes(Some("socks5h://a:1 http://b:2"), Some(file)),
+            vec!["socks5h://a:1", "http://b:2"]
+        );
+        assert!(parse_lanes(Some(""), Some(file)).is_empty());
+        assert!(parse_lanes(None, None).is_empty());
+    }
 }

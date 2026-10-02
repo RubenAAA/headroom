@@ -38,9 +38,15 @@ async fn zen(status: u16, body: Value) -> MockServer {
     server
 }
 
-/// Run the CLI off the async runtime so the mock server keeps serving.
+/// Run the CLI off the async runtime so the mock server keeps serving. No
+/// egress lanes: an empty pool also hides the developer's own pool file.
 async fn run(server: &MockServer, args: &[&str], key: Option<&str>) -> Output {
-    let url = format!("{}{ENDPOINT_PATH}", server.uri());
+    run_via(&format!("{}{ENDPOINT_PATH}", server.uri()), "", args, key).await
+}
+
+/// [`run`] against `url` with `pool` as the egress lanes.
+async fn run_via(url: &str, pool: &str, args: &[&str], key: Option<&str>) -> Output {
+    let (url, pool) = (url.to_string(), pool.to_string());
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let key = key.map(str::to_string);
     tokio::task::spawn_blocking(move || {
@@ -48,6 +54,7 @@ async fn run(server: &MockServer, args: &[&str], key: Option<&str>) -> Output {
         cmd.arg("classify")
             .args(&args)
             .env("HEADROOM_JEV_URL", url)
+            .env("HEADROOM_ZEN_HTTP_PROXY_POOL", pool)
             .env("NO_PROXY", "127.0.0.1,localhost")
             .env_remove("OPENCODE_API_KEY");
         if let Some(k) = key {
@@ -217,4 +224,73 @@ async fn http_errors_exit_nonzero_with_status_and_body() {
     assert!(e.contains("HTTP 400"), "{e}");
     assert!(e.contains("Too many choices"), "{e}");
     assert!(out(&o).is_empty());
+}
+
+/// Each lane here is an HTTP proxy onto its own mock, so one URL reaches a
+/// different server per lane.
+async fn lane(status: u16) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(reply()))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The limit follows the exit IP, so a 429 on one lane must not end the call
+/// while another lane answers. The start lane depends on the process id, so
+/// run it several times: whichever lane goes first, the call succeeds and only
+/// the open lane ever answers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_limited_lane_hands_the_call_to_the_next_lane() {
+    let limited = lane(429).await;
+    let open = lane(200).await;
+    let pool = format!("{} {}", limited.uri(), open.uri());
+    for _ in 0..4 {
+        let o = run_via(
+            "http://jev.invalid/zen/v1/systemone",
+            &pool,
+            &["--state", "hello", "--noul", "Is it urgent?"],
+            None,
+        )
+        .await;
+        assert!(o.status.success(), "{}", err(&o));
+        assert!(out(&o).contains("q1: 0.96"), "{}", out(&o));
+    }
+    assert_eq!(open.received_requests().await.unwrap().len(), 4);
+}
+
+/// Lanes first, the machine's own address last: with every lane limited the
+/// call still goes out directly, as it did before lanes existed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_direct_address_is_the_last_resort() {
+    let limited = lane(429).await;
+    let direct = zen(200, reply()).await;
+    let o = run_via(
+        &format!("{}{ENDPOINT_PATH}", direct.uri()),
+        &limited.uri(),
+        &["--state", "hello", "--noul", "Is it urgent?"],
+        None,
+    )
+    .await;
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("q1: 0.96"), "{}", out(&o));
+    assert_eq!(limited.received_requests().await.unwrap().len(), 1);
+    assert_eq!(direct.received_requests().await.unwrap().len(), 1);
+}
+
+/// With every route limited the user sees the 429, not a transport error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn when_everything_is_limited_the_429_reaches_the_user() {
+    let limited = lane(429).await;
+    let direct = zen(429, json!({"error": "Rate limit exceeded"})).await;
+    let o = run_via(
+        &format!("{}{ENDPOINT_PATH}", direct.uri()),
+        &limited.uri(),
+        &["--state", "hello", "--noul", "Is it urgent?"],
+        None,
+    )
+    .await;
+    assert!(!o.status.success());
+    assert!(err(&o).contains("HTTP 429"), "{}", err(&o));
 }

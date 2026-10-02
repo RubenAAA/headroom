@@ -117,7 +117,7 @@ adds 400, 402 and 403, and uses 401 and 422 differently.
 Two traps. A bad JSON body reports a missing model, not a parse error. A missing
 field reports "Endpoint is unavailable", which reads like an outage and is not.
 A fake key on the free ID is rejected, so send no `Authorization` header at all
-unless you hold a real key. 429 and 529 did not occur in this window.
+unless you hold a real key. 529 did not occur. 429 did, later; see Limits.
 
 ## Limits
 
@@ -127,7 +127,16 @@ unless you hold a real key. 429 and 529 did not occur in this window.
   about 33k input tokens, counted in tokens and not bytes. Repeated text packs
   at ~5.6 bytes per token; real prose packs tighter, so expect less.
 - Questions per request: 1,000 worked (1.0 s). No cap found.
-- Rate limits: not published and not hit. The free tier is "temporary".
+- Rate limits: not published. **Hit on 2026-10-01:** after about 140 calls in a
+  few minutes (70 at 12 in parallel, then 72 more) the free endpoint answered
+  429, and still did several minutes later, even at 4 in parallel with a
+  growing pause. The window and the quota are unmeasured. Budget well under
+  100 calls per session per half hour. The free tier is "temporary".
+- **The limit is per exit IP**, as for Spark (`notes/learnings/zen-free-limit-is-per-exit-daily.md`).
+  The same minute the machine's own address got 429, all 9 egress lanes
+  (`socks5h://127.0.0.1:18620`-`18628`) answered 200. So Jev calls go through
+  the lanes: the proxy's refresh observer uses the Zen lane pool with failover,
+  and the CLI does the same (below).
 
 ## Latency
 
@@ -203,9 +212,16 @@ headroom classify --request req.json --json    # choice/score need a request fil
 - It rejects an empty state or empty `questions` before sending. Zen would
   answer those with the misleading 422 above.
 - Exit code 1 on any HTTP error, with the status and body on stderr.
+- **Lanes.** The free limit follows the exit IP, so the CLI tries the egress
+  lanes first, starting at a lane picked by process id, and moves on after a
+  429 or a connection error. The machine's own address goes last, so with every
+  lane limited you see the direct 429. Lanes come from
+  `HEADROOM_ZEN_HTTP_PROXY_POOL` (space or newline separated; set but empty
+  means none), else from `~/.headroom-zen-pool.env`. With no pool it calls
+  directly, as before. Checked live 2026-10-01: direct 429, via lanes `q1: 0.90`.
 
 Tests: `cargo test -p headroom-proxy --test integration_cli_classify` (the real
-binary against a mock Zen).
+binary against a mock Zen, with HTTP-proxy mocks as lanes).
 
 ## Offline test: could Jev gate recall injection?
 
