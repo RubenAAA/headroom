@@ -99,6 +99,34 @@ ticket_hook "curl -X POST https://yt.example/api/issues/PROJ-12/comments -d @c.j
 [[ $RC -eq 0 && -z $OUT ]] || fail "a comment on an existing issue was diverted (rc=$RC out=$OUT)"
 ok "reads, other hosts, heredocs and existing-issue work pass through"
 
+# A prompt that asks for a filing is diverted; one that posts a report to an
+# existing ticket is not. YOUTRACK_TOKEN is unset, so a match prints
+# "TICKET DIVERT NOT STARTED" and a non-match prints nothing.
+PROMPTS=0
+ticket_prompt() { # prompt -> $OUT, $RC (new session each time: the warning is once per session)
+  local input
+  PROMPTS=$((PROMPTS + 1))
+  input=$(jq -nc --arg p "$1" --arg t "$T/transcript.jsonl" --arg s "p$PROMPTS" \
+    '{hook_event_name:"UserPromptSubmit",session_id:$s,cwd:"/tmp",
+      transcript_path:$t,prompt:$p}')
+  RC=0
+  OUT=$(printf '%s' "$input" | bash "$HOOKS/ticket-gate.sh" 2>&1) || RC=$?
+}
+for p in "file the ticket" "create a youtrack issue" "file it in youtrack"; do
+  ticket_prompt "$p"
+  [[ $OUT == *"TICKET DIVERT"* ]] || fail "filing prompt '$p' was not diverted (rc=$RC out=$OUT)"
+done
+ok "prompts that ask for a ticket are diverted"
+
+for p in \
+  "push both branches and open the merge requests. post the YouTrack report" \
+  "post the youtrack report on ANL-1426" \
+  "post the issue summary as a comment"; do
+  ticket_prompt "$p"
+  [[ $RC -eq 0 && -z $OUT ]] || fail "report prompt '$p' was diverted (rc=$RC out=$OUT)"
+done
+ok "posting a report is not filing a ticket"
+
 # ── review-gate ─────────────────────────────────────────────────────────────
 # Arming pins the MR from the last review command's own args, never from an
 # unrelated !NNN elsewhere in the transcript, and never guesses between two.

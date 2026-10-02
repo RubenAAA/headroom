@@ -474,7 +474,7 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   # ticket-gate's own pattern, copied exactly: a looser copy stood review
   # down on prompts ticket-gate ignores ("post the threads; ticket MVP-12
   # ...") and nothing fired at all. check-drift.sh fails if they differ.
-  TICKET_INTENT='(^|[^[:alnum:]_./-])(file|create|open|submit|raise|post|заведи|завести|создай|открыть|открой)( +[^ .;:!?,]+){0,2} +((tickets?|issues?|youtrack|mvp-[0-9]+)([^[:alnum:]_./-]|[.]([^[:alnum:]]|$)|$)|тикет|задач)'
+  TICKET_INTENT='(^|[^[:alnum:]_./-])(file|create|open|submit|raise|заведи|завести|создай|открыть|открой)( +[^ .;:!?,]+){0,2} +((tickets?|issues?|youtrack|mvp-[0-9]+)([^[:alnum:]_./-]|[.]([^[:alnum:]]|$)|$)|тикет|задач)'
   if echo "$PROMPT" | grep -qE "$TICKET_INTENT"; then
     INTENT=""
   fi

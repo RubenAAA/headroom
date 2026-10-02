@@ -257,7 +257,7 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   # review-gate.sh stands down on this exact pattern; check-drift.sh fails
   # if the two copies differ.
   INTENT=""
-  TICKET_INTENT='(^|[^[:alnum:]_./-])(file|create|open|submit|raise|post|заведи|завести|создай|открыть|открой)( +[^ .;:!?,]+){0,2} +((tickets?|issues?|youtrack|mvp-[0-9]+)([^[:alnum:]_./-]|[.]([^[:alnum:]]|$)|$)|тикет|задач)'
+  TICKET_INTENT='(^|[^[:alnum:]_./-])(file|create|open|submit|raise|заведи|завести|создай|открыть|открой)( +[^ .;:!?,]+){0,2} +((tickets?|issues?|youtrack|mvp-[0-9]+)([^[:alnum:]_./-]|[.]([^[:alnum:]]|$)|$)|тикет|задач)'
   if echo "$PROMPT" | grep -qE "$TICKET_INTENT"; then
     INTENT=1
   fi
