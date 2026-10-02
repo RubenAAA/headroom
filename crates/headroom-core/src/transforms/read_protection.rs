@@ -66,10 +66,23 @@ fn lockfile_re() -> &'static Regex {
     })
 }
 
-/// A redirect, `tee` or heredoc anywhere in the command.
+/// A redirect or `tee` in one command segment.
 fn writes_a_file_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(^|\s)(>>?|tee\b|<<)").expect("write pattern is valid"))
+    RE.get_or_init(|| Regex::new(r"(^|\s)(>>?|tee\b)").expect("write pattern is valid"))
+}
+
+/// A heredoc anywhere in the command.
+fn heredoc_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(^|\s)<<").expect("heredoc pattern is valid"))
+}
+
+/// `;`, `&&` and `||`, which start a new command. A single `|` does not: a
+/// later pipeline stage reads the stage before it, not a file.
+fn command_separator_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\|\||&&|;").expect("separator pattern is valid"))
 }
 
 /// `sed -n`, as its own token.
@@ -217,6 +230,13 @@ pub fn custom_tool_call_commands(script: &str) -> Vec<String> {
 /// writes the file (`cat > f <<EOF`), and a bare `sed` without `-n` is a
 /// stream edit.
 ///
+/// A chained command is a read when any of its `;`/`&&`/`||` segments is
+/// one: agents batch reads behind other work (`wc -l a.py && sed -n '1,60p'
+/// a.py`), and judging only the first program left those reads unprotected
+/// (upstream `ffc35997`). A redirect or `tee` counts against its own segment
+/// only; a heredoc rules out the whole command, since its body may hold
+/// separators that would split into segments that look like reads.
+///
 /// This decides only that the command IS a read. Whether the read is actually
 /// protected is settled by content in [`read_output_should_be_protected`].
 /// The one command-level carve-out is the lockfile.
@@ -225,13 +245,32 @@ pub fn is_read_command(command: &str) -> bool {
         return false;
     }
     let c = strip_cd_prefix(command);
-    if writes_a_file_re().is_match(&c) {
+    if heredoc_re().is_match(&c) {
+        return false;
+    }
+    command_separator_re()
+        .split(&c)
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .any(segment_is_read)
+}
+
+/// [`is_read_command`] for one command with no `;`/`&&`/`||` in it.
+fn segment_is_read(segment: &str) -> bool {
+    // Checked on the whole pipeline: `cat a.py | tee b.py` writes.
+    if writes_a_file_re().is_match(segment) {
+        return false;
+    }
+    // Only the first stage touches the file; `cat a.py | head -40` is a read,
+    // `grep -n x a.py | head -40` is search output.
+    let c = segment.split('|').next().unwrap_or_default().trim();
+    if c.is_empty() {
         return false;
     }
     // The same structural parser the search-fold uses, so `sudo cat f`,
     // `timeout 30 cat f` and `rtk cat f` are all recognized rather than
     // dropped by a first-token match.
-    let (prog, rest) = bash_program(&c);
+    let (prog, rest) = bash_program(c);
     if prog.is_empty() {
         return false;
     }
@@ -247,11 +286,11 @@ pub fn is_read_command(command: &str) -> bool {
     }
     let is_read = READ_VERBS.contains(&prog.as_str())
         // `sed -n '1,20p' file` prints a range; bare `sed` edits a stream.
-        || (prog == "sed" && sed_quiet_re().is_match(&c));
+        || (prog == "sed" && sed_quiet_re().is_match(c));
     if !is_read {
         return false;
     }
-    !lockfile_re().is_match(&c)
+    !lockfile_re().is_match(c)
 }
 
 /// Finalize read protection by content — protect unless this is clearly data.
@@ -327,6 +366,35 @@ mod tests {
             "cat f | tee g",
             "cat > f <<EOF",
             "head -1 a > b",
+        ] {
+            assert!(!is_read_command(c), "{c}");
+        }
+    }
+
+    /// Agents batch a read behind other work; any read segment protects.
+    #[test]
+    fn a_read_anywhere_in_a_chain_is_a_read() {
+        for c in [
+            "wc -l a.py b.py && sed -n '1,60p' c.py",
+            "grep -n X f.py | head -40; head -80 g.py",
+            "ls -la || cat f.py",
+            "git status && cat src/main.rs",
+            // A write in a sibling segment does not unprotect the read.
+            "cat a.py && echo done > marker",
+            "cat a.py | head -40",
+        ] {
+            assert!(is_read_command(c), "{c}");
+        }
+        for c in [
+            // A later pipeline stage reads search output, not a file.
+            "grep -n x a.py | head -40",
+            "cat a.py > b.py && ls",
+            "cat a.py | tee b.py; ls",
+            // A heredoc body can hold separators; the whole command is out.
+            "cat > f <<EOF\nx; cat g\nEOF",
+            // `-n` in a sibling segment does not make a bare `sed` a range print.
+            "sed 's/a/b/' f.py && wc -n",
+            "ls && cat Cargo.lock",
         ] {
             assert!(!is_read_command(c), "{c}");
         }
