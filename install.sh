@@ -611,6 +611,27 @@ done
 say "agents in $agent_dir: $(ls "$CONTRIB"/claude/agents/*.md | xargs -n1 basename | sed 's/\.md$//' | tr '\n' ' ')"
 done
 
+# ── Claude Code commands ──────────────────────────────────────────────────
+step "Commands"
+for command_dir in "$CLAUDE_DIR/commands" "$HOME/.claude-work/commands" "$HOME/.claude-personal/commands"; do
+if [ "$command_dir" != "$CLAUDE_DIR/commands" ] && [ ! -d "$(dirname "$command_dir")" ]; then
+    continue
+fi
+mkdir -p "$command_dir"
+for src in "$CONTRIB"/claude/commands/*.md; do
+    dst="$command_dir/$(basename "$src")"
+    if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
+        continue
+    elif [ -e "$dst" ]; then
+        say "$dst exists — left alone"
+    elif [ "$LINK" = 1 ]; then
+        ln -sfn "$src" "$dst"
+    else
+        install -m 644 "$src" "$dst"
+    fi
+done
+done
+
 # ── Claude Code hooks ─────────────────────────────────────────────────────
 # Headroom-owned hook scripts (session map logger, review write-offload
 # gate). Installed the same way as the launcher: copied by default,
