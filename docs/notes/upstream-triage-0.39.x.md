@@ -72,3 +72,70 @@ SDK, docs, CI and dependency bumps.
 - The profile exports `HEADROOM_SMART_CRUSHER_COMPACTION`; the proxy reads
   `HEADROOM_SMART_CRUSHER_WITH_COMPACTION`. Nothing on a serving path reads
   the field either way, so left alone.
+
+# Upstream triage: `b73adaa0` → `d5318ac2` (71 commits)
+
+Done 2026-10-02 with the merge `0d69a49d`. Same method and classes as above.
+
+Totals: **3 ported, 6 ALREADY-THERE, 7 optional, 55 N/A**. The one Rust
+commit, `49f69be2`, was not taken; see "Already there".
+
+## Landed ports
+
+- `ffc35997`: a chained command is a read when any `;`/`&&`/`||` segment is
+  one; redirects and `tee` count against their own segment, a heredoc against
+  the whole command (`headroom-core/src/transforms/read_protection.rs`).
+  Before, `git status && cat f.rs` went to the code-aware compressor.
+- `f19bc9a9`: the whitespace waste signal was always 0; each run now
+  collapses to one space (`headroom-core/src/waste_signals.rs`). Feeds
+  metrics only.
+- `f8645257`: output-savings baseline back-off pools every stratum under the
+  shorter prefix and returns no evidence instead of the global mean
+  (`headroom-core/src/output_savings.rs`). Upstream's opt-in
+  `fall_back_to_global` has no caller and was left out. This machine's
+  baseline is empty (`glob.n = 0`), so today's numbers do not move.
+
+## Optional
+
+| sha | what | Rust evidence | why not now |
+|---|---|---|---|
+| `fe2ed2b5` | Kompress keeps line breaks and table rows | `kompress.rs:522` joins kept words with a space | Kompress is off in the flags file |
+| `8dbbd1d8` | Keep record-bearing JSON away from Kompress | JSON arms go to SmartCrusher in `live_zone/dispatch.rs` | Kompress is off |
+| `005a4e14` | "Original content preserved." in the Kompress marker | | Kompress is off |
+| `74603899` | `HEADROOM_LICENSE` is the licence variable now | `main.rs` warns on `HEADROOM_LICENSE_KEY` only | No licence in use |
+| `9b26a49c` | Batch paths honour `x-headroom-bypass` | `handlers/batch*.rs` never read it | `--enable-batch-api false` |
+| `0a2c80d5` | Memoize OpenAI token counts | No count cache in `tokenizer/` | Perf only, unmeasured here |
+| `861e94d8` | No exception text in client error bodies | `error.rs:74-86` sends the reqwest error | Local single-user proxy; the text is for its own user |
+
+## Already there
+
+- `49f69be2` (live-zone SourceCode/PlainText arms): both arms route in
+  `live_zone/dispatch.rs:309,375` (`edeb2cca`), and Kompress loads only off
+  the request path (`live_zone/compressors.rs`). Declined: the
+  `HEADROOM_LIVE_ZONE_DISABLE_ARMS` env switch (`--code-aware` and
+  `--disable-kompress` already turn both arms off) and the 2048/5120 byte
+  floors (code-aware savings were measured at 512). Its tests and bench
+  target upstream's API and were dropped.
+- `94bb0558` (`proxy/ccr_response.rs:827`), `c46e7cc6`
+  (`proxy/egress.rs:344`, keepalive 20 s), `dcec8458`
+  (`proxy/ccr_expansion.rs:55-62` skips `<system-reminder>`), `c719d4af`
+  (`savings_tracker.rs` folds tool-schema into tokens and dollars alike),
+  `8f3d6773` (`compressors.rs`, a failed load is `None`).
+
+## N/A
+
+- No Rust counterpart: `728ff7e2` (the CCR store keeps raw text), `f87848cf`
+  (no `passthrough:*` model names), `143a38d5` and `4257ed4d` (no traffic
+  learner), `f90a56b0` and `9a9f35cd` (no TOIN), `88a1f4e5` (no per-path
+  inbound counter), `a6d6c14c` (Chat Completions through a gateway),
+  `246162d7` (no client sends the header), `3c9ed010` (not run stateless).
+- Python-only: wrap, doctor, install and MCP registry (`8cfeb692`,
+  `1982b3a7`, `bb1ab6af`, `d5318ac2`, `7287589d`, `0712e048`, `d0fd56e4`,
+  `f824a270`), copilot (`81a8a28d`, `2b2dc1b2`), learn (`c072251c`,
+  `db90b93d`, `c46e74d0`), memory and storage (`231a6277`, `a8c2e4d9`,
+  `b17b8127`, `91237cae`), plugins (`d75eecd8`, `2157400b`, `d1ad1898`),
+  dashboard and telemetry (`ecc49670`, `7df8bd87`, `f0ec2bb3`, `58b14542`),
+  and the rest (`fef99cc5`, `f78e66f7`, `eaa16d9f`, `fed72811`, `ef1c528e`,
+  `8538a831`, `d5e5534b`, `d7ed2309`, `b625d188`, `76ef2c3b`, `885af385`).
+- Docs and dependencies: `7ff67693`, `6ff74c5d`, `dea0f626`, `3080a9d4`,
+  `2df0c634`, `14a4b543`, `573e385f`, `59b8cefc`, `9320c972`, `ff1a0d69`.
