@@ -271,7 +271,15 @@ impl BaselineModel {
     }
 
     /// Return `(mean, var, n)` for `key` with hierarchical back-off: trim
-    /// trailing stratum fields, then fall back to the global mean.
+    /// trailing stratum fields and pool every observed stratum under the
+    /// shorter prefix. `(0.0, 0.0, 0)` when nothing matches; callers read
+    /// `n == 0` as no evidence.
+    ///
+    /// No global-mean last resort (upstream `f8645257`). The baseline is
+    /// seeded once from what ran before install, so every model family
+    /// adopted later resolved to that one mean: upstream measured 48% of a
+    /// real ledger's requests scored that way, producing 74% of its reported
+    /// savings.
     pub fn lookup(&self, key: &str) -> (f64, f64, i64) {
         if let Some(acc) = self.strata.get(key)
             && acc.n > 0
@@ -282,13 +290,17 @@ impl BaselineModel {
         while parts.len() > 1 {
             parts.pop();
             let prefix = format!("{}|", parts.join("|"));
+            let mut neighbours = Accum::default();
             for (k, a) in &self.strata {
-                if k.starts_with(&prefix) && a.n > 0 {
-                    return (a.mean(), a.var(), a.n);
+                if a.n > 0 && k.starts_with(&prefix) {
+                    neighbours.merge(a);
                 }
             }
+            if neighbours.n > 0 {
+                return (neighbours.mean(), neighbours.var(), neighbours.n);
+            }
         }
-        (self.glob.mean(), self.glob.var(), self.glob.n)
+        (0.0, 0.0, 0)
     }
 
     pub fn total_samples(&self) -> i64 {
@@ -906,20 +918,21 @@ mod tests {
     }
 
     #[test]
-    fn baseline_lookup_backoff_and_global() {
+    fn baseline_lookup_backs_off_but_never_to_the_global_mean() {
         let mut b = BaselineModel::default();
         b.observe("sonnet|cont|s|tools", 100);
         b.observe("sonnet|cont|s|tools", 200);
+        b.observe("sonnet|cont|s|edits", 600);
         // Exact hit.
         let (mean, _v, n) = b.lookup("sonnet|cont|s|tools");
         assert!((mean - 150.0).abs() < 1e-9);
         assert_eq!(n, 2);
-        // Back-off: unseen leaf, but prefix "sonnet|cont|s|" matches.
-        let (mean, _v, _n) = b.lookup("sonnet|cont|s|notools");
-        assert!((mean - 150.0).abs() < 1e-9);
-        // Global fallback for a totally unseen family.
-        let (mean, _v, _n) = b.lookup("gpt|x|xl|tools");
-        assert!((mean - 150.0).abs() < 1e-9); // only global samples exist
+        // Back-off: unseen leaf, so every stratum under "sonnet|cont|s|" pools.
+        let (mean, _v, n) = b.lookup("sonnet|cont|s|notools");
+        assert!((mean - 300.0).abs() < 1e-9);
+        assert_eq!(n, 3);
+        // A family the baseline never saw is no evidence, not the global mean.
+        assert_eq!(b.lookup("gpt|x|xl|tools"), (0.0, 0.0, 0));
     }
 
     #[test]
@@ -1242,15 +1255,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_stratum_falls_back_through_the_key_hierarchy() {
-        // `lookup` degrades to coarser keys rather than reporting no samples,
-        // so an unseen stratum still estimates from its family. Verified
-        // against Python, which returns 40 here rather than 0.
+    fn unknown_stratum_falls_back_within_its_family_only() {
+        // `lookup` degrades to coarser keys, so an unseen stratum still
+        // estimates from its family; a family the baseline never saw scores
+        // nothing (upstream `f8645257`).
         let dir = tempfile::tempdir().unwrap();
         let rec =
             recorder_with_baseline(dir.path().join("f.json"), "claude|b1|v2", &[90, 100, 110]);
+        let sibling = stratum_label("treatment", "claude|b1|v9");
+        assert_eq!(rec.estimate_request_savings(&[sibling], 60), 40);
         let other = stratum_label("treatment", "zz|b|v");
-        assert_eq!(rec.estimate_request_savings(&[other], 60), 40);
+        assert_eq!(rec.estimate_request_savings(&[other], 60), 0);
     }
 
     /// A truncating write leaves a half-file behind on a crash, and `load`
