@@ -384,6 +384,12 @@ pub fn build_app(state: AppState) -> Router {
         // snapshot, no I/O) so a statusline script can poll it every
         // few seconds. See `cache_stabilization::usage_observer`.
         .route("/cache-health", get(cache_health))
+        // Routed models, what each needs, and whether it is connected; the
+        // `/models` command reads it. See handlers::model_catalog.
+        .route(
+            "/models-status",
+            get(crate::handlers::model_catalog::handle_models_status),
+        )
         .route(
             "/stats",
             get(crate::handlers::stats::handle_stats),

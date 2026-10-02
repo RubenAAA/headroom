@@ -157,6 +157,8 @@ serde_json = { workspace = true }
 # dependency so the drift detector compiles outside `cfg(test)`. Also
 # used by PR-E4 for `prompt_cache_key` derivation.
 sha2 = { workspace = true }
+# Spots a mistyped routed alias so the proxy can name the one meant.
+strsim = "0.11"
 tar = "0.4"
 # Runtime ast-grep interceptor writes tool output to a temporary file before
 # invoking ast-grep. This is used outside tests, so tempfile must be a normal

@@ -13,9 +13,14 @@ the proxy; the session, tools, and cache stay intact.
 | `claude-codex-6-luna` | GPT-6 luna | OpenAI | `codex-6-luna` |
 | `claude-grok-4.6-high` | Grok 4.6 | Cursor subscription | `grok-high` |
 | `claude-grok-4.6-low` | Grok 4.6 Low | Cursor subscription | `grok-low` |
+| `claude-grok-4.6` | Grok 4.6 (effort from `/effort`) | Cursor subscription | — |
 | `claude-grok-4.6-xhigh` | Grok 4.6 Extra High | Cursor subscription | `grok-xhigh` |
 | `claude-muse-spark-1.3` | Muse Spark 1.3 | OpenCode Zen, free tier | `spark`, `spark-explore` |
 | `claude-union-alpha` | Union Alpha Free | OpenCode Zen, Anthropic Messages | — |
+
+Anthropic model IDs supported by Claude Code pass through to Anthropic unchanged;
+that set follows Claude Code and Anthropic's current model catalog, rather than a
+fixed list of proxy aliases.
 
 Notes:
 
@@ -29,6 +34,10 @@ Notes:
   model.
 - Union Alpha uses Zen's Anthropic Messages endpoint with the
   `OPENCODE_API_KEY` environment variable. Its upstream model ID is `union-alpha`.
+- `/models` shows which of these this machine can use right now, read from
+  `curl -s localhost:8787/models-status`. A name one or two letters off an
+  alias (`calude-muse-spark-1.3`) fails with that list instead of reaching
+  Anthropic as an unknown model.
 - When delegating from Claude Code, invoke the subagent without the `model`
   parameter. Passing one overrides the pinned model and sends the work back to
   a Claude alias.

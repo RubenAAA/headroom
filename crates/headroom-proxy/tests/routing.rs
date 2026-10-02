@@ -48,3 +48,6 @@ mod integration_beta_header_sticky;
 
 #[path = "suites/routing/integration_upstream_override_ssrf.rs"]
 mod integration_upstream_override_ssrf;
+
+#[path = "suites/routing/model_typo_guard.rs"]
+mod model_typo_guard;

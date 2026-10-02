@@ -1212,6 +1212,13 @@ pub fn apply_to_anthropic_body_with_cooldowns(
     let Some(model) = obj.get("model").and_then(|m| m.as_str()) else {
         return body;
     };
+    // Claude Code checks a name given to `/model` with a one-token, tool-less
+    // turn. Routed, that check is answered by the target and passes for any
+    // name, typos included; the session then fails on its first real turn.
+    // One output token has nothing to save, so leave it to the named model.
+    if obj.get("max_tokens").and_then(Value::as_u64) == Some(1) {
+        return body;
+    }
 
     let input_tokens =
         estimate_input_tokens(obj.get("messages"), obj.get("tools"), obj.get("system"));

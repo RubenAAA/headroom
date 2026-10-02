@@ -15,6 +15,7 @@ pub mod conversations;
 pub mod count_tokens;
 pub mod gemini;
 pub mod local_model;
+pub mod model_catalog;
 pub mod reasoning_signature;
 pub mod responses;
 pub mod route_resolve;

@@ -119,6 +119,15 @@ pub async fn handle_messages(
         return resp;
     }
 
+    // A mistyped routed alias is answered here with the names that exist;
+    // forwarded, it would only come back as Anthropic's bare 404.
+    if let Some(model) = parsed.get("model").and_then(|v| v.as_str())
+        && let Some(resp) =
+            crate::handlers::model_catalog::reject_near_miss(&state.config, model).await
+    {
+        return resp;
+    }
+
     // Cost-aware model routing (#1706): the same helper the passthrough path
     // uses, applied here so a rewritten id still meets the route table below.
     // Disabled by default; when no rule matches the bytes come back untouched.
@@ -209,8 +218,10 @@ pub async fn handle_messages(
 
     // Zen is free, so offload saves no money there and costs a hidden
     // retrieval round trip each time the model wants a digest back.
+    // `--ctx-offload-spark-min-bytes` is the opt-in for Spark on that route.
     let offload = state.config.ctx_offload_zen
-        || classify_upstream(&upstream, is_chatgpt_auth) != UpstreamKind::OpenCodeZen;
+        || classify_upstream(&upstream, is_chatgpt_auth) != UpstreamKind::OpenCodeZen
+        || crate::routed::transforms::spark_offload_min_bytes(&state, &parsed).is_some();
     let prepared = match prepare_turn(
         &state,
         parsed,
