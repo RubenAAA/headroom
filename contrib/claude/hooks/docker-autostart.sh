@@ -40,20 +40,26 @@ chmod 700 "$STATE_DIR" 2>/dev/null || true
 # share one startup attempt and one continuation notice.
 (set -o noclobber; : > "$MARKER") 2>/dev/null || exit 0
 
+# A stopped engine refuses the connection at once, so the limit only matters
+# for a slow one. A busy machine (a release build, say) can take over 2 s to
+# answer `docker info`; reading that as "down" made the hook report a running
+# Docker as dead.
+PROBE_SECONDS=10
+
 docker_ready() {
   if command -v timeout >/dev/null 2>&1; then
-    timeout 2 docker info >/dev/null 2>&1
+    timeout "$PROBE_SECONDS" docker info >/dev/null 2>&1
     return $?
   fi
   if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout 2 docker info >/dev/null 2>&1
+    gtimeout "$PROBE_SECONDS" docker info >/dev/null 2>&1
     return $?
   fi
 
   # macOS does not ship `timeout`; bound the probe without adding a dependency.
   docker info >/dev/null 2>&1 &
   local docker_pid=$!
-  (sleep 2; kill "$docker_pid" 2>/dev/null || true) &
+  (sleep "$PROBE_SECONDS"; kill "$docker_pid" 2>/dev/null || true) &
   local watchdog_pid=$!
   wait "$docker_pid" 2>/dev/null
   local result=$?
