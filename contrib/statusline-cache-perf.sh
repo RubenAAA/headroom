@@ -208,7 +208,7 @@ esac
 line="cache ✓ ${cache_txt}"
 # Older proxies do not publish it; the segment stays byte-identical there.
 if [ -n "$prod_pct" ]; then
-  if [ "$prod_pct" = "100" ]; then
+  if [ "$prod_pct" -ge 99 ]; then
     line="$line | prod ${GREEN}${prod_pct}%${RESET}"
   else
     line="$line | prod ${RED}${prod_pct}%${RESET}"
