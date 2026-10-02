@@ -1300,6 +1300,13 @@ fn offload_tool_result(
 /// this `tool_use` block was ever forwarded as one.
 const TOOL_USE_GATE_NS: &str = "tool_use:";
 
+/// Tools whose inputs are instructions the model writes again later. A digest
+/// in place of an old `Agent` prompt teaches the model to write its next
+/// prompt as a cut preview plus a pointer, with a hash it invents (seen live on
+/// Spark: nine truncated prompts in a row, every pointer absent from the store).
+/// Their inputs stay verbatim.
+const TOOL_USE_KEEP_VERBATIM: &[&str] = &["Agent", "Task", "SendMessage"];
+
 /// Replace large string values in prior-turn `tool_use` inputs (a Write's
 /// `content`, an Edit's `new_string`) with the digest [`offload_tool_result`]
 /// writes: a preview plus [`footer`], keyed by the value's own hash, so
@@ -1357,6 +1364,9 @@ pub fn offload_tool_use_inputs(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            if TOOL_USE_KEEP_VERBATIM.contains(&tool_name.as_str()) {
+                continue;
+            }
             let Some(input) = block.get_mut("input").and_then(Value::as_object_mut) else {
                 continue;
             };
@@ -1775,6 +1785,33 @@ mod tests {
 
     fn write_content(parsed: &Value) -> Value {
         parsed["messages"][1]["content"][0]["input"]["content"].clone()
+    }
+
+    #[test]
+    fn agent_and_sendmessage_inputs_stay_verbatim_on_a_rebuild_boundary() {
+        let gate = OffloadGate::new(16);
+        let mut parsed = session_with_old_write();
+        for (i, name) in ["Agent", "SendMessage"].into_iter().enumerate() {
+            parsed["messages"][1]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"tool_use","id":format!("tu_{i}"),"name":name,
+                    "input":{"prompt":big_body()}}));
+        }
+        let out = offload_tool_use_inputs(
+            &mut parsed,
+            &cfg(200),
+            &gate_policy(&gate, true),
+            Some(5),
+            &|_: &OffloadRecord| true,
+        );
+        assert_eq!(out.blocks_offloaded, 1, "only the Write converts");
+        for i in [1, 2] {
+            assert_eq!(
+                parsed["messages"][1]["content"][i]["input"]["prompt"],
+                Value::String(big_body())
+            );
+        }
     }
 
     #[test]

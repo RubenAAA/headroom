@@ -423,6 +423,10 @@ pub fn is_prefix_monotonic_with(blocks: &[DedupBlock], min_lines: usize, min_cha
     true
 }
 
+/// Marks a user `text` block in the location table; a tool_result's own
+/// sub-block index can never reach this value.
+const USER_TEXT_SLOT: usize = usize::MAX;
+
 /// Whole-conversation cross-turn de-dup over an Anthropic/OpenAI
 /// `messages` array, mutating it in place
 /// (cache-safe, information-lossless). Port of
@@ -447,6 +451,26 @@ pub fn is_prefix_monotonic_with(blocks: &[DedupBlock], min_lines: usize, min_cha
 /// Mutates `messages` in place only when at least one span folds; returns
 /// the stats either way.
 pub fn dedup_messages(messages: &mut [Value], frozen_message_count: usize) -> DedupStats {
+    dedup_messages_with_user_text(messages, frozen_message_count, 0)
+}
+
+/// [`dedup_messages`] that also folds repeated spans in user-role `text` blocks
+/// (and plain-string user messages), not only tool output. Subagent reports,
+/// hook feedback and re-injected reminders repeat across turns the same way a
+/// re-read file does.
+///
+/// `user_text_tail` is the number of newest messages whose user text is never
+/// rewritten (the live request must reach the model verbatim); they still
+/// serve as reference targets. `0` leaves user text alone, which is
+/// [`dedup_messages`]. A message that ages out of the tail is rewritten on a
+/// later request, so this changes bytes already sent once: use it where the
+/// prompt cache is not paid for.
+pub fn dedup_messages_with_user_text(
+    messages: &mut [Value],
+    frozen_message_count: usize,
+    user_text_tail: usize,
+) -> DedupStats {
+    let tail_start = messages.len().saturating_sub(user_text_tail);
     // (message index, Some(block index) for content-list blocks or None for
     // string-content tool messages, Some(sub-block index) when the block's own
     // content is a list holding one text part), parallel to `dblocks`.
@@ -461,6 +485,23 @@ pub fn dedup_messages(messages: &mut [Value], frozen_message_count: usize) -> De
                     let Some(obj) = block.as_object() else {
                         continue;
                     };
+                    if user_text_tail > 0
+                        && obj.get("type").and_then(Value::as_str) == Some("text")
+                        && msg.get("role").and_then(Value::as_str) == Some("user")
+                    {
+                        let text = obj.get("text").and_then(Value::as_str).unwrap_or("");
+                        if !text.is_empty() {
+                            locs.push((i, Some(bidx), Some(USER_TEXT_SLOT)));
+                            dblocks.push(DedupBlock {
+                                text: text.to_string(),
+                                turn: i,
+                                protected: frozen
+                                    || i >= tail_start
+                                    || obj.contains_key("cache_control"),
+                            });
+                        }
+                        continue;
+                    }
                     if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
                         continue;
                     }
@@ -498,16 +539,21 @@ pub fn dedup_messages(messages: &mut [Value], frozen_message_count: usize) -> De
                 }
             }
             Some(Value::String(content)) => {
-                if !matches!(
-                    msg.get("role").and_then(Value::as_str),
-                    Some("tool" | "function")
-                ) {
+                let user_text =
+                    user_text_tail > 0 && msg.get("role").and_then(Value::as_str) == Some("user");
+                if !user_text
+                    && !matches!(
+                        msg.get("role").and_then(Value::as_str),
+                        Some("tool" | "function")
+                    )
+                {
                     continue;
                 }
                 if content.is_empty() {
                     continue;
                 }
                 let protected = frozen
+                    || (user_text && i >= tail_start)
                     || msg
                         .as_object()
                         .is_some_and(|o| o.contains_key("cache_control"));
@@ -548,6 +594,16 @@ pub fn dedup_messages(messages: &mut [Value], frozen_message_count: usize) -> De
                     .and_then(Value::as_object_mut)
                 {
                     slot.insert("content".to_string(), new_text);
+                }
+            }
+            (Some(bidx), Some(USER_TEXT_SLOT)) => {
+                if let Some(slot) = messages[*mi]
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|c| c.get_mut(*bidx))
+                    .and_then(Value::as_object_mut)
+                {
+                    slot.insert("text".to_string(), new_text);
                 }
             }
             (Some(bidx), Some(sidx)) => {
@@ -1031,6 +1087,51 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("same as msg 0")
+        );
+    }
+
+    fn user_text_conversation(span: &str) -> Vec<Value> {
+        let user = |t: String| serde_json::json!({"role": "user", "content": [{"type": "text", "text": t}]});
+        let assistant = || serde_json::json!({"role": "assistant", "content": "ok"});
+        vec![
+            user(format!("report one\n{span}")),
+            assistant(),
+            user(format!("report two\n{span}")),
+            assistant(),
+            serde_json::json!({"role": "user", "content": format!("report three\n{span}")}),
+        ]
+    }
+
+    /// Off by default: user text is untouched unless a tail is given.
+    #[test]
+    fn user_text_is_left_alone_without_a_tail() {
+        let mut messages = user_text_conversation(&code("", 12));
+        let before = messages.clone();
+        assert_eq!(dedup_messages(&mut messages, 0).spans_folded, 0);
+        assert_eq!(messages, before);
+    }
+
+    /// An older repeat folds to a pointer at the first copy; the first copy and
+    /// the newest messages (the live request) stay verbatim, string or list shaped.
+    #[test]
+    fn user_text_repeat_folds_outside_the_tail_and_the_tail_stays_verbatim() {
+        let span = code("", 12);
+        let mut messages = user_text_conversation(&span);
+        let stats = dedup_messages_with_user_text(&mut messages, 0, 2);
+        assert_eq!(stats.spans_folded, 1);
+        let text = |i: usize| match &messages[i]["content"] {
+            Value::String(s) => s.clone(),
+            c => c[0]["text"].as_str().unwrap().to_string(),
+        };
+        assert!(text(0).contains(&span), "first copy kept");
+        assert!(text(2).contains("same as msg 0"), "{}", text(2));
+        assert!(text(4).contains(&span), "newest message verbatim");
+        // Prefix-monotonic: the same conversation one turn shorter gives the same bytes.
+        let mut shorter = user_text_conversation(&span)[..4].to_vec();
+        dedup_messages_with_user_text(&mut shorter, 0, 1);
+        assert_eq!(
+            shorter[2]["content"][0]["text"],
+            messages[2]["content"][0]["text"]
         );
     }
 

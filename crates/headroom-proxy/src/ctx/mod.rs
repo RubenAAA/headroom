@@ -22,6 +22,10 @@
 //!   every turn, invariant I4), with a synchronous sessions read fronted by an
 //!   in-memory LRU so steady-state turns stay off the DB.
 //!
+//! - [`refresh`] — Jev context refresh in observe mode: scores a long Spark
+//!   history in the background and logs what a refresh would stub; never
+//!   changes a request.
+//!
 //! With the exception of `inject`, everything here is a pure observer: no
 //! request/response byte is mutated and no latency is added to the request path.
 
@@ -35,3 +39,4 @@ pub mod inject;
 pub mod observer;
 pub mod offload_store;
 pub mod projects;
+pub mod refresh;

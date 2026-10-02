@@ -149,6 +149,12 @@ Options:
           
           [env: HEADROOM_PROXY_ENABLE_CROSS_TURN_DEDUP=]
 
+      --cross-turn-dedup-user-text-tail <CROSS_TURN_DEDUP_USER_TEXT_TAIL>
+          With `--enable-cross-turn-dedup`, also fold repeated spans in user-role text on the routed path (Spark, Codex), keeping the newest N messages verbatim. `0` (default) folds tool output only. Subagent reports, hook feedback and re-injected reminders repeat across turns like a re-read file: 9% of the user text in a 1M-token Spark session. A message that ages out of the N is rewritten on a later request, so the provider's cached prefix changes once; use it where the cache is free (Spark)
+          
+          [env: HEADROOM_PROXY_CROSS_TURN_DEDUP_USER_TEXT_TAIL=]
+          [default: 0]
+
       --context-edit
           Inject Anthropic-native context-editing (`context_management`) into `/v1/messages` so subscription users get the server-side context GC (`clear_tool_uses`) that Claude Code gates behind ant-only flags. Adds the `context-management-2025-06-27` beta header. Off by default
           
@@ -545,11 +551,33 @@ Options:
           [env: HEADROOM_PROXY_CTX_OFFLOAD_STALE_WINDOW=]
           [default: 0]
 
+      --ctx-refresh-observe-tokens <CTX_REFRESH_OBSERVE_TOKENS>
+          Jev context refresh, observe mode: past this many estimated tokens, a Spark turn starts a background run that asks Jev which earlier exchanges the current task no longer needs, and logs `ctx_refresh_observed` and one `ctx_refresh_exchange` per scored exchange. The request is never changed. `0` (the default) is off. See `docs/notes/ideas/jev-context-refresh.md`.
+          
+          The free Jev endpoint rate-limits, so a session is observed at most once per 30 minutes and at most 100 exchanges are scored.
+          
+          [env: HEADROOM_PROXY_CTX_REFRESH_OBSERVE_TOKENS=]
+          [default: 0]
+
+      --ctx-refresh-jev-url <CTX_REFRESH_JEV_URL>
+          Jev endpoint the refresh observer asks. The free model needs no key
+          
+          [env: HEADROOM_PROXY_CTX_REFRESH_JEV_URL=]
+          [default: https://opencode.ai/zen/v1/systemone]
+
       --ctx-offload-ttl-seconds <CTX_OFFLOAD_TTL_SECONDS>
           CTX-3: TTL (seconds) for offloaded originals in the CCR store. Long by design (retrieval outlives a session); default `604_800` (7 days)
           
           [env: HEADROOM_PROXY_CTX_OFFLOAD_TTL_SECONDS=]
           [default: 604800]
+
+      --ctx-offload-spark-min-bytes <CTX_OFFLOAD_SPARK_MIN_BYTES>
+          Spark-only offload: when above 0, a Spark model's history older than the newest 20 messages has tool results AND large `tool_use` input strings of at least this many bytes replaced with a retrievable digest, and may convert on any turn, not only at a rebuild boundary. Spark's input is free, so the rewritten prefix costs nothing; Claude and the other routed models keep `--ctx-offload-min-bytes` and the boundary gate. `0` (default) leaves Spark on the global settings. Needs `--ctx-offload`. Measured 2026-10-01 on a 1M-token Spark session: 16% of the old history at 400 to 1,000, nothing at the 20,000 default.
+          
+          Source priority: CLI flag -> `HEADROOM_PROXY_CTX_OFFLOAD_SPARK_MIN_BYTES` env var -> default (`0`).
+          
+          [env: HEADROOM_PROXY_CTX_OFFLOAD_SPARK_MIN_BYTES=]
+          [default: 0]
 
       --ctx-offload-tool-use <CTX_OFFLOAD_TOOL_USE>
           CTX-3: also offload large string values in prior-turn `tool_use` inputs (a Write's `content`, an Edit's `new_string`). Only effective with `--ctx-offload`. First conversions happen only where the block has never been sent upstream, so a cached prefix is never rewritten
@@ -681,6 +709,14 @@ Options:
           [env: HEADROOM_PROXY_ZEN_REASONING_REPLAY=]
           [default: false]
           [possible values: true, false]
+
+      --zen-reasoning-keep-recent <ZEN_REASONING_KEEP_RECENT>
+          With `--zen-reasoning-replay`, replay only the newest N encrypted reasoning blobs on a Zen turn; older ones are dropped and keep their visible summary. `0` (default) replays all of them. A blob counts toward the provider's window (measured 2026-10-01: about 7.5 to 10 envelope characters a token, 12 to 16% of a 1M-token Spark session) and only the model can read it. A blob that ages out changes the forwarded prefix once.
+          
+          Source priority: CLI flag -> `HEADROOM_PROXY_ZEN_REASONING_KEEP_RECENT` env var -> default (`0`).
+          
+          [env: HEADROOM_PROXY_ZEN_REASONING_KEEP_RECENT=]
+          [default: 0]
 
       --sidecar-route-timeout <SIDECAR_ROUTE_TIMEOUT>
           Bound on one spinner-sidecar attempt against a routed Responses upstream. The routed sidecar never retries: on timeout (or any other failure) it falls back to the direct sidecar path, so this is the longest a free-tier detour may hold a status line before Haiku answers it instead

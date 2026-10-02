@@ -515,6 +515,261 @@ async fn zen_hold_recovers_after_fast_budget_spent() {
     proxy.shutdown().await;
 }
 
+/// `--ctx-offload-spark-min-bytes`: on a Spark model, tool results older than
+/// the newest 20 messages go out as digests even though they are far below the
+/// global 20,000-byte floor, and the newest 20 messages stay whole. With the
+/// flag at 0 every result goes out whole.
+#[tokio::test]
+async fn spark_offload_stubs_old_tool_results_and_keeps_the_newest_twenty_messages() {
+    let result = |i: usize| format!("RESULT-{i} {}", "x".repeat(3000));
+    let forwarded = |min_bytes: usize| async move {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_offload", "object": "response", "created_at": 1, "model": "gpt-5",
+                "output": [{"type": "message", "id": "msg_1", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done", "annotations": []}]}],
+                "usage": {"input_tokens": 5, "output_tokens": 3},
+            })))
+            .mount(&upstream)
+            .await;
+        let upstream_url = Url::parse(&upstream.uri()).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let store_dir = store.path().join("ctx");
+        let proxy = start_proxy_with(&upstream.uri(), move |cfg| {
+            cfg.ctx_offload = true;
+            cfg.ctx_store_dir = Some(store_dir);
+            cfg.ctx_offload_spark_min_bytes = min_bytes;
+            cfg.model_routes = vec![ProviderRoute {
+                model_prefix: "claude-muse-spark".to_string(),
+                prefix_match: true,
+                upstream: Some(upstream_url.clone()),
+                translate: true,
+                cursor_agent: None,
+                target_model: Some("gpt-5".to_string()),
+                auth_env: None,
+            }];
+        })
+        .await;
+        let mut messages = vec![json!({"role": "user", "content": "start"})];
+        for i in 0..15 {
+            messages.push(json!({"role": "assistant", "content": [
+                    {"type": "tool_use", "id": format!("toolu_{i}"), "name": "Read",
+                     "input": {"file_path": "/a.rs", "prompt": format!("PROMPT-{i} {}", "p".repeat(3000))}}]}));
+            messages.push(json!({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": format!("toolu_{i}"),
+                     "content": result(i)}]}));
+        }
+        let resp = common::shared_client()
+            .post(format!("http://{}/v1/messages", proxy.addr))
+            .header("x-api-key", "test")
+            .header("anthropic-version", "2023-06-01")
+            .json(
+                &json!({"model": "claude-muse-spark-1.3", "max_tokens": 64, "messages": messages}),
+            )
+            .send()
+            .await
+            .expect("proxy responds");
+        assert_eq!(resp.status(), 200);
+        let reqs = upstream.received_requests().await.unwrap();
+        String::from_utf8(reqs[0].body.clone()).unwrap()
+    };
+    let whole = |body: &str| body.matches(&"x".repeat(3000)).count();
+    let prompts = |body: &str| body.matches(&"p".repeat(3000)).count();
+    let off = forwarded(0).await;
+    assert_eq!(
+        (whole(&off), prompts(&off)),
+        (15, 15),
+        "off: everything whole"
+    );
+    // 31 messages: the newest 20 (indices 11..30) hold 10 results and stay
+    // whole; the five results before them (indices 2, 4, 6, 8, 10) become digests.
+    let on = forwarded(400).await;
+    assert_eq!(whole(&on), 10, "on: five old results offloaded");
+    // Assistant messages 1, 3, ..., 9 are older than the newest 20 (11..30).
+    assert_eq!(prompts(&on), 10, "on: five old tool_use inputs offloaded");
+    assert!(on.contains("RESULT-0 ") && on.contains("RESULT-14 "));
+}
+
+/// `--cross-turn-dedup-user-text-tail`: a report pasted into three user turns
+/// reaches a routed model once in full plus a pointer, and the newest message
+/// stays verbatim. With the flag off, all three copies go through.
+#[tokio::test]
+async fn user_text_dedup_folds_old_repeats_on_a_routed_model_and_keeps_the_tail() {
+    let span: String = (0..12)
+        .map(|i| {
+            format!(
+                "    result_{i} = compute_overdraft(business_id={i}, amount={})",
+                i * 100
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let forwarded = |tail: usize| {
+        let span = span.clone();
+        async move {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "resp_dedup", "object": "response", "created_at": 1, "model": "gpt-5",
+                    "output": [{"type": "message", "id": "msg_1", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done", "annotations": []}]}],
+                    "usage": {"input_tokens": 5, "output_tokens": 3},
+                })))
+                .mount(&upstream)
+                .await;
+            let upstream_url = Url::parse(&upstream.uri()).unwrap();
+            let proxy = start_proxy_with(&upstream.uri(), |cfg| {
+                cfg.compression = true;
+                cfg.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
+                cfg.enable_cross_turn_dedup = true;
+                cfg.cross_turn_dedup_user_text_tail = tail;
+                cfg.model_routes = vec![ProviderRoute {
+                    model_prefix: "claude-muse-spark".to_string(),
+                    prefix_match: true,
+                    upstream: Some(upstream_url.clone()),
+                    translate: true,
+                    cursor_agent: None,
+                    target_model: Some("gpt-5".to_string()),
+                    auth_env: None,
+                }];
+            })
+            .await;
+            let mut messages = Vec::new();
+            for n in 1..=3 {
+                messages.push(json!({"role": "user", "content": [
+                    {"type": "text", "text": format!("report {n}\n{span}")}]}));
+                if n < 3 {
+                    messages.push(json!({"role": "assistant", "content": "noted"}));
+                }
+            }
+            let resp = common::shared_client()
+                .post(format!("http://{}/v1/messages", proxy.addr))
+                .header("x-api-key", "test")
+                .header("anthropic-version", "2023-06-01")
+                .json(&json!({"model": "claude-muse-spark-1.3", "max_tokens": 64, "messages": messages}))
+                .send()
+                .await
+                .expect("proxy responds");
+            assert_eq!(resp.status(), 200);
+            let reqs = upstream.received_requests().await.unwrap();
+            String::from_utf8(reqs[0].body.clone()).unwrap()
+        }
+    };
+    let off = forwarded(0).await;
+    assert_eq!(
+        off.matches("result_0 = compute_overdraft").count(),
+        3,
+        "off: all copies"
+    );
+    assert!(!off.contains("same as msg"));
+
+    let on = forwarded(1).await;
+    assert!(
+        on.contains("same as msg 0"),
+        "the middle copy points at the first"
+    );
+    assert_eq!(
+        on.matches("result_0 = compute_overdraft").count(),
+        3 - 1,
+        "the first copy and the newest message stay whole; the pointer quotes only its anchor"
+    );
+}
+
+/// Jev refresh, observe mode, end to end on the routed path: a Spark-named
+/// model past the trigger makes the proxy ask Jev about its earlier exchanges
+/// in the background, and the body that reaches the upstream is untouched.
+#[tokio::test]
+async fn refresh_observe_asks_jev_about_a_long_spark_history_and_changes_nothing() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_refresh",
+            "object": "response",
+            "created_at": 1,
+            "model": "gpt-5",
+            "output": [{"type": "message", "id": "msg_1", "role": "assistant",
+                "content": [{"type": "output_text", "text": "done", "annotations": []}]}],
+            "usage": {"input_tokens": 5, "output_tokens": 3},
+        })))
+        .mount(&upstream)
+        .await;
+    let jev = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"q": {"type": "noul", "noul": 0.2}})),
+        )
+        .mount(&jev)
+        .await;
+
+    let upstream_url = Url::parse(&upstream.uri()).unwrap();
+    let jev_url = jev.uri();
+    let proxy = start_proxy_with(&upstream.uri(), |cfg| {
+        cfg.ctx_refresh_observe_tokens = 1;
+        cfg.ctx_refresh_jev_url = jev_url.clone();
+        cfg.model_routes = vec![ProviderRoute {
+            model_prefix: "claude-muse-spark".to_string(),
+            prefix_match: true,
+            upstream: Some(upstream_url.clone()),
+            translate: true,
+            cursor_agent: None,
+            target_model: Some("gpt-5".to_string()),
+            auth_env: None,
+        }];
+    })
+    .await;
+
+    let mut messages = Vec::new();
+    for i in 0..10 {
+        messages.push(json!({"role": "user", "content": format!("refresh-e2e request number {i} about the parser")}));
+        messages.push(json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": format!("toolu_{i}"), "name": "Read", "input": {"file_path": "/a.rs"}}]}));
+        messages.push(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": format!("toolu_{i}"), "content": "ok"}]}));
+    }
+    let resp = common::shared_client()
+        .post(format!("http://{}/v1/messages", proxy.addr))
+        .header("x-api-key", "test")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({"model": "claude-muse-spark-1.3", "max_tokens": 64, "messages": messages}))
+        .send()
+        .await
+        .expect("proxy responds");
+    assert_eq!(resp.status(), 200);
+
+    // The run is a background task: wait for its four calls (exchanges 1 to
+    // 4; the opening, the newest five and the task's own are not asked about).
+    let mut asked = 0;
+    for _ in 0..100 {
+        asked = jev.received_requests().await.unwrap().len();
+        if asked >= 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(asked, 4, "Jev is asked about the four scorable exchanges");
+    let first: serde_json::Value =
+        serde_json::from_slice(&jev.received_requests().await.unwrap()[0].body).unwrap();
+    assert!(
+        first["state"]
+            .as_str()
+            .unwrap()
+            .contains("Current task:\nrefresh-e2e request number 9"),
+        "the last typed request is the task"
+    );
+
+    // Observe mode: all ten typed requests still reach the upstream.
+    let forwarded =
+        String::from_utf8_lossy(&upstream.received_requests().await.unwrap()[0].body).into_owned();
+    for i in 0..10 {
+        assert!(forwarded.contains(&format!("refresh-e2e request number {i} about")));
+    }
+    proxy.shutdown().await;
+}
+
 #[tokio::test]
 async fn an_explicit_routed_error_restores_placeholders_for_the_client() {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/testuser".to_string());

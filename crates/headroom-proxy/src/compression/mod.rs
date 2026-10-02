@@ -49,7 +49,7 @@ pub mod prior_thinking;
 // itself stays through B1 → B2 transition for parallel review;
 // `compress_anthropic_request` is sourced from the live-zone module.
 pub use anthropic::resolve_frozen_count;
-pub use cross_turn::apply_cross_turn_dedup;
+pub use cross_turn::{apply_cross_turn_dedup, apply_cross_turn_dedup_with_user_text};
 pub use live_zone_anthropic::{
     Outcome, PassthroughReason, PerStrategyTokens, compress_anthropic_request,
 };

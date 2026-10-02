@@ -189,6 +189,16 @@ HEADROOM_FLAGS=(
   # 18000 to 22000. See docs/notes/learnings/offload-loses-at-2000-bytes.md.
   --ctx-offload-min-bytes 20000
 
+  # Spark only, OFF until measured live: replace tool results and large tool_use
+  # inputs of at least this many bytes in Spark history older than the newest
+  # 20 messages with retrievable digests, on any turn. Spark's input is free, so
+  # the rewrite costs nothing; what it can cost is a hidden headroom_retrieve
+  # round trip (2.2 s median on Zen) and re-reads, which made 2,000 bytes a loss
+  # on Claude (docs/notes/learnings/offload-loses-at-2000-bytes.md). Offline on
+  # the 1M-token session: 16% of the old history at 400 to 1,000 bytes. Try 1000,
+  # then watch `ctx_offload_spark` and the retrieval rate. 0 = off.
+  --ctx-offload-spark-min-bytes 1000
+
   # ON 2026-08-17. --exclude-tools keeps Read/Grep/Glob results verbatim so the
   # model never edits a file from a summary of it. That argument is about the
   # results in play, and it was being applied to the entire history: raw Read
@@ -282,6 +292,13 @@ HEADROOM_FLAGS=(
   # sum, so do not add a third message slot without dropping something else.
 
   --enable-cross-turn-dedup
+
+  # Also fold repeated spans in user-role text (subagent reports, hook feedback)
+  # on the routed path, keeping the newest 8 messages verbatim. -9% of user text
+  # on the 1M-token Spark session (docs/notes/ideas/jev-context-refresh.md).
+  # A message aging out of the 8 is rewritten once, so the provider's cached
+  # prefix changes; Spark's is free. 0 turns it off.
+  --cross-turn-dedup-user-text-tail 8
 
   # TRIED AND REVERTED, 2026-08-17. Splitting the TTL — 1h on the tools and
   # system prefix, the 5-minute tier on the message tail, the long TTL taken
@@ -592,6 +609,20 @@ HEADROOM_FLAGS=(
   # `zen_reasoning_blobs_dropped` (each one is a wasted request) and revert if
   # Spark turns get slower with no better answers.
   --zen-reasoning-replay true
+
+  # Replay only the newest 10 blobs. Each is about 600 tokens of Spark's window
+  # (measured 2026-10-01); the 1M-token session carried 215, about 13% of it.
+  # An older blob drops out of the request as it ages, keeping its summary.
+  --zen-reasoning-keep-recent 10
+
+  # Jev context refresh, observe mode (see docs/notes/ideas/jev-context-refresh.md).
+  # Past this many estimated tokens a Spark turn starts a background run that
+  # asks Jev which earlier exchanges the current task no longer needs, and logs
+  # `ctx_refresh_exchange` per exchange and `ctx_refresh_observed` per run. It
+  # changes no request. Once per session per 30 minutes, at most 100 exchanges,
+  # because the free Jev endpoint rate-limits. Added 2026-10-01; read the log
+  # before building the apply half. 0 turns it off.
+  --ctx-refresh-observe-tokens 400000
 
   # ─── Defaults, written out ──────────────────────────────────────────
   #

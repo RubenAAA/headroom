@@ -870,6 +870,7 @@ impl AppState {
         );
 
         crate::routed::reasoning_blobs::set_enabled(config.zen_reasoning_replay);
+        crate::routed::reasoning_blobs::set_keep_recent(config.zen_reasoning_keep_recent);
 
         Ok(Self {
             config: Arc::new(config),

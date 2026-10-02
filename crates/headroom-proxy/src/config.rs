@@ -435,6 +435,20 @@ pub struct CliArgs {
     )]
     pub enable_cross_turn_dedup: bool,
 
+    /// With `--enable-cross-turn-dedup`, also fold repeated spans in user-role
+    /// text on the routed path (Spark, Codex), keeping the newest N messages
+    /// verbatim. `0` (default) folds tool output only. Subagent reports, hook
+    /// feedback and re-injected reminders repeat across turns like a re-read
+    /// file: 9% of the user text in a 1M-token Spark session. A message that
+    /// ages out of the N is rewritten on a later request, so the provider's
+    /// cached prefix changes once; use it where the cache is free (Spark).
+    #[arg(
+        long = "cross-turn-dedup-user-text-tail",
+        env = "HEADROOM_PROXY_CROSS_TURN_DEDUP_USER_TEXT_TAIL",
+        default_value_t = 0
+    )]
+    pub cross_turn_dedup_user_text_tail: usize,
+
     /// Inject Anthropic-native context-editing (`context_management`) into
     /// `/v1/messages` so subscription users get the server-side context GC
     /// (`clear_tool_uses`) that Claude Code gates behind ant-only flags.
@@ -1156,6 +1170,30 @@ pub struct CliArgs {
     )]
     pub ctx_offload_stale_window: usize,
 
+    /// Jev context refresh, observe mode: past this many estimated tokens, a
+    /// Spark turn starts a background run that asks Jev which earlier
+    /// exchanges the current task no longer needs, and logs
+    /// `ctx_refresh_observed` and one `ctx_refresh_exchange` per scored
+    /// exchange. The request is never changed. `0` (the default) is off.
+    /// See `docs/notes/ideas/jev-context-refresh.md`.
+    ///
+    /// The free Jev endpoint rate-limits, so a session is observed at most
+    /// once per 30 minutes and at most 100 exchanges are scored.
+    #[arg(
+        long = "ctx-refresh-observe-tokens",
+        env = "HEADROOM_PROXY_CTX_REFRESH_OBSERVE_TOKENS",
+        default_value_t = 0
+    )]
+    pub ctx_refresh_observe_tokens: usize,
+
+    /// Jev endpoint the refresh observer asks. The free model needs no key.
+    #[arg(
+        long = "ctx-refresh-jev-url",
+        env = "HEADROOM_PROXY_CTX_REFRESH_JEV_URL",
+        default_value = "https://opencode.ai/zen/v1/systemone"
+    )]
+    pub ctx_refresh_jev_url: String,
+
     /// CTX-3: TTL (seconds) for offloaded originals in the CCR store. Long by
     /// design (retrieval outlives a session); default `604_800` (7 days).
     #[arg(
@@ -1164,6 +1202,25 @@ pub struct CliArgs {
         default_value_t = 604_800
     )]
     pub ctx_offload_ttl_seconds: u64,
+
+    /// Spark-only offload: when above 0, a Spark model's history older than the
+    /// newest 20 messages has tool results AND large `tool_use` input strings of
+    /// at least this many bytes replaced with a retrievable digest, and may
+    /// convert on any turn, not only at a rebuild boundary. Spark's input is
+    /// free, so the rewritten prefix costs nothing; Claude and the other routed
+    /// models keep `--ctx-offload-min-bytes` and the boundary gate. `0`
+    /// (default) leaves Spark on the global settings. Needs `--ctx-offload`.
+    /// Measured 2026-10-01 on a 1M-token Spark session: 16% of the old history
+    /// at 400 to 1,000, nothing at the 20,000 default.
+    ///
+    /// Source priority: CLI flag -> `HEADROOM_PROXY_CTX_OFFLOAD_SPARK_MIN_BYTES`
+    /// env var -> default (`0`).
+    #[arg(
+        long = "ctx-offload-spark-min-bytes",
+        env = "HEADROOM_PROXY_CTX_OFFLOAD_SPARK_MIN_BYTES",
+        default_value_t = 0
+    )]
+    pub ctx_offload_spark_min_bytes: usize,
 
     /// CTX-3: also offload large string values in prior-turn `tool_use` inputs
     /// (a Write's `content`, an Edit's `new_string`). Only effective with
@@ -1396,6 +1453,22 @@ pub struct CliArgs {
         action = clap::ArgAction::Set,
     )]
     pub zen_reasoning_replay: bool,
+
+    /// With `--zen-reasoning-replay`, replay only the newest N encrypted
+    /// reasoning blobs on a Zen turn; older ones are dropped and keep their
+    /// visible summary. `0` (default) replays all of them. A blob counts toward
+    /// the provider's window (measured 2026-10-01: about 7.5 to 10 envelope
+    /// characters a token, 12 to 16% of a 1M-token Spark session) and only the
+    /// model can read it. A blob that ages out changes the forwarded prefix once.
+    ///
+    /// Source priority: CLI flag -> `HEADROOM_PROXY_ZEN_REASONING_KEEP_RECENT`
+    /// env var -> default (`0`).
+    #[arg(
+        long = "zen-reasoning-keep-recent",
+        env = "HEADROOM_PROXY_ZEN_REASONING_KEEP_RECENT",
+        default_value_t = 0
+    )]
+    pub zen_reasoning_keep_recent: usize,
 
     /// Bound on one spinner-sidecar attempt against a routed Responses
     /// upstream. The routed sidecar never retries: on timeout (or any other
@@ -2441,6 +2514,8 @@ pub struct Config {
     /// compression pipeline itself runs (`compression_mode` is not
     /// `Off`).
     pub enable_cross_turn_dedup: bool,
+    /// Newest messages whose user text the routed path never folds; `0` = off.
+    pub cross_turn_dedup_user_text_tail: usize,
     /// Inject Anthropic context-editing directives into `/v1/messages`.
     pub context_edit: bool,
     /// `clear_tool_uses`: keep this many most-recent tool results.
@@ -2554,12 +2629,18 @@ pub struct Config {
     pub ctx_offload_min_bytes: usize,
     /// CTX-3: offload on the OpenCode Zen route too.
     pub ctx_offload_zen: bool,
+    /// Spark-only offload threshold in bytes; `0` = the global settings.
+    pub ctx_offload_spark_min_bytes: usize,
     /// CTX-3: messages back from the tail before `exclude_tools` stops
     /// shielding a block from offload; `0` shields all of it.
     pub ctx_offload_stale_messages: usize,
     /// CTX-3: messages past that margin where a first conversion may skip the
     /// rebuild-boundary wait; `0` always waits.
     pub ctx_offload_stale_window: usize,
+    /// Jev refresh observe mode trigger, in estimated tokens; `0` is off.
+    pub ctx_refresh_observe_tokens: usize,
+    /// Jev endpoint the refresh observer asks.
+    pub ctx_refresh_jev_url: String,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
     pub ctx_offload_ttl_seconds: u64,
     /// CTX-3: offload large `tool_use` input strings too. Needs `ctx_offload`.
@@ -2619,6 +2700,8 @@ pub struct Config {
     pub sidecar_local_answer: Option<String>,
     /// Keep Zen's encrypted reasoning in the replayed input. Default `false`.
     pub zen_reasoning_replay: bool,
+    /// Newest Zen reasoning blobs replayed; `0` = all.
+    pub zen_reasoning_keep_recent: usize,
     /// Bound on one spinner-sidecar attempt against a routed Responses
     /// upstream before it falls back to the direct sidecar path.
     pub sidecar_route_timeout: Duration,
@@ -2829,6 +2912,7 @@ impl Config {
             compression_max_body_bytes,
             compression_mode,
             enable_cross_turn_dedup: args.enable_cross_turn_dedup,
+            cross_turn_dedup_user_text_tail: args.cross_turn_dedup_user_text_tail,
             context_edit: args.context_edit,
             context_edit_keep_tool_uses: args.context_edit_keep_tool_uses,
             context_edit_trigger_tokens: args.context_edit_trigger_tokens,
@@ -2887,8 +2971,11 @@ impl Config {
             replay_store_dir: args.replay_store_dir.clone(),
             ctx_offload_min_bytes: args.ctx_offload_min_bytes,
             ctx_offload_zen: args.ctx_offload_zen,
+            ctx_offload_spark_min_bytes: args.ctx_offload_spark_min_bytes,
             ctx_offload_stale_messages: args.ctx_offload_stale_messages,
             ctx_offload_stale_window: args.ctx_offload_stale_window,
+            ctx_refresh_observe_tokens: args.ctx_refresh_observe_tokens,
+            ctx_refresh_jev_url: args.ctx_refresh_jev_url,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_offload_tool_use: args.ctx_offload_tool_use,
             ctx_offload_cross_session_seed: args.ctx_offload_cross_session_seed,
@@ -2923,6 +3010,7 @@ impl Config {
             sidecar_model: args.sidecar_model,
             sidecar_local_answer: args.sidecar_local_answer,
             zen_reasoning_replay: args.zen_reasoning_replay,
+            zen_reasoning_keep_recent: args.zen_reasoning_keep_recent,
             sidecar_route_timeout: args.sidecar_route_timeout,
             local_upstream: args.local_upstream,
             model_routes: args
@@ -3107,6 +3195,7 @@ impl Config {
             // Production default: cross-turn dedup off (Python parity).
             // Tests opt in per-case.
             enable_cross_turn_dedup: false,
+            cross_turn_dedup_user_text_tail: 0,
             context_edit: false,
             context_edit_keep_tool_uses: 6,
             context_edit_trigger_tokens: 60_000,
@@ -3175,8 +3264,11 @@ impl Config {
             replay_store_dir: String::new(),
             ctx_offload_min_bytes: 50_000,
             ctx_offload_zen: false,
+            ctx_offload_spark_min_bytes: 0,
             ctx_offload_stale_messages: 0,
             ctx_offload_stale_window: 0,
+            ctx_refresh_observe_tokens: 0,
+            ctx_refresh_jev_url: "http://127.0.0.1:1/".to_string(),
             ctx_offload_ttl_seconds: 604_800,
             ctx_offload_tool_use: false,
             ctx_offload_cross_session_seed: false,
@@ -3200,6 +3292,7 @@ impl Config {
             sidecar_model: None,
             sidecar_local_answer: None,
             zen_reasoning_replay: false,
+            zen_reasoning_keep_recent: 0,
             sidecar_route_timeout: Duration::from_secs(15),
             local_upstream: None,
             model_routes: Vec::new(),

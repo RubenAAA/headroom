@@ -355,16 +355,60 @@ fn offload_tool_results(
     report: &mut CtxTransformReport,
 ) {
     if let Some(runtime) = state.ctx_offload.as_ref() {
+        // Spark: lower threshold, tool_use inputs too, any turn, and never the
+        // newest messages (see `--ctx-offload-spark-min-bytes`).
+        let spark_min = spark_offload_min_bytes(state, parsed);
+        let mut config = runtime.config.clone();
+        let mut tail = Vec::new();
+        if let Some(min) = spark_min {
+            config.min_bytes = min;
+            tail = split_off_tail(parsed, SPARK_OFFLOAD_TAIL);
+        }
         let policy = crate::compression::ctx_offload::OffloadPolicy {
             gate: &runtime.gate,
             session_key,
-            rebuild_boundary,
+            rebuild_boundary: rebuild_boundary || spark_min.is_some(),
         };
-        let out = crate::compression::ctx_offload::offload_anthropic_request(
+        let mut out = crate::compression::ctx_offload::offload_anthropic_request(
             parsed,
-            &runtime.config,
+            &config,
             Some(&policy),
         );
+        if spark_min.is_some() {
+            let ccr = runtime.store.ccr();
+            let put = |record: &crate::compression::ctx_offload::OffloadRecord| {
+                ccr.put(&record.hash, &record.original)
+            };
+            let tool_use = crate::compression::ctx_offload::offload_tool_use_inputs(
+                parsed, &config, &policy, None, &put,
+            );
+            // First 8 characters of every digest on this turn, so a later
+            // `ccr_content_not_found` can be checked against what the session
+            // was actually handed.
+            let hashes = out
+                .records
+                .iter()
+                .chain(tool_use.records.iter())
+                .map(|r| r.hash.get(..8).unwrap_or(&r.hash))
+                .collect::<Vec<_>>()
+                .join(",");
+            tracing::info!(
+                event = "ctx_offload_spark",
+                request_id = %request_id,
+                min_bytes = config.min_bytes,
+                tool_results = out.blocks_offloaded,
+                tool_use_inputs = tool_use.blocks_offloaded,
+                tokens_saved = out.tokens_saved + tool_use.tokens_saved,
+                hashes = %hashes,
+                "offloaded old Spark history"
+            );
+            out.blocks_offloaded += tool_use.blocks_offloaded;
+            out.tokens_saved += tool_use.tokens_saved;
+            out.records.extend(tool_use.records);
+            if let Some(messages) = parsed.get_mut("messages").and_then(Value::as_array_mut) {
+                messages.extend(tail);
+            }
+        }
         if out.changed() {
             let index_queued = runtime.store.persist(&out.records, ctx_project);
             report.transforms_applied.push("ctx_offload".to_string());
@@ -387,6 +431,29 @@ fn offload_tool_results(
                 request_id,
             );
         }
+    }
+}
+
+/// Messages at the end of a Spark request the Spark offload never touches.
+const SPARK_OFFLOAD_TAIL: usize = 20;
+
+/// The Spark offload threshold when it applies to this request: the flag is
+/// set and the model is a Spark one.
+pub(crate) fn spark_offload_min_bytes(state: &AppState, parsed: &Value) -> Option<usize> {
+    let min = state.config.ctx_offload_spark_min_bytes;
+    let is_spark = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.contains("spark"));
+    (min > 0 && is_spark).then_some(min)
+}
+
+/// Detach the newest `n` messages so a pass over the rest cannot reach them. A
+/// history no longer than `n` is detached whole.
+fn split_off_tail(parsed: &mut Value, n: usize) -> Vec<Value> {
+    match parsed.get_mut("messages").and_then(Value::as_array_mut) {
+        Some(messages) => messages.split_off(messages.len().saturating_sub(n)),
+        None => Vec::new(),
     }
 }
 
@@ -663,6 +730,10 @@ pub(crate) async fn apply_ctx_request_transforms(
         );
     }
 
+    // Jev refresh, observe mode: logs what a refresh would stub on a long
+    // Spark history. Reads the body, never changes it.
+    crate::ctx::refresh::observe(state, parsed, &session_key, request_id);
+
     // Tool-definition + recall stages on the still-Anthropic-shaped body.
     inject_turn_tools(state, parsed, &mut report);
 
@@ -813,12 +884,13 @@ fn maybe_compress_routed_body(
         // marker points at a recovery route the model can actually take.
         routed_ccr_store.as_deref(),
     );
-    let outcome = crate::compression::apply_cross_turn_dedup(
+    let outcome = crate::compression::apply_cross_turn_dedup_with_user_text(
         outcome,
         &body,
         &state.config,
         "/v1/messages",
         request_id,
+        state.config.cross_turn_dedup_user_text_tail,
     );
     match outcome {
         crate::compression::Outcome::Compressed {

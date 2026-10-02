@@ -22,7 +22,7 @@ use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// What Zen says when a blob is not the caller's own.
@@ -40,6 +40,13 @@ pub(crate) fn set_enabled(on: bool) {
 
 pub(crate) fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// `--zen-reasoning-keep-recent`: replay only the newest N blobs. `0` keeps all.
+static KEEP_RECENT: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn set_keep_recent(n: usize) {
+    KEEP_RECENT.store(n, Ordering::Relaxed);
 }
 
 fn refused() -> &'static Mutex<lru::LruCache<u64, ()>> {
@@ -89,6 +96,23 @@ pub(crate) fn drop_refused(body: &mut Value) -> usize {
         }
     }
     dropped
+}
+
+/// Drops all but the newest `--zen-reasoning-keep-recent` blobs; returns how
+/// many. A blob is about 600 tokens of the provider's window and only the model
+/// can read it, so old ones cost room and give back little. The item keeps its
+/// summary, as in [`drop_refused`].
+pub(crate) fn drop_old(body: &mut Value) -> usize {
+    let keep = KEEP_RECENT.load(Ordering::Relaxed);
+    if keep == 0 {
+        return 0;
+    }
+    let mut items: Vec<_> = blob_items(body).collect();
+    let old = items.len().saturating_sub(keep);
+    for item in items.iter_mut().take(old) {
+        drop_blob(item);
+    }
+    old
 }
 
 /// Is this a 400 body that says the blob was not the caller's?
@@ -163,6 +187,24 @@ mod tests {
         let mut next = body_with(&["old-blob-a", "old-blob-b", "new-blob-c"]);
         assert_eq!(drop_refused(&mut next), 2);
         assert_eq!(blobs_left(&next), vec!["new-blob-c".to_string()]);
+    }
+
+    /// Only the newest N blobs are replayed; the older items keep their summary.
+    /// The setting is process-wide, so this test owns it and restores 0.
+    #[test]
+    fn old_blobs_are_dropped_and_the_newest_n_replayed() {
+        set_keep_recent(2);
+        let mut body = body_with(&["keep-a", "keep-b", "keep-c", "keep-d"]);
+        assert_eq!(drop_old(&mut body), 2);
+        assert_eq!(
+            blobs_left(&body),
+            vec!["keep-c".to_string(), "keep-d".to_string()]
+        );
+        assert!(body["input"][1].get("id").is_none() && body["input"][1]["summary"].is_array());
+        assert_eq!(drop_old(&mut body), 0, "already within the limit");
+        set_keep_recent(0);
+        let mut all = body_with(&["keep-a", "keep-b", "keep-c"]);
+        assert_eq!(drop_old(&mut all), 0, "0 keeps every blob");
     }
 
     #[test]

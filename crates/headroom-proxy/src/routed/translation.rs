@@ -185,6 +185,7 @@ fn translate_shaped_body(
                 && crate::routed::reasoning_blobs::enabled()
             {
                 crate::routed::reasoning_blobs::drop_refused(&mut v);
+                crate::routed::reasoning_blobs::drop_old(&mut v);
             } else {
                 kind.strip_unreplayable_reasoning(&mut v);
             }

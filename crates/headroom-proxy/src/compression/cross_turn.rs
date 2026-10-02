@@ -27,7 +27,7 @@
 //! [`Outcome`] unchanged.
 
 use bytes::Bytes;
-use headroom_core::transforms::cross_turn_dedup::dedup_messages;
+use headroom_core::transforms::cross_turn_dedup::dedup_messages_with_user_text;
 use serde_json::Value;
 
 use crate::compression::{Outcome, resolve_frozen_count};
@@ -58,6 +58,21 @@ pub fn apply_cross_turn_dedup(
     path: &'static str,
     request_id: &str,
 ) -> Outcome {
+    apply_cross_turn_dedup_with_user_text(outcome, original_body, config, path, request_id, 0)
+}
+
+/// [`apply_cross_turn_dedup`] that also folds repeated spans in user-role text,
+/// keeping the newest `user_text_tail` messages verbatim (`0` = tool output
+/// only). For paths that do not pay for a rewritten prefix: a message that ages
+/// out of the tail is rewritten on a later request.
+pub fn apply_cross_turn_dedup_with_user_text(
+    outcome: Outcome,
+    original_body: &Bytes,
+    config: &Config,
+    path: &'static str,
+    request_id: &str,
+    user_text_tail: usize,
+) -> Outcome {
     if !config.enable_cross_turn_dedup || matches!(config.compression_mode, CompressionMode::Off) {
         return outcome;
     }
@@ -84,7 +99,7 @@ pub fn apply_cross_turn_dedup(
         return outcome;
     };
 
-    let stats = dedup_messages(messages, frozen_count);
+    let stats = dedup_messages_with_user_text(messages, frozen_count, user_text_tail);
     if stats.spans_folded == 0 {
         return outcome;
     }
@@ -115,6 +130,7 @@ pub fn apply_cross_turn_dedup(
         chars_removed = stats.chars_removed,
         blocks_scanned = stats.blocks,
         frozen_message_count = frozen_count,
+        user_text_tail = user_text_tail,
         body_bytes_out = new_body.len(),
         "cross-turn dedup folded verbatim re-read span(s) into in-context pointer(s)"
     );
