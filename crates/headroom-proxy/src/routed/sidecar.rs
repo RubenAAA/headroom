@@ -198,7 +198,8 @@ pub(crate) async fn try_routed_sidecar(
 
     if downstream_stream {
         let body =
-            routed_sidecar_stream_body(upstream_resp, sidecar_model, redact_table, request_id);
+            routed_sidecar_stream_body(upstream_resp, sidecar_model, redact_table, request_id)
+                .await?;
         crate::sidecar::record_sidecar(request_id, &shape);
         return Some(streaming_body_response(body));
     }
@@ -345,14 +346,22 @@ fn routed_sidecar_shape(
     }
 }
 
-/// Translate the upstream stream back to Anthropic shape and restore the
-/// redacted spans on the way to the spinner.
-fn routed_sidecar_stream_body(
+/// Translate the upstream stream back to Anthropic shape, restore the redacted
+/// spans, and hold it until it is whole.
+///
+/// Held, not relayed: the request's timeout also bounds the body, so a slow
+/// stream used to die after the first bytes had gone out, past the point a
+/// fallback could still answer. The finisher then closed it with its
+/// truncation marker, and the marker became the agent's line in the status
+/// bar (35 of 506 spinner calls on 2026-10-02). `None` when the stream
+/// broke, never finished, or carried no text, so the caller falls back.
+async fn routed_sidecar_stream_body(
     upstream_resp: reqwest::Response,
     sidecar_model: String,
     redact_table: Option<crate::redact::RestoreTable>,
     request_id: &str,
-) -> Body {
+) -> Option<Body> {
+    use futures_util::StreamExt;
     let stream = upstream_resp.bytes_stream();
     // A fresh quota store, not the shared one: Zen's rate-limit headers
     // must never pollute Codex quota tracking.
@@ -368,17 +377,57 @@ fn routed_sidecar_stream_body(
         // A sidecar carries no tools, so there is nothing to rename.
         None,
     );
-    // Same close-on-drop as the main routed path: a mid-response death
-    // ends `end_turn` with a marker instead of a reset socket.
-    let finished = crate::sse::stream_finisher::finish_on_drop(translated, request_id.to_string());
     // Restore before the client: Zen echoed placeholders back for the
     // paths and secrets it saw, and the 4 words go to the spinner.
-    match redact_table {
-        Some(table) => axum::body::Body::from_stream(crate::proxy::track_streaming(
-            crate::redact::restore_stream(finished, table),
-        )),
-        None => axum::body::Body::from_stream(crate::proxy::track_streaming(finished)),
+    let mut chunks = match redact_table {
+        Some(table) => crate::redact::restore_stream(translated, table).boxed(),
+        None => translated.boxed(),
+    };
+    let mut sse = Vec::new();
+    let mut broken = false;
+    while let Some(chunk) = chunks.next().await {
+        match chunk {
+            Ok(bytes) => sse.extend_from_slice(&bytes),
+            Err(_) => {
+                broken = true;
+                break;
+            }
+        }
     }
+    if broken || !sidecar_stream_complete(&sse) {
+        tracing::warn!(
+            event = "sidecar_routed_fallback",
+            request_id = %request_id,
+            reason = "incomplete_stream",
+            "routed sidecar stream ended early or empty; falling back to the direct path"
+        );
+        return None;
+    }
+    Some(Body::from(sse))
+}
+
+/// True when an Anthropic SSE body reached `message_stop` with some text.
+fn sidecar_stream_complete(sse: &[u8]) -> bool {
+    let (mut stopped, mut text) = (false, false);
+    for line in String::from_utf8_lossy(sse).lines() {
+        let Some(event) = line
+            .strip_prefix("data:")
+            .and_then(|d| serde_json::from_str::<Value>(d.trim()).ok())
+        else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_stop") => stopped = true,
+            Some("content_block_delta") => {
+                text |= event
+                    .pointer("/delta/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.trim().is_empty());
+            }
+            _ => {}
+        }
+    }
+    stopped && text
 }
 
 /// Serialise the sidecar's turn, restoring redacted spans before the client

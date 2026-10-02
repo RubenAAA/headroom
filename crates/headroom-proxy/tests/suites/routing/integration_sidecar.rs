@@ -1069,6 +1069,60 @@ async fn a_failed_chat_route_falls_back_to_the_fixed_line_not_haiku() {
     proxy.shutdown().await;
 }
 
+/// A chat route that starts its reply and then stalls past the timeout must
+/// fall back to the fixed line. Relayed as it came, the cut stream used to
+/// reach the status bar as the finisher's `[truncated: ...]` marker.
+#[tokio::test]
+async fn a_chat_route_that_stalls_mid_reply_falls_back_to_the_fixed_line() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let default = MockServer::start().await;
+    let default_captured = mount_capture(&default).await;
+
+    // wiremock sends a body whole, so a raw listener plays the stalling Zen:
+    // headers and the first text chunk, then silence.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = vec![0u8; 65536];
+        let _ = socket.read(&mut buf).await;
+        let first = "data: {\"choices\":[{\"delta\":{\"content\":\"Reading\"},\"finish_reason\":null}]}\n\n";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n",
+            first.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    });
+
+    let proxy = start_proxy_with(&default.uri(), |c| {
+        c.compression = true;
+        c.sidecar_model = Some("chat-sidecar".to_string());
+        c.sidecar_local_answer = Some("Working".to_string());
+        c.sidecar_route_timeout = Duration::from_millis(500);
+        c.model_routes = vec![ProviderRoute {
+            model_prefix: "chat-sidecar".to_string(),
+            prefix_match: false,
+            upstream: Some(Url::parse(&format!("http://127.0.0.1:{port}")).unwrap()),
+            translate: true,
+            cursor_agent: None,
+            target_model: None,
+            auth_env: Some("none".to_string()),
+        }];
+    })
+    .await;
+
+    let streamed = streamed_text(&proxy.url(), &sidecar_body()).await;
+    assert!(streamed.contains("\"text\":\"Working\""), "{streamed}");
+    assert!(!streamed.contains("truncated"), "{streamed}");
+    assert!(!streamed.contains("Reading"), "{streamed}");
+    assert!(default_captured.lock().unwrap().is_empty());
+
+    proxy.shutdown().await;
+}
+
 /// A 429 from the routed upstream is attempted exactly once — even with
 /// retries enabled — and then answered on the direct path.
 #[tokio::test]

@@ -15,8 +15,10 @@ day, after the retry budget. Routed 5xx are retried up to the attempt limit
 
 ## "[truncated: the connection to the API dropped mid-response]" (partly ours)
 
-2026-09-30: 77 `stream_tail_synthesised`. 58 are the spinner sidecar, which no
-worker sees. 19 are real Spark turns. Every cause reads `peer closed connection
+2026-09-30: 77 `stream_tail_synthesised`. 58 are the spinner sidecar. No
+worker sees those, but the user does: the marker became the agent's status-line
+text (corrected and fixed in `statusline-truncated-is-the-spinner.md`). 19 are
+real Spark turns. Every cause reads `peer closed connection
 without sending TLS close_notify`, so the far end of the lane (a Nord SOCKS
 exit or Zen) closed the socket. The relay log shows 431 `PermissionDenied`
 refusals from Nord SOCKS hosts, so lane churn is provider-side.

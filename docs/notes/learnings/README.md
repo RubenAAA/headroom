@@ -39,6 +39,10 @@ number to its window; do not quote across windows.
   TapBuy fleet kills sorted by cause: 503s fixed by lane failover, mid-stream
   drops are peer closes (10 of 19 near proxy restarts), malformed CCR hashes
   now fall back to keyword search.
+- [`statusline-truncated-is-the-spinner.md`](statusline-truncated-is-the-spinner.md):
+  `[truncated: ...]` on an agent's status line was the spinner sidecar's
+  stream timing out, not the agent; join a drop to its request before
+  naming the component.
 - [`zen-free-limit-is-per-exit-daily.md`](zen-free-limit-is-per-exit-daily.md):
   Zen's free-tier 429 follows the exit IP and resets at 00:00 UTC; a fresh exit
   carried about 150 requests; Nord rejects most logins; rotation is budgeted,
