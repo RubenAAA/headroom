@@ -2,7 +2,8 @@
 # ticket-gate.sh: preempt YouTrack ticket filing, hand the last 10 turns to a worker.
 # Serves UserPromptSubmit (an explicit "file the ticket" instruction) and
 # PreToolUse on Bash (the model composing the API call itself). Never blocks
-# benign work: exits 0 on every path except a diverted filing attempt (exit 2).
+# benign work: exits 0 on every path except a filing attempt (exit 2), which
+# is diverted to the worker in an armed session and blocked otherwise.
 # Installed by install.sh into $HOME/.claude/hooks (copied, or symlinked with --link).
 if [ -n "${OFFLOADED_TICKET_WORKER:-}" ] || [ -n "${TICKET_FILE_WORKER:-}" ]; then
   exit 0
@@ -25,11 +26,15 @@ umask 077
 mkdir -p "$OUTDIR" 2>/dev/null
 chmod 700 "$OUTDIR" 2>/dev/null || true
 
-# ── no arming: the phrases below are explicit enough to act on directly ──
+# ── arming: a filing prompt arms the session ──
 #
-# The review gate needs arming because "post the threads" is ambiguous without
-# a review session behind it. "File the ticket" names the action and its
-# object in one breath, so the instruction alone is the divert condition.
+# "File the ticket" names the action and its object in one breath, so the
+# prompt alone starts the worker. It also leaves .ticket.armed behind. A Bash
+# call that looks like a filing starts the worker only in an armed session;
+# unarmed, it is blocked and nothing starts. The command matcher guesses from
+# the text of a command, and a wrong guess (`tr -d` next to a token path, an
+# issue id in a variable) once started a worker that filed a real ticket. A
+# wrong guess now costs one blocked command.
 
 # done = worker finished AND filed (proof on disk). done + .failed = worker
 # finished without filing; the reason is in .failed. diverted without done =
@@ -142,8 +147,11 @@ spawn_ticket_worker() {
       pid="${pid#"${pid%%[! ]*}"}"; pid="${pid%"${pid##*[! ]}"}"
       # An empty prefix would match every cwd.
       if [ -z "$prefix" ] || [ -z "$pid" ]; then continue; fi
+      # The directory itself or anything below it, not a sibling that shares
+      # the leading characters (`.../analytics-old` under `.../analytics`).
+      prefix="${prefix%/}"
       case "$cwd" in
-        "$prefix"*)
+        "$prefix"|"$prefix"/*)
           if [ "${#prefix}" -gt "$best_len" ]; then
             best="$pid"; best_len="${#prefix}"
           fi
@@ -269,6 +277,7 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
     INTENT=""
 
   if [ -n "$INTENT" ]; then
+    touch "$OUTDIR/$SESSION_ID.ticket.armed"
     ST=$(ticket_state)
     # Diverted but no live worker is a crash, not a running worker. Saying
     # "already running" here would wedge the session: every later prompt
@@ -340,8 +349,10 @@ if [ "$TOOL" = "Bash" ]; then
     exit 0
   fi
   # Bare POST /api/issues (create) and POST /issues?draftId= (publish) carry
-  # no issue suffix and still fall through to the divert check.
-  if echo "$LOW" | grep -qE 'api/issues/[a-z0-9_.-]+|/issue/[a-z]+-[0-9]+'; then
+  # no issue suffix and still fall through to the divert check. Any path
+  # segment counts as the suffix, a shell variable included: `$k` in
+  # /api/issues/$k/comments is an existing issue as much as PROJ-12 is.
+  if echo "$LOW" | grep -qE 'api/issues/[^?"'"'"'[:space:]]|/issue/[a-z]+-[0-9]+'; then
     exit 0
   fi
   # Subject AND shape, never shape alone. `curl -X POST` to something else is
@@ -358,12 +369,21 @@ if [ "$TOOL" = "Bash" ]; then
   # ticket (already exempted above) while get/search/list/types/help stay
   # reads.
   # curl sends a POST for a bare -d/--data with no -X, so -d counts too.
-  echo "$LOW" | grep -qE '\-x (post|put|patch)|--data|(^|[[:space:]])-d[[:space:]@"'"'"']|requests\.post' && WRITES=1
+  # The flags count only inside curl's own pipeline segment: `tr -d`,
+  # `cut -d` and `date -d` share the letter, not the meaning. Continuation
+  # lines are joined first so a curl split over `\` lines stays one segment.
+  CURL_LINE=$(printf '%s\n' "$LOW" | sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta')
+  echo "$CURL_LINE" | grep -qE 'curl[^|;&]*[[:space:]](-x (post|put|patch)|--data|-d[[:space:]@"'"'"'])' && WRITES=1
+  echo "$LOW" | grep -qE 'requests\.post' && WRITES=1
   echo "$LOW" | grep -qE 'ai-youtrack(\.py)? +(create|publish)' && WRITES=1
 
   # A heredoc cannot trigger a divert by itself. Every match below needs an
   # explicit tracker subject and a write verb, so read-only checks pass.
   if [ -n "$SUBJECT" ] && [ -n "$WRITES" ]; then
+    if [ ! -f "$OUTDIR/$SESSION_ID.ticket.armed" ]; then
+      echo "TICKET WRITE BLOCKED: this looks like filing a new YouTrack ticket, and nothing in this command ran. The user has not asked for a ticket in this session, so no worker started. If a ticket is wanted, ask the user to say \"file the ticket\"; do not retry the call another way." >&2
+      exit 2
+    fi
     # A worker that cannot run must not brick the manual call: the spawn
     # refuses (reason in .ticket.failed) when token/URL/project are missing,
     # and then the call goes through instead of exit 2.
