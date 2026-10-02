@@ -763,6 +763,10 @@ HEADROOM_FLAGS=(
   # (2026-09-29 13:22-13:59, 39.8k tokens) read the terminal round's read and
   # none of its write. See docs/notes/ideas/ccr-continuation-cache-boundary.md.
   --ccr-keep-client-boundary-rounds 1
+  # The same for the memory-tool continuation, which the line above does not
+  # cover: 15 of 16 aftershock recaches from 2026-09-30 to 10-02 (112.6k
+  # tokens) followed a hidden memory round, not a CCR one.
+  --memory-keep-client-boundary-rounds 1
 
   # Transport and retry
   --retry true

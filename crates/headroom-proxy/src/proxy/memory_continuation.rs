@@ -416,7 +416,12 @@ pub(super) fn append_round_messages(
         &["_memory_tool_results", "_openai_responses_tool_results"],
     );
 
-    retail_continuation_breakpoint(current_request, provider, config, request_id, round + 1);
+    // Early rounds keep the marker on the client's last block, for the same
+    // reason as the CCR path: an entry ending on messages the client never
+    // sends is one its next turn cannot read.
+    if round >= usize::from(config.memory_keep_client_boundary_rounds) {
+        retail_continuation_breakpoint(current_request, provider, config, request_id, round + 1);
+    }
 
     // The spliced `output[]` carries the model's own reasoning items,
     // `id` and `encrypted_content` included. The translate and sidecar

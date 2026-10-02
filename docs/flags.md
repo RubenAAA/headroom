@@ -134,8 +134,8 @@ Options:
           Source priority: CLI flag → `HEADROOM_PROXY_COMPRESSION_MODE` env var → resolved default.
 
           Possible values:
-          - off:          Compression disabled. Body forwards byte-equal to upstream. This is the default; Phase B will switch the default to `live_zone` once that mode is implemented
-          - live_zone:    Compress only live-zone blocks (latest user message, latest tool/function/shell/patch outputs). NOT YET IMPLEMENTED: in PR-A1 this falls through to passthrough behaviour with a loud warning. Phase B PR-B2 wires in the actual dispatcher
+          - off:          Compression disabled. Body forwards byte-equal to upstream. This is the default
+          - live_zone:    Compress only live-zone blocks (latest user message, latest tool/function/shell/patch outputs) via the headroom-core live-zone dispatcher's per-content-type compressors
           - all_messages: Compress compressible blocks across ALL user messages, not just the latest. Deterministic per-content compression keeps identical content → identical bytes on every turn, so Anthropic's prompt cache forms over the compressed history (stable, no cascade). This is the subscription-savings mode (cuts cache_creation and the per-turn cache_read of compressed history)
           
           [env: HEADROOM_PROXY_COMPRESSION_MODE=]
@@ -222,8 +222,8 @@ Options:
           Source priority: CLI flag → `HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT` env var → default (`enabled` from c5/5 onward).
 
           Possible values:
-          - enabled:  Per-mode policy IS enforced. Subscription users see no cache_aligner; the dispatcher reads `policy.live_zone_compression_enabled()`
-          - disabled: Per-mode policy IS NOT enforced. Every mode runs the PAYG pipeline, identical to pre-F2.1 behaviour. Default in F2.1 commits 1–5 so the feature is dogfood-only until c6/6
+          - enabled:  Per-mode policy IS enforced. Subscription users see no cache_aligner; the dispatcher reads `policy.live_zone_compression_enabled()`. Default
+          - disabled: Per-mode policy IS NOT enforced. Every mode runs the PAYG pipeline, identical to pre-F2.1 behaviour. Rollback opt-out
           
           [env: HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT=]
           [default: enabled]
@@ -442,9 +442,17 @@ Options:
       --ccr-keep-client-boundary-rounds <CCR_KEEP_CLIENT_BOUNDARY_ROUNDS>
           Hidden CCR continuation rounds that leave the newest message breakpoint where the client's own request put it.
           
-          Default `0`: every round moves the marker onto the appended messages. A retrieval round appends messages the client never sees, so a marker moved onto them writes a cache entry the next client turn cannot read. Whether that costs more than it saves is not settled: the ledger totals of streamed CCR turns are exactly twice round 0's usage, so the final round is not visible there, and the per-round `ccr_round_usage` events are the evidence to read before raising this. `1` keeps the marker put for the first round only. Memory continuations always move it.
+          Default `0`: every round moves the marker onto the appended messages. A retrieval round appends messages the client never sees, so a marker moved onto them writes a cache entry the next client turn cannot read. Whether that costs more than it saves is not settled: the ledger totals of streamed CCR turns are exactly twice round 0's usage, so the final round is not visible there, and the per-round `ccr_round_usage` events are the evidence to read before raising this. `1` keeps the marker put for the first round only. Memory continuations have their own knob, `--memory-keep-client-boundary-rounds`.
           
           [env: HEADROOM_PROXY_CCR_KEEP_CLIENT_BOUNDARY_ROUNDS=]
+          [default: 0]
+
+      --memory-keep-client-boundary-rounds <MEMORY_KEEP_CLIENT_BOUNDARY_ROUNDS>
+          Hidden memory-tool continuation rounds that leave the cache marker on the client's last block.
+          
+          Default `0`: every round moves the marker onto the appended memory tool call and result, which the next client turn never sends. 15 of 16 `aftershock_of_continuation` recaches from 2026-09-30 to 10-02 (112,606 tokens) followed a memory continuation, not a CCR one. `1` keeps the marker put for the first round, as `--ccr-keep-client-boundary-rounds 1` does for CCR.
+          
+          [env: HEADROOM_PROXY_MEMORY_KEEP_CLIENT_BOUNDARY_ROUNDS=]
           [default: 0]
 
       --split-cache-ttl <SPLIT_CACHE_TTL>

@@ -4,6 +4,10 @@
   (default 1) 2026-09-29. After-deploy window read 2026-09-30 (last section):
   0 aftershock events, but the summed-usage fix shipped with it, so the policy's
   own effect is not separable. Keep open only for a CCR-only comparison.
+  2026-10-02: aftershocks came back, nearly all after memory-tool
+  continuations, which the flag never covered. The same policy now ships for
+  them as `--memory-keep-client-boundary-rounds` (flag file sets 1); see
+  the last section.
 - **Source:** live recache audit in
   `recache-provider-reasons.md` (2026-09-29 window); code in
   `crates/headroom-proxy/src/proxy/ccr_response.rs` and
@@ -199,3 +203,42 @@ most aftershock and unexplained events were server-tool turns scored against
 summed usage, which the first fix removes. The CCR marker policy's own effect
 cannot be read from these counts. Also unread: `forwarded_beta_rotated`
 (76 in 12 active hours, the largest remaining reason).
+
+## Memory continuations (2026-10-02)
+
+`aftershock_of_continuation` per day from the proxy logs, UTC:
+
+| Day | Events | Wasted tokens |
+|---|---:|---:|
+| 09-28 | 52 | 306,952 |
+| 09-29 | 17 | 58,644 |
+| 09-30 | 1 | 2,196 |
+| 10-01 | 11 | 101,882 |
+| 10-02 (to 12:10Z) | 4 | 8,528 |
+
+The flag file has set `--ccr-keep-client-boundary-rounds 1` since 09-29.
+Events from 09-30 on, by what the previous request in the same conversation
+ran:
+
+| Previous request | Events | Wasted tokens |
+|---|---:|---:|
+| memory rounds only | 13 | 81,273 |
+| memory and CCR rounds | 2 | 21,745 |
+| none found in the log | 1 | 9,588 |
+
+`memory_continuation::append_round_messages` called
+`retail_continuation_breakpoint` on every round, so the marker went onto the
+hidden memory tool call and its result. The worst case was one conversation
+on 10-01 at 08:49Z: four aftershocks in 50 s, 74,325 tokens, each turn
+reading about 115k while the turn before had written up to 153k.
+
+The one event with no continuation found behind it may be a mislabel:
+`had_continuation` comes from `billed_totals`. Not yet checked.
+
+Shipped: `--memory-keep-client-boundary-rounds` (default 0, flag file 1),
+gated at the memory call site, with
+`memory_continuation_keeps_the_client_boundary_for_the_first_round` pinning
+the marker. **To read next:** `aftershock_of_continuation` counts after the
+restart that loads it, split by previous-turn kind as above. If the memory
+share drops to near 0 and memory rounds' own writes do not grow to match,
+make 1 the default for both flags.

@@ -1148,3 +1148,6 @@ mod inbound_metrics_tests;
 
 #[cfg(test)]
 mod timing_field_tests;
+
+#[cfg(test)]
+mod continuation_marker_tests;
