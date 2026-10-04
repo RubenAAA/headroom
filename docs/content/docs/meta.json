@@ -28,6 +28,7 @@
     "opencode",
     "opencode-deepseek",
     "grok-build",
+    "hermes",
     "mcp",
     "---Configuration---",
     "configuration",
