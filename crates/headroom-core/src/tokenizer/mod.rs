@@ -36,6 +36,7 @@ mod registry;
 mod tiktoken_impl;
 
 pub use estimator::EstimatingCounter;
+pub(crate) use hf_impl::hf_offline;
 pub use hf_impl::{HfTokenizer, HfTokenizerError};
 pub use mistral::{mistral_hf_repo, mistral_tokenizer_version, try_register_default_mistral};
 pub(crate) use registry::name_candidates;

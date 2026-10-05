@@ -347,6 +347,19 @@ impl Kompress {
     /// downloading on miss). Blocking — call off the hot path. Tries the
     /// [`ONNX_CANDIDATES`] in order.
     pub fn from_pretrained(config: KompressConfig) -> Result<Self, KompressError> {
+        // Offline mode: never download. The model must already be in the
+        // local cache; `from_cache` is the intended path and the caller
+        // already fell back from it. Keep the error centered on the repo
+        // the caller passed, matching the Python allow_download=False miss.
+        if crate::tokenizer::hf_offline() {
+            return Err(KompressError::Hub {
+                repo: config.tokenizer_repo.clone(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "offline mode: Kompress artifacts not in HF cache",
+                )),
+            });
+        }
         let api = hf_hub::api::sync::Api::new().map_err(|e| KompressError::Hub {
             repo: config.model_id.clone(),
             source: Box::new(e),
@@ -796,14 +809,14 @@ fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
 fn hf_hub_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let push_env = |roots: &mut Vec<PathBuf>, var: &str, suffix: &[&str]| {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                let mut p = PathBuf::from(v);
-                for s in suffix {
-                    p = p.join(s);
-                }
-                roots.push(p);
+        if let Ok(v) = std::env::var(var)
+            && !v.is_empty()
+        {
+            let mut p = PathBuf::from(v);
+            for s in suffix {
+                p = p.join(s);
             }
+            roots.push(p);
         }
     };
     push_env(&mut roots, "HF_HUB_CACHE", &[]);

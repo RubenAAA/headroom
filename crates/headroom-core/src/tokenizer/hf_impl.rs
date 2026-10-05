@@ -157,7 +157,7 @@ impl HfTokenizer {
 /// True when the caller forbade HuggingFace downloads: `HEADROOM_OFFLINE`
 /// (our flag), or the stock `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`, all
 /// truthy when set to a non-empty, non-"0" value.
-fn hf_offline() -> bool {
+pub(crate) fn hf_offline() -> bool {
     ["HEADROOM_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"]
         .iter()
         .filter_map(|var| std::env::var(var).ok())
