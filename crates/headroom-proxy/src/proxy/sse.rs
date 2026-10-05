@@ -155,10 +155,19 @@ pub(super) fn spawn_sse_parser_tee(
 /// Streamed-path CCR retrieval: answer the offered `headroom_retrieve` tool call
 /// inside the Anthropic SSE stream — suppressing the block, running the
 /// continuation against `continuation_base`, splicing the result back in — so
-/// the streamed turn behaves like the buffered one. When `ccr_stream_eligible`
-/// is false the upstream body is handed on untouched.
+/// the streamed turn behaves like the buffered one. When neither CCR nor
+/// memory applies, the upstream body is handed on untouched.
+///
+/// `memory` carries the precomputed memory context for turns that were
+/// injected with memory tools but are not CCR-eligible (upstream `1cf49661`):
+/// a streamed memory call the proxy forwards is a `tool_use` block for tools
+/// the client never declared, so the client answers `No such tool available`.
+/// The fold below already suppresses and resolves those blocks; it only needs
+/// to run. A memory-only turn has no offload store, so retrieval rides an
+/// empty in-memory store it can never hit (no `headroom_retrieve` call can be
+/// standing on such a turn).
 //
-// Ten request-context args for one call site; a params struct would churn
+// Nine request-context args for one call site; a params struct would churn
 // both without buying clarity, so the lint stays off here by decision.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn maybe_rewrite_anthropic_stream(
@@ -167,40 +176,39 @@ pub(super) async fn maybe_rewrite_anthropic_stream(
     >,
     ccr_stream_eligible: bool,
     continuation_base: bytes::Bytes,
-    original_buffered: bytes::Bytes,
     state: &AppState,
     upstream_client: &reqwest::Client,
     upstream_url: &url::Url,
     outgoing_headers: &http::HeaderMap,
-    headers_snapshot: &Option<http::HeaderMap>,
     request_id: &str,
+    memory: Option<MemoryToolContext>,
 ) -> (
     std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
     Option<Arc<Mutex<CcrRoundUsage>>>,
 ) {
-    if ccr_stream_eligible {
+    if ccr_stream_eligible || memory.is_some() {
+        let (ccr_store, ccr_stores) = match state.ctx_offload.as_ref() {
+            Some(rt) => (
+                rt.store.ccr(),
+                state.ctx_offload.as_ref().map(|r| r.store.stores()),
+            ),
+            None => (
+                std::sync::Arc::new(headroom_core::ccr::InMemoryCcrStore::new())
+                    as std::sync::Arc<dyn headroom_core::ccr::CcrStore>,
+                None,
+            ),
+        };
         let ctx = crate::sse::ccr_stream::CcrStreamContext {
             client: upstream_client.clone(),
             upstream_url: upstream_url.clone(),
             outgoing_headers: outgoing_headers.clone(),
             forwarded_request: continuation_base.clone(),
-            ccr_store: state
-                .ctx_offload
-                .as_ref()
-                .expect("ctx_offload checked above")
-                .store
-                .ccr(),
-            ccr_stores: state.ctx_offload.as_ref().map(|r| r.store.stores()),
+            ccr_store,
+            ccr_stores,
             config: state.config.clone(),
             request_id: request_id.to_owned(),
             shape: crate::sse::ccr_stream::CcrShape::Anthropic,
-            memory: memory_tool_context(
-                state,
-                headers_snapshot,
-                Some("anthropic"),
-                &original_buffered,
-            )
-            .await,
+            memory,
             // Anthropic path: redaction lives on routed translate paths only.
             redact: None,
             // Anthropic path: the caller folds the returned handle itself.

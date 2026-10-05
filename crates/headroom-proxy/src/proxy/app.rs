@@ -607,9 +607,35 @@ pub(super) async fn track_inbound_request(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     crate::observability::proxy_counters::record_inbound_request();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let started = std::time::Instant::now();
     let response = next.run(request).await;
     crate::observability::proxy_counters::record_inbound_request_completed();
+    // Upstream `cfa479af`: log the response size next to timing so a slow
+    // response can be correlated with its payload. Debug-level on purpose:
+    // the counters above are the always-on signal, this is the drill-down.
+    tracing::debug!(
+        event = "proxy_inbound_response",
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+        response_content_length = ?inbound_response_content_length(&response),
+        "inbound response completed"
+    );
     response
+}
+
+/// Response payload size for the inbound-response log line: the
+/// `Content-Length` header when present and numeric, else `None` (streamed
+/// bodies carry no length — same as Python reading the Starlette header).
+pub(super) fn inbound_response_content_length(response: &axum::response::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Catch-all handler. If the request is a WebSocket upgrade, hand off to the

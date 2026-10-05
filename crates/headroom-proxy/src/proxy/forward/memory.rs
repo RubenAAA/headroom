@@ -87,6 +87,32 @@ pub(crate) fn inject_memory_tool_definitions(
     }
 }
 
+/// Whether a forwarded request carries proxy-owned memory tool definitions.
+///
+/// Upstream `1cf49661`: the proxy answers memory calls server-side on
+/// streaming turns, so the streamed rewrite has to run for exactly the turns
+/// the proxy injected into — not merely when memory is enabled. A request
+/// that never received the definitions cannot produce a memory call, and
+/// running the fold over it would only cost a spawned task plus an SSE
+/// parse per event. Both the five custom tools and the native
+/// `memory_20250818` tool count; anything unparseable counts as absent.
+pub(crate) fn request_carries_memory_tools(forwarded_body: &bytes::Bytes) -> bool {
+    let body: serde_json::Value = match serde_json::from_slice(forwarded_body) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    body.get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tools| {
+            tools.iter().any(|t| {
+                t.get("name").and_then(|n| n.as_str()).is_some_and(|name| {
+                    crate::memory::tool_adapter::MEMORY_TOOL_NAMES.contains(&name)
+                        || name == crate::memory::tool_adapter::NATIVE_MEMORY_TOOL_NAME
+                })
+            })
+        })
+}
+
 /// One memory-continuation send attempt, classified into its loop action.
 ///
 /// Extracted from `send_memory_continuation` without behavior change.
@@ -540,5 +566,55 @@ mod memory_status_is_retryable_tests {
         assert!(memory_status_is_retryable(forbidden, true));
         assert!(!memory_status_is_retryable(bad, false));
         assert!(!memory_status_is_retryable(bad, true));
+    }
+}
+
+#[cfg(test)]
+mod request_carries_memory_tools_tests {
+    use super::request_carries_memory_tools;
+
+    fn body(json: serde_json::Value) -> bytes::Bytes {
+        bytes::Bytes::from(serde_json::to_vec(&json).unwrap())
+    }
+
+    #[test]
+    fn finds_an_injected_memory_tool_among_client_tools() {
+        let b = body(serde_json::json!({
+            "model": "m",
+            "tools": [
+                {"name": "Read", "description": "r"},
+                {"name": "memory_search", "description": "m"},
+            ],
+        }));
+        assert!(request_carries_memory_tools(&b));
+    }
+
+    #[test]
+    fn client_tools_alone_do_not_count() {
+        let b = body(serde_json::json!({
+            "model": "m",
+            "tools": [{"name": "Read", "description": "r"}],
+        }));
+        assert!(!request_carries_memory_tools(&b));
+    }
+
+    #[test]
+    fn native_memory_tool_counts() {
+        let b = body(serde_json::json!({
+            "model": "m",
+            "tools": [{"name": "memory", "type": "memory_20250818"}],
+        }));
+        assert!(request_carries_memory_tools(&b));
+    }
+
+    #[test]
+    fn missing_tools_and_garbage_count_as_absent() {
+        assert!(!request_carries_memory_tools(&body(
+            serde_json::json!({"model": "m"})
+        )));
+        assert!(!request_carries_memory_tools(&bytes::Bytes::from_static(
+            b"not json"
+        )));
+        assert!(!request_carries_memory_tools(&bytes::Bytes::new()));
     }
 }

@@ -717,17 +717,50 @@ pub(crate) async fn assemble_response_stream(
     let continuation_base: bytes::Bytes = forwarded_body
         .clone()
         .unwrap_or_else(|| original_buffered.clone());
+    // Upstream `1cf49661`: a streamed turn carrying injected memory tools must
+    // run them server-side even when CCR is off. Without this the client's
+    // stream carries `tool_use` blocks for tools it never declared, and
+    // Claude Code answers `No such tool available: memory_save` (every
+    // request streams). The tools scan gates the CCR-off case only: for
+    // CCR-eligible turns the context is built exactly as before (whenever
+    // memory is on, even if this body carries no definitions), so a
+    // hallucinated memory call on those turns keeps the old suppression.
+    // Non-memory, non-CCR turns stream through untouched exactly as before.
+    // Transport guards mirror `ccr_stream_eligible`: the fold only
+    // understands Anthropic SSE — a buffered or failed body has no events to
+    // frame, and sending one through would swallow it whole.
+    let streamed_memory = if is_sse
+        && status.is_success()
+        && matches!(sse_kind, SseStreamKind::Anthropic)
+        && path_for_log.contains("/v1/messages")
+        && (ccr_stream_eligible
+            || state
+                .memory_handler
+                .as_ref()
+                .is_some_and(|handler| handler.is_initialized())
+                && forward::request_carries_memory_tools(
+                    forwarded_body.as_ref().unwrap_or(original_buffered),
+                )) {
+        memory_tool_context(
+            state,
+            headers_snapshot,
+            Some("anthropic"),
+            original_buffered,
+        )
+        .await
+    } else {
+        None
+    };
     let (upstream_body, ccr_round_usage) = maybe_rewrite_anthropic_stream(
         upstream_body,
         ccr_stream_eligible,
         continuation_base.clone(),
-        original_buffered.clone(),
         state,
         upstream_client,
         upstream_url,
         outgoing_headers,
-        headers_snapshot,
         request_id,
+        streamed_memory,
     )
     .await;
     (

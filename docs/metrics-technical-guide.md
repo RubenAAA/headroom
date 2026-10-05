@@ -302,7 +302,9 @@ sum by (strategy) (rate(proxy_compression_ratio_by_strategy_sum{strategy!="__ini
 
 3. **`/metrics` needs auth if you set a proxy token.** With
    `HEADROOM_PROXY_TOKEN` set, any non-loopback scraper must send
-   `Authorization: Bearer <token>`. Loopback is always exempt.
+   `Authorization: Bearer <token>` (or `X-Headroom-Proxy-Token: <token>`).
+   Loopback is always exempt. The proxy strips the token before forwarding,
+   so it never reaches a model provider.
 
 4. **Label vocabularies are bounded — read "other" as a signal.** `model`
    collapses past 1024 distinct values and `service_tier` buckets anything

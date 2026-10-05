@@ -71,3 +71,26 @@ async fn an_unmatched_route_is_still_counted() {
 
     assert_eq!(proxy_counters::inbound_total_for_test(), before + 1);
 }
+
+/// Upstream `cfa479af`: the inbound-response line reads size from the
+/// `Content-Length` header — numeric values pass through, missing or
+/// non-numeric (streamed bodies) report `None` instead of guessing.
+#[test]
+fn response_content_length_reads_the_header() {
+    let with_len = axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_LENGTH, "1234")
+        .body(axum::body::Body::empty())
+        .expect("response builds");
+    assert_eq!(inbound_response_content_length(&with_len), Some(1234));
+
+    let streamed = axum::response::Response::builder()
+        .body(axum::body::Body::empty())
+        .expect("response builds");
+    assert_eq!(inbound_response_content_length(&streamed), None);
+
+    let garbage = axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_LENGTH, "chunked?")
+        .body(axum::body::Body::empty())
+        .expect("response builds");
+    assert_eq!(inbound_response_content_length(&garbage), None);
+}

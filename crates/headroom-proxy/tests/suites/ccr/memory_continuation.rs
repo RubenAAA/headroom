@@ -119,6 +119,115 @@ fn sse(event: &str, data: Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
+/// Upstream that answers buffered JSON (never SSE): calls `memory_search`
+/// on the first request, answers with text on the continuation.
+async fn upstream_buffered(
+    rounds: Arc<AtomicUsize>,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let rounds = Arc::clone(&rounds);
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let rounds = Arc::clone(&rounds);
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        seen.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&body).into_owned());
+                        let round = rounds.fetch_add(1, Ordering::SeqCst);
+
+                        let event = if round > 0 {
+                            json!({
+                                "id": "m2", "type": "message", "role": "assistant",
+                                "model": "claude-opus-5", "stop_reason": "end_turn",
+                                "content": [{"type": "text", "text": "It cost 511 percent more creation."}],
+                                "usage": {"input_tokens": 20, "output_tokens": 9}
+                            })
+                        } else {
+                            json!({
+                                "id": "m1", "type": "message", "role": "assistant",
+                                "model": "claude-opus-5", "stop_reason": "tool_use",
+                                "content": [{"type": "tool_use", "id": "t1", "name": "memory_search", "input": {"query": "split cache TTL"}}],
+                                "usage": {"input_tokens": 10, "output_tokens": 5}
+                            })
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header("content-type", "application/json")
+                                .body(StreamBody::new(futures_util::stream::iter([Ok::<
+                                    _,
+                                    Infallible,
+                                >(
+                                    Frame::data(Bytes::from(event.to_string())),
+                                )])))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (addr, task)
+}
+
+/// A non-streaming memory turn must come back whole: the SSE fold only
+/// understands Anthropic events, so a buffered JSON body routed through it
+/// would be swallowed and the client would see an empty 200.
+async fn run_buffered_turn(dir: &TempDir) -> (String, Vec<String>, usize) {
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (addr, _task) = upstream_buffered(Arc::clone(&rounds), Arc::clone(&seen)).await;
+
+    let store = dir.path().to_path_buf();
+    let proxy = start_proxy_with_state(
+        &format!("http://{addr}"),
+        move |config| {
+            config.memory_enabled = true;
+            config.memory_inject_tools = true;
+            config.memory_mode = "tool".to_string();
+            config.ctx_store_dir = Some(store.clone());
+            config.compression = true;
+            config.ctx_offload = true;
+        },
+        |state| state,
+    )
+    .await;
+
+    let body = json!({
+        "model": "claude-opus-5",
+        "stream": false,
+        "messages": [{"role": "user", "content": "what did we learn about the split TTL?"}],
+        "tools": [{"name": "Read", "description": "read a file", "input_schema": {"type": "object"}}],
+    });
+    let text = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .json(&body)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .expect("proxy answers")
+        .text()
+        .await
+        .unwrap();
+
+    let requests = seen.lock().unwrap().clone();
+    let n = rounds.load(Ordering::SeqCst);
+    (text, requests, n)
+}
+
 async fn run_turn(dir: &TempDir) -> (String, Vec<String>, usize) {
     let tools =
         json!([{"name": "Read", "description": "read a file", "input_schema": {"type": "object"}}]);
@@ -126,6 +235,17 @@ async fn run_turn(dir: &TempDir) -> (String, Vec<String>, usize) {
 }
 
 async fn run_turn_with_tools(dir: &TempDir, tools: Option<Value>) -> (String, Vec<String>, usize) {
+    run_turn_with_tools_and_ccr(dir, tools, true).await
+}
+
+/// Upstream `1cf49661`: the streamed rewrite must run for memory-only turns
+/// too, not just CCR-eligible ones. `ccr_handle_responses = false` takes the
+/// CCR branch out while memory injection stays on.
+async fn run_turn_with_tools_and_ccr(
+    dir: &TempDir,
+    tools: Option<Value>,
+    ccr_handle_responses: bool,
+) -> (String, Vec<String>, usize) {
     let rounds = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (addr, _task) = upstream(Arc::clone(&rounds), Arc::clone(&seen)).await;
@@ -143,6 +263,7 @@ async fn run_turn_with_tools(dir: &TempDir, tools: Option<Value>) -> (String, Ve
             // silently depend on ctx offload being on. Production has it on.
             config.compression = true;
             config.ctx_offload = true;
+            config.ccr_handle_responses = ccr_handle_responses;
         },
         |state| state,
     )
@@ -233,6 +354,30 @@ async fn the_call_is_answered_by_the_proxy_and_never_reaches_the_client() {
     );
 }
 
+/// Upstream `1cf49661`: with CCR handling off, a streamed `memory_search`
+/// call must still be answered by the proxy. Before the port the upstream
+/// body streamed through untouched (the rewrite was CCR-gated), so the
+/// client received a `tool_use` block for a tool it never declared and
+/// answered `No such tool available: memory_search`.
+#[tokio::test]
+async fn a_memory_only_streamed_call_is_answered_with_ccr_off() {
+    let dir = TempDir::new().unwrap();
+    let tools =
+        json!([{"name": "Read", "description": "read a file", "input_schema": {"type": "object"}}]);
+    let (client_saw, _upstream_saw, rounds) =
+        run_turn_with_tools_and_ccr(&dir, Some(tools), false).await;
+
+    assert_eq!(rounds, 2, "the proxy must have continued the turn upstream");
+    assert!(
+        client_saw.contains("It cost 511 percent more creation."),
+        "the client must get the continued answer: {client_saw}"
+    );
+    assert!(
+        !client_saw.contains("\"type\":\"tool_use\""),
+        "the client must never see a tool it does not have: {client_saw}"
+    );
+}
+
 #[tokio::test]
 async fn the_answered_call_leaves_a_receipt_in_the_turn() {
     let dir = TempDir::new().unwrap();
@@ -244,6 +389,22 @@ async fn the_answered_call_leaves_a_receipt_in_the_turn() {
     assert!(
         client_saw.contains("[headroom memory]") && client_saw.contains("memory_search("),
         "the turn must record the call the proxy answered: {client_saw}"
+    );
+}
+
+/// A buffered (`stream: false`) memory turn resolves on the buffered path,
+/// never in the SSE fold: the fold only understands Anthropic events, so a
+/// JSON body routed through it would be swallowed and the client would see
+/// an empty 200.
+#[tokio::test]
+async fn a_buffered_memory_turn_comes_back_whole() {
+    let dir = TempDir::new().unwrap();
+    let (client_saw, _upstream_saw, rounds) = run_buffered_turn(&dir).await;
+
+    assert_eq!(rounds, 2, "the proxy must have continued the turn upstream");
+    assert!(
+        client_saw.contains("It cost 511 percent more creation."),
+        "the client must get the continued answer: {client_saw}"
     );
 }
 

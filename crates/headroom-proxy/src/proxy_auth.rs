@@ -84,13 +84,58 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Whether an `Authorization` value carries `expected` as its bearer token.
+///
+/// Parsing matches [`bearer_proxy_token`] (case-insensitive scheme, trimmed
+/// credential) and the comparison is constant-time. Any other value — a
+/// provider credential, a non-bearer scheme, non-UTF8 bytes — is kept.
+fn is_proxy_bearer(value: &axum::http::HeaderValue, expected: &str) -> bool {
+    let Ok(auth) = value.to_str() else {
+        return false;
+    };
+    let Some(token) = auth
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+        .map(|_| auth[7..].trim())
+    else {
+        return false;
+    };
+    !token.is_empty() && constant_time_eq(token.as_bytes(), expected.as_bytes())
+}
+
+/// Remove the proxy credential from headers about to travel further in.
+///
+/// Port of upstream `0147cf02` (`scrub_proxy_token_headers`): the provider
+/// handlers build their upstream headers from the inbound request, so a
+/// token sent as `Authorization: Bearer <token>` was forwarded verbatim to
+/// Anthropic/OpenAI and ended up in a third party's request logs (and could
+/// flip Anthropic auth-mode classification). `X-Headroom-Proxy-Token` is
+/// always dropped; `Authorization` is dropped only when it is the configured
+/// token — any other value is a provider credential and is kept.
+fn scrub_proxy_token_headers(headers: &mut axum::http::HeaderMap, expected: &str) {
+    headers.remove("x-headroom-proxy-token");
+    if !headers.contains_key(axum::http::header::AUTHORIZATION) {
+        return;
+    }
+    let kept: Vec<axum::http::HeaderValue> = headers
+        .get_all(axum::http::header::AUTHORIZATION)
+        .into_iter()
+        .filter(|v| !is_proxy_bearer(v, expected))
+        .cloned()
+        .collect();
+    headers.remove(axum::http::header::AUTHORIZATION);
+    for v in kept {
+        headers.append(axum::http::header::AUTHORIZATION, v);
+    }
+}
+
 /// Require `HEADROOM_PROXY_TOKEN` from non-loopback callers.
 ///
 /// Declines to act when no token is configured, which keeps the default
 /// single-user setup working exactly as before.
 pub async fn proxy_auth_gate(
     State(state): State<AppState>,
-    req: Request<axum::body::Body>,
+    mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let Some(expected) = state.config.proxy_token.as_deref() else {
@@ -99,6 +144,7 @@ pub async fn proxy_auth_gate(
 
     let path = req.uri().path();
     if AUTH_EXEMPT_PATHS.contains(&path) {
+        scrub_proxy_token_headers(req.headers_mut(), expected);
         return next.run(req).await;
     }
 
@@ -112,6 +158,10 @@ pub async fn proxy_auth_gate(
         &state.trusted_gateway_cidrs,
     );
     if crate::loopback_guard::is_loopback_host(Some(&client_ip)) {
+        // Still scrub: a local caller sending the token in `Authorization`
+        // on a route that forwards client headers would otherwise leak it
+        // upstream exactly like a remote caller.
+        scrub_proxy_token_headers(req.headers_mut(), expected);
         return next.run(req).await;
     }
 
@@ -141,6 +191,9 @@ pub async fn proxy_auth_gate(
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
 
+    // Authenticated: the credential has served its purpose. Strip it so no
+    // forward path can hand the shared secret to an upstream provider.
+    scrub_proxy_token_headers(req.headers_mut(), expected);
     next.run(req).await
 }
 
@@ -216,5 +269,77 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Port of upstream `0147cf02` (`TestScrubProxyTokenHeaders`): the proxy
+    /// credential must never travel further, while a provider credential in
+    /// the same carrier must survive.
+    #[test]
+    fn scrub_removes_matching_bearer_case_insensitive() {
+        for scheme in ["Bearer", "bearer", "BEARER"] {
+            let mut h = headers(&[("authorization", &format!("{scheme} s3cret"))]);
+            scrub_proxy_token_headers(&mut h, "s3cret");
+            assert!(!h.contains_key("authorization"), "scheme {scheme}");
+        }
+    }
+
+    #[test]
+    fn scrub_keeps_a_provider_bearer() {
+        let mut h = headers(&[("authorization", "Bearer sk-ant-real-key")]);
+        scrub_proxy_token_headers(&mut h, "s3cret");
+        assert_eq!(
+            h.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer sk-ant-real-key")
+        );
+    }
+
+    #[test]
+    fn scrub_keeps_non_bearer_schemes() {
+        let mut h = headers(&[("authorization", "Basic abc")]);
+        scrub_proxy_token_headers(&mut h, "s3cret");
+        assert!(h.contains_key("authorization"));
+    }
+
+    #[test]
+    fn scrub_handles_duplicate_authorization_per_value() {
+        let mut h = HeaderMap::new();
+        h.append("authorization", "Bearer s3cret".parse().unwrap());
+        h.append("authorization", "Bearer sk-ant-real-key".parse().unwrap());
+        scrub_proxy_token_headers(&mut h, "s3cret");
+        let kept: Vec<_> = h
+            .get_all("authorization")
+            .into_iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(kept, vec!["Bearer sk-ant-real-key"]);
+    }
+
+    #[test]
+    fn scrub_always_drops_the_dedicated_header() {
+        let mut h = headers(&[
+            ("x-headroom-proxy-token", "s3cret"),
+            ("authorization", "Bearer sk-ant-real-key"),
+        ]);
+        scrub_proxy_token_headers(&mut h, "s3cret");
+        assert!(!h.contains_key("x-headroom-proxy-token"));
+        assert!(h.contains_key("authorization"));
+    }
+
+    #[test]
+    fn scrub_keeps_non_utf8_authorization() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        scrub_proxy_token_headers(&mut h, "s3cret");
+        assert!(h.contains_key("authorization"));
+    }
+
+    #[test]
+    fn scrub_empty_bearer_is_not_a_token() {
+        let mut h = headers(&[("authorization", "Bearer   ")]);
+        scrub_proxy_token_headers(&mut h, "s3cret");
+        assert!(h.contains_key("authorization"));
     }
 }
