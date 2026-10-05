@@ -9,6 +9,8 @@
 #[path = "common/mod.rs"]
 mod common;
 
+#[path = "suites/routing/routed_drop_close.rs"]
+mod routed_drop_close;
 #[path = "suites/routing/routed_early_stream_retry.rs"]
 mod routed_early_stream_retry;
 #[path = "suites/routing/routed_forward_continuity.rs"]
