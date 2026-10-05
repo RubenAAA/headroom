@@ -386,7 +386,7 @@ fn translate_user_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
         }
     };
 
-    let mut text_parts: Vec<String> = Vec::new();
+    let mut parts: Vec<ToolResultPart> = Vec::new();
     let mut emitted_message = false;
     let mut emitted_tool_result = false;
 
@@ -394,17 +394,16 @@ fn translate_user_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
         match block.get("type").and_then(|v| v.as_str()) {
             Some("text") => {
                 if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                    text_parts.push(t.to_string());
+                    parts.push(ToolResultPart::Text(t.to_string()));
                 }
             }
             Some("tool_result") => {
-                if !text_parts.is_empty() {
+                if !parts.is_empty() {
                     out.push(json!({
                         "type": "message",
                         "role": "user",
-                        "content": text_parts.join("\n")
+                        "content": user_message_content(std::mem::take(&mut parts))
                     }));
-                    text_parts.clear();
                     emitted_message = true;
                 }
                 emitted_tool_result = true;
@@ -426,17 +425,59 @@ fn translate_user_message_to_responses(msg: &Value, out: &mut Vec<Value>) {
                     "output": tool_result_output_value(block.get("content"), is_error)
                 }));
             }
-            _ => {}
+            // Images the user attached used to vanish here, and an image-only
+            // message reached the backend as "". Same carry-or-placeholder
+            // rule as tool results (and as FINDING-024 on the chat path).
+            Some("image") => parts.push(match image_block_to_data_url(block) {
+                Some(url) => ToolResultPart::Image(url),
+                None => {
+                    ToolResultPart::Text("[unsupported content block omitted: image]".to_string())
+                }
+            }),
+            Some(other) => parts.push(ToolResultPart::Text(format!(
+                "[unsupported content block omitted: {other}]"
+            ))),
+            None => parts.push(ToolResultPart::Text(
+                "[unsupported content block omitted: unknown]".to_string(),
+            )),
         }
     }
 
-    if !text_parts.is_empty() || (!emitted_message && !emitted_tool_result) {
+    if !parts.is_empty() || (!emitted_message && !emitted_tool_result) {
         out.push(json!({
             "type": "message",
             "role": "user",
-            "content": text_parts.join("\n")
+            "content": user_message_content(parts)
         }));
     }
+}
+
+/// A user message's `content`: the joined string when no image survived (the
+/// bytes every text-only turn already sends), otherwise ordered parts.
+fn user_message_content(parts: Vec<ToolResultPart>) -> Value {
+    if !parts.iter().any(|p| matches!(p, ToolResultPart::Image(_))) {
+        return Value::String(
+            parts
+                .iter()
+                .filter_map(|p| match p {
+                    ToolResultPart::Text(t) => Some(t.as_str()),
+                    ToolResultPart::Image(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    Value::Array(
+        parts
+            .into_iter()
+            .map(|p| match p {
+                ToolResultPart::Text(text) => json!({"type": "input_text", "text": text}),
+                ToolResultPart::Image(image_url) => {
+                    json!({"type": "input_image", "image_url": image_url})
+                }
+            })
+            .collect(),
+    )
 }
 
 /// One piece of a rendered tool result: either text, or an image the Responses
@@ -1061,6 +1102,104 @@ mod tests {
             json!({"type": "input_text", "text": "Error:"})
         );
         assert_eq!(with_image[1]["type"], "input_image");
+    }
+
+    /// An image the user attached reaches the backend as `input_image`, in the
+    /// position it held among the text.
+    #[test]
+    fn user_message_images_become_input_image_in_place() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBOR w0KGgo"
+                }},
+                {"type": "text", "text": "after"}
+            ]}]
+        });
+        let output = anthropic_to_openai_responses_request(&input, true).unwrap();
+        assert_eq!(
+            output["input"],
+            json!([{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "before"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                {"type": "input_text", "text": "after"}
+            ]}])
+        );
+    }
+
+    /// An image-only message used to reach the backend as an empty string.
+    #[test]
+    fn image_only_user_message_is_not_empty() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQ"
+                }}
+            ]}]
+        });
+        let output = anthropic_to_openai_responses_request(&input, true).unwrap();
+        assert_eq!(
+            output["input"][0]["content"],
+            json!([{"type": "input_image", "image_url": "data:image/jpeg;base64,/9j/4AAQ"}])
+        );
+    }
+
+    /// Text around a tool result keeps its order, and an image after the
+    /// result lands in the message that follows it.
+    #[test]
+    fn user_images_after_a_tool_result_follow_it() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                    }},
+                    {"type": "text", "text": "what is this?"}
+                ]}
+            ]
+        });
+        let output = anthropic_to_openai_responses_request(&input, true).unwrap();
+        assert_eq!(output["input"][1]["type"], "function_call_output");
+        assert_eq!(
+            output["input"][2],
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                {"type": "input_text", "text": "what is this?"}
+            ]})
+        );
+    }
+
+    /// What cannot be carried leaves a marker, and with no surviving image the
+    /// message keeps the plain string shape.
+    #[test]
+    fn uncarriable_user_blocks_leave_placeholders() {
+        let input = json!({
+            "model": "claude-codex-5.5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a.png"}},
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}}
+            ]}]
+        });
+        let output = anthropic_to_openai_responses_request(&input, true).unwrap();
+        assert_eq!(
+            output["input"][0]["content"],
+            json!(
+                "look\n[unsupported content block omitted: image]\n[unsupported content block omitted: document]"
+            )
+        );
     }
 
     /// The string shape must be byte-identical to before for the common case,
