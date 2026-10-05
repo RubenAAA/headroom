@@ -263,6 +263,44 @@ pub(super) fn complete_anthropic_replay(close: &AnthropicClose<'_>) {
     }
 }
 
+/// Why a normally-closed turn still deserves a look. `None` = clean.
+fn turn_ended_rough_reason(
+    close: &AnthropicClose<'_>,
+    split: &crate::sse::anthropic::OutputSplit,
+    inv: &crate::sse::anthropic::ServerToolInventory,
+) -> Option<&'static str> {
+    if close.state.tool_call_defect().is_some() {
+        return Some("tool_call_defect");
+    }
+    if !close.stream_completed() {
+        return Some("stream_incomplete");
+    }
+    // A server-tool call the turn never paired with its result: the
+    // retrieval round died (or was artificially cut), and the client
+    // received the call but no answer to it.
+    if inv.calls_total > inv.results_total {
+        return Some("retrieval_without_result");
+    }
+    if close.state.stop_reason.as_deref() != Some("end_turn") {
+        return None;
+    }
+    // Reasoned but didn't act: thinking blocks present, no tool call,
+    // no visible text answer.
+    if split.thinking_blocks > 0 && split.tool_use_blocks == 0 && split.text_chars == 0 {
+        return Some("reasoning_only_end_turn");
+    }
+    // No tool call and answers nothing actionable.
+    if split.tool_use_blocks == 0 && split.text_chars == 0 {
+        return Some("empty_answer");
+    }
+    // Thought, said something, and never called a tool — the
+    // "reasoned, then stopped anyway" shape.
+    if split.thinking_blocks > 0 && split.tool_use_blocks == 0 {
+        return Some("no_tool_call_made");
+    }
+    None
+}
+
 /// Close + defect logs: the output census split and the tool-call
 /// defect warn for a turn the client would refuse whole.
 pub(super) fn log_anthropic_close(close: &AnthropicClose<'_>) {
@@ -298,6 +336,23 @@ pub(super) fn log_anthropic_close(close: &AnthropicClose<'_>) {
         server_tool_results_total = inv.results_total,
         "sse stream closed"
     );
+    // Turns whose close is allowed but worth a look: reasoning without
+    // action, an empty or tool-less answer, a call whose result never
+    // came, or a dropped/incomplete stream. One grep gets all of them.
+    if let Some(reason) = turn_ended_rough_reason(close, &split, &inv) {
+        tracing::warn!(
+            event = "turn_ended_rough",
+            request_id = %close.request_id,
+            provider = "anthropic",
+            stop_reason = close.state.stop_reason.as_deref().unwrap_or(""),
+            reason = reason,
+            thinking_blocks = split.thinking_blocks,
+            text_blocks = split.text_blocks,
+            tool_use_blocks = split.tool_use_blocks,
+            text_chars = split.text_chars,
+            "turn closed without something the next message would need: a tool call, an actionable answer, or a marker of intent to continue"
+        );
+    }
     // A turn the client will refuse whole: it was told a tool call
     // was coming and got nothing it can run. Warn here or the only
     // symptom is "tool call could not be parsed" on the far side,
