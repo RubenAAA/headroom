@@ -479,6 +479,7 @@ pub(crate) async fn handle_streaming_response(
     slow_probe: Option<crate::upstream_route_probe::SlowUpstreamProbe>,
     early_retry: Option<crate::routed::early_stream_retry::EarlyRetryCtx>,
     drop_close: crate::sse::stream_finisher::DropClose,
+    request_id: &str,
 ) -> Response {
     let original_model = original
         .get("model")
@@ -502,10 +503,14 @@ pub(crate) async fn handle_streaming_response(
     );
     let stream = crate::routed::early_stream_retry::wrap_streaming_body(stream, early_retry);
     // Snapshot before `outcome` moves into the translator below.
-    let request_id = outcome
-        .as_ref()
-        .map(|c| c.request_id.clone())
-        .unwrap_or_default();
+    let request_id = if request_id.is_empty() {
+        outcome
+            .as_ref()
+            .map(|c| c.request_id.clone())
+            .unwrap_or_default()
+    } else {
+        request_id.to_string()
+    };
     let redact_table = redact_table_for(outcome.as_ref());
     // CCR turns defer booking to the completion guard below, which folds
     // continuation rounds in. The translator keeps a clone for observation,
@@ -528,6 +533,7 @@ pub(crate) async fn handle_streaming_response(
         outcome,
         deferred.clone(),
         Some(tool_aliases),
+        Some(request_id.clone()),
     );
 
     // The translator has already put the turn into the Anthropic event

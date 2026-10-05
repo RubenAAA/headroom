@@ -864,6 +864,7 @@ async fn dispatch_upstream_answer(
             slow_probe,
             early_retry,
             crate::sse::stream_finisher::DropClose::from_headers(&headers),
+            request_id,
         )
         .await
     } else {

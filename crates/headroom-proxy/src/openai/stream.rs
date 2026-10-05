@@ -258,6 +258,10 @@ pub(crate) struct StreamTranslator {
     /// Where to book the turn once usage arrives. `None` in unit tests, which
     /// assert on translated events rather than metrics.
     outcome: Option<RoutedOutcomeContext>,
+    /// Fallback label for the abort and quota-miss log lines when `outcome`
+    /// is `None` (sidecars, stateless turns). Booking context is overkill
+    /// there; the request id alone keeps the lines attributable.
+    request_id: Option<String>,
     /// When set, `emit_outcome` records into `first` instead of booking: the
     /// rewriter downstream owns the single booking, with rounds folded in.
     /// Everything else `outcome` drives stays live.
@@ -366,6 +370,7 @@ impl StreamTranslator {
             codex_rate_limits_seen: false,
             codex_rate_limits_finished: false,
             outcome: None,
+            request_id: None,
             deferred_ccr: None,
             outcome_emitted: false,
             observation_completed: false,
@@ -409,6 +414,7 @@ impl StreamTranslator {
             .outcome
             .as_ref()
             .map(|ctx| ctx.request_id.as_str())
+            .or(self.request_id.as_deref())
             .unwrap_or("unknown");
         // Zen never sends quota (no headers, no rate_limits frames): warn
         // would fire on every routed turn. Debug keeps the signal for
@@ -435,6 +441,11 @@ impl StreamTranslator {
 
     fn with_outcome(mut self, ctx: Option<RoutedOutcomeContext>) -> Self {
         self.outcome = ctx;
+        self
+    }
+
+    fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
         self
     }
 
@@ -1441,6 +1452,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn translate_openai_stream_to_anthropic(
     stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     model: String,
@@ -1449,12 +1461,14 @@ pub(crate) fn translate_openai_stream_to_anthropic(
     outcome: Option<RoutedOutcomeContext>,
     deferred_ccr: Option<DeferredCcrBooking>,
     tool_aliases: Option<crate::routed::tool_alias::ToolAlias>,
+    request_id: Option<String>,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     let mut translator = StreamTranslator::new(model)
         .with_codex_limits(codex_limits)
         .with_initial_rate_limits_seen(quota_seen_in_headers)
         .with_outcome(outcome)
-        .with_tool_aliases(tool_aliases);
+        .with_tool_aliases(tool_aliases)
+        .with_request_id(request_id.filter(|id| !id.is_empty()));
     if let Some(deferred) = deferred_ccr {
         translator = translator.with_deferred_ccr(deferred);
     }
@@ -1513,6 +1527,7 @@ fn translate_with_translator(
                                 .outcome
                                 .as_ref()
                                 .map(|ctx| ctx.request_id.as_str())
+                                .or(state.translator.request_id.as_deref())
                                 .unwrap_or("unknown"),
                             // -1 when the lane is unknown (not Zen).
                             egress_slot = state
@@ -2583,6 +2598,7 @@ mod tests {
             None,
             None,
             None,
+            Some("test".to_string()),
         );
         let out: Vec<String> = translated
             .map(|r| String::from_utf8(r.unwrap().to_vec()).unwrap())
@@ -2638,6 +2654,7 @@ mod tests {
             None,
             None,
             None,
+            Some("test".to_string()),
         );
         let items: Vec<Result<bytes::Bytes, std::io::Error>> = translated.collect().await;
         // The upstream error follows the abort events, so the finisher can
