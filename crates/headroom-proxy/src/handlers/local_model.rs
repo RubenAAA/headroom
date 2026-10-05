@@ -36,6 +36,11 @@ use std::net::SocketAddr;
 /// who want a routed model (Codex, Grok, ...) to show up in `/model` name
 /// its route with a `claude-`/`anthropic-` prefix, e.g.
 /// `--extra-model-route "claude-grok-4.6=cursor:cursor-grok-4.6-high"`.
+///
+/// `--advertise-model` IDs are appended after the routes under the same
+/// filter. They have no route: requests for them fall through to the
+/// catch-all forwarder with the caller's own credentials. An ID already
+/// covered by `local_model` or a route is not duplicated.
 pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
     fn discoverable(id: &str) -> bool {
         id.starts_with("claude") || id.starts_with("anthropic")
@@ -66,6 +71,22 @@ pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
         data.push(json!({
             "id": route.model_prefix,
             "display_name": display_name,
+        }));
+    }
+
+    for id in &state.config.advertised_models {
+        if !discoverable(id) {
+            continue;
+        }
+        if data
+            .iter()
+            .any(|v| v.get("id").and_then(|x| x.as_str()) == Some(id.as_str()))
+        {
+            continue;
+        }
+        data.push(json!({
+            "id": id,
+            "display_name": format!("{id} (passthrough)"),
         }));
     }
 

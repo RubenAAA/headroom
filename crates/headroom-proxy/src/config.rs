@@ -1543,6 +1543,22 @@ pub struct CliArgs {
     #[arg(long = "extra-model-route", env = "HEADROOM_PROXY_EXTRA_MODEL_ROUTES")]
     pub extra_model_routes: Vec<String>,
 
+    /// Model IDs to advertise in `GET /v1/models` gateway discovery WITHOUT
+    /// routing them: requests for these IDs keep falling through to the
+    /// catch-all forwarder (full compression pipeline, caller's own
+    /// credentials). Use it for subscription/passthrough models that must
+    /// appear in discovery (Claude Desktop validates an explicit model list
+    /// against discovery output) but must not take the routed path. Can be
+    /// given multiple times or as a comma-separated list in
+    /// `HEADROOM_PROXY_ADVERTISED_MODELS`. Only `claude*`/`anthropic*` IDs
+    /// are listed (other clients ignore the rest); IDs already covered by a
+    /// route are not duplicated.
+    ///
+    /// Example:
+    ///   --advertise-model claude-sonnet-5-5 --advertise-model claude-opus-4-6
+    #[arg(long = "advertise-model", env = "HEADROOM_PROXY_ADVERTISED_MODELS")]
+    pub advertised_models: Vec<String>,
+
     /// Path to a Codex auth JSON file (default: ~/.codex/auth.json).
     /// When set and the file exists, the proxy reads the access_token
     /// and uses it as a Bearer token for OpenAI upstream requests.
@@ -2723,6 +2739,9 @@ pub struct Config {
     /// Additional model routes from `--extra-model-route` flags.
     /// Evaluated after `local_model` (exact match takes priority).
     pub model_routes: Vec<ProviderRoute>,
+    /// Model IDs listed in gateway discovery without a route.
+    /// From `--advertise-model` flags; see its docs.
+    pub advertised_models: Vec<String>,
     /// Path to Codex auth JSON file. When set, the proxy reads the
     /// access_token from this file and uses it as a Bearer token for
     /// OpenAI upstream requests. Re-read on each request for refresh.
@@ -3048,6 +3067,14 @@ impl Config {
                     }
                 })
                 .collect(),
+            advertised_models: args
+                .advertised_models
+                .iter()
+                .flat_map(|s| s.split(','))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
             codex_auth_file: args.codex_auth_file.or_else(|| {
                 let home = std::env::var("HOME").ok()?;
                 let p = std::path::PathBuf::from(home).join(".codex/auth.json");
@@ -3313,6 +3340,7 @@ impl Config {
             sidecar_route_timeout: Duration::from_secs(15),
             local_upstream: None,
             model_routes: Vec::new(),
+            advertised_models: Vec::new(),
             codex_auth_file: None,
             provider_name: None,
             // Cache by default, matching `headroom proxy` upstream: cache mode

@@ -204,6 +204,93 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
     proxy.shutdown().await;
 }
 
+/// `--advertise-model` IDs appear in gateway discovery without a route:
+/// discoverable IDs are listed once (no duplicate when a route already
+/// covers the ID, non-`claude*`/`anthropic*` IDs are skipped like routes),
+/// and inference for an advertised ID still falls through to the default
+/// upstream untouched (full pipeline, caller's credentials).
+#[tokio::test]
+async fn gateway_model_discovery_lists_advertised_models() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello"}],
+            "model": "claude-sonnet-5-5",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })))
+        .mount(&mock)
+        .await;
+
+    let proxy = start_proxy_with(mock.uri().as_str(), |cfg| {
+        cfg.model_routes = vec![ProviderRoute {
+            model_prefix: "claude-codex-5.5".to_string(),
+            prefix_match: false,
+            upstream: Some(Url::parse("https://api.openai.com/v1").unwrap()),
+            translate: true,
+            cursor_agent: None,
+            target_model: Some("gpt-5.5".to_string()),
+            auth_env: None,
+        }];
+        cfg.advertised_models = vec![
+            "claude-sonnet-5-5".to_string(),
+            "claude-codex-5.5".to_string(),
+            "gpt-5.5".to_string(),
+        ];
+    })
+    .await;
+
+    let client = common::shared_client();
+    let resp = client
+        .get(format!("{}/v1/models", proxy.url()))
+        .header("x-api-key", "test-key")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let ids: Vec<String> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().to_string())
+        .collect();
+
+    assert!(ids.contains(&"claude-sonnet-5-5".to_string()));
+    assert!(ids.contains(&"claude-codex-5.5".to_string()));
+    // Exact: the route-covered ID appears once, the non-claude ID never.
+    assert_eq!(ids.iter().filter(|id| *id == "claude-codex-5.5").count(), 1);
+    assert!(!ids.contains(&"gpt-5.5".to_string()));
+
+    // Inference for the advertised-but-unrouted ID reaches the default
+    // upstream with its model ID intact.
+    let resp = client
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-sonnet-5-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(sent["model"], "claude-sonnet-5-5");
+
+    proxy.shutdown().await;
+}
+
 /// Codex-targeted translate routes should route to OpenAI Responses
 /// instead of Chat Completions, so the upstream path matches the
 /// Codex/OpenAI surface.

@@ -750,6 +750,13 @@ Options:
           
           [env: HEADROOM_PROXY_EXTRA_MODEL_ROUTES=]
 
+      --advertise-model <ADVERTISED_MODELS>
+          Model IDs to advertise in `GET /v1/models` gateway discovery WITHOUT routing them: requests for these IDs keep falling through to the catch-all forwarder (full compression pipeline, caller's own credentials). Use it for subscription/passthrough models that must appear in discovery (Claude Desktop validates an explicit model list against discovery output) but must not take the routed path. Can be given multiple times or as a comma-separated list in `HEADROOM_PROXY_ADVERTISED_MODELS`. Only `claude*`/`anthropic*` IDs are listed (other clients ignore the rest); IDs already covered by a route are not duplicated.
+          
+          Example: --advertise-model claude-sonnet-5-5 --advertise-model claude-opus-4-6
+          
+          [env: HEADROOM_PROXY_ADVERTISED_MODELS=]
+
       --codex-auth-file <CODEX_AUTH_FILE>
           Path to a Codex auth JSON file (default: ~/.codex/auth.json). When set and the file exists, the proxy reads the access_token and uses it as a Bearer token for OpenAI upstream requests. The token is re-read from disk on each request so Codex's refresh cycle is picked up without proxy restarts.
           
