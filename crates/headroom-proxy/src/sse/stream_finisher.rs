@@ -59,33 +59,37 @@ const TRUNCATION_MARKER: &str = "\n\n[truncated: the connection to the API dropp
 
 /// Request header a client sets to choose how a mid-message drop is closed.
 /// Read on routed (translated) turns, where headless agents run; the direct
-/// Anthropic path always closes with the tail.
+/// Anthropic path always closes with the tail. Absent or unrecognised means
+/// the default ([`DropClose::Error`]); `tail` opts back into the marker.
 pub(crate) const DROP_CLOSE_HEADER: &str = "x-headroom-on-drop";
 
 /// How a stream that died mid-message is closed.
 ///
-/// The tail is right for a person at a terminal: the turn ends, the marker
-/// says where, and they decide what to do next. A headless client has nobody
-/// to read the marker. `claude -p` reports the tailed turn as a success
-/// (`is_error: false`, the marker as the whole answer — measured 2026-10-05),
-/// so an agent pipeline takes a dropped answer for a finished one. Ended with
-/// an in-band `error` instead, the same client re-sends the turn unstreamed
-/// and gets the full answer, or reports the failure if that fails too.
+/// The default is [`DropClose::Error`]. A headless client has nobody to read
+/// a marker: `claude -p` reports a tailed turn as a success (`is_error:
+/// false`, the marker as the whole answer — measured 2026-10-05), so an
+/// agent pipeline takes a dropped answer for a finished one. Ended with an
+/// in-band `error` instead, the same client re-sends the turn unstreamed
+/// and gets the full answer, or reports the failure if that fails too. The
+/// tail stays for a person at a terminal who would rather see the partial
+/// text and decide themselves.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum DropClose {
-    /// Close the message well-formed, marked truncated. The default.
-    #[default]
+    /// Close the message well-formed, marked truncated. Opt in with
+    /// `x-headroom-on-drop: tail`.
     Tail,
-    /// End the stream with an in-band `api_error`, opted into with
-    /// `x-headroom-on-drop: error`.
+    /// End the stream with an in-band `api_error`. The default, and the
+    /// `x-headroom-on-drop: error` value.
+    #[default]
     Error,
 }
 
 impl DropClose {
     pub(crate) fn from_headers(headers: &axum::http::HeaderMap) -> Self {
         match headers.get(DROP_CLOSE_HEADER).and_then(|v| v.to_str().ok()) {
+            Some(v) if v.trim().eq_ignore_ascii_case("tail") => Self::Tail,
             Some(v) if v.trim().eq_ignore_ascii_case("error") => Self::Error,
-            _ => Self::Tail,
+            _ => Self::default(),
         }
     }
 }
@@ -1115,12 +1119,12 @@ mod tests {
     #[test]
     fn drop_close_is_read_from_the_request_header() {
         let mut h = axum::http::HeaderMap::new();
-        assert_eq!(DropClose::from_headers(&h), DropClose::Tail);
+        assert_eq!(DropClose::from_headers(&h), DropClose::Error);
         h.insert(DROP_CLOSE_HEADER, "Error".parse().unwrap());
         assert_eq!(DropClose::from_headers(&h), DropClose::Error);
         h.insert(DROP_CLOSE_HEADER, "tail".parse().unwrap());
         assert_eq!(DropClose::from_headers(&h), DropClose::Tail);
         h.insert(DROP_CLOSE_HEADER, "bogus".parse().unwrap());
-        assert_eq!(DropClose::from_headers(&h), DropClose::Tail);
+        assert_eq!(DropClose::from_headers(&h), DropClose::Error);
     }
 }

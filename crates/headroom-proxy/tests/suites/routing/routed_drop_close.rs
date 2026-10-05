@@ -1,11 +1,12 @@
 //! A routed stream that dies after the client is committed is closed the way
-//! the client asked: the marked `end_turn` tail by default, an in-band `error`
-//! with `x-headroom-on-drop: error`.
+//! the client asked: an in-band `error` by default, the marked `end_turn` tail
+//! with `x-headroom-on-drop: tail`.
 //!
 //! The tail reads as success to a headless client. Measured 2026-10-05 on a
 //! Spark review pass: `claude -p` returned `is_error: false` with
 //! `[truncated: the connection to the API dropped mid-response]` as its whole
-//! answer, and the pipeline took that as a finished review.
+//! answer, and the pipeline took that as a finished review. So the default is
+//! the error: the client resends unstreamed and gets the full answer.
 
 use super::common;
 
@@ -127,12 +128,31 @@ async fn dropped_turn(on_drop: Option<&str>) -> (String, bool) {
 }
 
 #[tokio::test]
-async fn a_committed_drop_ends_in_the_marked_tail_by_default() {
+async fn a_committed_drop_ends_in_an_error_by_default() {
     let (text, _) = dropped_turn(None).await;
+    assert!(text.contains("partial"), "text already sent: {text:.300}");
+    let tail = &text[text.len().saturating_sub(400)..];
+    assert!(
+        tail.contains("event: error") && tail.contains("\"api_error\""),
+        "the drop must end in an in-band error: {tail}"
+    );
+    assert!(!text.contains("[truncated"), "no marker in error mode");
+    assert!(
+        !text.contains("event: message_stop"),
+        "turn must not read as finished"
+    );
+}
+
+#[tokio::test]
+async fn a_committed_drop_ends_in_the_marked_tail_when_the_client_asks() {
+    let (text, _) = dropped_turn(Some("tail")).await;
     assert!(text.contains("partial"), "text already sent: {text:.300}");
     assert!(text.contains("[truncated"), "marker missing");
     assert!(text.contains("event: message_stop"), "tail missing");
-    assert!(!text.contains("event: error"), "default must stay the tail");
+    assert!(
+        !text.contains("event: error"),
+        "tail mode must stay the tail"
+    );
 }
 
 #[tokio::test]
