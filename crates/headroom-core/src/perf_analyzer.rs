@@ -971,6 +971,7 @@ pub fn format_report(report: &PerfReport, cli: Option<&CliFiltering>) -> String 
     let records = &report.perf_records;
     if !records.is_empty() {
         push_headline_lines(records, &mut lines);
+        push_savings_audit_lines(records, &mut lines);
         push_per_model_lines(records, &mut lines);
         lines.push("  * Actual bill savings depend on provider caching behavior".to_string());
         lines.push(String::new());
@@ -1092,6 +1093,97 @@ fn push_headline_lines(records: &[PerfRecord], lines: &mut Vec<String>) {
             "  · messages {} / · tool schemas {}",
             commafy(total_msg),
             commafy(total_tool)
+        ));
+    }
+    lines.push(String::new());
+}
+
+/// Cross-check of logged savings against raw before/after deltas.
+///
+/// Prompt growth, cache accounting and tool-schema savings can all make the
+/// logged figure differ from the raw prompt reduction, and a record logging
+/// more saved than it ever had is impossible. Port of upstream `9a72bc02`
+/// (`build_savings_audit` aggregates); the per-record lists behind the
+/// Python dict (`top_saving_requests`, `suspicious_records`) have no text
+/// consumer and are left out.
+pub struct SavingsAudit {
+    pub prompt_reduction_tokens: i64,
+    pub prompt_reduction_pct: f64,
+    pub logged_tokens_saved: i64,
+    pub logged_savings_pct: f64,
+    pub accounting_delta_tokens: i64,
+    pub records_total: usize,
+    pub records_with_delta: usize,
+    pub impossible_saved_gt_before: usize,
+}
+
+/// Raw prompt-token delta for one record, excluding cache/accounting effects.
+fn audit_prompt_reduction_tokens(record: &PerfRecord) -> i64 {
+    (record.tokens_before - record.tokens_after).max(0)
+}
+
+fn pct_of(part: i64, whole: i64) -> f64 {
+    if whole > 0 {
+        part as f64 / whole as f64 * 100.0
+    } else {
+        0.0
+    }
+}
+
+pub fn build_savings_audit(records: &[PerfRecord]) -> SavingsAudit {
+    let total_before: i64 = records.iter().map(|r| r.tokens_before).sum();
+    let prompt_reduction: i64 = records.iter().map(audit_prompt_reduction_tokens).sum();
+    let logged: i64 = records.iter().map(|r| r.tokens_saved).sum();
+    SavingsAudit {
+        prompt_reduction_tokens: prompt_reduction,
+        prompt_reduction_pct: pct_of(prompt_reduction, total_before),
+        logged_tokens_saved: logged,
+        logged_savings_pct: pct_of(logged, total_before),
+        accounting_delta_tokens: logged - prompt_reduction,
+        records_total: records.len(),
+        records_with_delta: records
+            .iter()
+            .filter(|r| r.tokens_saved != audit_prompt_reduction_tokens(r))
+            .count(),
+        impossible_saved_gt_before: records
+            .iter()
+            .filter(|r| r.tokens_before > 0 && r.tokens_saved > r.tokens_before)
+            .count(),
+    }
+}
+
+/// Audit section between the headline and the per-model table, mirroring the
+/// Python layout. The delta and impossible lines print only when non-zero.
+fn push_savings_audit_lines(records: &[PerfRecord], lines: &mut Vec<String>) {
+    let audit = build_savings_audit(records);
+    lines.push("Savings Audit".to_string());
+    lines.push("-".repeat(40));
+    lines.push(format!(
+        "  Raw prompt reduction: {} tokens ({:.1}%)",
+        commafy(audit.prompt_reduction_tokens),
+        audit.prompt_reduction_pct
+    ));
+    lines.push(format!(
+        "  Logged savings:       {} tokens ({:.1}%)",
+        commafy(audit.logged_tokens_saved),
+        audit.logged_savings_pct
+    ));
+    let delta = audit.accounting_delta_tokens;
+    let sign = if delta < 0 { "-" } else { "+" };
+    lines.push(format!(
+        "  Accounting delta:     {sign}{} tokens",
+        commafy(delta.abs())
+    ));
+    if audit.records_with_delta > 0 {
+        lines.push(format!(
+            "  Records with delta:   {}/{}",
+            audit.records_with_delta, audit.records_total
+        ));
+    }
+    if audit.impossible_saved_gt_before > 0 {
+        lines.push(format!(
+            "  Impossible records:   {} saved more than before",
+            audit.impossible_saved_gt_before
         ));
     }
     lines.push(String::new());
@@ -1750,6 +1842,26 @@ mod tests {
         let report = parse_lines(&[line], 0.0);
         let text = format_report(&report, None);
         assert!(text.contains("list price unknown"));
+    }
+
+    /// Upstream `9a72bc02`: the audit cross-checks logged savings against raw
+    /// prompt deltas and flags impossible records. One clean record (no delta
+    /// lines) plus one logging more than it had (all lines).
+    #[test]
+    fn format_report_savings_audit_section() {
+        let clean = "2026-06-10 10:00:00,000 - x - INFO - [r] PERF model=m msgs=1 \
+                     tok_before=1000 tok_after=800 tok_saved=200 transforms=none";
+        let impossible = "2026-06-10 10:00:01,000 - x - INFO - [r] PERF model=m msgs=1 \
+                          tok_before=100 tok_after=90 tok_saved=200 transforms=none";
+        let report = parse_lines(&[clean, impossible], 0.0);
+        let text = format_report(&report, None);
+        assert!(text.contains("Savings Audit"));
+        // Raw reduction 200 + 10 = 210 (19.1% of 1100); logged 200 + 200 = 400.
+        assert!(text.contains("Raw prompt reduction: 210 tokens (19.1%)"));
+        assert!(text.contains("Logged savings:       400 tokens (36.4%)"));
+        assert!(text.contains("Accounting delta:     +190 tokens"));
+        assert!(text.contains("Records with delta:   1/2"));
+        assert!(text.contains("Impossible records:   1 saved more than before"));
     }
 
     #[test]

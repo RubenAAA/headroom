@@ -45,8 +45,12 @@ pub fn build_relevance_query(user_query: &str, tool_name: &str, tool_args: &str)
 ///
 /// Lossless partition: the concatenation of all segments equals the original.
 /// Blank lines delimit records; oversized or dense blank-free blocks are packed
-/// into windows of at most `window` lines / `max_chars` chars, with indented
-/// continuation lines held to their window so multi-line units aren't cut.
+/// into windows of at most `window` lines and `max_chars` chars, with indented
+/// continuation lines held past the line window (still inside `max_chars`) so
+/// multi-line units aren't cut mid-run. One budget covers the whole segment, so
+/// a long indented run is windowed rather than collapsed into one record. A
+/// single line longer than `max_chars` is emitted whole, since splitting it
+/// would break the partition.
 pub fn segment(content: &str, window: usize, max_chars: usize) -> Vec<String> {
     // Split like Python's splitlines(keepends=True) — preserve line endings
     let lines: Vec<&str> = splitlines_keepends(content);
@@ -72,24 +76,27 @@ pub fn segment(content: &str, window: usize, max_chars: usize) -> Vec<String> {
         blocks.push(cur);
     }
 
-    // Pass 2: pack/window each block
+    // Pass 2: grow one segment at a time under a single char budget
+    // (upstream `0ef7b2a7`). Always take at least one line — a single
+    // over-long line is atomic — then keep growing while the line window or
+    // an indented continuation asks for it AND the budget still fits, so
+    // `max_chars` bounds every multi-line segment instead of only the
+    // continuation.
     let mut segments = Vec::new();
     for block in &blocks {
-        let block_len = block.len();
-        let block_chars: usize = block.iter().map(|l| l.len()).sum();
-        if block_len <= window && block_chars <= max_chars {
-            segments.push(block.concat().to_string());
-            continue;
-        }
         let mut i = 0;
-        let n = block_len;
+        let n = block.len();
         while i < n {
-            let mut j = std::cmp::min(i + window, n);
-            while j < n && (block[j].starts_with(' ') || block[j].starts_with('\t')) {
+            let mut j = i + 1;
+            let mut size: usize = block[i].len();
+            while j < n
+                && (j - i < window || block[j].starts_with(' ') || block[j].starts_with('\t'))
+                && size + block[j].len() <= max_chars
+            {
+                size += block[j].len();
                 j += 1;
             }
-            let chunk: String = block[i..j].concat();
-            segments.push(chunk);
+            segments.push(block[i..j].concat());
             i = j;
         }
     }
@@ -269,6 +276,23 @@ mod tests {
         let joined: String = segs.concat();
         assert_eq!(joined, text);
         assert!(segs.len() > 1); // dense blank-free stream got windowed
+    }
+
+    #[test]
+    fn segment_respects_max_chars_upstream_0ef7b2a7() {
+        // Upstream `0ef7b2a7`: segments are bounded by `max_chars` as well
+        // as the line window, so one long line cannot blow the budget.
+        let text = "a\n".repeat(50);
+        let segs = segment(&text, 1000, 20);
+        assert!(segs.len() > 1, "a tiny char budget must force splits");
+        for s in &segs {
+            assert!(
+                s.chars().count() <= 20,
+                "no segment may exceed max_chars, got {} chars",
+                s.chars().count()
+            );
+        }
+        assert_eq!(segs.concat(), text);
     }
 
     #[test]

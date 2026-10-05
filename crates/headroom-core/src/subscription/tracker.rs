@@ -595,6 +595,38 @@ mod tests {
     }
 
     #[test]
+    fn traffic_bearer_never_becomes_poll_credential() {
+        // Upstream `65e63c08`: usage pollers must never poll with a network
+        // caller's credential. The Rust tracker keeps no raw bearer at all
+        // (PR-F3: only a hash + last-4), so a bearer learned from traffic can
+        // mark activity but can never become the poll credential, which comes
+        // solely from the operator's env var / credentials file.
+        let _g = crate::subscription::env_guard();
+        let saved_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        unsafe { std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") };
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/nonexistent-headroom-test-config-dir") };
+        let tracker = tracker_with(None);
+        tracker.notify_active("Bearer foreign-network-bearer");
+        assert!(tracker.is_active(), "activity is still marked");
+        assert_eq!(
+            tracker.poll_token(),
+            None,
+            "a traffic bearer must not become pollable"
+        );
+        unsafe { std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "operator-token") };
+        assert_eq!(
+            tracker.poll_token().as_deref(),
+            Some("operator-token"),
+            "the operator's own credential still polls"
+        );
+        unsafe { std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") };
+        match saved_config_dir {
+            Some(dir) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir) },
+            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
+    }
+
+    #[test]
     fn raw_token_not_stored_in_memory() {
         // PR-F3: the tracker keeps only a one-way hash + last-4 of the bearer.
         let tracker = tracker_with(None);

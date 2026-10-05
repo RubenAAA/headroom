@@ -1667,6 +1667,16 @@ fn external_compressor_matches(descriptor: &CompressorDescriptor, content_mime: 
 
 /// True if `out` must be discarded in favour of the built-in path, logging why.
 fn external_output_rejected(name: &str, content: &str, out: &CompressOutput) -> bool {
+    // A passthrough (`compressed: false`) is the compressor declining this
+    // block, not a result; fall back so the built-in path still gets its
+    // turn instead of the block going out uncompressed (upstream `2c4b20fc`).
+    if !out.compressed {
+        tracing::debug!(
+            compressor = %name,
+            "external compressor passed through; falling back to built-in"
+        );
+        return true;
+    }
     // Never blank out a non-empty block (an empty user/tool block makes
     // providers reject the request); fall back so the built-in path runs.
     if !content.trim().is_empty() && out.content.trim().is_empty() {
@@ -2347,8 +2357,14 @@ pub fn segment(content: &str, window: usize, max_chars: usize) -> Vec<String> {
                 window_chars += block[i].len();
                 i += 1;
                 // Python: `while j < n and block[j][:1] in (" ", "\t"): j += 1`
-                // Extend window to include indented continuation lines
-                while i < block.len() && block[i].starts_with([' ', '\t']) {
+                // Extend window to include indented continuation lines — but
+                // still inside `max_chars` (upstream `0ef7b2a7`): an unbounded
+                // indented run (stack trace, indented log/JSON) collapsed
+                // into one mega-segment scored as a single record.
+                while i < block.len()
+                    && block[i].starts_with([' ', '\t'])
+                    && window_chars + block[i].len() <= max_chars
+                {
                     window_lines.push(block[i]);
                     window_chars += block[i].len();
                     i += 1;

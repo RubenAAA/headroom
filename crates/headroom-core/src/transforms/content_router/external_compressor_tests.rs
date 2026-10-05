@@ -11,6 +11,8 @@ enum Behavior {
     Expand,
     /// Blank the block out entirely.
     Empty,
+    /// Decline the block: original bytes back with `compressed: false`.
+    Passthrough,
     /// Shrink, and also emit a recovery map entry.
     ShrinkWithRecoverable,
 }
@@ -52,6 +54,11 @@ impl Compressor for StubExternal {
             },
             Behavior::Empty => CompressOutput {
                 content: "   ".to_string(),
+                ..Default::default()
+            },
+            Behavior::Passthrough => CompressOutput {
+                content: input.content.clone(),
+                compressed: false,
                 ..Default::default()
             },
             Behavior::ShrinkWithRecoverable => {
@@ -187,6 +194,33 @@ fn a_compressor_that_blanks_the_block_is_rejected() {
 
     assert!(!out.trim().is_empty());
     assert!(!chain.iter().any(|c| c.starts_with("external:")));
+}
+
+/// A passthrough (`compressed: false`) is the compressor declining the block,
+/// not a result: the built-in path must still get its turn (upstream
+/// `2c4b20fc`), instead of the block going out uncompressed.
+#[test]
+fn a_passthrough_compressor_falls_back_to_the_builtin() {
+    let registry = registry_with(StubExternal::arc(
+        "ext",
+        &["text/plain"],
+        Behavior::Passthrough,
+    ));
+    let (out, _, chain) = run(SAMPLE, &selecting(&["ext"]), &registry);
+
+    assert!(
+        !chain.iter().any(|c| c.starts_with("external:")),
+        "a declined block must reach the built-in path, got {chain:?}"
+    );
+    let (builtin, _, _) = apply_strategy(
+        SAMPLE,
+        CompressionStrategy::Text,
+        &selecting(&["ext"]),
+        "",
+        None,
+        0.5,
+    );
+    assert_eq!(out, builtin, "fallback must equal the built-in result");
 }
 
 #[test]

@@ -1047,6 +1047,26 @@ fn adaptive_threshold_uniform_returns_floor() {
 
 // --- plan_relevance_split ---
 
+/// Upstream `0ef7b2a7`: a deep indented run (stack trace, indented log/JSON)
+/// must be windowed inside `max_chars`, not collapsed into one mega-segment
+/// by the continuation extension.
+#[test]
+fn segment_bounds_a_long_indented_run_by_max_chars() {
+    let run: String = (0..30).map(|i| format!("  indented line {i}\n")).collect();
+    let content = format!("head\n{run}");
+    let max_chars = 100;
+    let segs = segment(&content, 8, max_chars);
+    assert!(segs.len() > 1, "the run must be windowed, got one segment");
+    for s in &segs {
+        assert!(
+            s.len() <= max_chars,
+            "no segment may exceed max_chars, got {} chars",
+            s.len()
+        );
+    }
+    assert_eq!(segs.join("\n"), content, "partition must stay lossless");
+}
+
 #[test]
 fn plan_relevance_split_empty_query() {
     let content = "line1\n\nline2\n\nline3";

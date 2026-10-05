@@ -1361,6 +1361,21 @@ mod tests {
         assert_eq!(output["tool_choice"]["name"], "Bash");
     }
 
+    /// Upstream `57a57088`: Anthropic `{"type": "none"}` must map to OpenAI
+    /// `"none"` — falling through to the `"auto"` default inverts an explicit
+    /// do-not-call-tools instruction.
+    #[test]
+    fn anthropic_none_dict_tool_choice_maps_to_none_not_auto() {
+        let input = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "none"}
+        });
+        let output = anthropic_to_openai_responses_request(&input, false).unwrap();
+        assert_eq!(output["tool_choice"], json!("none"));
+    }
+
     #[test]
     fn anthropic_to_openai_responses_request_omits_tools_when_absent() {
         let input = json!({

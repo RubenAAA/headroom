@@ -399,6 +399,28 @@ mod tests {
     }
 
     #[test]
+    fn tail_anthropic_skips_a_trailing_system_message() {
+        // Upstream `3948dbe4`: Claude Code 2.1.x appends a trailing
+        // `role: "system"` environment message (carrying the cache
+        // breakpoint) after the user turn. Injection must land on the latest
+        // user turn and leave the system message byte-identical — never
+        // report `no_eligible_user_turn` just because `messages[-1]` is not
+        // a user turn.
+        let mut msgs = vec![
+            json!({"role": "user", "content": "the prompt"}),
+            json!({"role": "system", "content": "# Environment …"}),
+        ];
+        let n = append_to_latest_user_tail(&mut msgs, "CTX", "anthropic", 0);
+        assert_eq!(n, 3);
+        assert_eq!(msgs[0]["content"].as_str().unwrap(), "the prompt\n\nCTX");
+        assert_eq!(
+            msgs[1]["content"].as_str().unwrap(),
+            "# Environment …",
+            "the trailing system message must stay byte-identical"
+        );
+    }
+
+    #[test]
     fn tail_openai_dispatches() {
         let mut msgs = vec![json!({
             "role": "user",
