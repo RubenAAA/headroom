@@ -505,7 +505,7 @@ fn splice_memory_trace(provider: &str, trace: &[String], current_response: &mut 
             0,
             serde_json::json!({
                 "type": "text",
-                "text": format!("[headroom memory]\n{}", trace.join("\n")),
+                "text": format!("[headroom memory] (server-side memory calls, not assistant output)\n{}", trace.join("\n")),
             }),
         );
     }
