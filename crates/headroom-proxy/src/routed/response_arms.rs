@@ -469,6 +469,7 @@ fn with_ccr_booking(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_streaming_response(
     upstream_resp: reqwest::Response,
     original: &Value,
@@ -477,6 +478,7 @@ pub(crate) async fn handle_streaming_response(
     ccr: Option<RoutedCcr>,
     slow_probe: Option<crate::upstream_route_probe::SlowUpstreamProbe>,
     early_retry: Option<crate::routed::early_stream_retry::EarlyRetryCtx>,
+    drop_close: crate::sse::stream_finisher::DropClose,
 ) -> Response {
     let original_model = original
         .get("model")
@@ -569,9 +571,10 @@ pub(crate) async fn handle_streaming_response(
                             redact_table,
                             &request_id,
                             with_ccr_booking(
-                                Box::pin(crate::sse::stream_finisher::finish_on_drop(
+                                Box::pin(crate::sse::stream_finisher::finish_on_drop_with(
                                     translated_stream,
                                     request_id.clone(),
+                                    drop_close,
                                 )),
                                 &deferred,
                                 &guard_outcome,
@@ -624,7 +627,8 @@ pub(crate) async fn handle_streaming_response(
         }
         None => Box::pin(translated_stream),
     };
-    let finished = crate::sse::stream_finisher::finish_on_drop(inner, request_id.clone());
+    let finished =
+        crate::sse::stream_finisher::finish_on_drop_with(inner, request_id.clone(), drop_close);
     // CCR turns book once here, with rounds folded in; every other turn
     // passes through exactly as before.
     let finished = with_ccr_booking(Box::pin(finished), &deferred, &guard_outcome);

@@ -57,6 +57,39 @@ const CLIENT_QUEUE_DEPTH: usize = 64;
 /// Appended to the reply so a truncated answer never reads as a finished one.
 const TRUNCATION_MARKER: &str = "\n\n[truncated: the connection to the API dropped mid-response]";
 
+/// Request header a client sets to choose how a mid-message drop is closed.
+/// Read on routed (translated) turns, where headless agents run; the direct
+/// Anthropic path always closes with the tail.
+pub(crate) const DROP_CLOSE_HEADER: &str = "x-headroom-on-drop";
+
+/// How a stream that died mid-message is closed.
+///
+/// The tail is right for a person at a terminal: the turn ends, the marker
+/// says where, and they decide what to do next. A headless client has nobody
+/// to read the marker. `claude -p` reports the tailed turn as a success
+/// (`is_error: false`, the marker as the whole answer — measured 2026-10-05),
+/// so an agent pipeline takes a dropped answer for a finished one. Ended with
+/// an in-band `error` instead, the same client re-sends the turn unstreamed
+/// and gets the full answer, or reports the failure if that fails too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DropClose {
+    /// Close the message well-formed, marked truncated. The default.
+    #[default]
+    Tail,
+    /// End the stream with an in-band `api_error`, opted into with
+    /// `x-headroom-on-drop: error`.
+    Error,
+}
+
+impl DropClose {
+    pub(crate) fn from_headers(headers: &axum::http::HeaderMap) -> Self {
+        match headers.get(DROP_CLOSE_HEADER).and_then(|v| v.to_str().ok()) {
+            Some(v) if v.trim().eq_ignore_ascii_case("error") => Self::Error,
+            _ => Self::Tail,
+        }
+    }
+}
+
 /// The marker for a drop that took an unfinished tool call with it.
 ///
 /// A discarded `tool_use` is the expensive case and it used to read exactly
@@ -246,9 +279,24 @@ impl Wire {
     /// Empty when the message already ended properly, or when it never
     /// started — with no `message_start` on the wire there is no message to
     /// close, and the error belongs to the layer below.
-    fn tail(&self) -> Vec<Bytes> {
+    fn tail(&self, close: DropClose) -> Vec<Bytes> {
         if !self.saw_message_start || self.saw_message_stop || self.saw_error {
             return Vec::new();
+        }
+        if close == DropClose::Error {
+            // Nothing is closed first: the client discards a message that ends
+            // in an error, open blocks included, and a withheld tool block
+            // never reached it.
+            return vec![frame(
+                "error",
+                &serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "the connection to the API dropped mid-response",
+                    },
+                }),
+            )];
         }
         let mut out = Vec::new();
         // What the marker says. A drop that discarded a tool call has to name
@@ -385,6 +433,19 @@ fn client_gone(request_id: &str) {
 pub(crate) fn finish_on_drop<S, E>(
     inner: S,
     request_id: String,
+) -> impl Stream<Item = Result<Bytes, E>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + std::fmt::Debug + Send + 'static,
+{
+    finish_on_drop_with(inner, request_id, DropClose::Tail)
+}
+
+/// `finish_on_drop`, with the close the client asked for (see `DropClose`).
+pub(crate) fn finish_on_drop_with<S, E>(
+    inner: S,
+    request_id: String,
+    close: DropClose,
 ) -> impl Stream<Item = Result<Bytes, E>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -563,7 +624,7 @@ where
                 })
             })
             .count();
-        let tail = wire.tail();
+        let tail = wire.tail(close);
         if tail.is_empty() {
             let Some(e) = drop_err else {
                 return;
@@ -608,8 +669,9 @@ where
             cause = ?drop_err,
             discarded_tool_blocks = discarded,
             output_tokens = wire.output_tokens,
-            "upstream stream died mid-message; closing the turn cleanly so the \
-             session survives, with the reply marked truncated"
+            close = ?close,
+            "upstream stream died mid-message; closing the turn so the session \
+             survives — marked truncated (Tail) or as an in-band error (Error)"
         );
         for b in tail {
             if tx.send(Ok(b)).await.is_err() {
@@ -634,6 +696,10 @@ mod tests {
     /// line differs. That keeps the tests free of a hand-built `reqwest::Error`,
     /// which has no public constructor.
     fn drive(chunks: &[&str]) -> String {
+        drive_with(chunks, DropClose::Tail)
+    }
+
+    fn drive_with(chunks: &[&str], close: DropClose) -> String {
         let owned: Vec<reqwest::Result<Bytes>> = chunks
             .iter()
             .map(|c| Ok(Bytes::from(c.to_string())))
@@ -643,7 +709,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let out = finish_on_drop(futures_util::stream::iter(owned), "test".into());
+            let out = finish_on_drop_with(futures_util::stream::iter(owned), "test".into(), close);
             futures_util::pin_mut!(out);
             let mut s = String::new();
             while let Some(item) = out.next().await {
@@ -999,5 +1065,62 @@ mod tests {
             "downgraded a good turn:\n{out}"
         );
         assert!(out.contains("\"tool_use\""), "tool block missing:\n{out}");
+    }
+
+    /// A headless client reads a synthesised `end_turn` as success: measured
+    /// 2026-10-05, `claude -p` returned `is_error: false` with the marker as its
+    /// whole answer. Asked for it, the drop ends as an in-band `error` instead,
+    /// which `claude -p` answers by re-sending the turn unstreamed.
+    #[test]
+    fn error_mode_ends_a_drop_with_an_in_band_error() {
+        let out = drive_with(&[START, TEXT_START, TEXT_DELTA], DropClose::Error);
+        assert!(out.contains("hi"), "text already sent was lost: {out}");
+        assert!(
+            out.ends_with("\n\n") && out.rfind("event: error") > out.rfind("hi"),
+            "the drop must end in an error event: {out}"
+        );
+        assert!(out.contains("\"type\":\"api_error\""), "{out}");
+        assert!(
+            !out.contains("[truncated"),
+            "no marker in error mode: {out}"
+        );
+        assert!(
+            !out.contains("message_stop"),
+            "turn must not read as finished: {out}"
+        );
+        assert!(!out.contains("end_turn"), "{out}");
+    }
+
+    #[test]
+    fn error_mode_still_withholds_a_partial_tool_block() {
+        let out = drive_with(
+            &[START, TEXT_START, TEXT_DELTA, TOOL_START, TOOL_DELTA],
+            DropClose::Error,
+        );
+        assert!(!out.contains("rm -rf"), "partial tool input leaked: {out}");
+        assert!(!out.contains("tool_use"), "tool block leaked: {out}");
+        assert!(out.contains("event: error"), "{out}");
+    }
+
+    #[test]
+    fn error_mode_leaves_a_complete_stream_and_an_early_drop_alone() {
+        let complete = [START, TEXT_START, TEXT_DELTA, CB_STOP0, MSG_DELTA, MSG_STOP];
+        assert_eq!(drive_with(&complete, DropClose::Error), complete.concat());
+        assert_eq!(drive_with(&[], DropClose::Error), "");
+        // A provider error already on the wire is not doubled.
+        let out = drive_with(&[START, TEXT_START, TEXT_DELTA, ERROR_EV], DropClose::Error);
+        assert_eq!(out.matches("event: error").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn drop_close_is_read_from_the_request_header() {
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(DropClose::from_headers(&h), DropClose::Tail);
+        h.insert(DROP_CLOSE_HEADER, "Error".parse().unwrap());
+        assert_eq!(DropClose::from_headers(&h), DropClose::Error);
+        h.insert(DROP_CLOSE_HEADER, "tail".parse().unwrap());
+        assert_eq!(DropClose::from_headers(&h), DropClose::Tail);
+        h.insert(DROP_CLOSE_HEADER, "bogus".parse().unwrap());
+        assert_eq!(DropClose::from_headers(&h), DropClose::Tail);
     }
 }
