@@ -256,6 +256,7 @@ impl ContextTracker {
         query: &str,
         current_turn: Option<u32>,
         workspace_key: &str,
+        present_hashes: Option<&std::collections::HashSet<String>>,
     ) -> Vec<ExpansionRecommendation> {
         if !self.config.enabled || !self.config.proactive_expansion {
             return vec![];
@@ -276,6 +277,15 @@ impl ContextTracker {
         for (hash_key, context) in &self.contexts {
             // Workspace filter
             if context.workspace_key != workspace_key {
+                continue;
+            }
+
+            // Only compressions this conversation actually holds: a same-cwd
+            // teammate must never receive another agent's tool output. Upstream
+            // `9b9a883e`. `None` keeps the old workspace-only behaviour.
+            if let Some(present) = present_hashes
+                && !present.contains(&context.hash_key)
+            {
                 continue;
             }
 
@@ -563,7 +573,7 @@ mod tests {
             );
         }
 
-        let recs = tracker.analyze_query("auth middleware", Some(200), "ws");
+        let recs = tracker.analyze_query("auth middleware", Some(2), "ws", None);
         assert_eq!(recs.len(), 1);
         assert!(
             recs[0].reason.contains("in turn 1,"),
@@ -586,10 +596,10 @@ mod tests {
             "auth",
         );
 
-        let first = tracker.analyze_query("auth middleware", Some(1), "ws");
+        let first = tracker.analyze_query("auth middleware", Some(2), "ws", None);
         assert_eq!(first.len(), 1);
 
-        let second = tracker.analyze_query("auth middleware", Some(2), "ws");
+        let second = tracker.analyze_query("auth middleware", Some(2), "ws", None);
         assert!(
             second.is_empty(),
             "already in the conversation, offered again: {second:?}"
@@ -611,7 +621,7 @@ mod tests {
         );
         assert_eq!(
             tracker
-                .analyze_query("auth middleware", Some(1), "ws")
+                .analyze_query("auth middleware", Some(2), "ws", None)
                 .len(),
             1
         );
@@ -629,7 +639,7 @@ mod tests {
         );
         assert_eq!(
             tracker
-                .analyze_query("auth middleware", Some(1), "ws")
+                .analyze_query("auth middleware", Some(2), "ws", None)
                 .len(),
             1
         );
@@ -639,7 +649,7 @@ mod tests {
     fn analyze_query_empty_workspace_returns_empty() {
         let mut tracker = ContextTracker::new(None);
         tracker.track_compression("abc", 1, None, 10, 5, "ws", "query", "content");
-        let recs = tracker.analyze_query("content", None, "");
+        let recs = tracker.analyze_query("content", None, "", None);
         assert!(recs.is_empty());
     }
 
@@ -668,7 +678,7 @@ mod tests {
         );
 
         // Query from workspace_a should only find ws_a context
-        let recs = tracker.analyze_query("authentication middleware", None, "ws_a");
+        let recs = tracker.analyze_query("authentication middleware", None, "ws_a", None);
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].hash_key, "abc");
     }
@@ -692,7 +702,7 @@ mod tests {
         );
 
         // Query with no overlap should not trigger expansion
-        let recs = tracker.analyze_query("authentication middleware", None, "ws");
+        let recs = tracker.analyze_query("authentication middleware", None, "ws", None);
         assert!(recs.is_empty());
     }
 
@@ -708,7 +718,7 @@ mod tests {
         // Wait for context to age out
         std::thread::sleep(Duration::from_millis(5));
 
-        let recs = tracker.analyze_query("authentication", None, "ws");
+        let recs = tracker.analyze_query("authentication", None, "ws", None);
         assert!(recs.is_empty());
     }
 
@@ -851,7 +861,7 @@ mod tests {
         let mut tracker = ContextTracker::new(Some(config));
         tracker.track_compression("abc", 1, None, 10, 5, "ws", "query", "content");
 
-        let recs = tracker.analyze_query("content", None, "ws");
+        let recs = tracker.analyze_query("content", None, "ws", None);
         assert!(recs.is_empty());
     }
 
@@ -878,7 +888,7 @@ mod tests {
         let hashes = tracker.get_tracked_hashes();
         assert_eq!(hashes.len(), 1); // still only one entry
         // Query should find the updated content
-        let recs = tracker.analyze_query("new content", None, "ws");
+        let recs = tracker.analyze_query("new content", None, "ws", None);
         assert!(!recs.is_empty());
     }
 
@@ -898,7 +908,7 @@ mod tests {
             );
         }
         // Request only 2 recommendations
-        let recs = tracker.analyze_query("feature", Some(2), "ws");
+        let recs = tracker.analyze_query("feature", Some(2), "ws", None);
         assert!(recs.len() <= 2);
     }
 
@@ -909,7 +919,7 @@ mod tests {
         tracker.track_compression("h2", 2, None, 10, 5, "ws-b", "q", "auth middleware");
 
         // Query from ws-a should only find ws-a entries
-        let recs = tracker.analyze_query("auth", None, "ws-a");
+        let recs = tracker.analyze_query("auth", None, "ws-a", None);
         for _rec in &recs {
             // All recommendations should be from the requested workspace
             // (format_expansions adds workspace label when multiple workspaces exist)
@@ -983,7 +993,7 @@ mod tests {
         assert_eq!(hashes.len(), 3);
 
         // 3. Query should find relevant context
-        let recs = tracker.analyze_query("database connection pool", None, "ws-main");
+        let recs = tracker.analyze_query("database connection pool", None, "ws-main", None);
         assert!(
             !recs.is_empty(),
             "expected at least one recommendation for 'database connection pool'"
@@ -1059,7 +1069,7 @@ mod tests {
         tracker.track_compression("h1", 1, None, 10, 5, "ws", "q", "c");
         assert!(tracker.get_tracked_hashes().is_empty());
 
-        let recs = tracker.analyze_query("c", None, "ws");
+        let recs = tracker.analyze_query("c", None, "ws", None);
         assert!(recs.is_empty());
 
         let stats = tracker.get_stats();

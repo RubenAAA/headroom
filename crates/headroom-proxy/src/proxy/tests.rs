@@ -1904,10 +1904,10 @@ fn ccr_context_tracker_filters_cross_workspace() {
 
     assert!(
         tracker
-            .analyze_query("auth middleware", Some(2), "workspace-b")
+            .analyze_query("auth middleware", Some(2), "workspace-b", None)
             .is_empty()
     );
-    let recs = tracker.analyze_query("auth middleware", Some(2), "workspace-a");
+    let recs = tracker.analyze_query("auth middleware", Some(2), "workspace-a", None);
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].hash_key, "abc123");
 }

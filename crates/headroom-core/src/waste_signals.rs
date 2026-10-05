@@ -153,14 +153,19 @@ pub fn detect_waste_signals(text: &str, tokenizer: &dyn Tokenizer) -> WasteSigna
         return signals;
     }
 
-    // HTML tags and comments.
+    // HTML tags and comments. Comments are stripped before tag matching so a
+    // comment is counted once (and tags inside comments are not counted);
+    // upstream `d0e9c4ca`.
     let mut html_text = String::new();
-    for m in html_tag_pattern().find_iter(text) {
+    let comment_text: String = html_comment_pattern()
+        .find_iter(text)
+        .map(|m| m.as_str())
+        .collect();
+    let comment_free = html_comment_pattern().replace_all(text, "");
+    for m in html_tag_pattern().find_iter(&comment_free) {
         html_text.push_str(m.as_str());
     }
-    for m in html_comment_pattern().find_iter(text) {
-        html_text.push_str(m.as_str());
-    }
+    html_text.push_str(&comment_text);
     if !html_text.is_empty() {
         signals.html_noise_tokens = tokenizer.count_text(&html_text);
     }
@@ -239,6 +244,20 @@ mod tests {
         let signals = detect("<div class=\"a\">hi</div> <!-- a comment --> tail");
         assert!(signals.html_noise_tokens > 0);
         assert_eq!(signals.base64_tokens, 0);
+    }
+
+    /// A comment is noise once: the tag pattern also matches the comment
+    /// span, so without stripping, every comment counted twice and any tags
+    /// inside it a third time (upstream `d0e9c4ca`).
+    #[test]
+    fn an_html_comment_is_counted_once() {
+        let signals = detect_waste_signals("<!--<b>padded</b>-->", &CharTokenizer);
+        // Chars of one comment, counted once: `<!--<b>padded</b>-->`. Counting
+        // the embedded tags separately (the old behaviour) adds their length.
+        assert_eq!(
+            signals.html_noise_tokens,
+            "<!--<b>padded</b>-->".chars().count()
+        );
     }
 
     /// The comment pattern must span newlines — Python uses `[\s\S]`, which is

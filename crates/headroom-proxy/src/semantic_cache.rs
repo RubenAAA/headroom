@@ -340,6 +340,9 @@ impl SemanticCache {
             ttl: self.ttl,
             hit_count: 0,
         };
+        if !is_cacheable_reply(&entry.response_body) {
+            return;
+        }
         let mut cache = self.entries.write().unwrap();
         cache.insert(key, entry, self.max_entries);
     }
@@ -368,6 +371,33 @@ impl SemanticCache {
             serde_json::json!(self.ttl.as_secs()),
         );
         stats
+    }
+}
+
+/// Whether a response body may be cached. Error replies delivered as 200
+/// (or byte-identical error envelopes) must not replay: the next client
+/// would receive the error as if it were the answer. Upstream `1132a54b`.
+/// Non-JSON bytes (and non-JSON-shaped bodies, per upstream, since both
+/// handlers only store bodies they already decoded) are stored as before.
+fn is_cacheable_reply(response_body: &[u8]) -> bool {
+    if response_body.is_empty() {
+        return false;
+    }
+    match serde_json::from_slice::<Value>(response_body) {
+        Ok(Value::Object(map)) => {
+            if map.is_empty() {
+                return false;
+            }
+            if map.get("type").and_then(Value::as_str) == Some("error") {
+                return false;
+            }
+            match map.get("error") {
+                Some(Value::Null) | None => true,
+                Some(_) => false,
+            }
+        }
+        Ok(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -427,6 +457,37 @@ mod tests {
     }
 
     #[test]
+    fn error_shaped_bodies_are_not_cacheable() {
+        assert!(!is_cacheable_reply(b""));
+        assert!(!is_cacheable_reply(b"{}"));
+        assert!(!is_cacheable_reply(
+            br#"{"type":"error","error":{"type":"api_error"}}"#
+        ));
+        assert!(!is_cacheable_reply(br#"{"error":"overloaded"}"#));
+        assert!(!is_cacheable_reply(br#"[1,2,3]"#));
+        assert!(is_cacheable_reply(br#"{"error":null}"#));
+        assert!(is_cacheable_reply(br#"{"data":"ok"}"#));
+        assert!(is_cacheable_reply(b"\xff\xfe not json"));
+    }
+
+    #[test]
+    fn set_skips_caching_error_replies() {
+        let cache = SemanticCache::new(60, 8);
+        let msgs = [serde_json::json!({"role": "user", "content": "hello"})];
+        cache.set(
+            &[&msgs[0]],
+            "m",
+            serde_json::json!({"type":"error"}).to_string(),
+            HashMap::new(),
+            0,
+            &[],
+        );
+        assert!(cache.get(&[&msgs[0]], "m", &[]).is_none());
+        cache.set(&[&msgs[0]], "m", "ok-body", HashMap::new(), 0, &[]);
+        assert!(cache.get(&[&msgs[0]], "m", &[]).is_some());
+    }
+
+    #[test]
     fn get_miss_on_empty_cache() {
         let cache = SemanticCache::new(100, 3600);
         let extra: Vec<(&str, &Value)> = Vec::new();
@@ -461,9 +522,16 @@ mod tests {
         let m2 = vec![serde_json::json!({"role": "user", "content": "b"})];
         let m3 = vec![serde_json::json!({"role": "user", "content": "c"})];
 
-        cache.set(&refs(&m1), "m", b"1".to_vec(), HashMap::new(), 0, &extra);
-        cache.set(&refs(&m2), "m", b"2".to_vec(), HashMap::new(), 0, &extra);
-        cache.set(&refs(&m3), "m", b"3".to_vec(), HashMap::new(), 0, &extra);
+        cache.set(&refs(&m1), "m", b"one".to_vec(), HashMap::new(), 0, &extra);
+        cache.set(&refs(&m2), "m", b"two".to_vec(), HashMap::new(), 0, &extra);
+        cache.set(
+            &refs(&m3),
+            "m",
+            b"three".to_vec(),
+            HashMap::new(),
+            0,
+            &extra,
+        );
 
         // m1 should be evicted
         assert!(cache.get(&refs(&m1), "m", &extra).is_none());

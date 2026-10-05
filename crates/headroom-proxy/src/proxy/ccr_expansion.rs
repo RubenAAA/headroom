@@ -204,12 +204,28 @@ pub(super) fn ccr_tracker_and_runtime<'a>(
 /// Lock the tracker and analyze the query. A poisoned lock or an empty
 /// recommendation set each log and decline.
 /// Extracted from `recommend_ccr_expansions` without behavior change.
+use std::collections::HashSet;
+
+/// All `<<ccr:HEX>>` marker hashes in the request text, used to scope
+/// proactive expansion. Marker hashes are 12–24 lowercase hex per the
+/// tool-injection description (`<<ccr:7f6e11a407235b972da63df8>>`).
+fn present_marker_hashes(text: &str) -> HashSet<String> {
+    static RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex_lite::Regex::new(r"<<ccr:([a-f0-9]{12,24})\b").expect("ccr marker regex is valid")
+    });
+    re.captures_iter(text)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .collect()
+}
+
 pub(super) fn query_ccr_tracker(
     tracker: &std::sync::Arc<std::sync::Mutex<headroom_core::ccr::context_tracker::ContextTracker>>,
     user_query: &str,
     turn_number: u32,
     workspace_key: &str,
     request_id: &str,
+    present_hashes: Option<&std::collections::HashSet<String>>,
 ) -> Option<Vec<headroom_core::ccr::context_tracker::ExpansionRecommendation>> {
     let mut guard = match tracker.lock() {
         Ok(guard) => guard,
@@ -222,7 +238,8 @@ pub(super) fn query_ccr_tracker(
             return None;
         }
     };
-    let recommendations = guard.analyze_query(user_query, Some(turn_number), workspace_key);
+    let recommendations =
+        guard.analyze_query(user_query, Some(turn_number), workspace_key, present_hashes);
     if recommendations.is_empty() {
         tracing::info!(
             request_id = %request_id,
@@ -245,13 +262,20 @@ pub(super) fn recommend_ccr_expansions<'a>(
     turn_number: u32,
     workspace_key: &str,
     request_id: &str,
+    present_hashes: Option<&std::collections::HashSet<String>>,
 ) -> Option<(
     &'a CtxOffloadRuntime,
     Vec<headroom_core::ccr::context_tracker::ExpansionRecommendation>,
 )> {
     let (tracker, runtime) = ccr_tracker_and_runtime(state, request_id)?;
-    let recommendations =
-        query_ccr_tracker(tracker, user_query, turn_number, workspace_key, request_id)?;
+    let recommendations = query_ccr_tracker(
+        tracker,
+        user_query,
+        turn_number,
+        workspace_key,
+        request_id,
+        present_hashes,
+    )?;
     Some((runtime, recommendations))
 }
 
@@ -267,6 +291,7 @@ pub(super) fn check_ccr_expansion_prereqs<'a>(
     turn_number: u32,
     workspace_key: &str,
     request_id: &str,
+    present_hashes: Option<&std::collections::HashSet<String>>,
 ) -> Option<(
     &'a CtxOffloadRuntime,
     Vec<headroom_core::ccr::context_tracker::ExpansionRecommendation>,
@@ -274,7 +299,14 @@ pub(super) fn check_ccr_expansion_prereqs<'a>(
     if !expansion_gate_passes(state, user_query, request_id) {
         return None;
     }
-    recommend_ccr_expansions(state, user_query, turn_number, workspace_key, request_id)
+    recommend_ccr_expansions(
+        state,
+        user_query,
+        turn_number,
+        workspace_key,
+        request_id,
+        present_hashes,
+    )
 }
 
 /// Fetch the tracker's recommended contents from the CCR store, skipping
@@ -314,9 +346,22 @@ pub(crate) fn maybe_append_ccr_proactive_expansion(
     request_id: &str,
     budget: &crate::injection_budget::InjectionBudget,
 ) -> bool {
-    let Some((runtime, recommendations)) =
-        check_ccr_expansion_prereqs(state, user_query, turn_number, workspace_key, request_id)
-    else {
+    // Only compressions whose markers are present in this request: a same-cwd
+    // teammate must never receive another conversation's tool output. The scan
+    // is cheap at one serialized copy of the parsed body; nothing else holds
+    // the text as-is at this point.
+    let present_hashes = {
+        let body_text = serde_json::to_string(body).unwrap_or_default();
+        present_marker_hashes(&body_text)
+    };
+    let Some((runtime, recommendations)) = check_ccr_expansion_prereqs(
+        state,
+        user_query,
+        turn_number,
+        workspace_key,
+        request_id,
+        Some(&present_hashes),
+    ) else {
         return false;
     };
 

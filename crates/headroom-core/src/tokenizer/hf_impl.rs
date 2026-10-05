@@ -115,6 +115,22 @@ impl HfTokenizer {
     /// - [`HfTokenizerError::Load`] if the downloaded bytes don't parse as
     ///   a valid `tokenizer.json`. Should not happen for healthy HF repos.
     pub fn from_pretrained(repo: &str) -> Result<Self, HfTokenizerError> {
+        // Offline mode never reaches the network: the hf-hub crate has no
+        // offline fallback of its own, so a cold cache would download. A cache
+        // miss is an error here; the tokenizer falls back to estimation at
+        // the registration site. Upstream `d503c575`.
+        if hf_offline() {
+            let Some(path) = hf_cache_tokenizer(repo) else {
+                return Err(HfTokenizerError::Hub {
+                    repo: repo.to_string(),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "offline mode: tokenizer not in HF cache",
+                    ) as std::io::Error),
+                });
+            };
+            return Self::from_file(repo, path);
+        }
         let api = hf_hub::api::sync::Api::new().map_err(|e| HfTokenizerError::Hub {
             repo: repo.to_string(),
             source: Box::new(e),
@@ -136,6 +152,64 @@ impl HfTokenizer {
     pub fn name(&self) -> &str {
         &self.name
     }
+}
+
+/// True when the caller forbade HuggingFace downloads: `HEADROOM_OFFLINE`
+/// (our flag), or the stock `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`, all
+/// truthy when set to a non-empty, non-"0" value.
+fn hf_offline() -> bool {
+    ["HEADROOM_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"]
+        .iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .any(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// Look for `tokenizer.json` for `repo` under the local HuggingFace hub
+/// cache, never touching the network. Mirrors the root resolution in
+/// `transforms::kompress::hf_hub_roots`.
+fn hf_cache_tokenizer(repo: &str) -> Option<std::path::PathBuf> {
+    let repo_dir = format!("models--{}", repo.replace('/', "--"));
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for (var, suffix) in [("HF_HUB_CACHE", ""), ("HF_HOME", "hub")] {
+        if let Ok(v) = std::env::var(var)
+            && !v.is_empty()
+        {
+            roots.push(std::path::PathBuf::from(v).join(suffix));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        roots.push(
+            std::path::PathBuf::from(home)
+                .join(".cache")
+                .join("huggingface")
+                .join("hub"),
+        );
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE")
+        && !profile.is_empty()
+    {
+        roots.push(
+            std::path::PathBuf::from(profile)
+                .join(".cache")
+                .join("huggingface")
+                .join("hub"),
+        );
+    }
+    for hub in roots {
+        let snapshots = hub.join(&repo_dir).join("snapshots");
+        let Ok(entries) = std::fs::read_dir(&snapshots) else {
+            continue;
+        };
+        for snap in entries.flatten() {
+            let cand = snap.path().join("tokenizer.json");
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+    }
+    None
 }
 
 impl Tokenizer for HfTokenizer {
