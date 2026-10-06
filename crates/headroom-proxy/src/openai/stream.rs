@@ -227,6 +227,12 @@ pub(crate) struct StreamTranslator {
     /// streaming. The `output_item.done` event carries the finished item, and
     /// when the upstream sent no deltas that copy is the only one there is.
     saw_text_delta: bool,
+    /// Whether any text block reached the client this turn, by any path.
+    /// The per-item flags above reset in `output_item.done` so a second item
+    /// is judged on its own deltas; the completion log needs the sticky
+    /// answer instead (the Chat `delta.content` path and the message-item
+    /// recovery below emit text without touching the per-item flags).
+    saw_text_ever: bool,
     /// Same, for `response.refusal.delta` on the current item.
     saw_refusal_delta: bool,
     /// Whether any `function_call_arguments.delta` arrived for the tool call
@@ -369,6 +375,7 @@ impl StreamTranslator {
             total_output_tokens: 0,
             saw_tool_use: false,
             saw_text_delta: false,
+            saw_text_ever: false,
             saw_refusal_delta: false,
             saw_arg_delta: false,
             saw_thinking_text: false,
@@ -682,6 +689,37 @@ impl StreamTranslator {
         );
     }
 
+    /// `[DONE]` with a block still open and no terminal event seen: the
+    /// upstream closed the stream without `completed`/`failed`/`incomplete`.
+    /// A tool block closed here rides out with `end_turn`, so the client
+    /// never runs the call — the "announced it and stopped" shape. Log loud
+    /// so the next one joins to a lane instead of reading as a clean stop.
+    fn log_done_with_open_block(&self) {
+        if self.terminal_emitted {
+            return;
+        }
+        let kind = match self.open {
+            Some(OpenBlock::Tool) => "tool",
+            Some(OpenBlock::Text) => "text",
+            Some(OpenBlock::Thinking) => "thinking",
+            None => return,
+        };
+        let (request_id, egress_slot, model, provider, stream_age_s) = self.terminal_attribution();
+        tracing::warn!(
+            event = "routed_done_with_open_block",
+            request_id = %request_id,
+            egress_slot,
+            upstream_model = %model,
+            routed_provider = %provider,
+            stream_age_s,
+            open_block = kind,
+            saw_tool_use = self.saw_tool_use,
+            saw_text = self.saw_text_ever,
+            output_tokens = self.total_output_tokens,
+            "upstream closed the stream with a block still open and no terminal event"
+        );
+    }
+
     #[cfg(test)]
     fn process_line(&mut self, line: &str) -> Vec<String> {
         self.process_frame(None, line)
@@ -711,6 +749,7 @@ impl StreamTranslator {
                 self.complete_usage_observation(usage.as_ref());
             }
             if data.trim() == "[DONE]" && self.open.is_some() {
+                self.log_done_with_open_block();
                 self.close_block_final(&mut events);
                 events.push(self.emit_message_delta("end_turn"));
                 events.push(self.emit_message_stop());
@@ -775,6 +814,7 @@ impl StreamTranslator {
             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                 self.open_block(OpenBlock::Text, &mut events);
                 events.push(self.emit_text_delta(text));
+                self.saw_text_ever = true;
             }
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -922,6 +962,7 @@ impl StreamTranslator {
             self.open_block(OpenBlock::Text, events);
             events.push(self.emit_text_delta(delta));
             self.saw_text_delta = true;
+            self.saw_text_ever = true;
         }
     }
 
@@ -938,6 +979,7 @@ impl StreamTranslator {
             events.push(self.emit_text_delta(text));
             self.close_block(events);
             self.saw_text_delta = true;
+            self.saw_text_ever = true;
         }
     }
 
@@ -951,6 +993,7 @@ impl StreamTranslator {
             self.open_block(OpenBlock::Text, events);
             events.push(self.emit_text_delta(delta));
             self.saw_refusal_delta = true;
+            self.saw_text_ever = true;
         }
     }
 
@@ -965,6 +1008,7 @@ impl StreamTranslator {
             events.push(self.emit_text_delta(refusal));
             self.close_block(events);
             self.saw_refusal_delta = true;
+            self.saw_text_ever = true;
         }
     }
 
@@ -1095,6 +1139,7 @@ impl StreamTranslator {
                     );
                     self.open_block(OpenBlock::Text, events);
                     events.push(self.emit_text_delta(&text));
+                    self.saw_text_ever = true;
                     self.close_block(events);
                 }
             }
@@ -1242,7 +1287,7 @@ impl StreamTranslator {
             routed_provider = %provider,
             stream_age_s,
             output_tokens = self.total_output_tokens,
-            saw_text = self.saw_text_delta,
+            saw_text = self.saw_text_ever,
             saw_tool_use = self.saw_tool_use,
             stop_reason,
             "routed turn completed"
@@ -1866,6 +1911,41 @@ mod tests {
                 "expected {expected}, got: {sse}"
             );
         }
+    }
+
+    /// `[DONE]` with an announced-but-never-closed tool call: the tool block
+    /// still goes out, but the stop says `end_turn`, so the client never runs
+    /// it — the "announced it and stopped" shape. Pinned so a future change
+    /// to this close (e.g. offering the half-streamed call) is deliberate.
+    #[test]
+    fn done_with_open_tool_block_ends_turn_not_tool_use() {
+        let mut t = StreamTranslator::new("claude-muse-spark-1.3".to_string());
+        let sse = drive(
+            &mut t,
+            &[
+                (
+                    "response.output_text.delta",
+                    r#"{"delta":"I'll run the tests now"}"#,
+                ),
+                (
+                    "response.output_item.added",
+                    r#"{"item":{"type":"function_call","call_id":"c1","name":"Bash"}}"#,
+                ),
+                ("", "[DONE]"),
+            ],
+        );
+        assert!(
+            sse.contains(r#""type":"tool_use""#),
+            "tool block must still go out, got: {sse}"
+        );
+        assert!(
+            sse.contains(r#""stop_reason":"end_turn""#),
+            "stop must be end_turn, got: {sse}"
+        );
+        assert!(
+            !sse.contains(r#""stop_reason":"tool_use""#),
+            "half-streamed call must not be offered, got: {sse}"
+        );
     }
 
     /// A signature-only block must not collide with a block already open, or
