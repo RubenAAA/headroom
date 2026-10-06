@@ -363,6 +363,61 @@ fn ccr_retrieve_tool_result_is_never_compressed() {
     }
 }
 
+/// Port of `TestOrchestratorWrapperCcrRetrieveExemption`: a retrieval result
+/// delivered through an orchestrator wrapper (`execute` on the wire, the
+/// retrieve call inside its script payload) keeps the CCR exemption, while
+/// a wrapper invoking anything else still compresses.
+#[test]
+fn orchestrator_wrapper_retrieve_tool_result_is_never_compressed() {
+    let b = body(json!({
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "ccr1", "name": "execute",
+                 "input": {"code": "const r = await tools.headroom.headroom_retrieve({hash: \"abc\"});\nreturn r;"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "ccr1",
+                 "content": compressible_payload()}
+            ]},
+        ]
+    }));
+    let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+    assert!(
+        matches!(out, LiveZoneOutcome::NoChange { .. }),
+        "wrapper retrieve result must be forwarded unmodified; got {:?}",
+        outcome_block_actions(&out)
+    );
+    assert!(
+        matches!(
+            outcome_block_actions(&out).as_slice(),
+            [BlockAction::Excluded {
+                reason: ExclusionReason::CcrRetrieveResult
+            }]
+        ),
+        "got {:?}",
+        outcome_block_actions(&out)
+    );
+
+    let b = body(json!({
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "execute",
+                 "input": {"code": "const r = await tools.bash.bash({command: \"ls\"});\nreturn r;"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": compressible_payload()}
+            ]},
+        ]
+    }));
+    let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+    assert!(
+        matches!(out, LiveZoneOutcome::Modified { .. }),
+        "wrapper invoking another tool must still compress; got {:?}",
+        outcome_block_actions(&out)
+    );
+}
+
 /// The decay case: the all-messages dispatcher reaches tool_results
 /// that have aged out of the latest user message. An aged CCR marker
 /// is exactly as unredeemable as a fresh one, so the guard must hold

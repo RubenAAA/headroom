@@ -122,6 +122,7 @@ use crate::ccr::{CcrStore, compute_key, marker_for};
 use crate::tokenizer::{MemoizingTokenizer, get_tokenizer};
 use crate::tool_exclusion::{
     is_byte_exact_excluded, is_ccr_retrieve_tool, is_tool_excluded, is_verbatim_excluded,
+    unwrap_tool_call_name,
 };
 
 // ─── Tunable constants (no magic numbers in the dispatch logic) ────────

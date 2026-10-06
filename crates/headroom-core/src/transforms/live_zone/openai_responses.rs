@@ -144,6 +144,11 @@ pub fn compress_openai_responses_live_zone_with_config(
         let type_tag = item.get("type").and_then(Value::as_str).unwrap_or("");
         if type_tag == "function_call" {
             let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            // An orchestrator wrapper (`execute`, `exec`, `functions.exec`)
+            // hides the real callee in its script payload; resolve to the
+            // retrieval tool when the call itself invokes it, so the
+            // exemption below survives the wrapper.
+            let name = unwrap_tool_call_name(name, item.get("arguments"));
             if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
                 call_name_by_id.insert(call_id, name);
                 if name.ends_with("__headroom_retrieve")

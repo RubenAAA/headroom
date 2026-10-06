@@ -10,6 +10,7 @@
 //! Matching is deliberately forgiving about spelling, because the same logical
 //! tool reaches us under several names depending on the client.
 
+use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -253,6 +254,157 @@ pub fn is_ccr_retrieve_tool(name: &str) -> bool {
     is_tool_excluded(name, std::iter::once(CCR_TOOL_NAME))
 }
 
+/// Orchestrator wrappers whose payload is a script that may itself invoke the
+/// retrieval tool. Port of Python `_ORCHESTRATOR_WRAPPER_NAMES`: OpenCode V2
+/// Code Mode runs every MCP call inside its built-in `execute` tool, and
+/// Codex code mode sends calls as `exec` / `functions.exec` custom tool
+/// calls. On the wire the name is the wrapper — the inner tool name never
+/// reaches the proxy — so without unwrapping, a retrieval delivered through
+/// one of these loses the [`is_ccr_retrieve_tool`] exemption and its bytes
+/// are re-offloaded into a marker the agent can never redeem.
+const ORCHESTRATOR_WRAPPER_NAMES: &[&str] = &["execute", "exec", "functions.exec"];
+
+fn js_call_chain_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Port of Python `_JS_CALL_CHAIN_RE`, minus the leading negative
+        // lookbehind (`regex` has no look-around): the caller drops matches
+        // whose preceding character is a word character, `$`, or `.`.
+        regex::Regex::new(r"([A-Za-z_$][\w$]*(?:\??\.[A-Za-z_$][\w$]*)*)\s*(?:\?\.)?\s*\(")
+            .expect("JS call-chain pattern")
+    })
+}
+
+fn js_bracket_key_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Port of Python `_JS_BRACKET_KEY_RE`.
+        regex::Regex::new(
+            r#"\[\s*\\?(?:\"([^\"\n\\]{1,200})\\?\"|'([^'\n\\]{1,200})\\?')\s*\]\s*(?:\?\.)?\s*\("#,
+        )
+        .expect("JS bracket-key pattern")
+    })
+}
+
+/// Every string nested in a decoded payload (objects and arrays walk
+/// through); scalars contribute nothing. Port of Python `_decoded_strings`.
+fn decoded_strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    match value {
+        Value::String(s) => out.push(s.as_str()),
+        Value::Array(items) => {
+            for item in items {
+                decoded_strings(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                decoded_strings(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True when the trailing dotted segment (or bracket key) names the CCR
+/// retrieval tool under any spelling. Port of Python `_names_retrieve`.
+fn names_retrieve(candidate: &str) -> bool {
+    let last = candidate.rsplit('.').next().unwrap_or(candidate);
+    is_ccr_retrieve_tool(last)
+}
+
+/// True when a call-chain match starts at a real callee boundary: the
+/// character before it is not a word character, `$`, or `.`. This is the
+/// half of Python `_JS_CALL_CHAIN_RE`'s leading `(?<![\w$.])` that the
+/// `regex` crate cannot express.
+fn at_callee_boundary(text: &str, match_start: usize) -> bool {
+    if match_start == 0 {
+        return true;
+    }
+    match text[..match_start].chars().next_back() {
+        None => true,
+        Some(c) => !(c.is_alphanumeric() || c == '_' || c == '$' || c == '.'),
+    }
+}
+
+/// True when decoded script `text` invokes the retrieval tool: a dotted
+/// call chain (`headroom_retrieve(`, `tools.headroom.headroom_retrieve(`,
+/// optional chaining included) or a bracket call (`tools["headroom_retrieve"](`).
+fn script_invokes_retrieve(text: &str) -> bool {
+    // Cheap gate first, as upstream: regexes only run on texts that name
+    // the tool at all.
+    if !text.contains(CCR_TOOL_NAME) {
+        return false;
+    }
+    if js_call_chain_re()
+        .captures_iter(text)
+        .filter(|caps| {
+            caps.get(0)
+                .is_some_and(|m| at_callee_boundary(text, m.start()))
+        })
+        .filter_map(|caps| caps.get(1))
+        .any(|callee| names_retrieve(callee.as_str()))
+    {
+        return true;
+    }
+    js_bracket_key_re().captures_iter(text).any(|caps| {
+        caps.iter()
+            .skip(1)
+            .flatten()
+            .any(|key| names_retrieve(key.as_str()))
+    })
+}
+
+/// True when an orchestrator wrapper's payload invokes the retrieval tool.
+/// Port of Python `_orchestrator_invokes_retrieve`.
+///
+/// Only a call whose own payload invokes the retrieval tool counts: the
+/// wrapper is never exempted as a whole, and the match keys on the
+/// model-authored call arguments — never on the result content.
+pub fn orchestrator_invokes_retrieve(name: &str, arguments: Option<&Value>) -> bool {
+    if !ORCHESTRATOR_WRAPPER_NAMES.contains(&name) {
+        return false;
+    }
+    let Some(args) = arguments else {
+        return false;
+    };
+    // A JSON string argument decodes to its payload; raw JavaScript for a
+    // custom_tool_call is scanned as-is. Anything else (object or raw script
+    // on the Anthropic wire) is walked for nested strings.
+    let owned: Option<Value> = match args {
+        Value::String(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(object @ Value::Object(_)) => Some(object),
+            // A JSON scalar, string, or array: no orchestrator payload shape.
+            Ok(_) => return false,
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    let payload: &Value = match (&owned, args) {
+        (Some(object), _) => object,
+        (None, Value::String(raw)) => return script_invokes_retrieve(raw),
+        (None, Value::Object(_)) => args,
+        (None, _) => return false,
+    };
+    let mut texts = Vec::new();
+    decoded_strings(payload, &mut texts);
+    texts.iter().any(|text| script_invokes_retrieve(text))
+}
+
+/// Resolve a wrapper tool call to its effective name: the retrieval tool's
+/// own name when — and only when — the call's payload invokes it, otherwise
+/// `name` unchanged. Port of the orchestrator-wrapper half of Python
+/// `unwrap_tool_call_name`.
+///
+/// (The Hermes `tool_call` deferred-tool bridge has no Rust counterpart yet;
+// This function does not unwrap it.)
+pub fn unwrap_tool_call_name<'a>(name: &'a str, arguments: Option<&Value>) -> &'a str {
+    if orchestrator_invokes_retrieve(name, arguments) {
+        CCR_TOOL_NAME
+    } else {
+        name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +489,129 @@ mod tests {
                 is_tool_excluded(name, DEFAULT_EXCLUDE_TOOLS.iter().copied()),
                 "{name} must be excluded from lossy compression"
             );
+        }
+    }
+
+    /// Port of `TestOrchestratorUnwrap`: a `headroom_retrieve` call delivered
+    /// through a generic orchestrator wrapper resolves to the retrieval tool
+    /// when — and only when — the call's own payload invokes it.
+    fn unwrap<'a>(name: &'a str, arguments: Option<&'a Value>) -> &'a str {
+        unwrap_tool_call_name(name, arguments)
+    }
+
+    fn json_args(code: &str) -> Value {
+        Value::String(serde_json::to_string(&serde_json::json!({"code": code})).unwrap())
+    }
+
+    #[test]
+    fn opencode_execute_wrapper_resolves_to_retrieve() {
+        let code = r#"const r = await tools.headroom.headroom_retrieve({hash: "abc123def456"});
+return r;"#;
+        assert_eq!(unwrap("execute", Some(&json_args(code))), CCR_TOOL_NAME);
+    }
+
+    #[test]
+    fn qualified_mcp_name_inside_script_resolves() {
+        let code = r#"const r = await tools.mcp__headroom__headroom_retrieve({hash: "abc"});"#;
+        assert_eq!(unwrap("execute", Some(&json_args(code))), CCR_TOOL_NAME);
+    }
+
+    #[test]
+    fn bracket_access_inside_script_resolves() {
+        let code = r#"const r = await tools["headroom_retrieve"]({hash: "abc"});"#;
+        assert_eq!(unwrap("execute", Some(&json_args(code))), CCR_TOOL_NAME);
+    }
+
+    #[test]
+    fn execute_wrapper_without_retrieve_call_keeps_name() {
+        let code = "const r = await tools.bash.bash({command: \"ls\"});\nreturn r;";
+        assert_eq!(unwrap("execute", Some(&json_args(code))), "execute");
+    }
+
+    #[test]
+    fn non_wrapper_mentioning_retrieve_keeps_name() {
+        // A non-orchestrator tool whose arguments merely name the tool is not
+        // recovery output; only recognized wrappers resolve.
+        let args = Value::String(r#"{"command": "grep -n headroom_retrieve( README.md"}"#.into());
+        assert_eq!(unwrap("Bash", Some(&args)), "Bash");
+    }
+
+    #[test]
+    fn wrapper_payload_mentioning_retrieve_without_a_call_keeps_name() {
+        let args = json_args("// see headroom_retrieve");
+        assert_eq!(unwrap("execute", Some(&args)), "execute");
+    }
+
+    #[test]
+    fn json_encoded_whitespace_before_call_resolves() {
+        // The OpenAI wire JSON-encodes the payload, so the script's real
+        // newline between the callee and `(` arrives escaped; the call must be
+        // recognized on the decoded script.
+        for sep in ["\n", "\t"] {
+            let code = format!(
+                r#"const r = await tools.headroom.headroom_retrieve{sep}({{hash: "abc"}});"#
+            );
+            assert_eq!(
+                unwrap("execute", Some(&json_args(&code))),
+                CCR_TOOL_NAME,
+                "sep {sep:?}"
+            );
+            let code =
+                format!(r#"const r = await tools["headroom_retrieve"]{sep}({{hash: "abc"}});"#);
+            assert_eq!(
+                unwrap("execute", Some(&json_args(&code))),
+                CCR_TOOL_NAME,
+                "sep {sep:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_dict_payload_with_newline_resolves() {
+        // The Anthropic wire hands over a decoded dict; it must be scanned
+        // the same way.
+        let args = serde_json::json!({"code": "const r = await tools.headroom.headroom_retrieve\n({hash: \"abc\"});"});
+        assert_eq!(unwrap("exec", Some(&args)), CCR_TOOL_NAME);
+    }
+
+    #[test]
+    fn nested_containers_in_dict_payload_resolve() {
+        let args = serde_json::json!({
+            "meta": {"attempt": 1},
+            "calls": [{"code": "const r = await tools.headroom.headroom_retrieve\n({hash: \"abc\"});"}],
+        });
+        assert_eq!(unwrap("functions.exec", Some(&args)), CCR_TOOL_NAME);
+    }
+
+    #[test]
+    fn raw_javascript_payload_with_newline_resolves() {
+        // A custom_tool_call payload that is not JSON is scanned as-is.
+        let args = Value::String(
+            "const r = await tools.headroom.headroom_retrieve\n({hash: \"abc\"});".into(),
+        );
+        assert_eq!(unwrap("functions.exec", Some(&args)), CCR_TOOL_NAME);
+    }
+
+    #[test]
+    fn string_values_without_the_name_are_skipped() {
+        let args = serde_json::json!({
+            "note": "no tool call here",
+            "code": "const r = await tools.headroom.headroom_retrieve({hash: \"abc\"});",
+        });
+        assert_eq!(unwrap("execute", Some(&args)), CCR_TOOL_NAME);
+    }
+
+    #[test]
+    fn dict_payload_without_string_scripts_keeps_name() {
+        let args =
+            serde_json::json!({"code": 42, "meta": {"attempt": 1}, "flags": [true, Value::Null]});
+        assert_eq!(unwrap("execute", Some(&args)), "execute");
+    }
+
+    #[test]
+    fn non_string_non_object_arguments_fail_closed() {
+        for args in [None, Some(&Value::Null), Some(&serde_json::json!([1, 2]))] {
+            assert_eq!(unwrap("execute", args), "execute");
         }
     }
 

@@ -135,12 +135,17 @@ pub(super) fn collect_tool_guards(
             if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                 continue;
             }
-            let (Some(id), Some(name)) = (
+            let (Some(id), Some(wire_name)) = (
                 block.get("id").and_then(Value::as_str),
                 block.get("name").and_then(Value::as_str),
             ) else {
                 continue;
             };
+            // An orchestrator wrapper (`execute`, `exec`, `functions.exec`)
+            // hides the real callee in its input payload; resolve to the
+            // retrieval tool when the call itself invokes it, so the
+            // exemption below survives the wrapper.
+            let name = unwrap_tool_call_name(wire_name, block.get("input"));
             let excluded = is_tool_excluded(name, exclude_tools.iter().map(String::as_str));
             let guard = if is_ccr_retrieve_tool(name) {
                 ToolGuard::CcrRetrieve
