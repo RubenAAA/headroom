@@ -20,7 +20,7 @@
 //! authenticated while the upgrade on that same path was not.
 
 use axum::extract::{ConnectInfo, State};
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::net::SocketAddr;
@@ -129,6 +129,20 @@ fn scrub_proxy_token_headers(headers: &mut axum::http::HeaderMap, expected: &str
     }
 }
 
+/// Set on the request by [`proxy_auth_gate`] when the caller presented a
+/// valid proxy token. Downstream gates (rate-limit identity, operator reads)
+/// treat its presence as "authenticated at the gate": the token headers are
+/// scrubbed by then, so they cannot re-verify. Loopback-exempt and
+/// health-probe-exempt requests never carry it. Port of upstream's
+/// `request.state.proxy_authenticated` (commit `6fb7cadf`).
+#[derive(Clone, Copy, Debug)]
+pub struct ProxyTokenAuthenticated;
+
+/// Port of upstream `d99779da`: only GET health probes skip the token.
+fn health_probe_exempt(method: &Method, path: &str) -> bool {
+    *method == Method::GET && AUTH_EXEMPT_PATHS.contains(&path)
+}
+
 /// Require `HEADROOM_PROXY_TOKEN` from non-loopback callers.
 ///
 /// Declines to act when no token is configured, which keeps the default
@@ -143,7 +157,9 @@ pub async fn proxy_auth_gate(
     };
 
     let path = req.uri().path();
-    if AUTH_EXEMPT_PATHS.contains(&path) {
+    // Health probes are exempt, but only plain GETs: a load balancer asks;
+    // anything else on these paths still proves the token first.
+    if health_probe_exempt(req.method(), path) {
         scrub_proxy_token_headers(req.headers_mut(), expected);
         return next.run(req).await;
     }
@@ -191,8 +207,11 @@ pub async fn proxy_auth_gate(
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
 
-    // Authenticated: the credential has served its purpose. Strip it so no
-    // forward path can hand the shared secret to an upstream provider.
+    // Authenticated: mark it before scrubbing, so downstream gates can tell
+    // a token-authenticated caller from a loopback-exempt one. Then strip
+    // the credential so no forward path can hand the shared secret to an
+    // upstream provider.
+    req.extensions_mut().insert(ProxyTokenAuthenticated);
     scrub_proxy_token_headers(req.headers_mut(), expected);
     next.run(req).await
 }
@@ -341,5 +360,19 @@ mod tests {
         let mut h = headers(&[("authorization", "Bearer   ")]);
         scrub_proxy_token_headers(&mut h, "s3cret");
         assert!(h.contains_key("authorization"));
+    }
+
+    /// Only GET health probes skip the token (upstream `d99779da`): a POST
+    /// to the same path must still prove the token.
+    #[test]
+    fn only_get_health_probes_are_exempt() {
+        for path in ["/health", "/healthz", "/livez", "/readyz"] {
+            assert!(health_probe_exempt(&Method::GET, path), "{path}");
+            assert!(!health_probe_exempt(&Method::POST, path), "{path}");
+            assert!(!health_probe_exempt(&Method::PUT, path), "{path}");
+            assert!(!health_probe_exempt(&Method::DELETE, path), "{path}");
+        }
+        assert!(!health_probe_exempt(&Method::GET, "/v1/messages"));
+        assert!(!health_probe_exempt(&Method::GET, "/metrics"));
     }
 }

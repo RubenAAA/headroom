@@ -378,8 +378,18 @@ pub fn build_app(state: AppState) -> Router {
         // scrapes (`prometheus`'s registry uses internal locking).
         // Mounted unconditionally because it has no dependencies on
         // any feature flag; an operator who doesn't want it scraped
-        // simply firewalls the path.
-        .route("/metrics", get(crate::observability::handle_metrics))
+        // simply firewalls the path. With `--metrics-require-loopback`
+        // the scrape gate (upstream `ee731d7e` via `a05717f6`'s flag)
+        // restricts it to loopback scrapers and token-verified callers.
+        .route(
+            "/metrics",
+            get(crate::observability::handle_metrics).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::operator_gate::metrics_scrape_gate,
+                ),
+            ),
+        )
         // CTX-7: re-cache watchdog snapshot. Cheap (one in-memory
         // snapshot, no I/O) so a statusline script can poll it every
         // few seconds. See `cache_stabilization::usage_observer`.
@@ -411,9 +421,28 @@ pub fn build_app(state: AppState) -> Router {
             "/stats/reset",
             post(crate::handlers::stats::handle_stats_reset),
         )
+        // CCR retrieve endpoints: loopback-only, same-origin when browser
+        // provenance is present — the same gate as /stats/reset.
+        .route(
+            "/v1/retrieve",
+            post(crate::handlers::retrieve::handle_retrieve),
+        )
+        .route(
+            "/v1/retrieve/tool_call",
+            post(crate::handlers::retrieve::handle_retrieve_tool_call),
+        )
+        // Gated by the operator read gate (upstream `ee731d7e`): spend
+        // history is operator data, not a public readout. Token-verified
+        // callers, loopback, and the trusted dashboard chain pass; remote
+        // callers get the same 404 as the other operator routes.
         .route(
             "/stats-history",
-            get(crate::handlers::stats::handle_stats_history),
+            get(crate::handlers::stats::handle_stats_history).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::operator_gate::operator_read_gate,
+                ),
+            ),
         )
         .route(
             "/stats-lifetime",
@@ -760,8 +789,9 @@ mod identity_trust_tests {
 
     #[test]
     fn unknown_peer_fails_closed() {
-        // The loopback guard treats None as local; partition selection must not.
-        assert!(crate::loopback_guard::is_loopback_host(None));
+        // A missing peer is not loopback; partition selection must not
+        // treat it as local either.
+        assert!(!crate::loopback_guard::is_loopback_host(None));
         assert!(!identity_header_is_trusted(None));
     }
 }

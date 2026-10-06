@@ -11,12 +11,14 @@ pub const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "::1", "localhost"];
 
 /// Return true if `host` represents a loopback interface.
 ///
-/// `None` is treated as loopback (covers TestClient / UDS-style requests).
+/// A missing address is NOT loopback (upstream `ee731d7e` hardened this:
+/// the old `None => true` default let requests with no peer address at all
+/// pass as local).
 /// `"localhost"` is special-cased as a string since it is not a valid IP literal.
 /// Comparison is case-insensitive (RFC 4343).
 pub fn is_loopback_host(host: Option<&str>) -> bool {
     match host {
-        None => true,
+        None => false,
         Some(h) if h.eq_ignore_ascii_case("localhost") => true,
         Some(h) => {
             let addr: IpAddr = match h.parse() {
@@ -135,9 +137,11 @@ mod tests {
 
     // ── is_loopback_host ──────────────────────────────────────────
 
+    // Upstream `ee731d7e`: a missing address is not loopback — a request
+    // with no peer address at all must not pass as local.
     #[test]
-    fn none_is_loopback() {
-        assert!(is_loopback_host(None));
+    fn none_is_not_loopback() {
+        assert!(!is_loopback_host(None));
     }
 
     #[test]
