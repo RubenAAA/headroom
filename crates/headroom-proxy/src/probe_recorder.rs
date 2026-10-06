@@ -39,6 +39,13 @@ impl CompressionEventRecorder {
         }
         let pid = std::process::id();
         let path = record_dir.join(format!("compression-events-{pid}.jsonl"));
+        // Narrow a file left by an older build: the pairs recorded here are
+        // verbatim conversation content, so the file is owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
         Ok(Self {
             path,
             lock: Mutex::new(()),
@@ -56,11 +63,16 @@ impl CompressionEventRecorder {
             Err(_) => return,
         };
         let _guard = self.lock.lock();
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
+        // Born 0600: the umask can only clear bits, never add them, so an
+        // explicit mode is what makes this file owner-only on a stock host.
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Ok(mut file) = options.open(&self.path) {
             let _ = writeln!(file, "{line}");
         }
     }
@@ -119,5 +131,51 @@ mod tests {
     fn probe_recorder_from_env_returns_none_when_unset() {
         unsafe { std::env::remove_var(RECORD_DIR_ENV) };
         assert!(probe_recorder_from_env().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(p: &std::path::Path) -> u32 {
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        }
+
+        fn event() -> CompressionEvent {
+            CompressionEvent {
+                ts: 0.0,
+                request_id: "req-1".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude-3".to_string(),
+                tokens_before: Some(1000),
+                tokens_after: Some(500),
+                transforms_applied: vec!["kompress".to_string()],
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "headroom-probe-perms-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let recorder = CompressionEventRecorder::new(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+
+        // A wide file left by an older build is narrowed on open.
+        std::fs::write(recorder.path(), "").unwrap();
+        std::fs::set_permissions(recorder.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let recorder = CompressionEventRecorder::new(&dir).unwrap();
+        assert_eq!(mode(recorder.path()), 0o600);
+
+        // And a fresh file is born owner-only.
+        std::fs::remove_file(recorder.path()).unwrap();
+        recorder.record(&event());
+        assert_eq!(mode(recorder.path()), 0o600);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

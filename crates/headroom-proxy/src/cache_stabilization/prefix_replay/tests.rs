@@ -1795,6 +1795,35 @@ fn no_adoption_when_only_the_opening_messages_match() {
     assert!(store.history_will_be_rewritten("adopter", &incoming));
 }
 
+#[cfg(unix)]
+#[test]
+fn persisted_prefix_files_are_owner_only_and_old_ones_are_narrowed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(p: &std::path::Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    let dir = TempDir::new("perms");
+    let store = SessionReplayStore::with_persistence(8, dir.0.clone());
+    record_turn(&store, "fresh", "req-1", &conversation(14));
+    assert_eq!(mode(&dir.0), 0o700, "persist dir");
+    assert_eq!(
+        mode(&persisted_path(&dir.0, "fresh")),
+        0o600,
+        "newly persisted prefix"
+    );
+    drop(store);
+
+    // A file left by an older build at the process umask gets narrowed on
+    // the next start, not just on its next rewrite.
+    let legacy = persisted_path(&dir.0, "legacy");
+    std::fs::write(&legacy, b"{}").unwrap();
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = SessionReplayStore::with_persistence(8, dir.0.clone());
+    assert_eq!(mode(&legacy), 0o600, "legacy prefix file narrowed");
+}
+
 #[test]
 fn a_persisted_prefix_of_another_session_is_adopted_after_a_restart() {
     let dir = TempDir::new("adopt");

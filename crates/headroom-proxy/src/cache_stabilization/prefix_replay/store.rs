@@ -268,6 +268,35 @@ pub(super) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Make the persist directory and everything in it owner-only.
+///
+/// The files hold verbatim conversation content but were created at the
+/// process umask (usually 0644), so files written by older builds stay
+/// readable to other local users until they are rewritten. This runs once
+/// per process start, next to the stale-prefix sweep, and narrows them.
+/// Every failure is best-effort: the feature is a cost optimisation and a
+/// chmod error must not disable it. No-op off unix.
+pub(super) fn narrow_existing_permissions(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+}
+
 /// How stale a persisted prefix may be and still be worth loading.
 ///
 /// The proxy asks for the 1-hour tier, and a cache read refreshes the entry for
@@ -514,6 +543,11 @@ impl SessionReplayStore {
             return store;
         }
         let swept = sweep_stale_prefixes(&dir);
+        // The files hold verbatim conversation content, so the directory is
+        // owner-only; a chmod failure must not disable the feature (the
+        // feature is a cost optimisation and the in-memory fallback predates
+        // it), so this stays best-effort.
+        narrow_existing_permissions(&dir);
         tracing::info!(
             event = "prefix_replay_persist_enabled",
             dir = %dir.display(),
@@ -610,8 +644,26 @@ impl SessionReplayStore {
             std::process::id(),
             PERSIST_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        if std::fs::write(&temporary, &bytes).is_ok() && std::fs::rename(&temporary, &path).is_ok()
-        {
+        // Born owner-only: the file holds verbatim conversation content. The
+        // umask can only clear bits, never add them, so an explicit mode is
+        // what keeps this off-limits to other local users on a stock host.
+        // `rename` preserves the mode, so the final file inherits it.
+        #[cfg(unix)]
+        let written = {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temporary)
+                .and_then(|mut file| file.write_all(&bytes))
+                .is_ok()
+        };
+        #[cfg(not(unix))]
+        let written = std::fs::write(&temporary, &bytes).is_ok();
+        if written && std::fs::rename(&temporary, &path).is_ok() {
             // Remember the head of what was just written. Without this the next
             // adoption scan sees a file whose mtime moved, and reads and parses
             // it back purely to learn a hash this side already had — and every
