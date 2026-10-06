@@ -63,7 +63,9 @@
 #[cfg(feature = "ml")]
 use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "ml")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(feature = "ml", test))]
+use std::path::PathBuf;
 #[cfg(feature = "ml")]
 use std::sync::{Mutex, OnceLock};
 
@@ -85,6 +87,43 @@ use tokenizers::{EncodeInput, InputSequence, Tokenizer};
 pub const DEFAULT_MODEL_ID: &str = "chopratejas/kompress-v2-base";
 /// HuggingFace repo holding the tokenizer Kompress reuses.
 pub const DEFAULT_TOKENIZER_REPO: &str = "answerdotai/ModernBERT-base";
+/// Pinned HuggingFace revision of the ModernBERT tokenizer snapshot the
+/// shipped ONNX weights were exported against. Mirrors upstream
+/// `_PINNED_REVISIONS["answerdotai/ModernBERT-base"]`
+/// (`upstream-python/headroom/onnx_runtime.py`): a silently updated
+/// tokenizer would shift token ids under the trained keep/discard head.
+pub const PINNED_TOKENIZER_REVISION: &str = "8949b909ec900327062f0ebf497f51aef5e6f0c8";
+/// Pinned revision of the trained weights. Mirrors upstream
+/// `_PINNED_REVISIONS["chopratejas/kompress-v2-base"]`.
+pub const PINNED_MODEL_REVISION: &str = "b1563631b35bfdcee37587ad530147497d820d4c";
+/// Env var disabling revision pinning (`off`/`0`/`false`/`no`), mirroring
+/// upstream `HEADROOM_HF_PIN=off`. Floating resolution is for debugging
+/// only — never for production traffic.
+pub const HF_PIN_ENV: &str = "HEADROOM_HF_PIN";
+
+/// Pinned HuggingFace revision for a known artifact repo, or `None` when
+/// the repo is unknown or pinning is disabled via [`HF_PIN_ENV`].
+/// Mirrors upstream `_resolve_revision`.
+pub fn pinned_revision(repo: &str) -> Option<&'static str> {
+    let disabled = std::env::var(HF_PIN_ENV)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            )
+        })
+        .unwrap_or(false);
+    if disabled {
+        return None;
+    }
+    if repo == DEFAULT_TOKENIZER_REPO {
+        Some(PINNED_TOKENIZER_REVISION)
+    } else if repo == DEFAULT_MODEL_ID {
+        Some(PINNED_MODEL_REVISION)
+    } else {
+        None
+    }
+}
 /// Words per inference chunk. Coupled to the model's training window;
 /// kompress-v2-base was trained for 350.
 pub const DEFAULT_CHUNK_WORDS: usize = 350;
@@ -365,8 +404,17 @@ impl Kompress {
             source: Box::new(e),
         })?;
 
-        let tok_path = api
-            .model(config.tokenizer_repo.clone())
+        // The tokenizer revision is pinned: the weights were exported
+        // against that snapshot and a floating ref would shift token ids
+        // under them. Unknown repos keep the hub default (`main`).
+        let tok_repo = api.repo(hf_hub::Repo::with_revision(
+            config.tokenizer_repo.clone(),
+            hf_hub::RepoType::Model,
+            pinned_revision(&config.tokenizer_repo)
+                .unwrap_or("main")
+                .to_string(),
+        ));
+        let tok_path = tok_repo
             .get("tokenizer.json")
             .map_err(|e| KompressError::Hub {
                 repo: config.tokenizer_repo.clone(),
@@ -374,7 +422,13 @@ impl Kompress {
             })?;
         let tokenizer = load_tokenizer(&tok_path, &config.tokenizer_repo)?;
 
-        let model_api = api.model(config.model_id.clone());
+        let model_api = api.repo(hf_hub::Repo::with_revision(
+            config.model_id.clone(),
+            hf_hub::RepoType::Model,
+            pinned_revision(&config.model_id)
+                .unwrap_or("main")
+                .to_string(),
+        ));
         let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
         let mut tried: Vec<String> = Vec::new();
         for candidate in ONNX_CANDIDATES {
@@ -776,12 +830,39 @@ fn build_session(path: &Path) -> Result<Session, Box<dyn std::error::Error + Sen
 
 /// Resolve `rel` (e.g. `["tokenizer.json"]` or `["onnx", "kompress-int8-wo.onnx"]`)
 /// inside the local HuggingFace cache for `repo` (`"owner/name"`), searching
-/// every snapshot under every candidate cache root. Returns `None` if not
-/// present — never touches the network.
+/// every candidate cache root. When [`pinned_revision`] knows the repo, only
+/// that snapshot is accepted — a differently-revisioned snapshot must never
+/// silently substitute. Returns `None` if not present — never touches the
+/// network.
 #[cfg(feature = "ml")]
 fn hf_cache_file(repo: &str, rel: &[&str]) -> Option<PathBuf> {
+    resolve_hf_snapshot(&hf_hub_roots(), repo, rel, pinned_revision(repo))
+}
+
+/// Pure snapshot selection over explicit `roots` (reads no env): `Some(pin)`
+/// restricts to `snapshots/<pin>/` and returns `None` when that snapshot is
+/// absent, while `None` scans every snapshot (kept for repos with no pin).
+#[cfg(any(feature = "ml", test))]
+fn resolve_hf_snapshot(
+    roots: &[PathBuf],
+    repo: &str,
+    rel: &[&str],
+    pinned: Option<&str>,
+) -> Option<PathBuf> {
     let repo_dir = format!("models--{}", repo.replace('/', "--"));
-    for hub in hf_hub_roots() {
+    if let Some(pin) = pinned {
+        for hub in roots {
+            let mut cand = hub.join(&repo_dir).join("snapshots").join(pin);
+            for part in rel {
+                cand = cand.join(part);
+            }
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+        return None;
+    }
+    for hub in roots {
         let snapshots = hub.join(&repo_dir).join("snapshots");
         let Ok(entries) = std::fs::read_dir(&snapshots) else {
             continue;
@@ -849,6 +930,69 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.min_words.max(MIN_WORDS), MIN_WORDS);
+    }
+
+    /// The pinned snapshot wins even when a decoy snapshot sits beside it,
+    /// and a cache holding only a decoy resolves to `None` instead of
+    /// silently loading the wrong tokenizer — the hazard upstream
+    /// `2de58287` fixed on the Python side.
+    #[test]
+    fn revision_pin_selects_the_export_snapshot() {
+        assert_eq!(
+            pinned_revision("answerdotai/ModernBERT-base"),
+            Some(PINNED_TOKENIZER_REVISION)
+        );
+        assert_eq!(
+            pinned_revision("chopratejas/kompress-v2-base"),
+            Some(PINNED_MODEL_REVISION)
+        );
+        assert_eq!(pinned_revision("someone/else"), None);
+
+        let hub = tempfile::tempdir().expect("temp hub");
+        let snap = |rev: &str| {
+            hub.path()
+                .join("models--answerdotai--ModernBERT-base")
+                .join("snapshots")
+                .join(rev)
+        };
+        let decoy = snap("aaaadecoyrev00000000000000000000000000000000");
+        let pinned = snap(PINNED_TOKENIZER_REVISION);
+        for dir in [&decoy, &pinned] {
+            std::fs::create_dir_all(dir).expect("snapshot dir");
+            std::fs::write(dir.join("tokenizer.json"), "{}").expect("tokenizer.json");
+        }
+        // A missing root exercises the skip path; resolution must not care.
+        let roots = [hub.path().join("nothing"), hub.path().to_path_buf()];
+        assert_eq!(
+            resolve_hf_snapshot(
+                &roots,
+                "answerdotai/ModernBERT-base",
+                &["tokenizer.json"],
+                Some(PINNED_TOKENIZER_REVISION)
+            ),
+            Some(pinned.join("tokenizer.json"))
+        );
+        // Only a decoy present: strict `None`, never the wrong file.
+        std::fs::remove_dir_all(&pinned).expect("remove pinned");
+        assert_eq!(
+            resolve_hf_snapshot(
+                &roots,
+                "answerdotai/ModernBERT-base",
+                &["tokenizer.json"],
+                Some(PINNED_TOKENIZER_REVISION)
+            ),
+            None
+        );
+        // Unpinned repos keep the legacy any-snapshot scan.
+        assert_eq!(
+            resolve_hf_snapshot(
+                &roots,
+                "answerdotai/ModernBERT-base",
+                &["tokenizer.json"],
+                None
+            ),
+            Some(decoy.join("tokenizer.json"))
+        );
     }
 
     #[cfg(feature = "ml")]

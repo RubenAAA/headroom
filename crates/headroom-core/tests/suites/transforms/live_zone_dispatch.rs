@@ -325,33 +325,33 @@ fn main() {
     }
 }
 
-/// True iff the Kompress model + ModernBERT tokenizer are in the local HF
-/// cache. The PlainText dispatch loads cache-only, so its behavior is
-/// model-gated exactly like the kompress parity test.
+/// True iff the pinned Kompress model + ModernBERT tokenizer snapshots are
+/// in the local HF cache. The PlainText dispatch loads cache-only and
+/// strictly (a differently-revisioned snapshot never substitutes), so the
+/// gate checks the same pinned snapshots the loader accepts.
 fn kompress_model_cached() -> bool {
+    use headroom_core::transforms::kompress::{PINNED_MODEL_REVISION, PINNED_TOKENIZER_REVISION};
     use std::path::Path;
     let Ok(home) = std::env::var("HOME") else {
         return false;
     };
     let hub = Path::new(&home).join(".cache/huggingface/hub");
-    let has = |repo: &str, rel: &[&str]| -> bool {
-        let snaps = hub.join(repo).join("snapshots");
-        let Ok(rd) = std::fs::read_dir(&snaps) else {
-            return false;
-        };
-        rd.flatten().any(|e| {
-            let mut p = e.path();
-            for part in rel {
-                p = p.join(part);
-            }
-            p.exists()
-        })
+    let has = |repo: &str, pin: &str, rel: &[&str]| -> bool {
+        let mut p = hub.join(repo).join("snapshots").join(pin);
+        for part in rel {
+            p = p.join(part);
+        }
+        p.exists()
     };
-    has("models--answerdotai--ModernBERT-base", &["tokenizer.json"])
-        && has(
-            "models--chopratejas--kompress-v2-base",
-            &["onnx", "kompress-int8-wo.onnx"],
-        )
+    has(
+        "models--answerdotai--ModernBERT-base",
+        PINNED_TOKENIZER_REVISION,
+        &["tokenizer.json"],
+    ) && has(
+        "models--chopratejas--kompress-v2-base",
+        PINNED_MODEL_REVISION,
+        &["onnx", "kompress-int8-wo.onnx"],
+    )
 }
 
 #[test]

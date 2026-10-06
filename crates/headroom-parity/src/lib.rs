@@ -799,12 +799,24 @@ impl KompressComparator {
         Self::default()
     }
 
-    fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<PathBuf> {
+    /// Resolve `rel` inside one cached repo dir. A pinned revision resolves
+    /// strictly to `snapshots/<pin>/` — a differently-revisioned snapshot
+    /// must never silently substitute, mirroring the strict pin in
+    /// `headroom_core::transforms::kompress` for the pinned
+    /// tokenizer/weights.
+    fn hf_cache_file(repo_dir: &str, rel: &[&str], pinned: Option<&str>) -> Option<PathBuf> {
         let home = std::env::var("HOME").ok()?;
         let snapshots = Path::new(&home)
             .join(".cache/huggingface/hub")
             .join(repo_dir)
             .join("snapshots");
+        if let Some(pin) = pinned {
+            let mut cand = snapshots.join(pin);
+            for part in rel {
+                cand = cand.join(part);
+            }
+            return cand.exists().then_some(cand);
+        }
         for snap in fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {
             let mut cand = snap.path();
             for part in rel {
@@ -820,14 +832,18 @@ impl KompressComparator {
     fn model(&self) -> Option<&headroom_core::transforms::kompress::Kompress> {
         self.model
             .get_or_init(|| {
-                use headroom_core::transforms::kompress::{Kompress, KompressConfig};
+                use headroom_core::transforms::kompress::{
+                    Kompress, KompressConfig, pinned_revision,
+                };
                 let tok = Self::hf_cache_file(
                     "models--answerdotai--ModernBERT-base",
                     &["tokenizer.json"],
+                    pinned_revision("answerdotai/ModernBERT-base"),
                 )?;
                 let onnx = Self::hf_cache_file(
                     "models--chopratejas--kompress-v2-base",
                     &["onnx", "kompress-int8-wo.onnx"],
+                    pinned_revision("chopratejas/kompress-v2-base"),
                 )?;
                 Kompress::from_files(&tok, &onnx, KompressConfig::default()).ok()
             })

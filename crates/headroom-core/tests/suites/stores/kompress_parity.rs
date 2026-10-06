@@ -17,32 +17,38 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use headroom_core::transforms::kompress::{Kompress, KompressConfig};
+use headroom_core::transforms::kompress::{
+    Kompress, KompressConfig, PINNED_MODEL_REVISION, PINNED_TOKENIZER_REVISION,
+};
 use serde_json::Value;
 
-fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<PathBuf> {
+/// Resolve `rel` inside the pinned snapshot of a cached repo dir. Strict:
+/// a differently-revisioned snapshot must never silently substitute (the
+/// tokenizer the weights were exported against is pinned), so the gate
+/// agrees with the loader — absent pin means SKIP, not a wrong-tokenizer run.
+fn hf_cache_file(repo_dir: &str, pin: &str, rel: &[&str]) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let snapshots = Path::new(&home)
+    let mut cand = Path::new(&home)
         .join(".cache/huggingface/hub")
         .join(repo_dir)
-        .join("snapshots");
-    for snap in fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {
-        let mut cand = snap.path();
-        for part in rel {
-            cand = cand.join(part);
-        }
-        if cand.exists() {
-            return Some(cand);
-        }
+        .join("snapshots")
+        .join(pin);
+    for part in rel {
+        cand = cand.join(part);
     }
-    None
+    cand.exists().then_some(cand)
 }
 
 #[test]
 fn kompress_matches_python_fixtures_byte_for_byte() {
-    let tok = hf_cache_file("models--answerdotai--ModernBERT-base", &["tokenizer.json"]);
+    let tok = hf_cache_file(
+        "models--answerdotai--ModernBERT-base",
+        PINNED_TOKENIZER_REVISION,
+        &["tokenizer.json"],
+    );
     let onnx = hf_cache_file(
         "models--chopratejas--kompress-v2-base",
+        PINNED_MODEL_REVISION,
         &["onnx", "kompress-int8-wo.onnx"],
     );
     let (tok, onnx) = match (tok, onnx) {
@@ -124,9 +130,14 @@ fn short_input_passes_through() {
     // Pure-logic check — no model needed. Fewer than MIN_WORDS words must
     // pass through unchanged regardless of model availability... but the
     // engine needs a model to construct. Guard on cache like the main test.
-    let tok = hf_cache_file("models--answerdotai--ModernBERT-base", &["tokenizer.json"]);
+    let tok = hf_cache_file(
+        "models--answerdotai--ModernBERT-base",
+        PINNED_TOKENIZER_REVISION,
+        &["tokenizer.json"],
+    );
     let onnx = hf_cache_file(
         "models--chopratejas--kompress-v2-base",
+        PINNED_MODEL_REVISION,
         &["onnx", "kompress-int8-wo.onnx"],
     );
     let (Some(tok), Some(onnx)) = (tok, onnx) else {
