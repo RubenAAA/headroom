@@ -6,19 +6,135 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use axum::http::HeaderMap;
+use hmac::KeyInit;
 use serde_json::Value;
 
-/// Normalized key JSON: `{"model":..,"messages":[stripped..],extra..}`.
+/// Cache-key partition for callers that present no credential.
+///
+/// Upstream `ee6cfccc`: with no signed bytes the HMAC has nothing to
+/// separate, so every credential-less request shares one partition.
+/// `serde_json` renders the `&str` as `"anon"`.
+pub const ANONYMOUS_PARTITION: &str = "anon";
+
+/// Per-process HMAC key for [`compute_cache_partition`].
+///
+/// Two `Uuid::new_v4` (OS randomness, no new dependency): partitions are
+/// process-local by design — a restarted proxy must not serve one caller's
+/// cached completion to another caller's identical request anyway, and an
+/// unguessable key keeps the partition ids from confirming credential
+/// guesses (upstream `ee6cfccc`).
+fn partition_hmac_key() -> [u8; 32] {
+    use std::sync::OnceLock;
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    *KEY.get_or_init(|| {
+        let a = uuid::Uuid::new_v4().into_bytes();
+        let b = uuid::Uuid::new_v4().into_bytes();
+        let mut key = [0u8; 32];
+        key[..16].copy_from_slice(&a);
+        key[16..].copy_from_slice(&b);
+        key
+    })
+}
+
+/// Header-name components that mark credential material.
+///
+/// Port of the shared rule in upstream `ee6cfccc` (`identity.py`): names
+/// are lower-cased, `_` folds to `-`, matching is on whole components, so
+/// `X-Headroom-License_Token` is a credential while the numeric
+/// `tool-search-deferred-tokens` tag is not.
+const CREDENTIAL_NAME_COMPONENTS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "credentials",
+    "authorization",
+    "apikey",
+    "key",
+    "bearer",
+    "cookie",
+    "signature",
+];
+
+/// True when an inbound header carries a credential.
+fn is_credential_header(name: &str) -> bool {
+    if name
+        .strip_prefix("x-headroom-")
+        .or_else(|| name.strip_prefix("X-Headroom-"))
+        .is_some()
+    {
+        return false;
+    }
+    let lower = name.trim().to_ascii_lowercase();
+    if lower == "idempotency-key" || lower == "x-idempotency-key" {
+        return false;
+    }
+    match lower.as_str() {
+        "authorization" | "proxy-authorization" | "cookie" | "x-api-key" => true,
+        _ => lower
+            .replace('_', "-")
+            .split('-')
+            .any(|part| CREDENTIAL_NAME_COMPONENTS.contains(&part)),
+    }
+}
+
+/// Partition id separating cache entries by inbound credential.
+///
+/// Port of upstream `ee6cfccc` (`semantic_cache_key_policy.py`): the
+/// semantic cache was keyed only by request content and upstream, so a
+/// second caller sending the identical request with a different provider
+/// key was served the first caller's completion. Every credential header
+/// present on the request (name lower-cased, value trimmed, pairs sorted)
+/// is folded into an HMAC-SHA256 under a per-process key; empty values are
+/// skipped so a present-but-empty header cannot launder a partition.
+/// Credential-less requests share [`ANONYMOUS_PARTITION`]. The Rust proxy
+/// has no custom identity resolver (upstream OSS default returns `None`
+/// for the principal), so headers alone are the partition input.
+pub fn compute_cache_partition(headers: &HeaderMap) -> String {
+    use hmac::Mac as _;
+    let mut pairs: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| is_credential_header(name.as_str()))
+        .filter_map(|(name, value)| {
+            let trimmed = value.to_str().unwrap_or_default().trim().to_string();
+            (!trimmed.is_empty()).then(|| (name.as_str().to_ascii_lowercase(), trimmed))
+        })
+        .collect();
+    if pairs.is_empty() {
+        return ANONYMOUS_PARTITION.to_string();
+    }
+    pairs.sort();
+    let mut parts = Vec::with_capacity(pairs.len() * 2);
+    for (name, value) in &pairs {
+        parts.push(format!("h:{name}"));
+        parts.push(value.clone());
+    }
+    let canonical = serde_json::to_string(&parts).unwrap_or_else(|_| "[]".to_string());
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&partition_hmac_key())
+        .expect("HMAC takes a key of any length");
+    mac.update(canonical.as_bytes());
+    format!("p_{}", &hex::encode(mac.finalize().into_bytes())[..32])
+}
+
+/// Normalized key JSON: `{"partition":..,"model":..,"messages":[stripped..],extra..}`.
 ///
 /// Byte-identical to the `to_string(key_parts Map)` form this
-/// replaced: insertion order is `model`, `messages`, then `extra` in
+/// replaced, plus the leading `partition` member: insertion order is
+/// `partition`, `model`, `messages`, then `extra` in
 /// map order, with compact separators and `serde_json` escaping
 /// throughout. `cache_control` members are dropped at any depth; the
 /// marker comment from the old tree walker still applies — a moving
 /// breakpoint must not change the key. The one exception is a key of a
 /// JSON Schema `properties` object, where `cache_control` is a
 /// user-defined property name, not a marker (upstream `b84c4c9f`).
-fn normalized_key_json(messages: &[&Value], model: &str, extra: &[(&str, &Value)]) -> Vec<u8> {
+fn normalized_key_json(
+    partition: &str,
+    messages: &[&Value],
+    model: &str,
+    extra: &[(&str, &Value)],
+) -> Vec<u8> {
     use std::io::Write as _;
     fn write_stripped<W: std::io::Write>(
         w: &mut W,
@@ -65,7 +181,12 @@ fn normalized_key_json(messages: &[&Value], model: &str, extra: &[(&str, &Value)
     // Infallible in practice; on error the caller hashes whatever
     // prefix was written, which is still deterministic for the input.
     let _ = (|| -> std::io::Result<()> {
-        write!(out, "{{\"model\":")?;
+        // Upstream `ee6cfccc`: the partition separates entries by inbound
+        // credential, so identical bodies under different provider keys
+        // hash differently. Written first to mirror the upstream key order.
+        write!(out, "{{\"partition\":")?;
+        serde_json::to_writer(&mut out, &partition)?;
+        write!(out, ",\"model\":")?;
         serde_json::to_writer(&mut out, &model)?;
         write!(out, ",\"messages\":")?;
         write!(out, "[")?;
@@ -257,21 +378,31 @@ impl SemanticCache {
         }
     }
 
-    /// Compute cache key from messages, model, and extra fields.
+    /// Compute cache key from partition, messages, model, and extra fields.
     ///
     /// The normalized key JSON is byte-identical to the old
     /// `to_string(key_parts Map)` form (pinned by
-    /// `normalized_key_bytes_are_stable`): same key order (`model`,
-    /// `messages`, then `extra` in field order), same compact
-    /// separators, same `serde_json` escaping. Only the construction
-    /// changed — the old path deep-cloned the whole turn array
-    /// (`messages.to_vec()`) plus a stripped rebuild plus the map;
-    /// this streams the stripped form straight into one buffer.
-    /// `DefaultHasher` keys are process-local, so keys were never
-    /// stable across deploys; within a process equal inputs still
-    /// hash equal and marker moves still hash equal.
-    fn compute_key(messages: &[&Value], model: &str, extra: &[(&str, &Value)]) -> String {
-        let normalized = normalized_key_json(messages, model, extra);
+    /// `normalized_key_bytes_are_stable`) plus a leading `partition`
+    /// member: same key order (`partition`, `model`, `messages`, then
+    /// `extra` in field order), same compact separators, same
+    /// `serde_json` escaping. Only the construction changed — the old
+    /// path deep-cloned the whole turn array (`messages.to_vec()`) plus
+    /// a stripped rebuild plus the map; this streams the stripped form
+    /// straight into one buffer. `DefaultHasher` keys are process-local,
+    /// so keys were never stable across deploys; within a process equal
+    /// inputs still hash equal and marker moves still hash equal.
+    ///
+    /// The partition (see [`compute_cache_partition`], upstream `ee6cfccc`)
+    /// separates entries by inbound credential: identical bodies under
+    /// different provider keys hash differently, so one caller's cached
+    /// completion is never served to another caller.
+    fn compute_key(
+        partition: &str,
+        messages: &[&Value],
+        model: &str,
+        extra: &[(&str, &Value)],
+    ) -> String {
+        let normalized = normalized_key_json(partition, messages, model, extra);
         // `to_vec` output is valid UTF-8 by construction; `str::hash`
         // (bytes + 0xff terminator) is exactly what the old
         // `String::hash` fed the hasher, so key values are unchanged.
@@ -283,13 +414,17 @@ impl SemanticCache {
     }
 
     /// Get cached response if exists and not expired.
+    ///
+    /// `partition` is [`compute_cache_partition`] output for the inbound
+    /// request's headers (upstream `ee6cfccc`).
     pub fn get(
         &self,
+        partition: &str,
         messages: &[&Value],
         model: &str,
         extra: &[(&str, &Value)],
     ) -> Option<CacheEntry> {
-        let key = Self::compute_key(messages, model, extra);
+        let key = Self::compute_key(partition, messages, model, extra);
         let mut cache = self.entries.write().unwrap();
 
         let entry = match cache.get(&key) {
@@ -323,8 +458,16 @@ impl SemanticCache {
     }
 
     /// Cache a response.
+    ///
+    /// `partition` is [`compute_cache_partition`] output for the inbound
+    /// request's headers (upstream `ee6cfccc`); lookup and store must use
+    /// the partition computed from the same headers or hits never land.
+    /// Eight args: the partition key is a separate security input that must
+    /// not fold into `extra`.
+    #[allow(clippy::too_many_arguments)]
     pub fn set(
         &self,
+        partition: &str,
         messages: &[&Value],
         model: &str,
         response_body: impl Into<bytes::Bytes>,
@@ -332,7 +475,7 @@ impl SemanticCache {
         _tokens_saved: u64,
         extra: &[(&str, &Value)],
     ) {
-        let key = Self::compute_key(messages, model, extra);
+        let key = Self::compute_key(partition, messages, model, extra);
         let entry = CacheEntry {
             response_body: response_body.into(),
             response_headers,
@@ -417,16 +560,20 @@ mod tests {
     #[test]
     fn compute_key_same_for_same_input() {
         let extra: Vec<(&str, &Value)> = Vec::new();
-        let k1 = SemanticCache::compute_key(&refs(&msgs()), "claude-3", &extra);
-        let k2 = SemanticCache::compute_key(&refs(&msgs()), "claude-3", &extra);
+        let k1 =
+            SemanticCache::compute_key(ANONYMOUS_PARTITION, &refs(&msgs()), "claude-3", &extra);
+        let k2 =
+            SemanticCache::compute_key(ANONYMOUS_PARTITION, &refs(&msgs()), "claude-3", &extra);
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn compute_key_differs_for_different_model() {
         let extra: Vec<(&str, &Value)> = Vec::new();
-        let k1 = SemanticCache::compute_key(&refs(&msgs()), "claude-3", &extra);
-        let k2 = SemanticCache::compute_key(&refs(&msgs()), "claude-4", &extra);
+        let k1 =
+            SemanticCache::compute_key(ANONYMOUS_PARTITION, &refs(&msgs()), "claude-3", &extra);
+        let k2 =
+            SemanticCache::compute_key(ANONYMOUS_PARTITION, &refs(&msgs()), "claude-4", &extra);
         assert_ne!(k1, k2);
     }
 
@@ -439,20 +586,20 @@ mod tests {
     #[test]
     fn normalized_key_bytes_are_stable() {
         let extra: Vec<(&str, &Value)> = Vec::new();
-        let bytes = normalized_key_json(&refs(&msgs()), "claude-3", &extra);
+        let bytes = normalized_key_json(ANONYMOUS_PARTITION, &refs(&msgs()), "claude-3", &extra);
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
-            r#"{"model":"claude-3","messages":[{"role":"user","content":"hello"}]}"#
+            r#"{"partition":"anon","model":"claude-3","messages":[{"role":"user","content":"hello"}]}"#
         );
         // Markers stripped, key order and escaping preserved.
         let marked = vec![serde_json::json!({
             "role": "user",
             "content": [{"type": "text", "text": "hi \"yo\"", "cache_control": {"type": "ephemeral"}}],
         })];
-        let bytes = normalized_key_json(&refs(&marked), "m", &extra);
+        let bytes = normalized_key_json(ANONYMOUS_PARTITION, &refs(&marked), "m", &extra);
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
-            r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi \"yo\""}]}]}"#
+            r#"{"partition":"anon","model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi \"yo\""}]}]}"#
         );
     }
 
@@ -475,6 +622,7 @@ mod tests {
         let cache = SemanticCache::new(60, 8);
         let msgs = [serde_json::json!({"role": "user", "content": "hello"})];
         cache.set(
+            ANONYMOUS_PARTITION,
             &[&msgs[0]],
             "m",
             serde_json::json!({"type":"error"}).to_string(),
@@ -482,16 +630,110 @@ mod tests {
             0,
             &[],
         );
-        assert!(cache.get(&[&msgs[0]], "m", &[]).is_none());
-        cache.set(&[&msgs[0]], "m", "ok-body", HashMap::new(), 0, &[]);
-        assert!(cache.get(&[&msgs[0]], "m", &[]).is_some());
+        assert!(
+            cache
+                .get(ANONYMOUS_PARTITION, &[&msgs[0]], "m", &[])
+                .is_none()
+        );
+        cache.set(
+            ANONYMOUS_PARTITION,
+            &[&msgs[0]],
+            "m",
+            "ok-body",
+            HashMap::new(),
+            0,
+            &[],
+        );
+        assert!(
+            cache
+                .get(ANONYMOUS_PARTITION, &[&msgs[0]], "m", &[])
+                .is_some()
+        );
     }
 
     #[test]
     fn get_miss_on_empty_cache() {
         let cache = SemanticCache::new(100, 3600);
         let extra: Vec<(&str, &Value)> = Vec::new();
-        assert!(cache.get(&refs(&msgs()), "model", &extra).is_none());
+        assert!(
+            cache
+                .get(ANONYMOUS_PARTITION, &refs(&msgs()), "model", &extra)
+                .is_none()
+        );
+    }
+
+    /// Upstream `ee6cfccc`: two callers whose requests differ only in
+    /// credential must not share a cache entry. Same body, same model,
+    /// different `x-api-key` → store under one partition, miss under the
+    /// other.
+    #[test]
+    fn different_credentials_do_not_share_entries() {
+        let cache = SemanticCache::new(100, 3600);
+        let extra: Vec<(&str, &Value)> = Vec::new();
+        let headers = |key: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-api-key", axum::http::HeaderValue::from_str(key).unwrap());
+            h
+        };
+        let pa = compute_cache_partition(&headers("sk-caller-a"));
+        let pb = compute_cache_partition(&headers("sk-caller-b"));
+        assert_ne!(pa, pb);
+        cache.set(
+            &pa,
+            &refs(&msgs()),
+            "model",
+            b"response-a".to_vec(),
+            HashMap::new(),
+            0,
+            &extra,
+        );
+        assert!(cache.get(&pb, &refs(&msgs()), "model", &extra).is_none());
+        let hit = cache.get(&pa, &refs(&msgs()), "model", &extra);
+        assert_eq!(
+            hit.unwrap().response_body,
+            bytes::Bytes::from_static(b"response-a")
+        );
+    }
+
+    /// Requests without any credential share the anonymous partition, so
+    /// the single-tenant localhost path keeps its hit rate.
+    #[test]
+    fn credential_less_requests_share_the_anonymous_partition() {
+        assert_eq!(
+            compute_cache_partition(&HeaderMap::new()),
+            ANONYMOUS_PARTITION
+        );
+        let mut plain = HeaderMap::new();
+        plain.insert("content-type", "application/json".parse().unwrap());
+        assert_eq!(compute_cache_partition(&plain), ANONYMOUS_PARTITION);
+    }
+
+    /// Non-credential headers (model routing, session tags, idempotency
+    /// keys) must not move a request out of its credential partition, or
+    /// retries and multi-turn sessions would cold-miss.
+    #[test]
+    fn non_credential_headers_do_not_move_partitions() {
+        let headers = |extra: Option<(String, String)>| {
+            let mut h = HeaderMap::new();
+            h.insert("x-api-key", "sk-same".parse().unwrap());
+            if let Some((k, v)) = extra {
+                h.insert(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            h
+        };
+        let base = compute_cache_partition(&headers(None));
+        assert_ne!(base, ANONYMOUS_PARTITION);
+        for extra in [
+            Some(("x-headroom-session-id".to_string(), "s-1".to_string())),
+            Some(("anthropic-model".to_string(), "claude-opus-5".to_string())),
+            Some(("idempotency-key".to_string(), "retry-1".to_string())),
+            Some(("x-idempotency-key".to_string(), "retry-2".to_string())),
+        ] {
+            assert_eq!(compute_cache_partition(&headers(extra)), base);
+        }
     }
 
     #[test]
@@ -499,6 +741,7 @@ mod tests {
         let cache = SemanticCache::new(100, 3600);
         let extra: Vec<(&str, &Value)> = Vec::new();
         cache.set(
+            ANONYMOUS_PARTITION,
             &refs(&msgs()),
             "model",
             b"response".to_vec(),
@@ -506,7 +749,7 @@ mod tests {
             10,
             &extra,
         );
-        let entry = cache.get(&refs(&msgs()), "model", &extra);
+        let entry = cache.get(ANONYMOUS_PARTITION, &refs(&msgs()), "model", &extra);
         assert!(entry.is_some());
         assert_eq!(
             entry.unwrap().response_body,
@@ -522,9 +765,26 @@ mod tests {
         let m2 = vec![serde_json::json!({"role": "user", "content": "b"})];
         let m3 = vec![serde_json::json!({"role": "user", "content": "c"})];
 
-        cache.set(&refs(&m1), "m", b"one".to_vec(), HashMap::new(), 0, &extra);
-        cache.set(&refs(&m2), "m", b"two".to_vec(), HashMap::new(), 0, &extra);
         cache.set(
+            ANONYMOUS_PARTITION,
+            &refs(&m1),
+            "m",
+            b"one".to_vec(),
+            HashMap::new(),
+            0,
+            &extra,
+        );
+        cache.set(
+            ANONYMOUS_PARTITION,
+            &refs(&m2),
+            "m",
+            b"two".to_vec(),
+            HashMap::new(),
+            0,
+            &extra,
+        );
+        cache.set(
+            ANONYMOUS_PARTITION,
             &refs(&m3),
             "m",
             b"three".to_vec(),
@@ -534,9 +794,21 @@ mod tests {
         );
 
         // m1 should be evicted
-        assert!(cache.get(&refs(&m1), "m", &extra).is_none());
-        assert!(cache.get(&refs(&m2), "m", &extra).is_some());
-        assert!(cache.get(&refs(&m3), "m", &extra).is_some());
+        assert!(
+            cache
+                .get(ANONYMOUS_PARTITION, &refs(&m1), "m", &extra)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(ANONYMOUS_PARTITION, &refs(&m2), "m", &extra)
+                .is_some()
+        );
+        assert!(
+            cache
+                .get(ANONYMOUS_PARTITION, &refs(&m3), "m", &extra)
+                .is_some()
+        );
     }
 
     #[test]
@@ -544,6 +816,7 @@ mod tests {
         let cache = SemanticCache::new(100, 3600);
         let extra: Vec<(&str, &Value)> = Vec::new();
         cache.set(
+            ANONYMOUS_PARTITION,
             &refs(&msgs()),
             "m",
             b"data".to_vec(),
@@ -561,6 +834,7 @@ mod tests {
         let cache = SemanticCache::new(100, 3600);
         let extra: Vec<(&str, &Value)> = Vec::new();
         cache.set(
+            ANONYMOUS_PARTITION,
             &refs(&msgs()),
             "m",
             b"data".to_vec(),
@@ -569,7 +843,11 @@ mod tests {
             &extra,
         );
         cache.clear();
-        assert!(cache.get(&refs(&msgs()), "m", &extra).is_none());
+        assert!(
+            cache
+                .get(ANONYMOUS_PARTITION, &refs(&msgs()), "m", &extra)
+                .is_none()
+        );
         assert_eq!(cache.stats()["entries"], serde_json::json!(0));
     }
 }
@@ -594,8 +872,18 @@ mod cache_key_marker_tests {
     #[test]
     fn a_moved_breakpoint_does_not_fragment_the_key() {
         let extra: Vec<(&str, &Value)> = Vec::new();
-        let with = SemanticCache::compute_key(&refs(&msgs(true)), "claude-opus-5", &extra);
-        let without = SemanticCache::compute_key(&refs(&msgs(false)), "claude-opus-5", &extra);
+        let with = SemanticCache::compute_key(
+            ANONYMOUS_PARTITION,
+            &refs(&msgs(true)),
+            "claude-opus-5",
+            &extra,
+        );
+        let without = SemanticCache::compute_key(
+            ANONYMOUS_PARTITION,
+            &refs(&msgs(false)),
+            "claude-opus-5",
+            &extra,
+        );
         assert_eq!(
             with, without,
             "a cache_control marker in messages must not change the key"
@@ -605,8 +893,14 @@ mod cache_key_marker_tests {
     #[test]
     fn real_content_still_changes_the_key() {
         let extra: Vec<(&str, &Value)> = Vec::new();
-        let a = SemanticCache::compute_key(&refs(&msgs(false)), "claude-opus-5", &extra);
+        let a = SemanticCache::compute_key(
+            ANONYMOUS_PARTITION,
+            &refs(&msgs(false)),
+            "claude-opus-5",
+            &extra,
+        );
         let b = SemanticCache::compute_key(
+            ANONYMOUS_PARTITION,
             &refs(&[
                 serde_json::json!({"role": "user", "content": [{"type": "text", "text": "bye"}]}),
             ]),
@@ -630,7 +924,12 @@ mod cache_key_marker_tests {
         let marked = schema(serde_json::json!({"cache_control": {
             "type": "boolean", "cache_control": {"type": "ephemeral"}}}));
         let key = |tools: &Value| {
-            SemanticCache::compute_key(&refs(&msgs(false)), "claude-opus-5", &[("tools", tools)])
+            SemanticCache::compute_key(
+                ANONYMOUS_PARTITION,
+                &refs(&msgs(false)),
+                "claude-opus-5",
+                &[("tools", tools)],
+            )
         };
         assert_ne!(key(&without), key(&with));
         assert_eq!(key(&with), key(&marked));

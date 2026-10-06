@@ -181,10 +181,17 @@ pub(crate) fn store_semantic_cache_response(
     original_buffered: &bytes::Bytes,
     body_bytes: &bytes::Bytes,
     resp_headers: &HeaderMap,
-    request_headers: &HeaderMap,
+    // `None` on paths that dropped the inbound headers: the store then
+    // lands in the anonymous partition, matching the lookup. Never the
+    // outgoing (upstream-bound) headers: those carry the same credential,
+    // but only when the path kept it, so keying on them would split the
+    // store from the lookup whenever the snapshot is `None`.
+    request_headers: Option<&HeaderMap>,
     upstream_url: &Url,
     request_id: &str,
 ) {
+    let empty = HeaderMap::new();
+    let request_headers = request_headers.unwrap_or(&empty);
     if let Some(ref cache) = state.semantic_cache
         && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(original_buffered)
         // An auto-mode reply carries classifier results for this turn only.
@@ -208,12 +215,17 @@ pub(crate) fn store_semantic_cache_response(
                 })
                 .collect();
             // Same key derivation as the lookup above; the two
-            // have to move together or the cache stops hitting.
+            // have to move together or the cache stops hitting. The
+            // partition comes from the inbound request headers (upstream
+            // `ee6cfccc`) — `None` (no snapshot on this path) hashes to
+            // the anonymous partition on both sides.
             let upstream = serde_json::Value::String(upstream_url.to_string());
+            let partition = crate::semantic_cache::compute_cache_partition(request_headers);
             if let Some((messages, extra)) =
                 crate::semantic_cache::cache_key_inputs(&parsed, &upstream)
             {
                 cache.set(
+                    &partition,
                     &messages,
                     model,
                     body_bytes.to_vec(),
@@ -1252,7 +1264,7 @@ where
                     original_buffered,
                     &body_bytes,
                     &resp_headers,
-                    outgoing_headers,
+                    headers_snapshot.as_ref(),
                     upstream_url,
                     request_id,
                 );

@@ -585,6 +585,10 @@ pub(crate) async fn forward_http(
                 &upstream_url,
                 &request_id,
                 &path_for_log,
+                // `None` outside the intercept branch: no headers, no
+                // credential, so the lookup lands in the anonymous
+                // partition — the same partition the store uses below.
+                headers_snapshot.as_ref(),
             )
         {
             return Ok(hit);

@@ -18,6 +18,9 @@ pub(crate) fn check_semantic_cache(
     upstream_url: &url::Url,
     request_id: &str,
     path_for_log: &str,
+    // `None` on paths that dropped the inbound headers: the lookup then
+    // lands in the anonymous partition, matching the store below.
+    request_headers: Option<&HeaderMap>,
 ) -> Option<Response<Body>> {
     if let Some(ref cache) = state.semantic_cache
         && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(buffered)
@@ -32,8 +35,14 @@ pub(crate) fn check_semantic_cache(
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown");
             let upstream = serde_json::Value::String(upstream_url.to_string());
+            // Upstream `ee6cfccc`: partition the lookup by inbound
+            // credential, so a caller never receives the completion
+            // generated for another caller's provider key.
+            let empty = HeaderMap::new();
+            let headers = request_headers.unwrap_or(&empty);
+            let partition = crate::semantic_cache::compute_cache_partition(headers);
             if let Some(entry) = crate::semantic_cache::cache_key_inputs(&parsed, &upstream)
-                .and_then(|(messages, extra)| cache.get(&messages, model, &extra))
+                .and_then(|(messages, extra)| cache.get(&partition, &messages, model, &extra))
             {
                 tracing::info!(
                     event = "semantic_cache_hit",
