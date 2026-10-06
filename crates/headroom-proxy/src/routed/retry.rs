@@ -1062,9 +1062,11 @@ async fn try_replay_stripped_resend(
                 request_id = %request_id,
                 "routed upstream connection failed after replay-prefix retry"
             );
-            Err(crate::error::transient_response(format!(
-                "routed upstream error: {e}"
-            )))
+            // Generic body: the transport detail is in the warn above and
+            // must not reach the client (same redaction as `crate::error`).
+            Err(crate::error::transient_response(
+                "upstream transient error".to_string(),
+            ))
         }
     }
 }
@@ -1146,9 +1148,9 @@ async fn try_zen_hold(
                         request_id = %request_id,
                         "routed upstream connection failed after Zen rate-limit hold"
                     );
-                    Err(crate::error::transient_response(format!(
-                        "routed upstream error: {e}"
-                    )))
+                    Err(crate::error::transient_response(
+                        "upstream transient error".to_string(),
+                    ))
                 }
             }
         }
@@ -1222,10 +1224,12 @@ async fn handle_transport_error(
         // first-write miss): 503 + Retry-After so the client
         // retries — the same contract `ProxyError::Upstream`
         // upholds in `crate::error`. A bare 502 here would stall
-        // the session until a human nudges it.
-        return TransportOutcome::Fail(crate::error::transient_response(format!(
-            "routed upstream error: {e}"
-        )));
+        // the session until a human nudges it. The body stays generic:
+        // the transport detail is in the warn above, and must not reach
+        // the client (same redaction as `crate::error`).
+        return TransportOutcome::Fail(crate::error::transient_response(
+            "upstream transient error".to_string(),
+        ));
     }
     tracing::warn!(
         event = "routed_upstream_error",
@@ -1240,7 +1244,9 @@ async fn handle_transport_error(
     TransportOutcome::Fail(
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from(format!("routed upstream error: {e}")))
+            // Generic like `crate::error`'s non-transport 502: the detail is
+            // in the warn above and must not reach the client.
+            .body(Body::from("upstream request failed"))
             .expect("static response"),
     )
 }
@@ -1254,20 +1260,32 @@ mod tests {
     /// Transport exhaustion on the routed path must answer 503 + Retry-After
     /// (not a bare 502): rotation RSTs, wifi flaps, and corpse-pool misses
     /// are transient, and the client should retry instead of stalling.
-    /// Single attempt so the test never sleeps in backoff.
+    /// Single attempt so the test never sleeps in backoff. The body stays
+    /// generic: the refused address must not reach the client (same
+    /// redaction as `crate::error`).
     #[tokio::test]
     async fn transport_exhaustion_answers_503_with_retry_after() {
-        let upstream: url::Url = "http://127.0.0.1:1/unreachable".parse().unwrap();
+        // A just-closed port refuses with RST: fast and deterministic.
+        // (Port 1 blackholes instead of refusing in some sandboxes, which
+        // costs a 30s connect timeout per run.)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let upstream: url::Url = format!("http://127.0.0.1:{port}/unreachable")
+            .parse()
+            .unwrap();
         let mut config = crate::config::Config::for_test(upstream);
         config.retry_enabled = true;
         config.retry_max_attempts = 1;
+        config.retry_base_delay_ms = 1;
+        config.retry_max_delay_ms = 1;
         let state = AppState::new(config).expect("app state");
         let err = match send_with_retry(
             &state,
-            "http://127.0.0.1:1/unreachable",
-            HeaderMap::new(),
-            Bytes::from("{}"),
-            "test-exhaustion",
+            &format!("http://127.0.0.1:{port}/unreachable"),
+            http::HeaderMap::new(),
+            bytes::Bytes::from("{}"),
+            "test-request",
             None,
             None,
             false,
@@ -1276,13 +1294,20 @@ mod tests {
         .await
         {
             Ok(_) => panic!("closed port must fail"),
-            Err(resp) => resp,
+            Err(e) => e,
         };
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             err.headers().get(http::header::RETRY_AFTER).unwrap(),
             "2",
             "client must be told to retry shortly"
+        );
+        let bytes = axum::body::to_bytes(err.into_body(), 256).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert_eq!(body, "upstream transient error");
+        assert!(
+            !body.contains(&port.to_string()),
+            "refused address must not reach the client"
         );
     }
 
