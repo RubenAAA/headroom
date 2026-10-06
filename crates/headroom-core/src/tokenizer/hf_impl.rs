@@ -155,13 +155,20 @@ impl HfTokenizer {
 }
 
 /// True when the caller forbade HuggingFace downloads: `HEADROOM_OFFLINE`
-/// (our flag), or the stock `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`, all
-/// truthy when set to a non-empty, non-"0" value.
+/// read through [`crate::offline::is_offline`] (so `" 1"` means offline
+/// here exactly as it does for every other egress path), or the stock
+/// `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` set to `1`/`true`/`yes`/`on`.
 pub(crate) fn hf_offline() -> bool {
-    ["HEADROOM_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"]
-        .iter()
-        .filter_map(|var| std::env::var(var).ok())
-        .any(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    crate::offline::is_offline()
+        || ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"]
+            .iter()
+            .filter_map(|var| std::env::var(var).ok())
+            .any(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
 }
 
 /// Look for `tokenizer.json` for `repo` under the local HuggingFace hub

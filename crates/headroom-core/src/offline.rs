@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn unset_is_online() {
         let _guard = env_lock();
-        env::remove_var(OFFLINE_ENV);
+        unsafe { env::remove_var(OFFLINE_ENV) };
         assert!(!is_offline());
         assert!(guard_egress("anything", "https://example.invalid").is_ok());
     }
@@ -115,20 +115,20 @@ mod tests {
         // headroom/offline.py::_TRUE_VALUES. If this list drifts, the two
         // halves of the switch disagree and the air-gap has a hole.
         for raw in ["1", "true", "TRUE", "Yes", " on ", "\ton\n"] {
-            env::set_var(OFFLINE_ENV, raw);
+            unsafe { env::set_var(OFFLINE_ENV, raw) };
             assert!(is_offline(), "{raw:?} should read as offline");
         }
-        env::remove_var(OFFLINE_ENV);
+        unsafe { env::remove_var(OFFLINE_ENV) };
     }
 
     #[test]
     fn falsy_values_stay_online() {
         let _guard = env_lock();
         for raw in ["", "0", "off", "no", "false", "maybe", " "] {
-            env::set_var(OFFLINE_ENV, raw);
+            unsafe { env::set_var(OFFLINE_ENV, raw) };
             assert!(!is_offline(), "{raw:?} should read as online");
         }
-        env::remove_var(OFFLINE_ENV);
+        unsafe { env::remove_var(OFFLINE_ENV) };
     }
 
     /// Normalisation parity, not just value parity. Every case here is
@@ -155,16 +155,16 @@ mod tests {
             ("", false),
             (" ", false),
         ] {
-            env::set_var(OFFLINE_ENV, raw);
+            unsafe { env::set_var(OFFLINE_ENV, raw) };
             assert_eq!(is_offline(), expected, "{raw:?}");
         }
-        env::remove_var(OFFLINE_ENV);
+        unsafe { env::remove_var(OFFLINE_ENV) };
     }
 
     #[test]
     fn guard_reports_purpose_and_destination() {
         let _guard = env_lock();
-        env::set_var(OFFLINE_ENV, "1");
+        unsafe { env::set_var(OFFLINE_ENV, "1") };
         let err = guard_egress("HuggingFace tokenizer download", "hf.co/acme/model")
             .expect_err("guard must refuse while offline");
         assert_eq!(err.purpose, "HuggingFace tokenizer download");
@@ -176,6 +176,6 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("hf.co/acme/model"), "{rendered}");
-        env::remove_var(OFFLINE_ENV);
+        unsafe { env::remove_var(OFFLINE_ENV) };
     }
 }

@@ -18,6 +18,15 @@
 //! bare `null` = JSON null, a bare empty cell = missing key, `""` = empty
 //! string, `"null"` (quoted) = the literal string `"null"`.
 //!
+//! Decoding alone does not prove a block lossless. The format cannot tell
+//! some inputs apart: a mixed-type column is tagged `json`, so its string
+//! `"2"` decodes as the number 2; a literal `a.b` key decodes nested; an
+//! array of objects in a cell decodes to the formatter's table wrapper.
+//! Those decode to `Some(different)`, not `None`. A caller that needs the
+//! guarantee must compare the decoded value to the original, canonically,
+//! and keep the original on a mismatch (upstream `compress.py`
+//! `_string_pair_is_lossless`). No proxy path relies on it today.
+//!
 //! The decoder is total on success paths: malformed or lossy input (CCR
 //! markers, dropped-row notes) yields `None`, never a panic. Two deliberate
 //! deviations from the Python original, both on error paths only:
@@ -256,13 +265,14 @@ fn decode_cell(quoted: bool, value: &str, col: &Column) -> (bool, Value) {
         return (true, Value::Null);
     }
     match col.col_type.as_str() {
-        "int" => match value.parse::<i64>().or_else(|_| {
-            value
-                .parse::<u64>()
-                .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
-        }) {
+        // Above `i64::MAX` the value stays a `u64`, as Python's unbounded
+        // `int` keeps it; capping would decode a different number.
+        "int" => match value.parse::<i64>() {
             Ok(n) => (true, Value::from(n)),
-            Err(_) => as_string(value),
+            Err(_) => match value.parse::<u64>() {
+                Ok(n) => (true, Value::from(n)),
+                Err(_) => as_string(value),
+            },
         },
         "float" => match value.parse::<f64>() {
             Ok(f) if f.is_finite() => (true, Value::from(f)),
@@ -479,6 +489,12 @@ mod tests {
         assert!(decoded[0]["ok"].is_boolean());
         assert!(decoded[0]["n"].is_i64());
         assert!(decoded[0]["f"].is_f64());
+    }
+
+    #[test]
+    fn int_above_i64_max_is_not_capped() {
+        let decoded = expand_compacted("[1]{n:int}\n18446744073709551615\n").expect("decodes");
+        assert_eq!(decoded[0]["n"], json!(u64::MAX));
     }
 
     #[test]

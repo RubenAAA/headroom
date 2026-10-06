@@ -224,8 +224,12 @@ impl CcrStore for InMemoryCcrStore {
             default_ttl_seconds: self.ttl.as_secs(),
         };
         drop(entry);
-        // `clean_expired=True` semantics: purge the stale row.
-        self.map.remove(hash);
+        // `clean_expired=True` semantics: purge the stale row. Re-checked
+        // under the shard write lock, like `get`: a concurrent `put` of the
+        // same hash may have landed since the read guard dropped, and a bare
+        // `remove` would wipe that fresh entry.
+        self.map
+            .remove_if(hash, |_, e| e.is_expired(self.ttl, self.max_lifetime));
         status
     }
 }

@@ -335,9 +335,9 @@ mod tests {
     #[test]
     fn try_new_refuses_while_offline() {
         let _guard = crate::test_support::env_lock();
-        std::env::set_var(crate::offline::OFFLINE_ENV, "1");
+        unsafe { std::env::set_var(crate::offline::OFFLINE_ENV, "1") };
         let result = EmbeddingScorer::try_new();
-        std::env::remove_var(crate::offline::OFFLINE_ENV);
+        unsafe { std::env::remove_var(crate::offline::OFFLINE_ENV) };
 
         let err = result.err().expect("guard must refuse while offline");
         assert!(err.contains("refused"), "{err}");

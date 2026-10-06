@@ -12,6 +12,7 @@ pub mod conversation_savings;
 pub mod cost_tracker;
 pub mod ctx;
 pub mod memory;
+pub mod offline;
 #[cfg(feature = "ml")]
 mod onnx_cpu;
 pub mod output_savings;
@@ -167,5 +168,23 @@ mod tests {
     #[test]
     fn hello_returns_crate_name() {
         assert_eq!(hello(), "headroom-core");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The process environment is global while `cargo test` runs tests in
+    /// parallel threads inside one process, so a test that sets an env var can
+    /// be observed by an unrelated sibling mid-assertion. Every test that
+    /// mutates the environment holds this for its whole body. Same shape as
+    /// `REGISTRY_LOCK` in `tokenizer::registry`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Recovers from poisoning on purpose: one panicking test should not
+    /// cascade into every later test that touches the environment.
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
