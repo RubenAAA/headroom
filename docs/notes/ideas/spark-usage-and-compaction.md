@@ -48,3 +48,21 @@
 log line). So the true input count is available at the proxy and is dropped
 before the client; nothing needs estimating. The open question is still what
 Claude Code does with it (auto-compaction), not whether it can be given.
+
+## Addendum 2026-10-05: the compactor, not the usage number
+
+- **Found by binary inspection (2.1.286–2.1.289, identical):** `muse-spark`
+  appears zero times in the CLI; Spark model ids are `unknown-model`, so the
+  CLI enforces an assumed 200k window (`vWe`/`KUe` = 200000, belief clamp)
+  and auto-compacts against it. Measured: auto `compact_boundary` at
+  preTokens=132342 with settings.json `autoCompactWindow: 306000` set.
+- **The setting does not hold** because the effective threshold is
+  min(setting, assumed window). `CLAUDE_CODE_AUTO_COMPACT_WINDOW` cannot fix
+  unknown models for the same reason. The binary documents two knobs:
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS=<real window>` (fixes the assumed window)
+  and `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` (restores the
+  previous wait-for-the-API behavior = no auto-compact, the pre-regression
+  state).
+- **Shipped:** launcher exports the DISABLE flag (live since 2026-10-05, new
+  sessions only). Rejected: `muse-spark-1.3[1m]` rename (invasive),
+  MAX_CONTEXT_TOKENS alone (still compacts, only later).

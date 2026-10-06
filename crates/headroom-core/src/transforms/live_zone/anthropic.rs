@@ -179,6 +179,8 @@ pub fn compress_anthropic_live_zone_with_ccr(
     // produced compressed output; the byte-threshold gate filters
     // sub-threshold content first.
     let tokenizer = get_tokenizer(model);
+    // Memoize re-counts of the same spans for this request only.
+    let tokenizer = MemoizingTokenizer::new(tokenizer.as_ref());
 
     for slot in plan {
         let outcome = match slot.kind {
@@ -201,7 +203,7 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     target_idx,
                     Some(slot.block_index),
                     block_type,
-                    tokenizer.as_ref(),
+                    &tokenizer,
                     &mut replacements,
                     ccr_store,
                     dispatch_config,
@@ -218,7 +220,7 @@ pub fn compress_anthropic_live_zone_with_ccr(
                 target_idx,
                 Some(slot.block_index),
                 block_type,
-                tokenizer.as_ref(),
+                &tokenizer,
                 &mut replacements,
             ),
             SlotKind::StringContent {
@@ -233,7 +235,7 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     target_idx,
                     None,
                     "string_content".to_string(),
-                    tokenizer.as_ref(),
+                    &tokenizer,
                     &mut replacements,
                     ccr_store,
                     dispatch_config,
@@ -339,6 +341,8 @@ pub fn compress_anthropic_all_messages(
 
     let messages_total = messages.len();
     let tokenizer = get_tokenizer(model);
+    // Memoize re-counts of the same spans for this request only.
+    let tokenizer = MemoizingTokenizer::new(tokenizer.as_ref());
     // `--exclude-tools` guards apply here exactly as they do on the
     // live-zone path; the unconditional CCR guard rides along inside
     // `collect_tool_guards`.
@@ -380,7 +384,7 @@ pub fn compress_anthropic_all_messages(
                         msg_idx,
                         Some(slot.block_index),
                         block_type,
-                        tokenizer.as_ref(),
+                        &tokenizer,
                         &mut replacements,
                         ccr_store,
                         dispatch_config,
@@ -396,7 +400,7 @@ pub fn compress_anthropic_all_messages(
                     msg_idx,
                     Some(slot.block_index),
                     block_type,
-                    tokenizer.as_ref(),
+                    &tokenizer,
                     &mut replacements,
                 ),
                 SlotKind::StringContent {
@@ -411,7 +415,7 @@ pub fn compress_anthropic_all_messages(
                         msg_idx,
                         None,
                         "string_content".to_string(),
-                        tokenizer.as_ref(),
+                        &tokenizer,
                         &mut replacements,
                         None,
                         dispatch_config,

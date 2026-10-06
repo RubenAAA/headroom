@@ -380,6 +380,7 @@ if [ "$LINK" = 1 ]; then
     ln -sfn "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
     ln -sfn "$CONTRIB/update-headroom.sh" "$BIN_DIR/update-headroom.sh"
     ln -sfn "$CONTRIB/concurrency-report.sh" "$BIN_DIR/concurrency-report.sh"
+    ln -sfn "$CONTRIB/spark-budget.sh" "$BIN_DIR/spark-budget.sh"
     say "linked claude-launcher, opencode-launcher and restart-headroom.sh into the checkout"
 else
     install -m 755 "$CONTRIB/claude-launcher" "$BIN_DIR/claude-launcher"
@@ -389,6 +390,7 @@ else
     install -m 755 "$CONTRIB/headroom-rss-sample" "$BIN_DIR/headroom-rss-sample"
     install -m 755 "$CONTRIB/update-headroom.sh" "$BIN_DIR/update-headroom.sh"
     install -m 755 "$CONTRIB/concurrency-report.sh" "$BIN_DIR/concurrency-report.sh"
+    install -m 755 "$CONTRIB/spark-budget.sh" "$BIN_DIR/spark-budget.sh"
     say "installed launchers, rotation watcher and local SOCKS egress helper"
 fi
 ln -sfn claude-launcher "$BIN_DIR/cclaude"

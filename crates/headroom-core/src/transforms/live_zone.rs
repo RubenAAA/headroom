@@ -119,7 +119,7 @@ use super::read_protection::{
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{CcrStore, compute_key, marker_for};
-use crate::tokenizer::get_tokenizer;
+use crate::tokenizer::{MemoizingTokenizer, get_tokenizer};
 use crate::tool_exclusion::{
     is_byte_exact_excluded, is_ccr_retrieve_tool, is_tool_excluded, is_verbatim_excluded,
 };

@@ -244,6 +244,14 @@ pub(crate) struct StreamTranslator {
     /// Set once the turn was closed early (`abort_terminal`): any straggler
     /// frames after a transport error must not reopen it.
     terminated: bool,
+    /// Set once a Responses terminal event (`completed`/`incomplete`/`failed`)
+    /// reached the wire. Upstreams occasionally send two terminals for one
+    /// turn; the second must be swallowed, not emitted — a `failed` after a
+    /// `completed` must not error a good turn, and a `completed` after a
+    /// `failed` must not re-close an errored one. Separate from `terminated`,
+    /// which also stops frame processing: ordinary frames (notably the
+    /// trailing `[DONE]`, which still books the outcome) must keep flowing.
+    terminal_emitted: bool,
     /// Identity of the reasoning item currently streaming, assembled from the
     /// `output_item.added`/`.done` pair that describes it.
     pending_reasoning: PendingReasoning,
@@ -365,6 +373,7 @@ impl StreamTranslator {
             saw_arg_delta: false,
             saw_thinking_text: false,
             terminated: false,
+            terminal_emitted: false,
             pending_reasoning: PendingReasoning::default(),
             codex_limits: None,
             codex_rate_limits_seen: false,
@@ -1172,15 +1181,22 @@ impl StreamTranslator {
         self.complete_usage_observation(usage.as_ref());
         self.emit_outcome(usage.as_ref(), 200);
         self.close_block_final(events);
+        // A second terminal for one turn (usually `completed` after `failed`):
+        // swallow it rather than re-closing an errored turn as clean.
+        if !self.claim_terminal() {
+            return;
+        }
         // A completed response can still carry `incomplete_details`,
         // and truncation outranks a tool call: a `tool_use` stop on a
         // cut-off turn would have the client run a half-streamed call.
-        let truncated = chunk
+        // Logged loud with attribution: a completed-but-cut turn still
+        // looks like a voluntary stop downstream.
+        let incomplete_reason = chunk
             .get("response")
             .and_then(|v| v.get("incomplete_details"))
             .and_then(|v| v.get("reason"))
-            .and_then(|v| v.as_str())
-            == Some("max_output_tokens");
+            .and_then(|v| v.as_str());
+        let truncated = incomplete_reason == Some("max_output_tokens");
         let stop_reason = if truncated {
             "max_tokens"
         } else if self.saw_tool_use {
@@ -1188,13 +1204,70 @@ impl StreamTranslator {
         } else {
             "end_turn"
         };
+        if !truncated && incomplete_reason.is_some() {
+            let (request_id, egress_slot, model, provider, stream_age_s) =
+                self.terminal_attribution();
+            tracing::warn!(
+                event = "routed_response_completed_incomplete",
+                request_id = %request_id,
+                egress_slot,
+                upstream_model = %model,
+                routed_provider = %provider,
+                stream_age_s,
+                output_tokens = self.total_output_tokens,
+                incomplete_reason = incomplete_reason.unwrap_or("none"),
+                stop_reason,
+                "routed turn completed but carried incomplete_details"
+            );
+        }
         events.push(self.emit_message_delta(stop_reason));
         events.push(self.emit_message_stop());
     }
 
-    /// `response.failed`: book a 500 outcome and still end the turn on the
-    /// wire. Extracted from `process_responses_frame` without behavior change.
+    /// Claim the single terminal emission for this turn. Returns false when a
+    /// terminal event already reached the wire and this one must be swallowed.
+    fn claim_terminal(&mut self) -> bool {
+        if self.terminal_emitted {
+            return false;
+        }
+        self.terminal_emitted = true;
+        true
+    }
+
+    /// Attribution shared by the non-clean terminal log lines, so the next
+    /// "the turn just stopped" report joins to a lane, a stream age, and a
+    /// token count instead of a bare request id.
+    fn terminal_attribution(&self) -> (String, Option<usize>, String, String, f64) {
+        match self.outcome.as_ref() {
+            Some(ctx) => (
+                ctx.request_id.clone(),
+                ctx.egress_slot,
+                ctx.model.clone(),
+                ctx.provider.clone(),
+                ctx.started_at.elapsed().as_secs_f64(),
+            ),
+            None => (
+                self.request_id.clone().unwrap_or_else(|| "unknown".into()),
+                None,
+                "unknown".into(),
+                "unknown".into(),
+                -1.0,
+            ),
+        }
+    }
+
+    /// `response.failed`: book a 500 outcome and end the turn LOUD on the
+    /// wire. Before, this emitted `end_turn` + `message_stop`, so a provider
+    /// failure arrived at the client indistinguishable from a voluntary stop —
+    /// and, worse, the client accepted it instead of retrying. An in-band
+    /// `api_error` is terminal too (no hang: the finisher treats an error
+    /// event as the end of the message), but the client surfaces it and
+    /// retries the turn.
     fn on_failed(&mut self, chunk: &Value, events: &mut Vec<String>) {
+        // A straggler after a transport abort: the finisher owns that close.
+        if self.terminated {
+            return;
+        }
         self.close_block_final(events);
         // Booked as a 500 so the outcome funnel routes it to
         // `record_failed` — a failed turn must not feed the save-rate.
@@ -1211,17 +1284,38 @@ impl StreamTranslator {
         {
             observer.note_stream_ended(&ctx.request_id);
         }
-        // The turn still has to end on the wire: without terminal
-        // events the client hangs, and the `[DONE]` fallback cannot
-        // rescue it — the block above already closed `open`, which is
-        // the fallback's trigger. `end_turn`, never `tool_use`: a
-        // half-streamed call must not run.
-        events.push(self.emit_message_delta("end_turn"));
-        events.push(self.emit_message_stop());
+        // A second terminal for one turn (usually `failed` after `completed`):
+        // swallow it rather than erroring a turn that already closed clean.
+        if !self.claim_terminal() {
+            return;
+        }
+        let provider_message = chunk
+            .get("response")
+            .and_then(|v| v.get("error"))
+            .and_then(|v| v.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("upstream response failed");
+        let (request_id, egress_slot, model, provider, stream_age_s) = self.terminal_attribution();
+        tracing::warn!(
+            event = "routed_response_failed",
+            request_id = %request_id,
+            egress_slot,
+            upstream_model = %model,
+            routed_provider = %provider,
+            stream_age_s,
+            output_tokens = self.total_output_tokens,
+            provider_message = %provider_message,
+            "routed turn failed upstream; ending loud so the client retries"
+        );
+        events.push(crate::sse::outbound::api_error(provider_message));
     }
 
     /// `response.incomplete`: end the turn with the truncation stop reason.
-    /// Extracted from `process_responses_frame` without behavior change.
+    /// The stop mapping is unchanged on purpose: `max_output_tokens` is the
+    /// client's cue to continue, `content_filter` retried would filter again,
+    /// and a missing reason is routine on healthy providers — erroring those
+    /// would break good turns. But an incomplete turn must never pass
+    /// silently, so it logs loud with attribution.
     fn on_incomplete(&mut self, chunk: &Value, events: &mut Vec<String>) {
         let reason = chunk
             .get("response")
@@ -1229,10 +1323,27 @@ impl StreamTranslator {
             .and_then(|v| v.get("reason"))
             .and_then(|v| v.as_str());
         self.close_block_final(events);
+        // A second terminal for one turn: swallow it.
+        if !self.claim_terminal() {
+            return;
+        }
         let stop_reason = match reason {
             Some("max_output_tokens") => "max_tokens",
             _ => "end_turn",
         };
+        let (request_id, egress_slot, model, provider, stream_age_s) = self.terminal_attribution();
+        tracing::warn!(
+            event = "routed_response_incomplete",
+            request_id = %request_id,
+            egress_slot,
+            upstream_model = %model,
+            routed_provider = %provider,
+            stream_age_s,
+            output_tokens = self.total_output_tokens,
+            incomplete_reason = reason.unwrap_or("none"),
+            stop_reason,
+            "routed turn stopped short upstream"
+        );
         events.push(self.emit_message_delta(stop_reason));
         events.push(self.emit_message_stop());
         // Outside the reason: a response that stopped short still
@@ -1536,6 +1647,31 @@ fn translate_with_translator(
                                 .as_ref()
                                 .and_then(|ctx| ctx.egress_slot)
                                 .map_or(-1, |slot| slot as i64),
+                            // Which upstream died and how old the stream was:
+                            // without these a stall (no bytes for minutes) is
+                            // indistinguishable from the 600s total timeout
+                            // killing a slow-but-healthy turn. 2026-10-05:
+                            // 538 mid-stream Body-TimedOut aborts on Oct 2 with
+                            // every one of these fields unknown.
+                            upstream_model = state
+                                .translator
+                                .outcome
+                                .as_ref()
+                                .map(|ctx| ctx.model.as_str())
+                                .unwrap_or("unknown"),
+                            routed_provider = state
+                                .translator
+                                .outcome
+                                .as_ref()
+                                .map(|ctx| ctx.provider.as_str())
+                                .unwrap_or("unknown"),
+                            stream_age_s = state
+                                .translator
+                                .outcome
+                                .as_ref()
+                                .map(|ctx| ctx.started_at.elapsed().as_secs_f64())
+                                .unwrap_or(-1.0),
+                            output_tokens = state.translator.total_output_tokens,
                             error = %e,
                             cause = ?e,
                             "routed upstream stream failed after the client had events"
@@ -2521,6 +2657,13 @@ mod tests {
     /// booked the outcome but emitted no terminal events, and the `[DONE]`
     /// fallback could not rescue it (the block was already closed, which is
     /// the fallback's trigger) — so the client hung.
+    ///
+    /// The first fix emitted `end_turn` + `message_stop`, which traded the
+    /// hang for a lie: a provider failure arrived indistinguishable from a
+    /// voluntary stop, and the client accepted it instead of retrying. Now a
+    /// failure ends loud, as an in-band `api_error` with no `message_stop` —
+    /// the finisher treats the error as the end of the message, and the
+    /// client surfaces it and retries the turn.
     #[test]
     fn a_failed_turn_still_terminates() {
         let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
@@ -2532,23 +2675,82 @@ mod tests {
         ));
         out.extend(t.process_frame(
             Some("response.failed"),
-            &json!({"response": {}}).to_string(),
+            &json!({"response": {"error": {"message": "boom"}}}).to_string(),
         ));
         out.extend(t.process_frame(None, "[DONE]"));
 
         let joined = out.join("");
         assert!(
-            joined.contains("message_stop"),
-            "failed turn left the client hanging: {joined}"
+            joined.contains("\"type\":\"api_error\""),
+            "failed turn must end loud so the client retries: {joined}"
         );
         assert!(
-            joined.contains("end_turn"),
-            "a half-streamed call must not run as tool_use: {joined}"
+            joined.contains("boom"),
+            "the provider's error message must reach the client: {joined}"
+        );
+        assert!(
+            !joined.contains("message_stop"),
+            "an errored turn must not also close clean: {joined}"
+        );
+        assert!(
+            !joined.contains("end_turn"),
+            "a failed turn must not masquerade as a voluntary stop: {joined}"
         );
         assert_eq!(
-            joined.matches("event: message_stop").count(),
+            joined.matches("event: error").count(),
             1,
             "the [DONE] fallback must not double-terminate: {joined}"
+        );
+    }
+
+    /// A second terminal for one turn is provider noise, not a second turn:
+    /// `failed` after `completed` must not error a turn that already closed
+    /// clean, and `completed` after `failed` must not re-close an errored one.
+    #[test]
+    fn a_second_terminal_event_is_swallowed() {
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut out = Vec::new();
+        out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        out.extend(t.process_frame(
+            Some("response.completed"),
+            &json!({"response": {"usage": {"input_tokens": 5, "output_tokens": 9}}}).to_string(),
+        ));
+        out.extend(t.process_frame(
+            Some("response.failed"),
+            &json!({"response": {}}).to_string(),
+        ));
+
+        let joined = out.join("");
+        assert!(
+            joined.contains("message_stop"),
+            "the clean close must stand: {joined}"
+        );
+        assert!(
+            !joined.contains("api_error"),
+            "a straggler failed must not error a completed turn: {joined}"
+        );
+
+        let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+        let mut out = Vec::new();
+        out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+        out.extend(t.process_frame(
+            Some("response.failed"),
+            &json!({"response": {}}).to_string(),
+        ));
+        out.extend(t.process_frame(
+            Some("response.completed"),
+            &json!({"response": {"usage": {"input_tokens": 5, "output_tokens": 9}}}).to_string(),
+        ));
+
+        let joined = out.join("");
+        assert_eq!(
+            joined.matches("event: error").count(),
+            1,
+            "the error must stand alone: {joined}"
+        );
+        assert!(
+            !joined.contains("message_stop"),
+            "a straggler completed must not re-close an errored turn: {joined}"
         );
     }
 

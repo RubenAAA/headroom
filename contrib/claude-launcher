@@ -342,6 +342,20 @@ unset HEADROOM_ZEN_EGRESS_ROTATE_COMMAND
 env_vars=()
 [ -n "$CONFIG_DIR" ] && env_vars+=("CLAUDE_CONFIG_DIR=$CONFIG_DIR")
 [ "$use_context" -eq 1 ] && env_vars+=("ANTHROPIC_BASE_URL=$PROXY_URL")
+# Routed model ids (muse-spark-*, claude-codex-*) are unknown to the CLI's
+# model table (zero hits for muse-spark in 2.1.289), so since the 2.1.28x
+# line the CLI enforces an assumed 200k window on them and Spark sessions
+# auto-compact near ~100-130k although the upstream model serves 1M —
+# measured: this session auto-compacted at preTokens=132342 with
+# settings.json autoCompactWindow=306000 set. NOTE: setting
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW does NOT help here: the effective
+# threshold is min(setting, assumed window), so it caps at 200k. The
+# binary's own documented knob for unknown models is
+# CLAUDE_CODE_MAX_CONTEXT_TOKENS, but that only moves the ceiling;
+# DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 restores the previous
+# wait-for-the-API behavior (no auto-compact), which is what Spark
+# sessions had before the regression.
+env_vars+=("CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1")
 if [ "$use_qwen" -eq 1 ]; then
     env_vars+=(
         "ANTHROPIC_CUSTOM_MODEL_OPTION=$QWEN_MODEL"

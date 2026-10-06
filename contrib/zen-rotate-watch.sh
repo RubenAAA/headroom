@@ -389,6 +389,25 @@ EOF
   log "rotation notices written (reason=$reason, egress=$before->$after)"
 }
 
+# A failed exit rotation is otherwise invisible: the watchlog line never
+# reaches a session, so a parent fanning out past the lane budget reads the
+# silence as "still rotating" and keeps widening the fan-out. Emit a throttled
+# failure notice (one per window) so rotation-notice.sh warns the session.
+ROTATION_FAILED_NOTICE_SECS=1800
+write_rotation_failure_notice() {
+  local egress_id="$1" detail="$2" stamp now last
+  stamp="$NOTICE_DIR/.rotation-failed-last"
+  now=$(date +%s)
+  last=$(cat "$stamp" 2>/dev/null || echo 0)
+  if (( now - last < ROTATION_FAILED_NOTICE_SECS )); then
+    return 0
+  fi
+  mkdir -p "$NOTICE_DIR" 2>/dev/null || return 0
+  echo "$now" >"$stamp"
+  write_notices "rotation-failed" "$egress_id" "$egress_id" \
+    "Exit rotation FAILED for $egress_id ($detail): no spare exit is verifying, so rate limits may persist on this lane. Hold unfinished Spark tasks within the lane budget (spark-budget) and retry the last failed request instead of widening the fan-out."
+}
+
 # Next proactive rotation: now + interval ± jitter. In device-wide mode, a
 # reactive rotation resets the timer. In per-egress mode, resetting this
 # pool-wide timer on every single-lane 429 could starve the timed all-lane
@@ -570,6 +589,7 @@ rotate_zen_egress() {
       if [[ "$probed" == 429 || "$probed" == 000 ]]; then
         log "egress=$egress_id rotated ($reason) but Zen answers $probed on the new exit; counted as failed"
         rotation_failed "$egress_id"
+        write_rotation_failure_notice "$egress_id" "new exit still answers $probed"
         exit 3
       fi
       rotation_worked "$egress_id"
@@ -577,6 +597,7 @@ rotate_zen_egress() {
     else
       rotation_failed "$egress_id"
       log "egress=$egress_id rotation FAILED ($reason); external rotator returned non-zero or timed out: $(printf '%s' "$rotator_out" | tail -c 400 | tr '\n' ' ')"
+      write_rotation_failure_notice "$egress_id" "$reason; rotator returned no verified distinct exit"
       # 3, not 1: the rotator answered no. Retrying at once cannot change
       # that, unlike a drain that ran out of time (1).
       exit 3

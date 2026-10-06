@@ -134,6 +134,8 @@ pub fn compress_openai_chat_live_zone_with_config(
     }
 
     let tokenizer = get_tokenizer(model);
+    // Memoize re-counts of the same spans for this request only.
+    let tokenizer = MemoizingTokenizer::new(tokenizer.as_ref());
     let mut block_outcomes: Vec<BlockOutcome> = Vec::with_capacity(all_slots.len());
     let mut replacements: Vec<Replacement> = Vec::new();
 
@@ -201,7 +203,7 @@ pub fn compress_openai_chat_live_zone_with_config(
                     msg_idx,
                     slot.block_index,
                     slot.block_type,
-                    tokenizer.as_ref(),
+                    &tokenizer,
                     &mut replacements,
                 ));
                 continue;
@@ -215,7 +217,7 @@ pub fn compress_openai_chat_live_zone_with_config(
             msg_idx,
             slot.block_index,
             slot.block_type,
-            tokenizer.as_ref(),
+            &tokenizer,
             &mut replacements,
             None, // PR-C2: no CCR store yet on the OpenAI path.
             dispatch_config,

@@ -136,6 +136,19 @@ pub(crate) fn message_stop() -> String {
     frame("message_stop", json!({"type": "message_stop"}))
 }
 
+/// In-band terminal error: the upstream failed the turn, so the client must
+/// see a failure it can retry — never a clean stop. No `message_stop` follows;
+/// like the finisher's own error close, the stream ends here.
+pub(crate) fn api_error(message: &str) -> String {
+    frame(
+        "error",
+        json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message},
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

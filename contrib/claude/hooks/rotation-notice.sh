@@ -26,7 +26,11 @@ if [ -n "$MSG" ]; then
     STAMP=$(date -r "$TS" '+%F %T' 2>/dev/null || date -d "@$TS" '+%F %T' 2>/dev/null || echo "$TS")
     WHEN=" (at $STAMP)"
   fi
-  echo "VPN EXIT ROTATED${REASON:+ ($REASON)}$WHEN: $MSG"
+  if [ "$REASON" = "rotation-failed" ]; then
+    echo "VPN EXIT ROTATION FAILED$WHEN: $MSG"
+  else
+    echo "VPN EXIT ROTATED${REASON:+ ($REASON)}$WHEN: $MSG"
+  fi
   touch "$MARKED" 2>/dev/null || true
 fi
 exit 0

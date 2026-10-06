@@ -21,6 +21,7 @@ nothing here is on the request path.
 | `egress-relay` | `~/.local/bin/` | Rust helper binary for the optional local SOCKS5 relay pool: eight verified Nord lanes (ten when all preferred exits pass) plus one Proton lane over `wireproxy` when Proton WireGuard configs are set up. Rotates a lane to an unused endpoint when a spare is available. Called `nord-socks-egress` before the Proton lane; `install.sh` leaves that name as a symlink. |
 | `wireproxy` | `~/.local/bin/` | Third-party, pinned to 1.1.3 and checksum-verified by `install.sh`: userspace WireGuard served as a loopback SOCKS5 port. The relay starts it for the Proton lane; nothing else uses it. |
 | `headroom-rss-sample` | `~/.local/bin/` | Samples the proxy's RSS once a minute into `~/headroom-rss.log`, so a leak over a long session is visible. |
+| `spark-budget.sh` | `~/.local/bin/` | Pre-fan-out lane budget check for Spark sessions: prints the live `lane_count`, or with a count argument exits 1 when the plan is over budget. Eight when the relay is unreachable. |
 | `reconcile_books.py` | not installed | Checks the proxy's token books against a number it did not compute (the Anthropic usage API, or a console export). Run by hand. |
 
 The review and ticket offload workers can be configured to send session data
@@ -381,7 +382,7 @@ session.
 | `stale-branch.sh` | SessionStart | No — one-time notice when the branch trails its origin |
 | `stale-install.sh` | SessionStart | No — one-time notice when the checkout moved under the installed copies (scripts/hooks differ, or the built binary is newer); fires only inside the checkout |
 | `session-map-log.sh` | SessionStart | No — logs session id to transcript path for the review worker |
-| `rotation-notice.sh` | UserPromptSubmit | No — relays VPN-rotation notices once each |
+| `rotation-notice.sh` | UserPromptSubmit | No — relays VPN-rotation notices once each, including rotation failures (no spare exit verifying) with a hold-the-fan-out warning |
 | `retry-dropped-turn.sh` | Stop, SubagentStop | No — continues a turn parked on a dropped connection, a completed upstream error, a proxy-dropped tool call that left an empty reply, a retrieval splice the model never answered, or a dropped memory lookup |
 | `docker-autostart.sh` | Stop, SubagentStop, UserPromptSubmit | Starts Docker Desktop on macOS/Windows/WSL or the Docker service on Linux when assistant text mentions Docker and the engine is down; continues once with the confirmed result injected |
 

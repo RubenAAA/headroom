@@ -217,6 +217,34 @@ if rotate_zen_egress 'not-an-egress' rate-limit; then
 fi
 grep -qF 'refusing invalid egress id' "$WATCHLOG"
 
+# A failed rotation warns the sessions instead of failing silently: the first
+# failure writes a rotation-failed notice, a repeat inside the window does not
+# rewrite it, and a failure past the window refreshes it.
+forget_rotation_history
+notice_sessions() { echo active-session; }
+NOTICE_DIR="$TEST_HOME/.local/state/spark-review"
+# Earlier failure cases already stamped a notice; clear it so this section
+# starts from "no notice pending".
+rm -f "$NOTICE_DIR/.rotation-failed-last"
+ZEN_ROTATOR_TEST_FAIL=1
+export ZEN_ROTATOR_TEST_FAIL
+ROTATION_FAILED_NOTICE_SECS=1800
+rotate_zen_egress proxy-aaaaaaaaaaaa proactive || true
+notice="$NOTICE_DIR/active-session.rotation.json"
+[[ -f "$notice" ]]
+grep -qF '"reason": "rotation-failed"' "$notice"
+grep -qF 'spark-budget' "$notice"
+first_ts=$(grep -oF '"ts": [0-9]*' "$notice")
+forget_rotation_history
+rotate_zen_egress proxy-aaaaaaaaaaaa proactive || true
+[[ "$(grep -oF '"ts": [0-9]*' "$notice")" == "$first_ts" ]]
+ROTATION_FAILED_NOTICE_SECS=0
+forget_rotation_history
+sleep 1
+rotate_zen_egress proxy-aaaaaaaaaaaa proactive || true
+[[ "$(grep -oF '"ts": [0-9]*' "$notice")" != "$first_ts" ]]
+unset ZEN_ROTATOR_TEST_FAIL
+
 # Missing control configuration never falls back to a global VPN command.
 ZEN_EGRESS_ROTATE_COMMAND=""
 if rotate_zen_egress proxy-aaaaaaaaaaaa rate-limit; then
