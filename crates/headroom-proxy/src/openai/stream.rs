@@ -1220,8 +1220,33 @@ impl StreamTranslator {
                 "routed turn completed but carried incomplete_details"
             );
         }
+        // Every clean completion logs one line: the Responses path is
+        // otherwise silent per turn, so a text-only stop (model announced
+        // work but emitted no tool call) was indistinguishable from a
+        // translator drop. `saw_tool_use`/`saw_text_delta` join the next
+        // "turn just stopped" report to what upstream actually sent.
+        self.log_completion(stop_reason);
         events.push(self.emit_message_delta(stop_reason));
         events.push(self.emit_message_stop());
+    }
+
+    /// One INFO line per clean completion. Extracted so `on_completed`
+    /// stays under the complexity ratchet; see the call-site comment.
+    fn log_completion(&self, stop_reason: &str) {
+        let (request_id, egress_slot, model, provider, stream_age_s) = self.terminal_attribution();
+        tracing::info!(
+            event = "routed_response_completed",
+            request_id = %request_id,
+            egress_slot,
+            upstream_model = %model,
+            routed_provider = %provider,
+            stream_age_s,
+            output_tokens = self.total_output_tokens,
+            saw_text = self.saw_text_delta,
+            saw_tool_use = self.saw_tool_use,
+            stop_reason,
+            "routed turn completed"
+        );
     }
 
     /// Claim the single terminal emission for this turn. Returns false when a

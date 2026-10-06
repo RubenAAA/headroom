@@ -309,6 +309,17 @@ pub(super) fn log_anthropic_close(close: &AnthropicClose<'_>) {
     // turn's history when an orphan-result 400 needs wire-vs-client
     // attribution. Empty on turns without server tools.
     let inv = close.state.server_tool_inventory();
+    log_anthropic_close_info(close, &split, &inv);
+    warn_turn_ended_rough(close, &split, &inv);
+    warn_tool_call_defect(close);
+    warn_server_result_orphans(close);
+}
+
+fn log_anthropic_close_info(
+    close: &AnthropicClose<'_>,
+    split: &crate::sse::anthropic::OutputSplit,
+    inv: &crate::sse::anthropic::ServerToolInventory,
+) {
     tracing::info!(
         request_id = %close.request_id,
         provider = "anthropic",
@@ -336,10 +347,17 @@ pub(super) fn log_anthropic_close(close: &AnthropicClose<'_>) {
         server_tool_results_total = inv.results_total,
         "sse stream closed"
     );
-    // Turns whose close is allowed but worth a look: reasoning without
-    // action, an empty or tool-less answer, a call whose result never
-    // came, or a dropped/incomplete stream. One grep gets all of them.
-    if let Some(reason) = turn_ended_rough_reason(close, &split, &inv) {
+}
+
+/// Turns whose close is allowed but worth a look: reasoning without
+/// action, an empty or tool-less answer, a call whose result never
+/// came, or a dropped/incomplete stream. One grep gets all of them.
+fn warn_turn_ended_rough(
+    close: &AnthropicClose<'_>,
+    split: &crate::sse::anthropic::OutputSplit,
+    inv: &crate::sse::anthropic::ServerToolInventory,
+) {
+    if let Some(reason) = turn_ended_rough_reason(close, split, inv) {
         tracing::warn!(
             event = "turn_ended_rough",
             request_id = %close.request_id,
@@ -353,10 +371,13 @@ pub(super) fn log_anthropic_close(close: &AnthropicClose<'_>) {
             "turn closed without something the next message would need: a tool call, an actionable answer, or a marker of intent to continue"
         );
     }
-    // A turn the client will refuse whole: it was told a tool call
-    // was coming and got nothing it can run. Warn here or the only
-    // symptom is "tool call could not be parsed" on the far side,
-    // with a clean `sse stream closed` on this one.
+}
+
+/// A turn the client will refuse whole: it was told a tool call
+/// was coming and got nothing it can run. Warn here or the only
+/// symptom is "tool call could not be parsed" on the far side,
+/// with a clean `sse stream closed` on this one.
+fn warn_tool_call_defect(close: &AnthropicClose<'_>) {
     if let Some(defect) = close.state.tool_call_defect() {
         tracing::warn!(
             event = "tool_call_defect",
@@ -368,10 +389,13 @@ pub(super) fn log_anthropic_close(close: &AnthropicClose<'_>) {
             "upstream declared a tool call the client cannot execute"
         );
     }
-    // A server result this stream never paired with a call. Provider-side
-    // evidence for the orphan-result 400 class: if the call is absent here
-    // too, the client cannot be blamed for losing it. Gated on completion
-    // so a cut stream's partial inventory doesn't false-positive.
+}
+
+/// A server result this stream never paired with a call. Provider-side
+/// evidence for the orphan-result 400 class: if the call is absent here
+/// too, the client cannot be blamed for losing it. Gated on completion
+/// so a cut stream's partial inventory doesn't false-positive.
+fn warn_server_result_orphans(close: &AnthropicClose<'_>) {
     if close.stream_completed() {
         let orphans = close.state.server_result_orphans();
         if !orphans.is_empty() {
