@@ -155,6 +155,7 @@ fn translate_shaped_body(
             if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen && is_responses {
                 lift_zen_output_ceiling(&mut v, request_id);
                 move_zen_instructions_to_developer(&mut v, request_id);
+                mark_zen_commentary(&mut v);
                 // Match OpenCode's Responses request defaults. Its AI SDK
                 // sends the real OpenCode session as the cache key and leaves
                 // parallel tool calls at the provider default; forcing false
@@ -309,6 +310,40 @@ fn move_zen_instructions_to_developer(body: &mut Value, request_id: &str) {
             "content": instructions,
         }),
     );
+}
+
+/// Hand Spark back the `phase` it gave each message.
+///
+/// Spark labels the text it writes before a tool call `commentary` and leaves
+/// a final answer unlabelled. Claude Code's transcript keeps no label, so
+/// without this every preamble in history reads as a turn that ended on an
+/// announcement, and Spark copies that: it says what it will do next and
+/// stops. One stalled request, replayed to Zen at `max` effort, stopped 32
+/// times in 47; with the label back, 0 in 28 (2026-10-07). OpenCode's AI SDK
+/// replays the label the same way.
+///
+/// The label is rebuilt from position, not stored: an assistant message whose
+/// next item (reasoning aside) is a function call was a preamble. That keeps
+/// it the same on every turn, so the cached prefix does not move.
+fn mark_zen_commentary(body: &mut Value) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for i in 0..input.len() {
+        if input[i].get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let next = input[i + 1..]
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) != Some("reasoning"));
+        if next
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            == Some("function_call")
+        {
+            input[i]["phase"] = serde_json::json!("commentary");
+        }
+    }
 }
 
 /// Endpoint selection is the provider quirk (P6): ChatGPT-subscription
@@ -468,6 +503,81 @@ mod tests {
                 .is_some_and(|key| key.starts_with("ses_"))
         );
         assert!(out.openai_body.get("parallel_tool_calls").is_none());
+    }
+
+    /// A preamble to a tool call goes back to Zen as `commentary`, reasoning
+    /// in between or not; a final answer goes back unlabelled.
+    #[test]
+    fn zen_route_labels_preambles_commentary() {
+        let parsed = json!({
+            "model": "claude-muse-spark-1.3",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "fix it"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Running the tests."},
+                    {"type": "tool_use", "id": "call_1", "name": "Bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}
+                ]},
+                {"role": "assistant", "content": [{"type": "text", "text": "All fixed."}]},
+                {"role": "user", "content": "thanks"}
+            ],
+        });
+        let zen: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            Some("muse-spark-1.3-contributor-free"),
+            &zen,
+            false,
+            "claude-muse-spark-1.3",
+            "req-zen-phase",
+        )
+        .expect("translates");
+        let phases: Vec<(String, Option<String>)> = out.openai_body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["role"] == json!("assistant"))
+            .map(|i| {
+                (
+                    i["content"].as_str().unwrap_or_default().to_string(),
+                    i.get("phase").and_then(Value::as_str).map(str::to_string),
+                )
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                (
+                    "Running the tests.".to_string(),
+                    Some("commentary".to_string())
+                ),
+                ("All fixed.".to_string(), None),
+            ]
+        );
+
+        // Other Responses upstreams are untouched.
+        let openai: url::Url = "https://api.openai.com/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            Some("gpt-5.5"),
+            &openai,
+            false,
+            "claude-codex-5.5",
+            "req-openai-phase",
+        )
+        .expect("translates");
+        assert!(
+            out.openai_body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|i| i.get("phase").is_none())
+        );
     }
 
     /// Zen gets `max` whatever effort the client picked.
