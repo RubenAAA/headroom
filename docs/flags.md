@@ -59,6 +59,20 @@ Options:
           [env: HEADROOM_PROXY_LISTEN=]
           [default: 0.0.0.0:8787]
 
+      --uds <UDS>
+          Serve on a Unix domain socket instead of --listen (POSIX only). Lets a client keep a first-party base URL while its traffic still reaches Headroom. When set, the TCP listen address is not bound
+          
+          [env: HEADROOM_PROXY_UDS=]
+
+      --metrics-require-loopback <METRICS_REQUIRE_LOOPBACK>
+          Restrict the Prometheus `/metrics` scrape endpoint to loopback clients. Default `false` to preserve existing behaviour (the endpoint is reachable from wherever the proxy is bound). Set to `true` — recommended whenever `--listen` binds a non-loopback address — so `/metrics` (token counts, per-session cache-hit rates, rate-limit gauges) is served only to `127.0.0.1` / `::1` and returns 403 otherwise. This is defense-in-depth alongside firewalling the path.
+          
+          Source priority: CLI flag → `HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK` env var → default (`false`).
+          
+          [env: HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK=]
+          [default: false]
+          [possible values: true, false]
+
       --upstream <UPSTREAM>
           Upstream base URL the proxy forwards to (e.g. http://127.0.0.1:8788). REQUIRED — there is no default; we want operators to be explicit
           
@@ -824,6 +838,13 @@ Options:
           CCR: auto-handle `headroom_retrieve` tool calls server-side (retrieve context and continue the conversation). Default `true`
           
           [env: HEADROOM_CCR_HANDLE_RESPONSES=]
+          [default: true]
+          [possible values: true, false]
+
+      --orphan-turn-continuation <ORPHAN_TURN_CONTINUATION>
+          Orphan-turn continuation: a text-only turn that announces an action but emits no tool call gets one extra upstream round with a nudge, so the client sees the turn complete instead of a bare end_turn. Default `true`
+          
+          [env: HEADROOM_ORPHAN_TURN_CONTINUATION=]
           [default: true]
           [possible values: true, false]
 

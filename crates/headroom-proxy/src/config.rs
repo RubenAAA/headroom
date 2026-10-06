@@ -285,6 +285,12 @@ pub struct CliArgs {
     #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "0.0.0.0:8787")]
     pub listen: SocketAddr,
 
+    /// Serve on a Unix domain socket instead of --listen (POSIX only).
+    /// Lets a client keep a first-party base URL while its traffic still
+    /// reaches Headroom. When set, the TCP listen address is not bound.
+    #[arg(long, env = "HEADROOM_PROXY_UDS")]
+    pub uds: Option<std::path::PathBuf>,
+
     /// Restrict the Prometheus `/metrics` scrape endpoint to loopback
     /// clients. Default `false` to preserve existing behaviour (the
     /// endpoint is reachable from wherever the proxy is bound). Set to
@@ -2530,6 +2536,8 @@ pub struct Config {
     /// Runtime rollout state resolved from CLI/env.
     pub rollout: RolloutSnapshot,
     pub listen: SocketAddr,
+    /// Unix socket path to serve on instead of `listen` (`None` = TCP).
+    pub uds: Option<std::path::PathBuf>,
     /// Gate the Prometheus `/metrics` endpoint to loopback clients.
     /// Default `false`; recommend `true` when `listen` is non-loopback.
     pub metrics_require_loopback: bool,
@@ -2967,6 +2975,7 @@ impl Config {
         Self {
             rollout: rollout.clone(),
             listen: args.listen,
+            uds: args.uds.clone(),
             metrics_require_loopback: args.metrics_require_loopback,
             upstream: args.upstream,
             upstream_timeout: args.upstream_timeout,
@@ -3259,6 +3268,7 @@ impl Config {
         Self {
             rollout: RolloutSnapshot::default(),
             listen: "127.0.0.1:0".parse().unwrap(),
+            uds: None,
             // Off by default in tests: the metrics integration tests
             // scrape `/metrics` and assert 200, and oneshot-style tests
             // carry no `ConnectInfo`. Tests that exercise the gate set

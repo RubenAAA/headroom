@@ -101,7 +101,21 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
     spawn_resource_heartbeat();
     spawn_cursor_reaper(&config, &state);
     spawn_savings_handoff_absorber(&state);
-    warn_on_open_bind(&config);
+    // Refuse a token-less non-loopback bind (upstream `ee731d7e`): serving
+    // the /v1/* relay to the whole network with no token is a startup
+    // error, not a warning. Exits non-zero with the reason on stderr.
+    // Skipped for a socket bind: no TCP port opens, so there is no
+    // network surface to refuse.
+    if config.uds.is_none()
+        && let Err(reason) = headroom_proxy::bind_policy::enforce_bind_policy(
+            &config.listen,
+            config.proxy_token.is_some(),
+        )
+    {
+        tracing::error!(event = "proxy_bind_refused", reason = %reason);
+        eprintln!("headroom-proxy: {reason}");
+        std::process::exit(2);
+    }
 
     serve(state, &config).await
 }
@@ -316,27 +330,17 @@ fn spawn_cursor_reaper(config: &Config, state: &AppState) {
     }
 }
 
-fn warn_on_open_bind(config: &Config) {
-    // Binding a non-loopback interface with no token leaves every `/v1/*`
-    // route reachable from the surrounding network — the shape the 0.0.0.0
-    // container image has by default. Say so at boot, where an operator will
-    // see it, rather than leaving it to be discovered.
-    if config.proxy_token.is_none()
-        && !headroom_proxy::loopback_guard::is_loopback_host(Some(&config.listen.ip().to_string()))
-    {
-        tracing::warn!(
-            event = "proxy_open_bind",
-            host = %config.listen.ip(),
-            "bound to a non-loopback interface with no HEADROOM_PROXY_TOKEN; \
-             the /v1/* routes are reachable WITHOUT authentication"
-        );
-    }
-}
-
 async fn serve(
     state: AppState,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // A socket bind never opens a TCP port: the filesystem owns access
+    // control, so --listen is ignored entirely (upstream arbitrates the
+    // same way: the socket wins, --host/--port are not bound).
+    if let Some(uds_path) = &config.uds {
+        return serve_uds(state, config, uds_path).await;
+    }
+
     let savings_tracker = state.savings_tracker.clone();
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
@@ -345,28 +349,90 @@ async fn serve(
 
     let grace = config.graceful_shutdown_timeout;
 
-    // The shutdown future used to `sleep(grace)` before returning. Axum only
-    // begins draining once this future completes, so the timeout delayed the
-    // drain by its own length and then waited on in-flight connections with no
-    // limit at all. Three deploys on 2026-09-03 needed SIGKILL after the
-    // process outlived a 30s grace by more than ten seconds. Return as soon as
-    // the signal lands, and bound the drain below, which is what the flag says
-    // it does.
     let signalled_at: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
         std::sync::Arc::new(std::sync::OnceLock::new());
     let mark = signalled_at.clone();
     let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        let _ = mark.set(std::time::Instant::now());
-        // Before this future returns and the listener closes: the next proxy
-        // starts once the port is free and loads the savings file then, so the
-        // final write has to be on disk first.
-        savings_tracker.begin_handoff();
-        log_shutdown_started(grace);
-        let _ = drain_started_tx.send(());
-    });
+    let serve = axum::serve(listener, app).with_graceful_shutdown(drain_on_signal(
+        savings_tracker,
+        mark,
+        drain_started_tx,
+        grace,
+    ));
+    drive_serve(serve, &signalled_at, drain_started_rx, grace).await
+}
+
+/// Serve the app on a Unix domain socket instead of TCP. Request handling
+/// is untouched; only the transport differs. The socket file is removed on
+/// exit so a stale path never blocks the next start.
+async fn serve_uds(
+    state: AppState,
+    config: &Config,
+    uds_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let resolved = headroom_proxy::uds::prepare_uds_path(uds_path).await?;
+    let savings_tracker = state.savings_tracker.clone();
+    let app = headroom_proxy::uds::uds_router(state).into_make_service();
+
+    let listener = tokio::net::UnixListener::bind(&resolved)?;
+    for line in headroom_proxy::uds::socket_usage_lines(&resolved) {
+        tracing::info!("{line}");
+    }
+
+    let grace = config.graceful_shutdown_timeout;
+
+    let signalled_at: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
+        std::sync::Arc::new(std::sync::OnceLock::new());
+    let mark = signalled_at.clone();
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let serve = axum::serve(listener, app).with_graceful_shutdown(drain_on_signal(
+        savings_tracker,
+        mark,
+        drain_started_tx,
+        grace,
+    ));
+    let result = drive_serve(serve, &signalled_at, drain_started_rx, grace).await;
+    // The listener is gone here, so no live socket can exist at the path;
+    // remove the file the way upstream does on server exit.
+    headroom_proxy::uds::remove_uds_path(&resolved);
+    result
+}
+
+/// Build the graceful-shutdown future shared by the TCP and socket serve
+/// paths.
+///
+/// The shutdown future used to `sleep(grace)` before returning. Axum only
+/// begins draining once this future completes, so the timeout delayed the
+/// drain by its own length and then waited on in-flight connections with no
+/// limit at all. Three deploys on 2026-09-03 needed SIGKILL after the
+/// process outlived a 30s grace by more than ten seconds. Return as soon as
+/// the signal lands, and bound the drain below, which is what the flag says
+/// it does.
+async fn drain_on_signal(
+    savings_tracker: std::sync::Arc<headroom_core::savings_tracker::SavingsTracker>,
+    mark: std::sync::Arc<std::sync::OnceLock<std::time::Instant>>,
+    drain_started_tx: tokio::sync::oneshot::Sender<()>,
+    grace: std::time::Duration,
+) {
+    shutdown_signal().await;
+    let _ = mark.set(std::time::Instant::now());
+    // Before this future returns and the listener closes: the next proxy
+    // starts once the port is free and loads the savings file then, so the
+    // final write has to be on disk first.
+    savings_tracker.begin_handoff();
+    log_shutdown_started(grace);
+    let _ = drain_started_tx.send(());
+}
+
+/// Shared drain driver for the TCP and socket serve futures.
+async fn drive_serve(
+    serve: impl std::future::IntoFuture<Output = std::io::Result<()>>,
+    signalled_at: &std::sync::OnceLock<std::time::Instant>,
+    drain_started_rx: tokio::sync::oneshot::Receiver<()>,
+    grace: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `WithGracefulShutdown` is `IntoFuture`, not `Future`, so it cannot be
     // polled in the `select!` below until it is converted.
     let serve = std::future::IntoFuture::into_future(serve);
@@ -384,11 +450,11 @@ async fn serve(
 
     tokio::select! {
         result = &mut serve => {
-            log_drained(&signalled_at);
+            log_drained(signalled_at);
             result?;
         }
         _ = &mut deadline => {
-            log_drain_timed_out(grace, &signalled_at);
+            log_drain_timed_out(grace, signalled_at);
         }
     }
 
