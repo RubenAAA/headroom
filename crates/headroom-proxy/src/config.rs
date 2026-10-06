@@ -1692,9 +1692,11 @@ pub struct CliArgs {
     )]
     pub ccr_handle_responses: bool,
 
-    /// Orphan-turn continuation: a text-only turn that announces an action but
-    /// emits no tool call gets one extra upstream round with a nudge, so the
-    /// client sees the turn complete instead of a bare end_turn. Default `true`.
+    /// Orphan-turn continuation: a routed Responses turn (Spark) that stops
+    /// text-only on a message the model labelled `phase: commentary` (a
+    /// preamble to a tool call) gets one extra upstream round with a nudge,
+    /// so the client sees the turn complete instead of a bare end_turn.
+    /// Turns without that label never trigger. Default `true`.
     #[arg(
         long = "orphan-turn-continuation",
         env = "HEADROOM_ORPHAN_TURN_CONTINUATION",
@@ -2845,8 +2847,8 @@ pub struct Config {
     pub ccr_inject_tool: bool,
     /// CCR: auto-handle retrieval tool calls server-side.
     pub ccr_handle_responses: bool,
-    /// One extra upstream round for turns that announce an action but emit no
-    /// tool call, so the client never sees the bare end_turn.
+    /// One extra upstream round for routed turns that stop text-only on a
+    /// `commentary` message, so the client never sees the bare end_turn.
     pub orphan_turn_continuation: bool,
     /// CCR: max retrieve-continue rounds per response.
     pub ccr_max_retrieval_rounds: usize,

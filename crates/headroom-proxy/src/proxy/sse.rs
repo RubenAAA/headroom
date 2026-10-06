@@ -213,6 +213,7 @@ pub(super) async fn maybe_rewrite_anthropic_stream(
             redact: None,
             // Anthropic path: the caller folds the returned handle itself.
             rounds_sink: None,
+            commentary_stop: None,
         };
         let (stream, usage) = crate::sse::ccr_stream::rewrite_anthropic_stream(upstream_body, ctx);
         (Box::pin(stream), Some(usage))

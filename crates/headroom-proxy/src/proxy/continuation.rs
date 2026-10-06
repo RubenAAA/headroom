@@ -447,7 +447,10 @@ pub(crate) fn continuation_stream_terminal(body: &[u8], provider: &str) -> Optio
     }
 }
 
-pub(super) fn continuation_turn_from_body(
+/// Fold one continuation body into a turn `Value`, whichever shape it came
+/// back in. Re-exported through `proxy` for the orphan-turn rescue in
+/// `sse::ccr_stream`, which folds its seed round through this same helper.
+pub(crate) fn continuation_turn_from_body(
     body: &bytes::Bytes,
     content_type: Option<&str>,
     provider: &str,

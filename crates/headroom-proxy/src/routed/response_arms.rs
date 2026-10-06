@@ -620,6 +620,7 @@ pub(crate) async fn handle_streaming_response(
                 // Booking-owned handle: the rewriter populates it and the
                 // completion guard books it together with first-round usage.
                 rounds_sink: deferred.as_ref().map(|d| d.rounds.clone()),
+                commentary_stop: deferred.as_ref().map(|d| d.ended_on_commentary.clone()),
             };
             let (rewritten, usage_handle) =
                 crate::sse::ccr_stream::rewrite_anthropic_stream(translated_stream, ctx);
@@ -779,9 +780,11 @@ pub(crate) async fn handle_passthrough(
                 None,
                 started_at,
             );
+            // Generic like `crate::error`'s non-transport 502: the detail is
+            // in the warn above and must not reach the client.
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("upstream error: {e}")))
+                .body(Body::from("upstream request failed"))
                 .expect("static response");
         }
     };

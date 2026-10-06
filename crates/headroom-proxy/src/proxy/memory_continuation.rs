@@ -1024,7 +1024,11 @@ pub(crate) async fn handle_memory_response(
 
         // `handle_memory_tool_calls` returns provider-shaped tool results
         // already; wrap them the way the continuation array expects.
-        let assistant_msg = shaper.extract_assistant_message(&current_response, provider);
+        // Rename first: Spark's free tier reuses one call id across
+        // calls in a turn, and replaying the duplicates draws a 400 that
+        // strands every call and empties the turn.
+        let mut assistant_msg = shaper.extract_assistant_message(&current_response, provider);
+        rename_duplicate_call_ids(&mut assistant_msg, &mut results, provider, request_id);
         let tool_result_msg = memory_results_message(&results, provider);
 
         let Some(continuation_body) = append_round_messages(
@@ -1354,6 +1358,99 @@ fn memory_trace_lines(
         }
     }
     lines
+}
+
+/// Give every repeat of a tool-call id its own id, in both the assistant
+/// turn and its results. Spark's free tier reuses one `call_id` across
+/// calls in a turn; replaying them draws a 400 "Duplicate
+/// function_call_output", which used to strand every call and empty the
+/// turn (and the client stop hook then retried the dropped calls in a
+/// loop). Every call already ran, so each keeps its result: the n-th call
+/// with an id pairs with the n-th result carrying it (results come back in
+/// call order), and repeats become `id_2`, `id_3`, … Dropping the repeats
+/// instead hid a save that had landed from the model. Unknown provider
+/// shapes pass through untouched rather than risk mangling a shape this
+/// helper never saw.
+fn rename_duplicate_call_ids(
+    assistant_msg: &mut serde_json::Value,
+    results: &mut [serde_json::Value],
+    provider: &str,
+    request_id: &str,
+) {
+    use serde_json::Value;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let (calls_field, call_type, call_key, result_key) = match provider {
+        "openai_responses" => (
+            "_openai_responses_input_items",
+            Some("function_call"),
+            "call_id",
+            "tool_call_id",
+        ),
+        "openai" => ("tool_calls", None, "id", "tool_call_id"),
+        "anthropic" => ("content", Some("tool_use"), "id", "tool_use_id"),
+        _ => return,
+    };
+    let Some(calls) = assistant_msg
+        .get_mut(calls_field)
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    let is_call =
+        |c: &Value| call_type.is_none_or(|t| c.get("type").and_then(Value::as_str) == Some(t));
+    let mut taken: HashSet<String> = calls
+        .iter()
+        .filter(|c| is_call(c))
+        .filter_map(|c| c.get(call_key).and_then(Value::as_str).map(str::to_string))
+        .collect();
+    // Raw id -> the ids handed out for it, in call order.
+    let mut handed: HashMap<String, VecDeque<String>> = HashMap::new();
+    let mut renamed = 0usize;
+    for call in calls.iter_mut().filter(|c| is_call(c)) {
+        let Some(id) = call
+            .get(call_key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let ids = handed.entry(id.clone()).or_default();
+        let new_id = if ids.is_empty() {
+            id
+        } else {
+            let mut n = ids.len() + 1;
+            loop {
+                let candidate = format!("{id}_{n}");
+                if taken.insert(candidate.clone()) {
+                    break candidate;
+                }
+                n += 1;
+            }
+        };
+        if !ids.is_empty() {
+            call[call_key] = Value::String(new_id.clone());
+            renamed += 1;
+        }
+        ids.push_back(new_id);
+    }
+    if renamed == 0 {
+        return;
+    }
+    for result in results.iter_mut() {
+        let Some(id) = result.get(result_key).and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(new_id) = handed.get_mut(id).and_then(VecDeque::pop_front) {
+            result[result_key] = Value::String(new_id);
+        }
+    }
+    tracing::info!(
+        event = "memory_duplicate_call_ids_renamed",
+        request_id = %request_id,
+        provider = %provider,
+        renamed,
+        "upstream reused a call id in one turn; gave each repeat its own id"
+    );
 }
 
 /// Wrap provider-shaped memory tool results for the continuation array.
@@ -1778,7 +1875,7 @@ mod memory_trace_tests {
 mod memory_continuation_tests {
     use super::{
         append_stranded_notice, continuation_dangling_calls, excise_failed_memory_calls,
-        memory_results_message, turn_has_visible_text,
+        memory_results_message, rename_duplicate_call_ids, turn_has_visible_text,
     };
 
     #[test]
@@ -1919,5 +2016,85 @@ mod memory_continuation_tests {
             .filter(|t| t.contains("did NOT run"))
             .collect();
         assert_eq!(texts.len(), 1, "notices must not stack: {turn}");
+    }
+
+    /// The live shape: Spark's free tier reuses one `call_id` across calls
+    /// in a turn. Each repeat gets its own id and keeps its own result, so
+    /// the replayed continuation carries one output per call, the upstream
+    /// accepts it instead of 400ing on duplicates, and the model still sees
+    /// that the second save ran.
+    #[test]
+    fn duplicate_call_ids_get_distinct_ids_paired_with_their_results() {
+        let mut assistant = serde_json::json!({
+            "_openai_responses_input_items": [
+                {"type": "function_call", "call_id": "c1", "name": "memory_save",
+                 "arguments": "{\"fact\":\"a\"}"},
+                {"type": "function_call", "call_id": "c1", "name": "memory_save",
+                 "arguments": "{\"fact\":\"b\"}"},
+                {"type": "function_call", "call_id": "c2", "name": "memory_save",
+                 "arguments": "{}"},
+            ]
+        });
+        let mut results = vec![
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "saved a"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "saved b"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c2", "content": "saved"}),
+        ];
+        rename_duplicate_call_ids(&mut assistant, &mut results, "openai_responses", "test");
+        let items = assistant["_openai_responses_input_items"]
+            .as_array()
+            .unwrap();
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|i| i["call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["c1", "c1_2", "c2"], "{assistant}");
+        let paired: Vec<(&str, &str)> = results
+            .iter()
+            .map(|r| {
+                (
+                    r["tool_call_id"].as_str().unwrap(),
+                    r["content"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            paired,
+            [("c1", "saved a"), ("c1_2", "saved b"), ("c2", "saved")]
+        );
+    }
+
+    /// Non-call items ride along untouched, and a renamed id skips one the
+    /// turn already uses.
+    #[test]
+    fn duplicate_rename_keeps_untagged_items_and_avoids_taken_ids() {
+        let mut assistant = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "saving both"},
+                {"type": "tool_use", "id": "t1", "name": "memory_save"},
+                {"type": "tool_use", "id": "t1_2", "name": "memory_save"},
+                {"type": "tool_use", "id": "t1", "name": "memory_save"},
+            ]
+        });
+        let mut results = vec![
+            serde_json::json!({"type": "tool_result", "tool_use_id": "t1", "content": "a"}),
+            serde_json::json!({"type": "tool_result", "tool_use_id": "t1_2", "content": "b"}),
+            serde_json::json!({"type": "tool_result", "tool_use_id": "t1", "content": "c"}),
+        ];
+        rename_duplicate_call_ids(&mut assistant, &mut results, "anthropic", "test");
+        let content = assistant["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "saving both", "{assistant}");
+        let ids: Vec<&str> = content[1..]
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["t1", "t1_2", "t1_3"], "{assistant}");
+        let result_ids: Vec<&str> = results
+            .iter()
+            .map(|r| r["tool_use_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(result_ids, ["t1", "t1_2", "t1_3"]);
+        assert_eq!(results[2]["content"], "c");
     }
 }

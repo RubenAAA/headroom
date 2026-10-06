@@ -264,6 +264,11 @@ pub(crate) struct CcrStreamContext {
     /// completion guard books first-round usage and rounds together. `None`
     /// everywhere else; the returned handle is then the only copy.
     pub rounds_sink: Option<Arc<Mutex<crate::proxy::CcrRoundUsage>>>,
+    /// Routed Responses turns only: the translator's verdict that the turn
+    /// ended text-only on a `commentary` message (see
+    /// [`crate::openai::stream::DeferredCcrBooking::ended_on_commentary`]).
+    /// `None` (every non-routed path) never triggers.
+    pub commentary_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Convert a rebuilt Anthropic assistant turn into the OpenAI
@@ -1144,66 +1149,10 @@ impl Rewriter {
     }
 }
 
-/// Phrases that announce an imminent action. A turn that ends on one of these
-/// with no tool call is the orphan: the model said it would act and then
-/// stopped. Matched case-insensitively against the whole turn text; the
-/// length cap below is what keeps substantive answers out.
-const ORPHAN_ANNOUNCEMENTS: &[&str] = &[
-    "i'll ",
-    "i will ",
-    "let me ",
-    "i'm going to ",
-    "i am going to ",
-    "let's ",
-    "starting with",
-    "i'll start",
-    "checking ",
-    "looking into",
-    "investigating ",
-    "on it",
-];
-
-/// Turns longer than this never trigger an orphan continuation. A real final
-/// answer that happens to contain "let me explain" is hundreds of chars; the
-/// orphan is one short sentence ("I'll investigate the X failure and get the
-/// fix in place." was 62). Measured shape, not a guess.
-const ORPHAN_MAX_CHARS: usize = 600;
-
-/// If the rebuilt turn is a lone short text-only `end_turn` announcing an
-/// action, the turn is an orphan: return the matched phrase for the log.
-/// `None` for anything with a non-text block, a truncated stop, a long
-/// answer, or no announcement. Pure: unit-test the trigger here, not on a
-/// live stream.
-pub(crate) fn orphan_announcement(message: &Value) -> Option<&'static str> {
-    if message.get("stop_reason").and_then(Value::as_str) != Some("end_turn") {
-        return None;
-    }
-    let content = message.get("content")?.as_array()?;
-    if content.is_empty() {
-        return None;
-    }
-    let mut text = String::new();
-    for block in content {
-        if block.get("type").and_then(Value::as_str) != Some("text") {
-            return None;
-        }
-        if let Some(t) = block.get("text").and_then(Value::as_str) {
-            text.push_str(t);
-        }
-    }
-    if text.chars().count() > ORPHAN_MAX_CHARS {
-        return None;
-    }
-    let lower = text.to_lowercase();
-    ORPHAN_ANNOUNCEMENTS
-        .iter()
-        .find(|p| lower.contains(**p))
-        .copied()
-}
-
 /// Wrap an Anthropic SSE body so `headroom_retrieve` calls are answered here
 /// instead of reaching the client.
-///////// Returns the rewritten stream and a handle to the usage of any continuation
+///
+/// Returns the rewritten stream and a handle to the usage of any continuation
 /// rounds, which the caller folds into the request outcome. The handle stays
 /// zeroed on every turn that does not retrieve.
 /// Generic over the stream's error type: the Anthropic path feeds it
@@ -1265,13 +1214,22 @@ where
 
         // Nothing was retrieved: release the terminal events and the client
         // has had the upstream turn, unchanged — unless the turn is an
-        // orphan: text-only, announcing an action, with no tool call. One
-        // extra round with a nudge usually produces the call, and the client
-        // sees the turn complete normally instead of a bare end_turn.
+        // orphan: a text-only stop that announced work it never started.
+        // One extra round with a nudge usually produces the call, and the
+        // client sees the turn complete normally instead of a bare end_turn.
+        // The model's own `commentary` label is the only signal. Never a
+        // word list: one missed every new phrasing and fired on ordinary
+        // replies.
         // One-shot by construction (see `resolve_orphan_turn`): the resolved
         // synthesis below never re-enters this branch.
-        let orphan_trigger = if !rw.saw_ccr && ctx.config.orphan_turn_continuation {
-            orphan_announcement(&rebuild_message(&rw.state))
+        let orphan_trigger = if rw.saw_ccr || !ctx.config.orphan_turn_continuation {
+            None
+        } else if ctx
+            .commentary_stop
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            Some("phase=commentary")
         } else {
             None
         };
@@ -1285,19 +1243,11 @@ where
         }
 
         let (resolved, extras) = match orphan_trigger {
-            Some(trigger) => {
-                tracing::info!(
-                    event = "orphan_turn_continuation",
-                    request_id = %ctx.request_id,
-                    trigger = trigger,
-                    "stream: text-only turn announced an action without a tool call; running one continuation round"
-                );
-                (
-                    resolve_orphan_turn(&ctx, &round_usage, &rebuild_message(&rw.state), trigger)
-                        .await,
-                    None,
-                )
-            }
+            // `resolve_orphan_turn` logs `orphan_turn_continuation` itself.
+            Some(trigger) => (
+                resolve_orphan_turn(&ctx, &round_usage, &rebuild_message(&rw.state), trigger).await,
+                None,
+            ),
             None => {
                 CONTINUATION_EXTRAS
                     .scope(RefCell::new(None), async {
@@ -1726,9 +1676,9 @@ async fn run_resolver_alternation(
 /// an instruction to chat — a question would spend the round answering it.
 const ORPHAN_NUDGE: &str = "Your last message announced an action but contained no tool call, so nothing ran. Continue now: emit the tool call.";
 
-/// Upper bound on the orphan round trip: the seed round plus whatever the
-/// resolver alternation spends afterwards. A sick route must stall one turn,
-/// not the session.
+/// Upper bound on each leg of the orphan round trip: the seed round, then
+/// whatever the resolver alternation spends afterwards. A sick route must
+/// stall one turn, not the session.
 const ORPHAN_ROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
 
 /// Splice `entry` into a continuation array the way the resolver loop does: a
@@ -1780,6 +1730,10 @@ fn orphan_seed_request(request: &mut Value, items_field: &str, assistant: Value)
 /// sees exactly what it said. The enriched request also seeds the
 /// alternation: rounds 3+ must keep round 1 in history, and the template
 /// alone does not have it.
+///
+/// The settled turn replaces the orphan only when it carries a tool call:
+/// if the nudged round came back text-only too, the original announcement
+/// streams as-is instead of being replaced by a second stall.
 async fn resolve_orphan_turn(
     ctx: &CcrStreamContext,
     round_usage: &Arc<Mutex<crate::proxy::CcrRoundUsage>>,
@@ -1793,20 +1747,87 @@ async fn resolve_orphan_turn(
         CcrShape::RoutedChat { .. } => ("openai", "messages"),
         CcrShape::RoutedResponses { .. } => ("openai_responses", "input"),
     };
+    let Some(seed_bytes) = orphan_seed_bytes(ctx, rebuilt, provider, items_field) else {
+        return rebuilt.clone();
+    };
 
-    // The turn in the shape its upstream speaks — the same conversion the
-    // retrieval path feeds the handlers.
+    tracing::info!(
+        event = "orphan_turn_continuation",
+        request_id = %ctx.request_id,
+        trigger,
+        "ccr: text-only turn stopped on a commentary message; sending it back with a nudge"
+    );
+    let Some(round_two) = orphan_nudge_round(ctx, seed_bytes.clone(), provider).await else {
+        return rebuilt.clone();
+    };
+    let Some(settled) =
+        settle_orphan_round(ctx, round_usage, round_two, seed_bytes, provider).await
+    else {
+        return rebuilt.clone();
+    };
+
+    let turn = settled_as_anthropic(ctx, settled);
+    let first_tool = turn
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks.iter().find_map(|b| {
+                (b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .then(|| b.get("name").and_then(Value::as_str).unwrap_or(""))
+            })
+        });
+    match first_tool {
+        Some(tool) => {
+            // Fired only when the nudge round actually brought a tool call
+            // back: this is the save, not the attempt. (`orphan_turn_`
+            // `continuation` above fires at launch, before the seed POST.)
+            tracing::info!(
+                event = "orphan_turn_rescued",
+                request_id = %ctx.request_id,
+                trigger,
+                tool,
+                "ccr: orphan nudge round returned a tool call; streaming it to the client"
+            );
+            turn
+        }
+        None => {
+            tracing::info!(
+                event = "orphan_turn_rescue_empty",
+                request_id = %ctx.request_id,
+                "ccr: orphan nudge round came back text-only too; streaming the original announcement"
+            );
+            rebuilt.clone()
+        }
+    }
+}
+
+/// The nudge round's request body: the round-1 template with the orphaned
+/// turn and [`ORPHAN_NUDGE`] appended, streaming set the way the resolver
+/// loop sets it. `None` (logged) when the template cannot carry it.
+fn orphan_seed_bytes(
+    ctx: &CcrStreamContext,
+    rebuilt: &Value,
+    provider: &str,
+    items_field: &str,
+) -> Option<Bytes> {
+    // The turn in the shape its upstream speaks, with upstream tool names —
+    // the same conversion the retrieval path feeds the handlers. It goes
+    // back upstream as history, so the rename runs forward, not reverse.
     let turn_for_handler = match &ctx.shape {
         CcrShape::Anthropic => rebuilt.clone(),
-        CcrShape::RoutedChat { anthropic_request } => {
-            let mut turn = anthropic_turn_as_openai_response(&rebuilt);
+        CcrShape::RoutedChat { anthropic_request }
+        | CcrShape::RoutedResponses { anthropic_request } => {
+            let mut turn = if matches!(ctx.shape, CcrShape::RoutedChat { .. }) {
+                anthropic_turn_as_openai_response(rebuilt)
+            } else {
+                anthropic_turn_as_responses_output(rebuilt)
+            };
             crate::routed::tool_alias::ToolAlias::derive(
                 anthropic_request.get("tools").and_then(|t| t.as_array()),
             )
-            .reverse_turn(&mut turn);
+            .forward_body(&mut turn);
             turn
         }
-        CcrShape::RoutedResponses { .. } => anthropic_turn_as_responses_output(&rebuilt),
     };
 
     let mut request: Value = match serde_json::from_slice(&ctx.forwarded_request) {
@@ -1818,7 +1839,7 @@ async fn resolve_orphan_turn(
                 error = %e,
                 "ccr: orphan turn matched but the request template does not parse; streaming it as-is"
             );
-            return rebuilt.clone();
+            return None;
         }
     };
     let handler = headroom_core::ccr::response_handler::CCRResponseHandler::new(None);
@@ -1830,47 +1851,46 @@ async fn resolve_orphan_turn(
             items_field,
             "ccr: orphan turn matched but the request template has no continuation array; streaming it as-is"
         );
-        return rebuilt.clone();
+        return None;
     };
     // Continuations come back as plain JSON — except on backends that mandate
     // streaming, where de-streaming 400s. Same rule as the resolver loop.
-    let seed_bytes = if matches!(ctx.shape, CcrShape::Anthropic) {
+    Some(if matches!(ctx.shape, CcrShape::Anthropic) {
         streamed_continuation_request(seed_bytes)
     } else {
         restore_stream_when_mandated(
             non_streaming_continuation_request(&seed_bytes),
             &ctx.upstream_url,
         )
-    };
+    })
+}
 
-    let text_head: String = rebuilt
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
-    tracing::info!(
-        event = "orphan_turn_continued",
-        request_id = %ctx.request_id,
-        trigger,
-        text_head = %text_head.chars().take(160).collect::<String>(),
-        "ccr: text-only turn announced an action and stopped; sending it back with a nudge"
-    );
+/// POST the nudge round and fold its body into one turn. `None` (logged)
+/// on a send failure, a non-success status, or a body that will not fold.
+async fn orphan_nudge_round(
+    ctx: &CcrStreamContext,
+    seed_bytes: Bytes,
+    provider: &str,
+) -> Option<Value> {
     let resp = ctx
         .client
         .post(ctx.upstream_url.clone())
         .headers(ctx.outgoing_headers.clone())
-        .body(seed_bytes.clone())
+        .body(seed_bytes)
         .timeout(ORPHAN_ROUND_TIMEOUT)
         .send()
         .await;
-    let body = match resp {
-        Ok(r) if r.status().is_success() => r.bytes().await.unwrap_or_default(),
+    let (body, content_type) = match resp {
+        Ok(r) if r.status().is_success() => {
+            let content_type = r
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let bytes = r.bytes().await.unwrap_or_default();
+            (bytes, content_type)
+        }
         Ok(r) => {
             tracing::warn!(
                 event = "orphan_turn_round_failed",
@@ -1878,7 +1898,7 @@ async fn resolve_orphan_turn(
                 status = %r.status(),
                 "ccr: orphan nudge round came back non-success; streaming the orphan as-is"
             );
-            return rebuilt.clone();
+            return None;
         }
         Err(e) => {
             tracing::warn!(
@@ -1887,27 +1907,80 @@ async fn resolve_orphan_turn(
                 error = %e,
                 "ccr: orphan nudge round failed to send; streaming the orphan as-is"
             );
-            return rebuilt.clone();
+            return None;
         }
     };
-    let Ok(round_two) = serde_json::from_slice::<Value>(&body) else {
+    fold_orphan_round(ctx, &body, &content_type, provider)
+}
+
+/// Fold the nudge round's body into one turn. `None` (logged) when it
+/// will not fold.
+fn fold_orphan_round(
+    ctx: &CcrStreamContext,
+    body: &Bytes,
+    content_type: &str,
+    provider: &str,
+) -> Option<Value> {
+    // The seed round usually comes back streamed (Anthropic shape always
+    // streams; routed backends like Zen mandate it), so fold SSE the same way
+    // the resolver loop does instead of assuming a JSON body. Plain
+    // `from_slice` here mistook every streamed seed round for unparsable and
+    // the rescue never ran once — both live firings on 2026-10-06 died here.
+    let round_two = crate::proxy::continuation_turn_from_body(body, Some(content_type), provider);
+    if round_two.is_none() {
         tracing::warn!(
             event = "orphan_turn_round_failed",
             request_id = %ctx.request_id,
             "ccr: orphan nudge round came back unparsable; streaming the orphan as-is"
         );
-        return rebuilt.clone();
+    }
+    round_two
+}
+
+/// Run the resolver alternation over the nudge round and book every round
+/// it billed. `None` when the alternation times out or returns unparsable.
+async fn settle_orphan_round(
+    ctx: &CcrStreamContext,
+    round_usage: &Arc<Mutex<crate::proxy::CcrRoundUsage>>,
+    round_two: Value,
+    seed_bytes: Bytes,
+    provider: &str,
+) -> Option<Value> {
+    // The alternation reads JSON, and the body may have been SSE: hand it
+    // the folded turn, not the raw bytes.
+    let round_two_bytes = serde_json::to_vec(&round_two).ok()?;
+    let Ok((settled, mut usage)) = tokio::time::timeout(
+        ORPHAN_ROUND_TIMEOUT,
+        run_resolver_alternation(
+            ctx,
+            Bytes::from(round_two_bytes),
+            provider,
+            Some(seed_bytes),
+        ),
+    )
+    .await
+    else {
+        tracing::warn!(
+            event = "orphan_turn_round_failed",
+            request_id = %ctx.request_id,
+            "ccr: orphan resolver alternation timed out; streaming the orphan as-is"
+        );
+        // Round two was billed; book it before giving up on the rest.
+        if let Ok(mut guard) = round_usage.lock() {
+            guard.add_response_logged(&round_two, &ctx.request_id, "orphan");
+        }
+        return None;
     };
-    // Book the seed round's own usage: the alternation only books the rounds
-    // it sends, and the settled turn's usage covers just the last one.
+    let settled = serde_json::from_slice::<Value>(&settled).ok()?;
+    // `usage` holds every response the alternation superseded (round two
+    // included, when a round ran); the settled turn is the one it returned
+    // and was billed too. With no rounds the settled turn is round two, so
+    // it books exactly once either way.
+    usage.add_response_logged(&settled, &ctx.request_id, "orphan");
     if let Ok(mut guard) = round_usage.lock() {
-        guard.add_response_logged(&round_two, &ctx.request_id, "orphan");
+        guard.absorb(usage);
     }
-    let (settled, _) = run_resolver_alternation(ctx, body, provider, Some(seed_bytes)).await;
-    match serde_json::from_slice::<Value>(&settled) {
-        Ok(turn) => turn,
-        Err(_) => rebuilt.clone(),
-    }
+    Some(settled)
 }
 
 async fn resolve_retrieval(
@@ -1993,6 +2066,13 @@ async fn resolve_retrieval(
     let Ok(resolved) = serde_json::from_slice::<Value>(&resolved_bytes) else {
         return rebuilt;
     };
+    settled_as_anthropic(ctx, resolved)
+}
+
+/// A settled turn in its upstream's shape, translated back to the Anthropic
+/// shape the emit tail splices, with client tool names restored. Both
+/// resolvers end here.
+fn settled_as_anthropic(ctx: &CcrStreamContext, resolved: Value) -> Value {
     match &ctx.shape {
         CcrShape::Anthropic => resolved,
         CcrShape::RoutedChat { anthropic_request } => {
@@ -2449,97 +2529,6 @@ mod tests {
         assert!(
             orphan_seed_request(&mut req, "messages", json!({})).is_none(),
             "without messages[] there is nothing to append to"
-        );
-    }
-
-    /// The orphan trigger, pinned: the 2026-10-06 cut turn ended on one short
-    /// sentence announcing an action and no tool call. The matcher must fire
-    /// on exactly that shape and stay silent on real answers.
-    #[test]
-    fn orphan_trigger_fires_on_the_cut_turn_shape() {
-        // Fed through the real rewriter, not hand-built: the trigger reads
-        // the rebuilt message, so the test pins the whole path.
-        let mut rw = Rewriter::new(false);
-        feed(
-            &mut rw,
-            "message_start",
-            r#"{"type":"message_start","message":{"id":"msg_1","model":"spark","usage":{"input_tokens":10,"output_tokens":0}}}"#,
-        );
-        feed(
-            &mut rw,
-            "content_block_start",
-            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
-        );
-        feed(
-            &mut rw,
-            "content_block_delta",
-            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I'll investigate the Tao mastery failure and get the fix in place."}}"#,
-        );
-        feed(
-            &mut rw,
-            "content_block_stop",
-            r#"{"type":"content_block_stop","index":0}"#,
-        );
-        feed(
-            &mut rw,
-            "message_delta",
-            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
-        );
-        let msg = rebuild_message(&rw.state);
-        assert_eq!(
-            orphan_announcement(&msg),
-            Some("i'll "),
-            "the cut turn must trigger: {msg}"
-        );
-    }
-
-    #[test]
-    fn orphan_trigger_ignores_tool_calls_long_answers_and_done_notes() {
-        let tool_turn = json!({
-            "content": [
-                {"type": "text", "text": "I'll investigate that now."},
-                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
-            ],
-            "stop_reason": "end_turn",
-        });
-        assert_eq!(
-            orphan_announcement(&tool_turn),
-            None,
-            "a turn that DID emit a tool call is not an orphan"
-        );
-
-        let mut long = String::from("Let me explain what I found. ");
-        while long.len() <= ORPHAN_MAX_CHARS {
-            long.push_str("The fix touches three files and the tests pass. ");
-        }
-        let long_answer = json!({
-            "content": [{"type": "text", "text": long}],
-            "stop_reason": "end_turn",
-        });
-        assert_eq!(
-            orphan_announcement(&long_answer),
-            None,
-            "a substantive answer containing an announcement phrase is not an orphan"
-        );
-
-        let done = json!({
-            "content": [{"type": "text", "text": "All done, the fix is in place."}],
-            "stop_reason": "end_turn",
-        });
-        assert_eq!(
-            orphan_announcement(&done),
-            None,
-            "a completion note with no announcement is not an orphan"
-        );
-
-        let cut_short = json!({
-            "content": [{"type": "text", "text": "I'll investigate that now."}],
-            "stop_reason": "max_tokens",
-        });
-        assert_eq!(
-            orphan_announcement(&cut_short),
-            None,
-            "a truncated turn is a different failure, not an orphan"
         );
     }
 

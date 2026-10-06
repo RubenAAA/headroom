@@ -15,6 +15,8 @@ mod routed_drop_close;
 mod routed_early_stream_retry;
 #[path = "suites/routing/routed_forward_continuity.rs"]
 mod routed_forward_continuity;
+#[path = "suites/routing/routed_orphan_rescue.rs"]
+mod routed_orphan_rescue;
 #[path = "suites/routing/routed_shadow_call.rs"]
 mod routed_shadow_call;
 

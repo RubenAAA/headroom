@@ -842,7 +842,7 @@ Options:
           [possible values: true, false]
 
       --orphan-turn-continuation <ORPHAN_TURN_CONTINUATION>
-          Orphan-turn continuation: a text-only turn that announces an action but emits no tool call gets one extra upstream round with a nudge, so the client sees the turn complete instead of a bare end_turn. Default `true`
+          Orphan-turn continuation: a routed Responses turn (Spark) that stops text-only on a message the model labelled `phase: commentary` (a preamble to a tool call) gets one extra upstream round with a nudge, so the client sees the turn complete instead of a bare end_turn. Turns without that label never trigger. Default `true`
           
           [env: HEADROOM_ORPHAN_TURN_CONTINUATION=]
           [default: true]
