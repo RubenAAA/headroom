@@ -235,9 +235,16 @@ fn classify_client(headers: &HeaderMap) -> Option<String> {
 
 /// Whether to stamp `X-Client: codex`. Port of
 /// `auth_mode.should_stamp_codex_client`: only for an unidentified caller
-/// on `/v1/responses` (or a subpath).
+/// on a Responses endpoint — `/v1/responses` or the Pi-compatible alias
+/// `/v1/codex/responses` — or a subpath of either.
 fn should_stamp_codex_client(path: &str, headers: &HeaderMap) -> bool {
-    if path != "/v1/responses" && !path.starts_with("/v1/responses/") {
+    const CODEX_RESPONSES_PATHS: [&str; 2] = ["/v1/responses", "/v1/codex/responses"];
+    let on_responses = CODEX_RESPONSES_PATHS.iter().any(|root| {
+        path.len() >= root.len()
+            && path.starts_with(root)
+            && (path.len() == root.len() || path.as_bytes()[root.len()] == b'/')
+    });
+    if !on_responses {
         return false;
     }
     classify_client(headers).is_none()
@@ -2537,6 +2544,22 @@ mod tests {
         ));
         let known = hm(&[("user-agent", "codex-cli/1.0")]);
         assert!(!should_stamp_codex_client("/v1/responses", &known));
+    }
+
+    #[test]
+    fn stamp_codex_covers_pi_responses_alias() {
+        // Pi-compatible callers (e.g. Gajae-Code) open the Responses
+        // WebSocket at `/v1/codex/responses` with an unrecognized UA.
+        let pi = hm(&[("user-agent", "pi/0.11.11 (darwin 25.5.0; arm64)")]);
+        assert!(should_stamp_codex_client("/v1/codex/responses", &pi));
+        assert!(should_stamp_codex_client(
+            "/v1/codex/responses/compact",
+            &pi
+        ));
+        assert!(!should_stamp_codex_client("/v1/codex/responses-other", &pi));
+        assert!(!should_stamp_codex_client("/v1/codex", &pi));
+        let known = hm(&[("user-agent", "codex-cli/1.0")]);
+        assert!(!should_stamp_codex_client("/v1/codex/responses", &known));
     }
 
     // ── merge_openai_beta ────────────────────────────────────────
