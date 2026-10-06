@@ -380,7 +380,7 @@ pub(super) fn apply_upstream_write_timeout(
 /// reqwest's connector to use the already-validated addresses. `no_proxy`
 /// prevents an ambient or provider proxy from resolving the target a second
 /// time beyond this process's policy boundary.
-pub(super) fn caller_upstream_client(
+pub(crate) fn caller_upstream_client(
     state: &AppState,
     upstream: &crate::upstream_guard::ResolvedCallerUpstream,
 ) -> Result<reqwest::Client, ProxyError> {

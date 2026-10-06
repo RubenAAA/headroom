@@ -50,9 +50,8 @@ pub(crate) fn gemini_output_tokens(usage_meta: &Value) -> u64 {
 /// Parse `model:action` where the action is the part AFTER the last colon.
 /// For `"gemini-2.0-flash:generateContent"` returns `("gemini-2.0-flash", "generateContent")`.
 pub(crate) fn parse_model_and_action(model_action: &str) -> Option<(&str, &str)> {
-    model_action
-        .rsplit_once(':')
-        .map(|(action, model)| (model, action))
+    // rsplit_once splits "model:action" into (head, tail) = (model, action).
+    model_action.rsplit_once(':')
 }
 
 // ─── Query params ─────────────────────────────────────────────────────────
@@ -482,7 +481,15 @@ pub async fn handle_gemini_action(
                         );
                     }
                 };
-                match forward_to_upstream(&state, "POST", &url, upstream_headers, &body_json).await
+                match forward_to_upstream(
+                    &state,
+                    "POST",
+                    &url,
+                    upstream_headers,
+                    &body_json,
+                    &state.client,
+                )
+                .await
                 {
                     Ok(r) => r,
                     Err(e) => {
@@ -510,6 +517,11 @@ async fn handle_generate_content_inner(
     body: Bytes,
 ) -> Response {
     let request_id = crate::proxy::ensure_request_id(&headers);
+    let (upstream_base, upstream_client) =
+        match resolve_gemini_upstream(&state, &headers, &request_id).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
     let start = std::time::Instant::now();
 
     let req = match parse_gemini_request(&body, &headers) {
@@ -525,6 +537,8 @@ async fn handle_generate_content_inner(
             &req.upstream_headers,
             &req.body_json,
             &query,
+            &upstream_base,
+            &upstream_client,
         )
         .await;
     }
@@ -557,18 +571,21 @@ async fn handle_generate_content_inner(
             original_tokens.saturating_sub(tokens_saved),
             tokens_saved,
             &transforms_applied,
+            &upstream_base,
+            &upstream_client,
         )
         .await;
     }
 
     // Non-streaming forward
-    let upstream_url = build_gemini_upstream_url(&state, &model, &query, false);
+    let upstream_url = build_gemini_upstream_url(&upstream_base, &model, &query, false);
     let resp = forward_to_upstream(
         &state,
         "POST",
         &upstream_url,
         upstream_headers.clone(),
         &output_body,
+        &upstream_client,
     )
     .await;
 
@@ -667,6 +684,11 @@ async fn handle_stream_generate_content_inner(
     body: Bytes,
 ) -> Response {
     let request_id = crate::proxy::ensure_request_id(&headers);
+    let (upstream_base, upstream_client) =
+        match resolve_gemini_upstream(&state, &headers, &request_id).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
 
     let req = match parse_gemini_request(&body, &headers) {
         Ok(req) => req,
@@ -691,6 +713,8 @@ async fn handle_stream_generate_content_inner(
         original_tokens.saturating_sub(tokens_saved),
         tokens_saved,
         &transforms_applied,
+        &upstream_base,
+        &upstream_client,
     )
     .await
 }
@@ -706,6 +730,11 @@ async fn handle_count_tokens_inner(
     body: Bytes,
 ) -> Response {
     let request_id = crate::proxy::ensure_request_id(&headers);
+    let (upstream_base, upstream_client) =
+        match resolve_gemini_upstream(&state, &headers, &request_id).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
     let start = std::time::Instant::now();
 
     let req = match parse_gemini_request(&body, &headers) {
@@ -721,6 +750,8 @@ async fn handle_count_tokens_inner(
             &req.upstream_headers,
             &req.body_json,
             &query,
+            &upstream_base,
+            &upstream_client,
         )
         .await;
     }
@@ -736,7 +767,7 @@ async fn handle_count_tokens_inner(
     // Forward to upstream countTokens
     let upstream_url = format!(
         "{}/v1beta/models/{}:countTokens",
-        state.config.upstream.as_str().trim_end_matches('/'),
+        upstream_base.as_str().trim_end_matches('/'),
         model
     );
     let resp = forward_to_upstream(
@@ -745,6 +776,7 @@ async fn handle_count_tokens_inner(
         &upstream_url,
         upstream_headers,
         &output_body,
+        &upstream_client,
     )
     .await;
 
@@ -802,13 +834,78 @@ async fn handle_count_tokens_inner(
 
 // ─── Upstream forwarding ──────────────────────────────────────────────────
 
-fn build_gemini_upstream_url(
+/// Upstream base plus transport for a Gemini request.
+///
+/// Ports the `supports_custom_base_url` opt-in from upstream
+/// `headroom/providers/route_specs.py` (0ad996a8): when the
+/// `x-headroom-base-url` header names a caller-selected base, Gemini traffic
+/// runs the same native transforms as direct traffic but is forwarded to that
+/// base over the DNS-pinned caller transport. A present-but-unsafe (or
+/// malformed) value stops with 400 before any handler connects to it; absent
+/// or blank falls back to the configured upstream. Trim/strip contract
+/// mirrors `header_upstream_override` in `proxy/upstream.rs`.
+async fn resolve_gemini_upstream(
     state: &AppState,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Result<(url::Url, reqwest::Client), Response> {
+    let custom = headers
+        .get(crate::headers::UPSTREAM_OVERRIDE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().trim_end_matches('/'))
+        .filter(|s| !s.is_empty());
+    let Some(custom) = custom else {
+        return Ok((state.config.upstream.clone(), state.client.clone()));
+    };
+    let reject = |reason: &str| {
+        tracing::warn!(
+            event = "gemini_override_rejected",
+            request_id = %request_id,
+            value = %custom,
+            reason = %reason,
+            "rejecting caller-selected upstream on Gemini route",
+        );
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "Rejected unsafe upstream base URL",
+            400,
+        )
+    };
+    let url = match url::Url::parse(custom) {
+        Ok(url) => url,
+        Err(_) => return Err(reject("malformed")),
+    };
+    match crate::upstream_guard::ResolvedCallerUpstream::resolve(url).await {
+        Some(resolved) => {
+            let base = resolved.url().clone();
+            match crate::proxy::caller_upstream_client(state, &resolved) {
+                Ok(client) => Ok((base, client)),
+                Err(e) => {
+                    tracing::error!(
+                        event = "gemini_override_client_failed",
+                        request_id = %request_id,
+                        error = %e,
+                        "caller upstream client build failed",
+                    );
+                    Err(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "Upstream client build failed",
+                        502,
+                    ))
+                }
+            }
+        }
+        None => Err(reject("unsafe")),
+    }
+}
+
+fn build_gemini_upstream_url(
+    base: &url::Url,
     model: &str,
     query: &GeminiQuery,
     streaming: bool,
 ) -> String {
-    let base = state.config.upstream.as_str().trim_end_matches('/');
+    let base = base.as_str().trim_end_matches('/');
     let action = if streaming {
         "streamGenerateContent"
     } else {
@@ -831,6 +928,7 @@ async fn forward_to_upstream(
     url: &str,
     headers: HashMap<String, String>,
     body: &Value,
+    client: &reqwest::Client,
 ) -> Result<axum::response::Response<Body>, ProxyError> {
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|e| ProxyError::InvalidUpstream(format!("invalid method: {e}")))?;
@@ -851,7 +949,7 @@ async fn forward_to_upstream(
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
     );
     let (body_bytes, seam) = gate.seam_bytes(body_bytes);
-    let mut req_builder = state.client.request(method, url);
+    let mut req_builder = client.request(method, url);
     for (k, v) in &headers {
         if let Ok(hv) = HeaderValue::from_str(v) {
             req_builder = req_builder.header(k.as_str(), hv);
@@ -889,9 +987,11 @@ async fn forward_to_gemini_upstream(
     headers: &HashMap<String, String>,
     body: &Value,
     query: &GeminiQuery,
+    upstream_base: &url::Url,
+    upstream_client: &reqwest::Client,
 ) -> Response {
-    let url = build_gemini_upstream_url(state, model, query, false);
-    match forward_to_upstream(state, "POST", &url, headers.clone(), body).await {
+    let url = build_gemini_upstream_url(upstream_base, model, query, false);
+    match forward_to_upstream(state, "POST", &url, headers.clone(), body, upstream_client).await {
         Ok(r) => {
             let status = r.status();
             let resp_headers = r.headers().clone();
@@ -937,8 +1037,10 @@ async fn forward_streaming(
     optimized_tokens: usize,
     tokens_saved: usize,
     transforms_applied: &[String],
+    upstream_base: &url::Url,
+    upstream_client: &reqwest::Client,
 ) -> Response {
-    let url = build_gemini_upstream_url(state, model, query, true);
+    let url = build_gemini_upstream_url(upstream_base, model, query, true);
 
     let method = Method::POST;
     let body_bytes = Bytes::from(serde_json::to_vec(body).unwrap_or_default());
@@ -950,7 +1052,7 @@ async fn forward_streaming(
         request_id,
     );
     let (body_bytes, seam) = gate.seam_bytes(body_bytes);
-    let mut req_builder = state.client.request(method, &url);
+    let mut req_builder = upstream_client.request(method, &url);
     for (k, v) in headers {
         if let Ok(hv) = HeaderValue::from_str(v) {
             req_builder = req_builder.header(k.as_str(), hv);
