@@ -22,7 +22,7 @@ const TRUE_VALUES: &[&str] = &["1", "true", "yes", "on"];
 pub struct BindPolicy {
     /// The bind host as printed in log lines.
     pub host: String,
-    /// True when the bind reaches beyond loopback (and is not unspecified).
+    /// True when the bind reaches beyond loopback, unspecified included.
     pub open_bind: bool,
     /// True when the operator acknowledged an open bind via [`OPEN_BIND_ACK_ENV`].
     pub acknowledged: bool,
@@ -63,14 +63,12 @@ impl BindPolicy {
 }
 
 /// Pure bind-policy evaluation. `listen` is the socket the server would
-/// bind; unspecified (`0.0.0.0`, `::`) keeps the historical behavior of
-/// binding everywhere while the auth gate still applies per request.
+/// bind. Only loopback is closed: unspecified (`0.0.0.0`, `::`) listens on
+/// every interface, the exact shape upstream refuses (systemd units,
+/// `docker run -p`).
 pub fn evaluate_bind_policy(listen: &SocketAddr, acknowledged: bool) -> BindPolicy {
     let ip = listen.ip();
-    // Unspecified and loopback binds are not open binds: upstream treats
-    // the default bind as loopback-equivalent, and the per-request gates
-    // (proxy token, loopback guards) still apply to every connection.
-    let open_bind = !(ip.is_unspecified() || ip.is_loopback());
+    let open_bind = !ip.is_loopback();
     BindPolicy {
         host: ip.to_string(),
         open_bind,
@@ -120,11 +118,12 @@ mod tests {
     }
 
     #[test]
-    fn unspecified_bind_keeps_historical_behavior() {
+    fn unspecified_bind_is_open() {
         for host in ["0.0.0.0:8787", "[::]:8787"] {
             let p = evaluate_bind_policy(&addr(host), false);
-            assert!(!p.open_bind, "{host}");
-            assert!(p.allow(false));
+            assert!(p.open_bind, "{host}");
+            assert!(!p.allow(false), "{host}");
+            assert!(p.allow(true), "{host}");
         }
     }
 

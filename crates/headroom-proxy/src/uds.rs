@@ -12,8 +12,9 @@
 //! `ConnectInfo<std::net::SocketAddr>`, and the orphan rule forbids bridging
 //! those two. So `uds_router` serves the same `build_app` plus a layer that
 //! attributes every connection to 127.0.0.1. A socket peer is local by
-//! construction, so loopback-scoped guards (metrics gating, operator gates)
-//! treat it exactly like a loopback TCP client. All socket clients share
+//! construction, and `restrict_socket_mode` makes the socket owner-only,
+//! so loopback-scoped guards (metrics gating, operator gates) treat it
+//! exactly like a loopback TCP client. All socket clients share
 //! that one identity for rate-limit purposes; the directory holding the
 //! socket file is the access-control boundary, per upstream.
 
@@ -43,11 +44,6 @@ pub const UDS_LOOPBACK_PEER: SocketAddr =
 /// A Unix socket path cannot be used for the reason described.
 #[derive(Debug, thiserror::Error)]
 pub enum UdsError {
-    /// This platform has no `AF_UNIX` listener to bind.
-    #[error(
-        "--uds needs Unix domain sockets, which are unavailable on this platform. Use --listen instead."
-    )]
-    Unsupported,
     /// The path (or its parents) fails a preflight check.
     #[error("{0}")]
     Invalid(String),
@@ -67,18 +63,6 @@ pub fn max_uds_path_length() -> usize {
     #[cfg(not(target_os = "linux"))]
     {
         104
-    }
-}
-
-/// Fail when this build cannot serve on a socket (non-`AF_UNIX` platforms).
-pub fn require_uds_support() -> Result<(), UdsError> {
-    #[cfg(unix)]
-    {
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        Err(UdsError::Unsupported)
     }
 }
 
@@ -188,15 +172,17 @@ fn prepare_parent_dir(parent: &Path) -> Result<(), UdsError> {
 /// Expand `~`, make absolute, and run every preflight check, returning the
 /// path to bind. Mirrors upstream `prepare_uds_path` step for step:
 ///
-/// - reject on platforms without `AF_UNIX`;
 /// - enforce the `sun_path` byte limit (absolute path plus trailing NUL);
+/// - create missing parents owner-only, vet pre-existing ones;
 /// - clear a stale socket file, refuse a live one, and never touch any
-///   other file type (not even a symlink — it could point anywhere);
-/// - create missing parents owner-only, vet pre-existing ones.
+///   other file type (not even a symlink — it could point anywhere).
+///
+/// The parent is vetted before anything is unlinked, so a path in an unsafe
+/// directory is refused without side effects. (The module is `cfg(unix)`;
+/// `main.rs` refuses `--uds` on other platforms.)
 pub async fn prepare_uds_path(path: &Path) -> Result<PathBuf, UdsError> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    require_uds_support()?;
     let resolved = absolute_socket_path(path);
     if resolved.as_os_str().as_bytes().len() + 1 > max_uds_path_length() {
         return Err(UdsError::Invalid(format!(
@@ -205,6 +191,9 @@ pub async fn prepare_uds_path(path: &Path) -> Result<PathBuf, UdsError> {
             max_uds_path_length(),
             resolved.display()
         )));
+    }
+    if let Some(parent) = resolved.parent() {
+        prepare_parent_dir(parent)?;
     }
     match std::fs::symlink_metadata(&resolved) {
         Ok(meta) if meta.file_type().is_socket() => {
@@ -227,10 +216,17 @@ pub async fn prepare_uds_path(path: &Path) -> Result<PathBuf, UdsError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(UdsError::Io(e)),
     }
-    if let Some(parent) = resolved.parent() {
-        prepare_parent_dir(parent)?;
-    }
     Ok(resolved)
+}
+
+/// Make the bound socket owner-only (`0600`). Connecting needs write access
+/// to the socket file, so this is what limits clients to the proxy's own
+/// user whatever the umask or a sticky shared parent (`/tmp`) allows. It is
+/// also what justifies [`UDS_LOOPBACK_PEER`]: every peer that can connect
+/// runs as the owner, a narrower set than can reach a loopback TCP port.
+pub fn restrict_socket_mode(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 /// Remove the socket file on shutdown. Only ever unlinks a socket, so a
@@ -286,12 +282,6 @@ mod tests {
         assert_eq!(max_uds_path_length(), 108);
         #[cfg(not(target_os = "linux"))]
         assert_eq!(max_uds_path_length(), 104);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn uds_supported_on_unix() {
-        assert!(require_uds_support().is_ok());
     }
 
     #[test]

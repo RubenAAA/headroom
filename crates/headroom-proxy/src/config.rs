@@ -281,8 +281,10 @@ pub struct CliArgs {
     )]
     pub unsafe_allow_unstable_features: bool,
 
-    /// Address the proxy listens on (e.g. 0.0.0.0:8787).
-    #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "0.0.0.0:8787")]
+    /// Address the proxy listens on (e.g. 127.0.0.1:8787). A non-loopback
+    /// address, `0.0.0.0` included, needs HEADROOM_PROXY_TOKEN or
+    /// HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1.
+    #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "127.0.0.1:8787")]
     pub listen: SocketAddr,
 
     /// Serve on a Unix domain socket instead of --listen (POSIX only).
@@ -297,8 +299,8 @@ pub struct CliArgs {
     /// `true` — recommended whenever `--listen` binds a non-loopback
     /// address — so `/metrics` (token counts, per-session cache-hit
     /// rates, rate-limit gauges) is served only to `127.0.0.1` / `::1`
-    /// and returns 403 otherwise. This is defense-in-depth alongside
-    /// firewalling the path.
+    /// (or a caller that passed the proxy token) and returns 404
+    /// otherwise. This is defense-in-depth alongside firewalling the path.
     ///
     /// Source priority: CLI flag → `HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK`
     /// env var → default (`false`).

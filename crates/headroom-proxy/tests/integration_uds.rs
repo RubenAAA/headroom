@@ -4,6 +4,8 @@
 //! (commit `e7b3baf2`): the socket is not just prepared, it serves the
 //! real app and answers a request.
 
+#![cfg(unix)]
+
 use std::time::Duration;
 
 use headroom_proxy::uds::{prepare_uds_path, remove_uds_path, socket_usage_lines, uds_router};

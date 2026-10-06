@@ -41,8 +41,11 @@ fn partition_hmac_key() -> [u8; 32] {
 ///
 /// Port of the shared rule in upstream `ee6cfccc` (`identity.py`): names
 /// are lower-cased, `_` folds to `-`, matching is on whole components, so
-/// `X-Headroom-License_Token` is a credential while the numeric
-/// `tool-search-deferred-tokens` tag is not.
+/// `X-Goog-Api-Key` is a credential while the numeric
+/// `tool-search-deferred-tokens` tag is not. `account`, `organization`
+/// and `project` select the billed account (`chatgpt-account-id`,
+/// `openai-organization`, `openai-project`): two callers sharing a key but
+/// billing different orgs must not share entries.
 const CREDENTIAL_NAME_COMPONENTS: &[&str] = &[
     "token",
     "secret",
@@ -56,6 +59,9 @@ const CREDENTIAL_NAME_COMPONENTS: &[&str] = &[
     "bearer",
     "cookie",
     "signature",
+    "account",
+    "organization",
+    "project",
 ];
 
 /// True when an inbound header carries a credential.
@@ -733,6 +739,28 @@ mod tests {
             Some(("x-idempotency-key".to_string(), "retry-2".to_string())),
         ] {
             assert_eq!(compute_cache_partition(&headers(extra)), base);
+        }
+    }
+
+    /// One key billing different accounts, orgs or projects must not share
+    /// entries: the account-selector headers move the partition.
+    #[test]
+    fn account_selector_headers_move_partitions() {
+        let with = |name: &str, value: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("authorization", "Bearer sk-same".parse().unwrap());
+            h.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+            compute_cache_partition(&h)
+        };
+        for name in [
+            "chatgpt-account-id",
+            "openai-organization",
+            "openai-project",
+        ] {
+            assert_ne!(with(name, "a"), with(name, "b"), "{name}");
         }
     }
 

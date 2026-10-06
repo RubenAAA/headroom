@@ -493,7 +493,15 @@ pub async fn handle_gemini_action(
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        error_response(StatusCode::BAD_GATEWAY, format!("upstream error: {e}"), 502)
+                        // The transport detail (upstream URL included) stays
+                        // in the log; the client gets the generic body, same
+                        // redaction as `crate::error`.
+                        tracing::warn!(
+                            event = "gemini_upstream_error",
+                            error = %e,
+                            "gemini upstream request failed"
+                        );
+                        error_response(StatusCode::BAD_GATEWAY, "upstream request failed", 502)
                     }
                 }
             }
@@ -507,6 +515,46 @@ pub async fn handle_gemini_action(
 }
 
 // ─── Route: :generateContent ──────────────────────────────────────────────
+
+/// The `x-headroom-*` metrics headers on a non-streaming Gemini response.
+/// Extracted from `handle_generate_content_inner` without behavior change.
+fn insert_metrics_headers(
+    resp_headers: &mut HeaderMap,
+    model: &str,
+    original_tokens: usize,
+    optimized_tokens: usize,
+    transforms_applied: &[String],
+    cached: bool,
+) {
+    let actual_saved = original_tokens.saturating_sub(optimized_tokens);
+    resp_headers.remove("content-encoding");
+    resp_headers.remove("content-length");
+    resp_headers.insert(
+        "x-headroom-tokens-before",
+        HeaderValue::from_str(&original_tokens.to_string()).unwrap(),
+    );
+    resp_headers.insert(
+        "x-headroom-tokens-after",
+        HeaderValue::from_str(&optimized_tokens.to_string()).unwrap(),
+    );
+    resp_headers.insert(
+        "x-headroom-tokens-saved",
+        HeaderValue::from_str(&actual_saved.to_string()).unwrap(),
+    );
+    // `model` comes from the URL path — invalid header bytes must not panic.
+    if let Ok(hv) = HeaderValue::from_str(model) {
+        resp_headers.insert("x-headroom-model", hv);
+    }
+    if !transforms_applied.is_empty() {
+        resp_headers.insert(
+            "x-headroom-transforms",
+            HeaderValue::from_str(&transforms_applied.join(",")).unwrap(),
+        );
+    }
+    if cached {
+        resp_headers.insert("x-headroom-cached", HeaderValue::from_str("true").unwrap());
+    }
+}
 
 /// Handle `POST /v1beta/models/*model_action` where model_action is `model:generateContent`.
 async fn handle_generate_content_inner(
@@ -628,33 +676,14 @@ async fn handle_generate_content_inner(
 
     // Build response with metrics headers
     let mut resp_headers: HeaderMap = resp_headers_map;
-    resp_headers.remove("content-encoding");
-    resp_headers.remove("content-length");
-    resp_headers.insert(
-        "x-headroom-tokens-before",
-        HeaderValue::from_str(&original_tokens.to_string()).unwrap(),
+    insert_metrics_headers(
+        &mut resp_headers,
+        &model,
+        original_tokens,
+        optimized_tokens,
+        &transforms_applied,
+        cache_read_tokens > 0,
     );
-    resp_headers.insert(
-        "x-headroom-tokens-after",
-        HeaderValue::from_str(&optimized_tokens.to_string()).unwrap(),
-    );
-    resp_headers.insert(
-        "x-headroom-tokens-saved",
-        HeaderValue::from_str(&actual_saved.to_string()).unwrap(),
-    );
-    // `model` comes from the URL path — invalid header bytes must not panic.
-    if let Ok(hv) = HeaderValue::from_str(&model) {
-        resp_headers.insert("x-headroom-model", hv);
-    }
-    if !transforms_applied.is_empty() {
-        resp_headers.insert(
-            "x-headroom-transforms",
-            HeaderValue::from_str(&transforms_applied.join(",")).unwrap(),
-        );
-    }
-    if cache_read_tokens > 0 {
-        resp_headers.insert("x-headroom-cached", HeaderValue::from_str("true").unwrap());
-    }
 
     // Log outcome
     tracing::info!(

@@ -1310,9 +1310,10 @@ where
                 );
                 // Can't recover the stream after partial consumption. Surface
                 // a gateway error rather than the upstream 2xx with a
-                // plain-text body that JSON clients would choke on.
+                // plain-text body that JSON clients would choke on. The
+                // detail is in the warn above, not the client body.
                 status = StatusCode::BAD_GATEWAY;
-                Body::from(format!("upstream response buffering failed: {e}"))
+                Body::from("upstream response buffering failed")
             }
         }
     } else if is_sse && status.is_success() && buffered_responses_ccr {

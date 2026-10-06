@@ -75,6 +75,7 @@ pub mod tool_schema_compaction;
 pub use headroom_core::tool_schema_savings;
 pub mod tool_search_deferral;
 pub mod turn_hooks;
+#[cfg(unix)]
 pub mod uds;
 pub mod upstream_guard;
 pub mod upstream_path;

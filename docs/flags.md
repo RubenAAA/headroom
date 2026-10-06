@@ -54,10 +54,10 @@ Options:
           [possible values: true, false]
 
       --listen <LISTEN>
-          Address the proxy listens on (e.g. 0.0.0.0:8787)
+          Address the proxy listens on (e.g. 127.0.0.1:8787). A non-loopback address, `0.0.0.0` included, needs HEADROOM_PROXY_TOKEN or HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1
           
           [env: HEADROOM_PROXY_LISTEN=]
-          [default: 0.0.0.0:8787]
+          [default: 127.0.0.1:8787]
 
       --uds <UDS>
           Serve on a Unix domain socket instead of --listen (POSIX only). Lets a client keep a first-party base URL while its traffic still reaches Headroom. When set, the TCP listen address is not bound
@@ -65,7 +65,7 @@ Options:
           [env: HEADROOM_PROXY_UDS=]
 
       --metrics-require-loopback <METRICS_REQUIRE_LOOPBACK>
-          Restrict the Prometheus `/metrics` scrape endpoint to loopback clients. Default `false` to preserve existing behaviour (the endpoint is reachable from wherever the proxy is bound). Set to `true` — recommended whenever `--listen` binds a non-loopback address — so `/metrics` (token counts, per-session cache-hit rates, rate-limit gauges) is served only to `127.0.0.1` / `::1` and returns 403 otherwise. This is defense-in-depth alongside firewalling the path.
+          Restrict the Prometheus `/metrics` scrape endpoint to loopback clients. Default `false` to preserve existing behaviour (the endpoint is reachable from wherever the proxy is bound). Set to `true` — recommended whenever `--listen` binds a non-loopback address — so `/metrics` (token counts, per-session cache-hit rates, rate-limit gauges) is served only to `127.0.0.1` / `::1` (or a caller that passed the proxy token) and returns 404 otherwise. This is defense-in-depth alongside firewalling the path.
           
           Source priority: CLI flag → `HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK` env var → default (`false`).
           

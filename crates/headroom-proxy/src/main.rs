@@ -70,6 +70,22 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
     let config = Config::from_cli(args);
 
     init_tracing(&config.log_level);
+    // Refuse a token-less non-loopback bind (upstream `ee731d7e`): serving
+    // the /v1/* relay to the whole network with no token is a startup
+    // error, not a warning. Exits non-zero with the reason on stderr.
+    // Skipped for a socket bind: no TCP port opens, so there is no
+    // network surface to refuse. Checked before any state or background
+    // task exists, so a refused start leaves nothing half-built.
+    if config.uds.is_none()
+        && let Err(reason) = headroom_proxy::bind_policy::enforce_bind_policy(
+            &config.listen,
+            config.proxy_token.is_some(),
+        )
+    {
+        tracing::error!(event = "proxy_bind_refused", reason = %reason);
+        eprintln!("headroom-proxy: {reason}");
+        std::process::exit(2);
+    }
     headroom_core::init_ort_ep();
 
     // Runs after tracing is up so the warning is actually visible.
@@ -101,21 +117,6 @@ async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Syn
     spawn_resource_heartbeat();
     spawn_cursor_reaper(&config, &state);
     spawn_savings_handoff_absorber(&state);
-    // Refuse a token-less non-loopback bind (upstream `ee731d7e`): serving
-    // the /v1/* relay to the whole network with no token is a startup
-    // error, not a warning. Exits non-zero with the reason on stderr.
-    // Skipped for a socket bind: no TCP port opens, so there is no
-    // network surface to refuse.
-    if config.uds.is_none()
-        && let Err(reason) = headroom_proxy::bind_policy::enforce_bind_policy(
-            &config.listen,
-            config.proxy_token.is_some(),
-        )
-    {
-        tracing::error!(event = "proxy_bind_refused", reason = %reason);
-        eprintln!("headroom-proxy: {reason}");
-        std::process::exit(2);
-    }
 
     serve(state, &config).await
 }
@@ -338,7 +339,17 @@ async fn serve(
     // control, so --listen is ignored entirely (upstream arbitrates the
     // same way: the socket wins, --host/--port are not bound).
     if let Some(uds_path) = &config.uds {
+        #[cfg(unix)]
         return serve_uds(state, config, uds_path).await;
+        #[cfg(not(unix))]
+        {
+            let _ = (state, uds_path);
+            return Err(
+                "--uds needs Unix domain sockets, which are unavailable on this \
+                        platform. Use --listen instead."
+                    .into(),
+            );
+        }
     }
 
     let savings_tracker = state.savings_tracker.clone();
@@ -366,6 +377,7 @@ async fn serve(
 /// Serve the app on a Unix domain socket instead of TCP. Request handling
 /// is untouched; only the transport differs. The socket file is removed on
 /// exit so a stale path never blocks the next start.
+#[cfg(unix)]
 async fn serve_uds(
     state: AppState,
     config: &Config,
@@ -376,6 +388,7 @@ async fn serve_uds(
     let app = headroom_proxy::uds::uds_router(state).into_make_service();
 
     let listener = tokio::net::UnixListener::bind(&resolved)?;
+    headroom_proxy::uds::restrict_socket_mode(&resolved)?;
     for line in headroom_proxy::uds::socket_usage_lines(&resolved) {
         tracing::info!("{line}");
     }
