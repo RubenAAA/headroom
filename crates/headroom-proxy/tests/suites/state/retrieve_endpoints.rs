@@ -186,8 +186,8 @@ async fn tool_call_anthropic_returns_tool_result_envelope() {
     assert_eq!(body["success"], true);
     assert_eq!(body["tool_result"]["type"], "tool_result");
     assert_eq!(body["tool_result"]["tool_use_id"], "toolu_1");
-    assert_eq!(body["data"]["status"], "retrieved");
-    assert_eq!(body["data"]["content"], PAYLOAD);
+    assert_eq!(body["data"]["hash"], HASH);
+    assert_eq!(body["data"]["original_content"], PAYLOAD);
     proxy.shutdown().await;
 }
 
@@ -222,8 +222,7 @@ async fn tool_call_openai_returns_tool_role_envelope() {
     assert_eq!(body["tool_result"]["tool_call_id"], "call_1");
     let content: serde_json::Value =
         serde_json::from_str(body["tool_result"]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(content["status"], "retrieved");
-    assert_eq!(content["content"], PAYLOAD);
+    assert_eq!(content["original_content"], PAYLOAD);
     proxy.shutdown().await;
 }
 
@@ -249,12 +248,12 @@ async fn tool_call_rejects_non_ccr_calls() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.status(), 400);
     proxy.shutdown().await;
 }
 
 #[tokio::test]
-async fn tool_call_missing_hash_404s_with_ttl_detail() {
+async fn tool_call_miss_is_unsuccessful_envelope_with_ttl_detail() {
     let dir = TempDir::new().unwrap();
     let proxy = start_proxy_with_state(
         "http://127.0.0.1:1",
@@ -275,15 +274,20 @@ async fn tool_call_missing_hash_404s_with_ttl_detail() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404);
+    // Upstream answers a miss inside the envelope, so the agent still gets
+    // a tool_result to splice.
+    assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert_eq!(body["tool_result"]["tool_use_id"], "toolu_2");
+    assert_eq!(body["data"]["status"], "missing");
     assert!(
-        body["detail"]
+        body["data"]["error"]
             .as_str()
             .unwrap()
             .starts_with("Entry not found (CCR TTL: "),
         "miss detail names the TTL, got: {}",
-        body["detail"]
+        body["data"]["error"]
     );
     proxy.shutdown().await;
 }

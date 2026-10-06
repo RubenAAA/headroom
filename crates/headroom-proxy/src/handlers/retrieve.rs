@@ -21,8 +21,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use headroom_core::ccr::tool_injection::parse_tool_call;
-use headroom_core::ccr::{CcrEntryState, format_retrieval_miss_detail};
+use headroom_core::ccr::tool_injection::{CCR_TOOL_NAME, parse_tool_call};
+use headroom_core::ccr::{CcrEntryState, CcrEntryStatus, format_retrieval_miss_detail};
 
 use crate::forwarded_headers::has_same_origin_or_no_provenance;
 use crate::loopback_guard::{is_loopback_host, is_loopback_host_header};
@@ -54,6 +54,14 @@ fn err(status: StatusCode, detail: impl Into<String>) -> Response {
     (status, axum::Json(json!({ "detail": detail.into() }))).into_response()
 }
 
+/// Parse the request body as JSON. Done by hand after [`gate`] rather than
+/// by the `Json` extractor, which runs first and would answer a remote
+/// caller's bad body with 400/415 instead of the invisible 404.
+fn json_body(body: &[u8]) -> Result<Value, Box<Response>> {
+    serde_json::from_slice(body)
+        .map_err(|_| Box::new(err(StatusCode::BAD_REQUEST, "invalid JSON body")))
+}
+
 // Boxed error: a bare `Response` Err variant trips clippy::result_large_err.
 fn ccr_store(state: &AppState) -> Result<Arc<dyn headroom_core::ccr::CcrStore>, Box<Response>> {
     match state.ccr_store() {
@@ -80,11 +88,15 @@ pub async fn handle_retrieve(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: axum::Json<Value>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Some(rejection) = gate(addr, &headers) {
         return rejection;
     }
+    let body = match json_body(&body) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
     let store = match ccr_store(&state) {
         Ok(store) => store,
         Err(response) => return *response,
@@ -116,61 +128,70 @@ pub async fn handle_retrieve(
 
 /// POST /v1/retrieve/tool_call — resolve a retrieval tool call.
 ///
-/// Request: `{"provider": "anthropic", "tool_call": {...}}`. The provider
-/// selects the wire shape (`anthropic` / `openai` / `gemini` / anything
-/// else); a call that is not a well-formed `headroom_retrieve` invocation
-/// is a 404, and a hash that misses is a 404 with the same TTL detail as
-/// `/v1/retrieve`. The returned `tool_result` envelope matches the
-/// provider shape so it splices straight into the conversation.
+/// Request: `{"provider": "anthropic", "tool_call": {...}}`, `provider`
+/// defaulting to `anthropic` as upstream does. It selects the wire shape
+/// (`anthropic` / `openai` / anything else). A call that is not a
+/// well-formed `headroom_retrieve` invocation is a 400. A miss is still a
+/// 200: `success: false` and `data` carrying the TTL detail as `error`, so
+/// the envelope splices into the conversation either way (upstream
+/// `ccr_handle_tool_call`). Hit `data` is `hash` + `original_content`,
+/// narrowed like `/v1/retrieve` (no per-entry counts in the Rust store).
 pub async fn handle_retrieve_tool_call(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: axum::Json<Value>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Some(rejection) = gate(addr, &headers) {
         return rejection;
     }
+    let body = match json_body(&body) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
     let store = match ccr_store(&state) {
         Ok(store) => store,
         Err(response) => return *response,
     };
-    let provider = body.get("provider").and_then(Value::as_str).unwrap_or("");
-    let tool_call = body.get("tool_call");
-    if provider.is_empty() || tool_call.is_none() {
-        return err(StatusCode::BAD_REQUEST, "provider and tool_call required");
-    }
-    let tool_call = tool_call.unwrap_or(&Value::Null);
-    let tool_call_id = tool_call.get("id").and_then(Value::as_str).unwrap_or("");
+    let provider = body
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("anthropic");
+    let tool_call = body.get("tool_call").unwrap_or(&Value::Null);
     let Some(hash_key) = parse_tool_call(tool_call, provider) else {
-        return err(StatusCode::NOT_FOUND, "not a CCR tool call");
-    };
-    let status = store.entry_status(&hash_key);
-    if !matches!(status.state, CcrEntryState::Available) {
-        return err(StatusCode::NOT_FOUND, format_retrieval_miss_detail(&status));
-    }
-    let Some(content) = store.get(&hash_key) else {
         return err(
-            StatusCode::NOT_FOUND,
-            format_retrieval_miss_detail(&store.entry_status(&hash_key)),
+            StatusCode::BAD_REQUEST,
+            format!("Invalid tool call or not a {CCR_TOOL_NAME} call"),
         );
     };
-
-    let retrieval_data = if provider == "anthropic" || provider == "openai" {
-        json!({ "status": "retrieved", "content": content })
-    } else {
+    let miss = |status: CcrEntryStatus| {
         json!({
-            "status": "retrieved",
-            "response": {
-                "TextResponse": {
-                    "parts": [{ "text": content }],
-                },
+            "error": format_retrieval_miss_detail(&status),
+            "hash": hash_key,
+            "status": match status.state {
+                CcrEntryState::Available => "available",
+                CcrEntryState::Expired => "expired",
+                CcrEntryState::Missing => "missing",
+            },
+            "ttl_seconds": match status.state {
+                CcrEntryState::Missing => status.default_ttl_seconds,
+                _ => status.ttl_seconds,
             },
         })
     };
-    // `json.dumps(..., indent=2)`: borrowed content owned for the envelope.
-    let result_content =
-        serde_json::to_string_pretty(&retrieval_data).unwrap_or_else(|_| content.clone());
+    let status = store.entry_status(&hash_key);
+    let retrieval_data = if !matches!(status.state, CcrEntryState::Available) {
+        miss(status)
+    } else {
+        match store.get(&hash_key) {
+            Some(content) => json!({ "hash": hash_key, "original_content": content }),
+            None => miss(store.entry_status(&hash_key)),
+        }
+    };
+
+    let tool_call_id = tool_call.get("id").and_then(Value::as_str).unwrap_or("");
+    // `json.dumps(..., indent=2)`, as upstream.
+    let result_content = serde_json::to_string_pretty(&retrieval_data).unwrap_or_default();
     let tool_result = if provider == "anthropic" {
         json!({
             "type": "tool_result",
@@ -191,7 +212,7 @@ pub async fn handle_retrieve_tool_call(
     };
     axum::Json(json!({
         "tool_result": tool_result,
-        "success": true,
+        "success": retrieval_data.get("error").is_none(),
         "data": retrieval_data,
     }))
     .into_response()
