@@ -2019,7 +2019,27 @@ pub fn apply_strategy_with_registry(
 
     let strategy_result = match strategy {
         CompressionStrategy::SmartCrusher if config.enable_smart_crusher => {
-            let crusher = super::smart_crusher::SmartCrusher::new(Default::default());
+            // Mirror headroom/transforms/smart_crusher.py::_get_smart_crusher:
+            // the router-level CCR / compaction knobs rebuild the engine
+            // config, so the agent regime (CCR + kompress off, compaction on)
+            // densifies with markers off instead of dropping rows behind
+            // retrieval pointers.
+            let crusher_defaults = super::smart_crusher::SmartCrusherConfig::default();
+            let crusher_cfg = super::smart_crusher::SmartCrusherConfig {
+                enable_ccr_marker: config.ccr_enabled && config.ccr_inject_marker,
+                max_items_after_crush: config
+                    .smart_crusher_max_items_after_crush
+                    .unwrap_or(crusher_defaults.max_items_after_crush),
+                lossless_only: config
+                    .smart_crusher_lossless_only
+                    .unwrap_or(crusher_defaults.lossless_only),
+                ..crusher_defaults
+            };
+            let crusher = if config.smart_crusher_with_compaction {
+                super::smart_crusher::SmartCrusher::new(crusher_cfg)
+            } else {
+                super::smart_crusher::SmartCrusher::without_compaction(crusher_cfg)
+            };
             let result = crusher.crush(content, context, bias);
             let compressed = result.compressed;
             let tokens = compressed.split_whitespace().count();

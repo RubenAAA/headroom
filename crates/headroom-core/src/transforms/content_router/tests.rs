@@ -1,3 +1,4 @@
+use super::super::smart_crusher::compaction::expand_compacted;
 use super::*;
 use serde_json::json;
 
@@ -859,6 +860,88 @@ fn apply_strategy_smart_crusher() {
     assert!(!compressed.is_empty());
     assert!(tokens <= 15); // SmartCrusher should compress
     assert_eq!(chain, vec!["smart_crusher"]);
+}
+
+#[test]
+fn apply_strategy_smart_crusher_agent_regime_densifies_without_ccr() {
+    // Agent regime (mirrors compress(mode="agent")): CCR + kompress off,
+    // compaction on. Uniform tool-result rows must densify inline — a
+    // `[N]{...}` block, no `<<ccr:` retrieval pointer — and the output must
+    // be byte-stable across runs (prompt-cache-safe).
+    let config = ContentRouterConfig {
+        ccr_enabled: false,
+        ccr_inject_marker: false,
+        enable_kompress: false,
+        ..ContentRouterConfig::default()
+    };
+    let items: Vec<String> = (0..40)
+        .map(|i| format!("{{\"id\": {i}, \"name\": \"user{i}\", \"active\": true}}"))
+        .collect();
+    let content = format!("[{}]", items.join(", "));
+    let run = || {
+        apply_strategy(
+            &content,
+            CompressionStrategy::SmartCrusher,
+            &config,
+            "",
+            None,
+            1.0,
+        )
+    };
+    let (compressed, _tokens, chain) = run();
+    assert_eq!(chain, vec!["smart_crusher".to_string()]);
+    assert!(
+        !compressed.contains("<<ccr:"),
+        "agent mode must not emit CCR pointers"
+    );
+    // The router re-serializes the compacted block as a JSON string (the same
+    // wrapper `peel` in the codec handles); unwrap before expanding.
+    let block: String = serde_json::from_str(&compressed).unwrap_or_else(|_| compressed.clone());
+    assert!(
+        block.starts_with("[40]"),
+        "expected densified block, got: {block:.120}"
+    );
+    // Round trip: decode the densified block back to the original records.
+    let decoded = expand_compacted(&block).expect("agent output must be decodable");
+    let expected: Vec<serde_json::Value> = (0..40)
+        .map(|i| json!({"id": i, "name": format!("user{i}"), "active": true}))
+        .collect();
+    assert_eq!(decoded, expected);
+    // Determinism: the same tool result densifies to the same bytes, so the
+    // compressed prefix stays stable for the prompt cache.
+    let (again, _, _) = run();
+    assert_eq!(compressed, again, "densify output must be deterministic");
+}
+
+#[test]
+fn apply_strategy_smart_crusher_without_compaction_flag_honored() {
+    // smart_crusher_with_compaction=false must take the lossy path (no
+    // `[N]{...}` block); the default true keeps the densified block under
+    // the agent-regime config above.
+    let config = ContentRouterConfig {
+        ccr_enabled: false,
+        ccr_inject_marker: false,
+        enable_kompress: false,
+        smart_crusher_with_compaction: false,
+        ..ContentRouterConfig::default()
+    };
+    let items: Vec<String> = (0..40)
+        .map(|i| format!("{{\"id\": {i}, \"name\": \"user{i}\", \"active\": true}}"))
+        .collect();
+    let content = format!("[{}]", items.join(", "));
+    let (compressed, _, _) = apply_strategy(
+        &content,
+        CompressionStrategy::SmartCrusher,
+        &config,
+        "",
+        None,
+        1.0,
+    );
+    let block: String = serde_json::from_str(&compressed).unwrap_or_else(|_| compressed.clone());
+    assert!(!block.starts_with("[40]{"));
+    // The lossy path must not decode back to the original rows.
+    let original: Vec<serde_json::Value> = serde_json::from_str(&content).unwrap();
+    assert_ne!(expand_compacted(&block), Some(original));
 }
 
 #[test]

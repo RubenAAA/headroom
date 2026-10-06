@@ -24,12 +24,14 @@
 //! [`CsvSchemaFormatter`]: formatter::CsvSchemaFormatter
 
 pub mod classifier;
+pub mod codec;
 pub mod compactor;
 pub mod formatter;
 pub mod ir;
 pub mod walker;
 
 pub use classifier::{CellClass, ClassifyConfig, classify_cell};
+pub use codec::{NULL_TOKEN, contains_removal_marker, expand_compacted, is_compacted};
 pub use compactor::{CompactConfig, compact, compact_with_store};
 pub use formatter::{CsvSchemaFormatter, Formatter, JsonFormatter, MarkdownKvFormatter};
 pub use ir::{Bucket, CellValue, Compaction, FieldSpec, OpaqueKind, Row, Schema};
