@@ -234,15 +234,15 @@ notice="$NOTICE_DIR/active-session.rotation.json"
 [[ -f "$notice" ]]
 grep -qF '"reason": "rotation-failed"' "$notice"
 grep -qF 'spark-budget' "$notice"
-first_ts=$(grep -oF '"ts": [0-9]*' "$notice")
+first_ts=$(grep -o '"ts": [0-9]*' "$notice")
 forget_rotation_history
 rotate_zen_egress proxy-aaaaaaaaaaaa proactive || true
-[[ "$(grep -oF '"ts": [0-9]*' "$notice")" == "$first_ts" ]]
+[[ "$(grep -o '"ts": [0-9]*' "$notice")" == "$first_ts" ]]
 ROTATION_FAILED_NOTICE_SECS=0
 forget_rotation_history
 sleep 1
 rotate_zen_egress proxy-aaaaaaaaaaaa proactive || true
-[[ "$(grep -oF '"ts": [0-9]*' "$notice")" != "$first_ts" ]]
+[[ "$(grep -o '"ts": [0-9]*' "$notice")" != "$first_ts" ]]
 unset ZEN_ROTATOR_TEST_FAIL
 
 # Missing control configuration never falls back to a global VPN command.
