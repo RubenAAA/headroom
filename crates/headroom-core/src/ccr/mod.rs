@@ -70,6 +70,87 @@ pub trait CcrStore: Send + Sync {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Store-wide idle-window TTL, for availability reporting. Backends
+    /// already carry this as configuration; the default covers stores
+    /// that cannot report one.
+    fn default_ttl_seconds(&self) -> u64 {
+        DEFAULT_TTL.as_secs()
+    }
+
+    /// Availability + TTL metadata for `hash`, mirroring Python
+    /// `CompressionStore.get_entry_status(hash, clean_expired=True)`:
+    /// expired entries are purged as a side effect. The default impl
+    /// cannot distinguish expired from missing, so it reports `Missing`
+    /// — backends with per-entry timestamps (memory, sqlite) override
+    /// this; Redis overrides with an existence probe (present means
+    /// available, since Redis evicts expired keys itself).
+    fn entry_status(&self, hash: &str) -> CcrEntryStatus {
+        if self.get(hash).is_some() {
+            CcrEntryStatus {
+                state: CcrEntryState::Available,
+                ttl_seconds: self.default_ttl_seconds(),
+                age_seconds: None,
+                default_ttl_seconds: self.default_ttl_seconds(),
+            }
+        } else {
+            CcrEntryStatus::missing(self.default_ttl_seconds())
+        }
+    }
+}
+
+/// Availability of one CCR entry. Port of the `"available" | "expired" |
+/// "missing"` statuses from Python `get_entry_status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CcrEntryState {
+    Available,
+    Expired,
+    Missing,
+}
+
+/// TTL metadata for one CCR entry. Port of the dict Python
+/// `get_entry_status` returns (`status`, `ttl_seconds`, `age_seconds`,
+/// `default_ttl_seconds`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CcrEntryStatus {
+    pub state: CcrEntryState,
+    pub ttl_seconds: u64,
+    pub age_seconds: Option<u64>,
+    pub default_ttl_seconds: u64,
+}
+
+impl CcrEntryStatus {
+    pub fn missing(default_ttl_seconds: u64) -> Self {
+        Self {
+            state: CcrEntryState::Missing,
+            ttl_seconds: 0,
+            age_seconds: None,
+            default_ttl_seconds,
+        }
+    }
+}
+
+/// Human-readable retrieval-miss detail. Port of Python
+/// `format_retrieval_miss_detail`: an expired entry names its TTL and,
+/// when known, its age; a missing entry names the store TTL.
+pub fn format_retrieval_miss_detail(status: &CcrEntryStatus) -> String {
+    match status.state {
+        CcrEntryState::Available => "Entry available".to_string(),
+        CcrEntryState::Expired => {
+            if let Some(age) = status.age_seconds {
+                format!(
+                    "Entry expired (CCR TTL: {} seconds; age: {} seconds)",
+                    status.ttl_seconds, age
+                )
+            } else {
+                format!("Entry expired (CCR TTL: {} seconds)", status.ttl_seconds)
+            }
+        }
+        CcrEntryState::Missing => format!(
+            "Entry not found (CCR TTL: {} seconds)",
+            status.default_ttl_seconds
+        ),
+    }
 }
 
 /// Default capacity — matches Python's `CompressionStore` default.
@@ -146,5 +227,31 @@ mod tests {
     #[test]
     fn marker_format_is_pinned() {
         assert_eq!(marker_for("abc123"), "<<ccr:abc123>>");
+    }
+
+    #[test]
+    fn miss_detail_matches_upstream_shapes() {
+        assert_eq!(
+            format_retrieval_miss_detail(&CcrEntryStatus::missing(604_800)),
+            "Entry not found (CCR TTL: 604800 seconds)"
+        );
+        assert_eq!(
+            format_retrieval_miss_detail(&CcrEntryStatus {
+                state: CcrEntryState::Expired,
+                ttl_seconds: 60,
+                age_seconds: Some(150),
+                default_ttl_seconds: 60,
+            }),
+            "Entry expired (CCR TTL: 60 seconds; age: 150 seconds)"
+        );
+        assert_eq!(
+            format_retrieval_miss_detail(&CcrEntryStatus {
+                state: CcrEntryState::Expired,
+                ttl_seconds: 60,
+                age_seconds: None,
+                default_ttl_seconds: 60,
+            }),
+            "Entry expired (CCR TTL: 60 seconds)"
+        );
     }
 }

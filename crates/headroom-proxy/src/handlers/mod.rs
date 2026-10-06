@@ -18,5 +18,6 @@ pub mod local_model;
 pub mod model_catalog;
 pub mod reasoning_signature;
 pub mod responses;
+pub mod retrieve;
 pub mod route_resolve;
 pub mod stats;

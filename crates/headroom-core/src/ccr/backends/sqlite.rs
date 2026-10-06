@@ -281,6 +281,47 @@ impl CcrStore for SqliteCcrStore {
         .map(|n| n.max(0) as usize)
         .unwrap_or(0)
     }
+
+    fn default_ttl_seconds(&self) -> u64 {
+        self.default_ttl_seconds
+    }
+
+    fn entry_status(&self, hash: &str) -> crate::ccr::CcrEntryStatus {
+        use crate::ccr::{CcrEntryState, CcrEntryStatus};
+        let now = Self::now_unix_seconds();
+        let conn = self.conn.lock().expect("ccr sqlite mutex poisoned");
+        let row: Option<(i64, i64, i64)> = conn
+            .query_row(
+                "SELECT created_at, ttl_seconds, last_accessed FROM ccr_entries WHERE hash = ?1",
+                [hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .unwrap_or(None);
+        let Some((created_at, ttl_seconds, last_accessed)) = row else {
+            return CcrEntryStatus::missing(self.default_ttl_seconds);
+        };
+        let now = now as i64;
+        let expired = last_accessed + ttl_seconds < now
+            || created_at + (self.max_lifetime_seconds as i64) < now;
+        if !expired {
+            return CcrEntryStatus {
+                state: CcrEntryState::Available,
+                ttl_seconds: ttl_seconds.max(0) as u64,
+                age_seconds: Some(now.saturating_sub(created_at).max(0) as u64),
+                default_ttl_seconds: self.default_ttl_seconds,
+            };
+        }
+        let status = CcrEntryStatus {
+            state: CcrEntryState::Expired,
+            ttl_seconds: ttl_seconds.max(0) as u64,
+            age_seconds: Some(now.saturating_sub(created_at).max(0) as u64),
+            default_ttl_seconds: self.default_ttl_seconds,
+        };
+        // `clean_expired=True` semantics: purge the stale row.
+        let _ = conn.execute("DELETE FROM ccr_entries WHERE hash = ?1", [hash]);
+        status
+    }
 }
 
 #[cfg(test)]
@@ -366,5 +407,47 @@ mod tests {
             "constant access must not extend an entry past its max lifetime"
         );
         assert_eq!(store.len(), 0, "expired row must be purged");
+    }
+
+    #[test]
+    fn status_reports_available_missing_and_expired() {
+        use crate::ccr::CcrEntryState;
+
+        let now = SqliteCcrStore::now_unix_seconds();
+        // Idle window one hour, ceiling one day.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteCcrStore::open_with_ttls(dir.path().join("ccr.sqlite"), 3_600, 86_400)
+            .expect("open sqlite store");
+        store.put("live", "payload");
+        let live = store.entry_status("live");
+        assert!(matches!(live.state, CcrEntryState::Available));
+        assert_eq!(live.ttl_seconds, 3_600);
+
+        let missing = store.entry_status("never_stored");
+        assert!(matches!(missing.state, CcrEntryState::Missing));
+        assert_eq!(missing.default_ttl_seconds, 3_600);
+
+        // A row idle since long before the window, written with raw
+        // timestamps so no sleep is needed.
+        {
+            let conn = store.conn.lock().expect("ccr sqlite mutex poisoned");
+            conn.execute(
+                "INSERT INTO ccr_entries
+                    (hash, original, created_at, ttl_seconds, last_accessed)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "stale",
+                    b"payload".as_slice(),
+                    (now - 7_200) as i64,
+                    3_600,
+                    (now - 7_200) as i64
+                ],
+            )
+            .expect("insert stale row");
+        }
+        let expired = store.entry_status("stale");
+        assert!(matches!(expired.state, CcrEntryState::Expired));
+        assert_eq!(expired.age_seconds, Some(7_200));
+        assert_eq!(store.get("stale"), None, "status must purge expired rows");
     }
 }

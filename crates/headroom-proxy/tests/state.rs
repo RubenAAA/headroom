@@ -21,6 +21,9 @@ mod memory_routed_mixed_turn;
 #[path = "suites/state/ctx_endpoints.rs"]
 mod ctx_endpoints;
 
+#[path = "suites/state/retrieve_endpoints.rs"]
+mod retrieve_endpoints;
+
 #[path = "suites/state/e2e_simulators.rs"]
 mod e2e_simulators;
 

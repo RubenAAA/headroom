@@ -199,6 +199,35 @@ impl CcrStore for InMemoryCcrStore {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    fn default_ttl_seconds(&self) -> u64 {
+        self.ttl.as_secs()
+    }
+
+    fn entry_status(&self, hash: &str) -> crate::ccr::CcrEntryStatus {
+        use crate::ccr::{CcrEntryState, CcrEntryStatus};
+        let Some(entry) = self.map.get(hash) else {
+            return CcrEntryStatus::missing(self.ttl.as_secs());
+        };
+        if !entry.is_expired(self.ttl, self.max_lifetime) {
+            return CcrEntryStatus {
+                state: CcrEntryState::Available,
+                ttl_seconds: self.ttl.as_secs(),
+                age_seconds: Some(entry.inserted.elapsed().as_secs()),
+                default_ttl_seconds: self.ttl.as_secs(),
+            };
+        }
+        let status = CcrEntryStatus {
+            state: CcrEntryState::Expired,
+            ttl_seconds: self.ttl.as_secs(),
+            age_seconds: Some(entry.inserted.elapsed().as_secs()),
+            default_ttl_seconds: self.ttl.as_secs(),
+        };
+        drop(entry);
+        // `clean_expired=True` semantics: purge the stale row.
+        self.map.remove(hash);
+        status
+    }
 }
 
 #[cfg(test)]
@@ -356,5 +385,29 @@ mod tests {
             hits > 100,
             "reader should mostly observe live entry, hits={hits}"
         );
+    }
+
+    #[test]
+    fn status_distinguishes_available_missing_and_expired() {
+        use crate::ccr::CcrEntryState;
+        use std::time::Duration;
+
+        let store = InMemoryCcrStore::with_capacity_and_ttl(16, Duration::from_millis(50));
+        store.put("live", "payload");
+        let live = store.entry_status("live");
+        assert!(matches!(live.state, CcrEntryState::Available));
+
+        let missing = store.entry_status("never_stored");
+        assert!(matches!(missing.state, CcrEntryState::Missing));
+        assert_eq!(missing.default_ttl_seconds, 0);
+
+        // Monotonic `Instant` backs the check, so this sleep cannot
+        // observe a wall-clock step backwards.
+        std::thread::sleep(Duration::from_millis(150));
+        let expired = store.entry_status("live");
+        assert!(matches!(expired.state, CcrEntryState::Expired));
+        assert_eq!(expired.ttl_seconds, 0);
+        assert!(expired.age_seconds.is_some());
+        assert_eq!(store.get("live"), None, "status must purge expired rows");
     }
 }

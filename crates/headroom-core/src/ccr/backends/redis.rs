@@ -218,4 +218,37 @@ impl CcrStore for RedisCcrStore {
         // backend assert get/put behavior, not len().
         0
     }
+
+    fn default_ttl_seconds(&self) -> u64 {
+        self.default_ttl_seconds
+    }
+
+    fn entry_status(&self, hash: &str) -> crate::ccr::CcrEntryStatus {
+        use crate::ccr::{CcrEntryState, CcrEntryStatus};
+        // Redis evicts expired keys itself, so existence means available.
+        // Age is not tracked (only the idle TTL and the max-lifetime
+        // companion key), so an available entry reports no age and a
+        // gone key reports missing — never expired.
+        let exists: bool = self
+            .client
+            .get_connection()
+            .ok()
+            .and_then(|mut conn| {
+                redis::cmd("EXISTS")
+                    .arg(self.key_for(hash))
+                    .query(&mut conn)
+                    .ok()
+            })
+            .unwrap_or(false);
+        if exists {
+            CcrEntryStatus {
+                state: CcrEntryState::Available,
+                ttl_seconds: self.default_ttl_seconds,
+                age_seconds: None,
+                default_ttl_seconds: self.default_ttl_seconds,
+            }
+        } else {
+            CcrEntryStatus::missing(self.default_ttl_seconds)
+        }
+    }
 }
