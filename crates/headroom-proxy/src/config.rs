@@ -1686,6 +1686,17 @@ pub struct CliArgs {
     )]
     pub ccr_handle_responses: bool,
 
+    /// Orphan-turn continuation: a text-only turn that announces an action but
+    /// emits no tool call gets one extra upstream round with a nudge, so the
+    /// client sees the turn complete instead of a bare end_turn. Default `true`.
+    #[arg(
+        long = "orphan-turn-continuation",
+        env = "HEADROOM_ORPHAN_TURN_CONTINUATION",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub orphan_turn_continuation: bool,
+
     /// CCR: max rounds of retrieve-continue per response. Default `8`.
     #[arg(
         long = "ccr-max-retrieval-rounds",
@@ -2826,6 +2837,9 @@ pub struct Config {
     pub ccr_inject_tool: bool,
     /// CCR: auto-handle retrieval tool calls server-side.
     pub ccr_handle_responses: bool,
+    /// One extra upstream round for turns that announce an action but emit no
+    /// tool call, so the client never sees the bare end_turn.
+    pub orphan_turn_continuation: bool,
     /// CCR: max retrieve-continue rounds per response.
     pub ccr_max_retrieval_rounds: usize,
     /// Retry upstream requests on transient errors.
@@ -3157,6 +3171,7 @@ impl Config {
             cache_max_entries: args.cache_max_entries,
             ccr_inject_tool: args.ccr_inject_tool,
             ccr_handle_responses: args.ccr_handle_responses,
+            orphan_turn_continuation: args.orphan_turn_continuation,
             ccr_max_retrieval_rounds: args.ccr_max_retrieval_rounds,
             retry_enabled: args.retry_enabled,
             retry_max_attempts: args.retry_max_attempts,
@@ -3398,6 +3413,7 @@ impl Config {
             cache_max_entries: 1000,
             ccr_inject_tool: true,
             ccr_handle_responses: true,
+            orphan_turn_continuation: true,
             ccr_max_retrieval_rounds: 8,
             retry_enabled: true,
             retry_max_attempts: 3,

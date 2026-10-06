@@ -121,7 +121,7 @@ pub(crate) fn maybe_prune_tools(
     };
     let before = tools.len();
     let removed = crate::cache_stabilization::tool_prune::prune_tools(tools, policy);
-    if removed == 0 {
+    if removed.is_empty() {
         return body;
     }
     match serde_json::to_vec(&value) {
@@ -129,7 +129,8 @@ pub(crate) fn maybe_prune_tools(
             tracing::info!(
                 request_id = %request_id,
                 tools_before = before,
-                tools_removed = removed,
+                tools_removed = removed.len(),
+                removed_tools = ?removed,
                 "pruned tools[] per policy"
             );
             bytes::Bytes::from(bytes)

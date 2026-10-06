@@ -1144,10 +1144,66 @@ impl Rewriter {
     }
 }
 
+/// Phrases that announce an imminent action. A turn that ends on one of these
+/// with no tool call is the orphan: the model said it would act and then
+/// stopped. Matched case-insensitively against the whole turn text; the
+/// length cap below is what keeps substantive answers out.
+const ORPHAN_ANNOUNCEMENTS: &[&str] = &[
+    "i'll ",
+    "i will ",
+    "let me ",
+    "i'm going to ",
+    "i am going to ",
+    "let's ",
+    "starting with",
+    "i'll start",
+    "checking ",
+    "looking into",
+    "investigating ",
+    "on it",
+];
+
+/// Turns longer than this never trigger an orphan continuation. A real final
+/// answer that happens to contain "let me explain" is hundreds of chars; the
+/// orphan is one short sentence ("I'll investigate the X failure and get the
+/// fix in place." was 62). Measured shape, not a guess.
+const ORPHAN_MAX_CHARS: usize = 600;
+
+/// If the rebuilt turn is a lone short text-only `end_turn` announcing an
+/// action, the turn is an orphan: return the matched phrase for the log.
+/// `None` for anything with a non-text block, a truncated stop, a long
+/// answer, or no announcement. Pure: unit-test the trigger here, not on a
+/// live stream.
+pub(crate) fn orphan_announcement(message: &Value) -> Option<&'static str> {
+    if message.get("stop_reason").and_then(Value::as_str) != Some("end_turn") {
+        return None;
+    }
+    let content = message.get("content")?.as_array()?;
+    if content.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            return None;
+        }
+        if let Some(t) = block.get("text").and_then(Value::as_str) {
+            text.push_str(t);
+        }
+    }
+    if text.chars().count() > ORPHAN_MAX_CHARS {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    ORPHAN_ANNOUNCEMENTS
+        .iter()
+        .find(|p| lower.contains(**p))
+        .copied()
+}
+
 /// Wrap an Anthropic SSE body so `headroom_retrieve` calls are answered here
 /// instead of reaching the client.
-///
-/// Returns the rewritten stream and a handle to the usage of any continuation
+///////// Returns the rewritten stream and a handle to the usage of any continuation
 /// rounds, which the caller folds into the request outcome. The handle stays
 /// zeroed on every turn that does not retrieve.
 /// Generic over the stream's error type: the Anthropic path feeds it
@@ -1208,8 +1264,18 @@ where
         }
 
         // Nothing was retrieved: release the terminal events and the client
-        // has had the upstream turn, unchanged.
-        if !rw.saw_ccr {
+        // has had the upstream turn, unchanged — unless the turn is an
+        // orphan: text-only, announcing an action, with no tool call. One
+        // extra round with a nudge usually produces the call, and the client
+        // sees the turn complete normally instead of a bare end_turn.
+        // One-shot by construction (see `resolve_orphan_turn`): the resolved
+        // synthesis below never re-enters this branch.
+        let orphan_trigger = if !rw.saw_ccr && ctx.config.orphan_turn_continuation {
+            orphan_announcement(&rebuild_message(&rw.state))
+        } else {
+            None
+        };
+        if !rw.saw_ccr && orphan_trigger.is_none() {
             for ev in rw.withheld {
                 if tx.send(Ok(ev)).await.is_err() {
                     return;
@@ -1218,12 +1284,29 @@ where
             return;
         }
 
-        let (resolved, extras) = CONTINUATION_EXTRAS
-            .scope(RefCell::new(None), async {
-                let resolved = resolve_retrieval(&ctx, &rw, &round_usage).await;
-                (resolved, CONTINUATION_EXTRAS.with(RefCell::take))
-            })
-            .await;
+        let (resolved, extras) = match orphan_trigger {
+            Some(trigger) => {
+                tracing::info!(
+                    event = "orphan_turn_continuation",
+                    request_id = %ctx.request_id,
+                    trigger = trigger,
+                    "stream: text-only turn announced an action without a tool call; running one continuation round"
+                );
+                (
+                    resolve_orphan_turn(&ctx, &round_usage, &rebuild_message(&rw.state), trigger)
+                        .await,
+                    None,
+                )
+            }
+            None => {
+                CONTINUATION_EXTRAS
+                    .scope(RefCell::new(None), async {
+                        let resolved = resolve_retrieval(&ctx, &rw, &round_usage).await;
+                        (resolved, CONTINUATION_EXTRAS.with(RefCell::take))
+                    })
+                    .await
+            }
+        };
         // Only the final continuation's extras describe the turn going out.
         // One from a round the resolvers then discarded names another message.
         let extras = extras.filter(|e| {
@@ -1540,81 +1623,39 @@ fn streamed_continuation_request(request: Bytes) -> Bytes {
 }
 
 /// Run the buffered continuation logic against a rebuilt streamed turn.
-async fn resolve_retrieval(
+/// Run the resolver alternation (retrieval, then memory, then one shadow
+/// answer) over `turn_bytes` until a whole pass changes nothing. Shared by
+/// the retrieval path and the orphan-turn continuation: both seed a turn and
+/// need whatever proxy-owned calls it reaches answered the same way.
+/// Returns the settled turn and the usage the rounds accumulated.
+///
+/// One-shot by construction, not by flag: the caller folds the returned turn
+/// into synthesized events and closes the stream, so the output never
+/// re-enters the rewriter and a still-orphaned round two cannot recurse.
+async fn run_resolver_alternation(
     ctx: &CcrStreamContext,
-    rw: &Rewriter,
-    round_usage: &Arc<Mutex<crate::proxy::CcrRoundUsage>>,
-) -> Value {
-    let rebuilt = rebuild_message(&rw.state);
-
-    // The handler reads whatever shape its upstream speaks, so hand it the
-    // turn in that shape and translate the answer back.
-    let (mut turn_for_handler, provider) = match &ctx.shape {
-        CcrShape::Anthropic => (rebuilt.clone(), "anthropic"),
-        CcrShape::RoutedChat { .. } => (anthropic_turn_as_openai_response(&rebuilt), "openai"),
-        CcrShape::RoutedResponses { .. } => (
-            anthropic_turn_as_responses_output(&rebuilt),
-            "openai_responses",
-        ),
-    };
-    // The rebuilt turn speaks client tool names (the rewriter observes the
-    // translated-back stream); continuations go back upstream, where the
-    // Zen outbound rename still applies. Same tool list both directions,
-    // so this is a no-op unless that pass renamed something.
-    if !matches!(ctx.shape, CcrShape::Anthropic)
-        && let Some(anthropic_request) = match &ctx.shape {
-            CcrShape::RoutedChat { anthropic_request } => Some(anthropic_request),
-            CcrShape::RoutedResponses { anthropic_request } => Some(anthropic_request),
-            CcrShape::Anthropic => None,
-        }
-    {
-        crate::routed::tool_alias::ToolAlias::derive(
-            anthropic_request.get("tools").and_then(|t| t.as_array()),
-        )
-        .forward_body(&mut turn_for_handler);
-    }
-    // The rebuilt turn echoes first-response usage, which is already booked
-    // through the first-round path on every streaming arm. Leaving the block
-    // in place makes the resolver count it as a continuation round and the
-    // turn's output books twice. Continuation responses keep their own usage;
-    // only the seed turn is scrubbed.
-    if let Some(obj) = turn_for_handler.as_object_mut() {
-        obj.remove("usage");
-    }
-
-    let turn_bytes = match serde_json::to_vec(&turn_for_handler) {
-        Ok(b) => Bytes::from(b),
-        Err(e) => {
-            tracing::warn!(
-                event = "ccr_stream_rebuild_failed",
-                request_id = %ctx.request_id,
-                error = %e,
-                "ccr: could not rebuild the streamed turn; leaving it unresolved"
-            );
-            return rebuilt;
-        }
-    };
-
+    turn_bytes: Bytes,
+    provider: &str,
+    seed_request: Option<Bytes>,
+) -> (Bytes, crate::proxy::CcrRoundUsage) {
     // An Anthropic continuation streams, so a slow round is not mistaken for a
     // stalled one. A routed one comes back as JSON, which this code can parse
     // without a second SSE body to fold, except on backends that mandate
-    // streaming, where de-streaming 400s.
-    let continuation_request = if matches!(ctx.shape, CcrShape::Anthropic) {
-        streamed_continuation_request(ctx.forwarded_request.clone())
-    } else {
-        restore_stream_when_mandated(
+    // streaming, where de-streaming 400s. A caller that already seeded a round
+    // (the orphan continuation) hands its enriched request in: later rounds
+    // must keep the seeded history, and the bare template does not have it.
+    let continuation_request = match seed_request {
+        Some(seed) => seed,
+        None if matches!(ctx.shape, CcrShape::Anthropic) => {
+            streamed_continuation_request(ctx.forwarded_request.clone())
+        }
+        None => restore_stream_when_mandated(
             non_streaming_continuation_request(&ctx.forwarded_request),
             &ctx.upstream_url,
-        )
+        ),
     };
 
-    // Memory tools run after retrieval, on whatever the retrieval left. A turn
-    // can reach for both, and the client can run neither — but neither can the
-    // answer to one be the end of it, because a resolved memory call can leave
-    // the model asking for a retrieval that retrieval has already passed by.
-    // So alternate rather than run each once, and stop as soon as a whole pass
-    // changes nothing. See `MAX_RESOLVER_ALTERNATIONS`.
-    let mut resolved_bytes = turn_bytes.clone();
+    let mut resolved_bytes = turn_bytes;
     let mut usage = crate::proxy::CcrRoundUsage::default();
     // Answering a shadow call gets the model one more round, once per turn.
     let mut shadow_answered = false;
@@ -1676,6 +1717,262 @@ async fn resolve_retrieval(
             break;
         }
     }
+    (resolved_bytes, usage)
+}
+
+/// The nudge appended to an orphaned turn before it goes back upstream: the
+/// model announced an action and stopped, so the round only exists to get the
+/// tool call it meant to emit. Phrased as a statement of what happened, not
+/// an instruction to chat — a question would spend the round answering it.
+const ORPHAN_NUDGE: &str = "Your last message announced an action but contained no tool call, so nothing ran. Continue now: emit the tool call.";
+
+/// Upper bound on the orphan round trip: the seed round plus whatever the
+/// resolver alternation spends afterwards. A sick route must stall one turn,
+/// not the session.
+const ORPHAN_ROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// Splice `entry` into a continuation array the way the resolver loop does: a
+/// sentinel-keyed wrapper (`_openai_responses_input_items`,
+/// `_openai_tool_results`) extends in place, anything else pushes. Local copy
+/// of that merge so the orphan seed round appends history identically.
+fn extend_or_push_items(items: &mut Vec<Value>, entry: Value) {
+    if let Some(obj) = entry.as_object() {
+        for key in ["_openai_responses_input_items", "_openai_tool_results"] {
+            if let Some(list) = obj.get(key).and_then(|v| v.as_array()) {
+                items.extend(list.iter().cloned());
+                return;
+            }
+        }
+    }
+    items.push(entry);
+}
+
+/// Build the orphan seed request: the round-1 template plus the orphaned turn
+/// as the assistant message and [`ORPHAN_NUDGE`] as the following user
+/// message. Pure over the parsed template so tests can pin each provider's
+/// item shape without a network round. Returns `None` when the template has
+/// no continuation array, in which case the caller streams the turn as-is.
+fn orphan_seed_request(request: &mut Value, items_field: &str, assistant: Value) -> Option<Bytes> {
+    let items = request
+        .get_mut(items_field)
+        .and_then(|v| v.as_array_mut())?;
+    extend_or_push_items(items, assistant);
+    if items_field == "input" {
+        items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": ORPHAN_NUDGE,
+        }));
+    } else {
+        items.push(json!({"role": "user", "content": ORPHAN_NUDGE}));
+    }
+    serde_json::to_vec(&request).ok().map(Bytes::from)
+}
+
+/// Send an orphaned turn back upstream with [`ORPHAN_NUDGE`] appended, then
+/// settle whatever the extra round reaches for through the same alternation
+/// the retrieval path runs. Returns the settled turn in Anthropic shape for
+/// the emit tail to splice; on any failure returns the rebuilt original so
+/// the client still gets the turn it already watched stream by.
+///
+/// The seed round reuses the round-1 request template with the turn's own
+/// history appended (assistant turn, then the nudge as user), so the model
+/// sees exactly what it said. The enriched request also seeds the
+/// alternation: rounds 3+ must keep round 1 in history, and the template
+/// alone does not have it.
+async fn resolve_orphan_turn(
+    ctx: &CcrStreamContext,
+    round_usage: &Arc<Mutex<crate::proxy::CcrRoundUsage>>,
+    rebuilt: &Value,
+    trigger: &str,
+) -> Value {
+    // Provider names are the response-handler vocabulary (`openai` is chat
+    // completions, not the Responses API).
+    let (provider, items_field) = match &ctx.shape {
+        CcrShape::Anthropic => ("anthropic", "messages"),
+        CcrShape::RoutedChat { .. } => ("openai", "messages"),
+        CcrShape::RoutedResponses { .. } => ("openai_responses", "input"),
+    };
+
+    // The turn in the shape its upstream speaks — the same conversion the
+    // retrieval path feeds the handlers.
+    let turn_for_handler = match &ctx.shape {
+        CcrShape::Anthropic => rebuilt.clone(),
+        CcrShape::RoutedChat { anthropic_request } => {
+            let mut turn = anthropic_turn_as_openai_response(&rebuilt);
+            crate::routed::tool_alias::ToolAlias::derive(
+                anthropic_request.get("tools").and_then(|t| t.as_array()),
+            )
+            .reverse_turn(&mut turn);
+            turn
+        }
+        CcrShape::RoutedResponses { .. } => anthropic_turn_as_responses_output(&rebuilt),
+    };
+
+    let mut request: Value = match serde_json::from_slice(&ctx.forwarded_request) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                event = "orphan_turn_seed_failed",
+                request_id = %ctx.request_id,
+                error = %e,
+                "ccr: orphan turn matched but the request template does not parse; streaming it as-is"
+            );
+            return rebuilt.clone();
+        }
+    };
+    let handler = headroom_core::ccr::response_handler::CCRResponseHandler::new(None);
+    let assistant = handler.extract_assistant_message(&turn_for_handler, provider);
+    let Some(seed_bytes) = orphan_seed_request(&mut request, items_field, assistant) else {
+        tracing::warn!(
+            event = "orphan_turn_seed_failed",
+            request_id = %ctx.request_id,
+            items_field,
+            "ccr: orphan turn matched but the request template has no continuation array; streaming it as-is"
+        );
+        return rebuilt.clone();
+    };
+    // Continuations come back as plain JSON — except on backends that mandate
+    // streaming, where de-streaming 400s. Same rule as the resolver loop.
+    let seed_bytes = if matches!(ctx.shape, CcrShape::Anthropic) {
+        streamed_continuation_request(seed_bytes)
+    } else {
+        restore_stream_when_mandated(
+            non_streaming_continuation_request(&seed_bytes),
+            &ctx.upstream_url,
+        )
+    };
+
+    let text_head: String = rebuilt
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    tracing::info!(
+        event = "orphan_turn_continued",
+        request_id = %ctx.request_id,
+        trigger,
+        text_head = %text_head.chars().take(160).collect::<String>(),
+        "ccr: text-only turn announced an action and stopped; sending it back with a nudge"
+    );
+    let resp = ctx
+        .client
+        .post(ctx.upstream_url.clone())
+        .headers(ctx.outgoing_headers.clone())
+        .body(seed_bytes.clone())
+        .timeout(ORPHAN_ROUND_TIMEOUT)
+        .send()
+        .await;
+    let body = match resp {
+        Ok(r) if r.status().is_success() => r.bytes().await.unwrap_or_default(),
+        Ok(r) => {
+            tracing::warn!(
+                event = "orphan_turn_round_failed",
+                request_id = %ctx.request_id,
+                status = %r.status(),
+                "ccr: orphan nudge round came back non-success; streaming the orphan as-is"
+            );
+            return rebuilt.clone();
+        }
+        Err(e) => {
+            tracing::warn!(
+                event = "orphan_turn_round_failed",
+                request_id = %ctx.request_id,
+                error = %e,
+                "ccr: orphan nudge round failed to send; streaming the orphan as-is"
+            );
+            return rebuilt.clone();
+        }
+    };
+    let Ok(round_two) = serde_json::from_slice::<Value>(&body) else {
+        tracing::warn!(
+            event = "orphan_turn_round_failed",
+            request_id = %ctx.request_id,
+            "ccr: orphan nudge round came back unparsable; streaming the orphan as-is"
+        );
+        return rebuilt.clone();
+    };
+    // Book the seed round's own usage: the alternation only books the rounds
+    // it sends, and the settled turn's usage covers just the last one.
+    if let Ok(mut guard) = round_usage.lock() {
+        guard.add_response_logged(&round_two, &ctx.request_id, "orphan");
+    }
+    let (settled, _) = run_resolver_alternation(ctx, body, provider, Some(seed_bytes)).await;
+    match serde_json::from_slice::<Value>(&settled) {
+        Ok(turn) => turn,
+        Err(_) => rebuilt.clone(),
+    }
+}
+
+async fn resolve_retrieval(
+    ctx: &CcrStreamContext,
+    rw: &Rewriter,
+    round_usage: &Arc<Mutex<crate::proxy::CcrRoundUsage>>,
+) -> Value {
+    let rebuilt = rebuild_message(&rw.state);
+
+    // The handler reads whatever shape its upstream speaks, so hand it the
+    // turn in that shape and translate the answer back.
+    let (mut turn_for_handler, provider) = match &ctx.shape {
+        CcrShape::Anthropic => (rebuilt.clone(), "anthropic"),
+        CcrShape::RoutedChat { .. } => (anthropic_turn_as_openai_response(&rebuilt), "openai"),
+        CcrShape::RoutedResponses { .. } => (
+            anthropic_turn_as_responses_output(&rebuilt),
+            "openai_responses",
+        ),
+    };
+    // The rebuilt turn speaks client tool names (the rewriter observes the
+    // translated-back stream); continuations go back upstream, where the
+    // Zen outbound rename still applies. Same tool list both directions,
+    // so this is a no-op unless that pass renamed something.
+    if !matches!(ctx.shape, CcrShape::Anthropic)
+        && let Some(anthropic_request) = match &ctx.shape {
+            CcrShape::RoutedChat { anthropic_request } => Some(anthropic_request),
+            CcrShape::RoutedResponses { anthropic_request } => Some(anthropic_request),
+            CcrShape::Anthropic => None,
+        }
+    {
+        crate::routed::tool_alias::ToolAlias::derive(
+            anthropic_request.get("tools").and_then(|t| t.as_array()),
+        )
+        .forward_body(&mut turn_for_handler);
+    }
+    // The rebuilt turn echoes first-response usage, which is already booked
+    // through the first-round path on every streaming arm. Leaving the block
+    // in place makes the resolver count it as a continuation round and the
+    // turn's output books twice. Continuation responses keep their own usage;
+    // only the seed turn is scrubbed.
+    if let Some(obj) = turn_for_handler.as_object_mut() {
+        obj.remove("usage");
+    }
+
+    let turn_bytes = match serde_json::to_vec(&turn_for_handler) {
+        Ok(b) => Bytes::from(b),
+        Err(e) => {
+            tracing::warn!(
+                event = "ccr_stream_rebuild_failed",
+                request_id = %ctx.request_id,
+                error = %e,
+                "ccr: could not rebuild the streamed turn; leaving it unresolved"
+            );
+            return rebuilt;
+        }
+    };
+
+    // Memory tools run after retrieval, on whatever the retrieval left. A turn
+    // can reach for both, and the client can run neither — but neither can the
+    // answer to one be the end of it, because a resolved memory call can leave
+    // the model asking for a retrieval that retrieval has already passed by.
+    // So alternate rather than run each once, and stop as soon as a whole pass
+    // changes nothing. See `MAX_RESOLVER_ALTERNATIONS`.
+    let (resolved_bytes, mut usage) =
+        run_resolver_alternation(ctx, turn_bytes, provider, None).await;
 
     // Fold the terminal response's usage: the loop above adds every
     // superseded response, but the final one returns as the turn and was
@@ -2102,6 +2399,147 @@ mod tests {
             text.matches("the answer").count(),
             1,
             "content duplicated across start and delta: {text}"
+        );
+    }
+
+    /// The orphan seed request, pinned per provider shape: the assistant turn
+    /// must land where each upstream reads conversation history, and the
+    /// sentinel-wrapped Responses items must stay wrapped.
+    #[test]
+    fn orphan_seed_request_shapes() {
+        // Anthropic/chat: messages[] of role/content objects.
+        let mut req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+        let seed = orphan_seed_request(
+            &mut req,
+            "messages",
+            json!({"role": "assistant", "content": "I'll check."}),
+        )
+        .expect("messages array present");
+        let back: Value = serde_json::from_slice(&seed).unwrap();
+        assert_eq!(
+            back["messages"],
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "I'll check."},
+                {"role": "user", "content": ORPHAN_NUDGE},
+            ])
+        );
+        // Responses: assistant output items splice through the sentinel, the
+        // nudge is a plain user message item.
+        let mut req = json!({"model": "x", "input": [
+            {"_openai_responses_input_items": [{"type": "message", "role": "user", "content": "hi"}]},
+        ]});
+        let seed = orphan_seed_request(
+            &mut req,
+            "input",
+            json!({"_openai_responses_input_items": [{"type": "output_text", "text": "I'll check."}]}),
+        )
+        .expect("input array present");
+        let back: Value = serde_json::from_slice(&seed).unwrap();
+        assert_eq!(
+            back["input"],
+            json!([
+                {"_openai_responses_input_items": [{"type": "message", "role": "user", "content": "hi"}]},
+                {"type": "output_text", "text": "I'll check."},
+                {"type": "message", "role": "user", "content": ORPHAN_NUDGE},
+            ])
+        );
+        // No continuation array: no seed, the turn streams as-is.
+        let mut req = json!({"model": "x"});
+        assert!(
+            orphan_seed_request(&mut req, "messages", json!({})).is_none(),
+            "without messages[] there is nothing to append to"
+        );
+    }
+
+    /// The orphan trigger, pinned: the 2026-10-06 cut turn ended on one short
+    /// sentence announcing an action and no tool call. The matcher must fire
+    /// on exactly that shape and stay silent on real answers.
+    #[test]
+    fn orphan_trigger_fires_on_the_cut_turn_shape() {
+        // Fed through the real rewriter, not hand-built: the trigger reads
+        // the rebuilt message, so the test pins the whole path.
+        let mut rw = Rewriter::new(false);
+        feed(
+            &mut rw,
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_1","model":"spark","usage":{"input_tokens":10,"output_tokens":0}}}"#,
+        );
+        feed(
+            &mut rw,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        );
+        feed(
+            &mut rw,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I'll investigate the Tao mastery failure and get the fix in place."}}"#,
+        );
+        feed(
+            &mut rw,
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        );
+        feed(
+            &mut rw,
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+        );
+        let msg = rebuild_message(&rw.state);
+        assert_eq!(
+            orphan_announcement(&msg),
+            Some("i'll "),
+            "the cut turn must trigger: {msg}"
+        );
+    }
+
+    #[test]
+    fn orphan_trigger_ignores_tool_calls_long_answers_and_done_notes() {
+        let tool_turn = json!({
+            "content": [
+                {"type": "text", "text": "I'll investigate that now."},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
+            ],
+            "stop_reason": "end_turn",
+        });
+        assert_eq!(
+            orphan_announcement(&tool_turn),
+            None,
+            "a turn that DID emit a tool call is not an orphan"
+        );
+
+        let mut long = String::from("Let me explain what I found. ");
+        while long.len() <= ORPHAN_MAX_CHARS {
+            long.push_str("The fix touches three files and the tests pass. ");
+        }
+        let long_answer = json!({
+            "content": [{"type": "text", "text": long}],
+            "stop_reason": "end_turn",
+        });
+        assert_eq!(
+            orphan_announcement(&long_answer),
+            None,
+            "a substantive answer containing an announcement phrase is not an orphan"
+        );
+
+        let done = json!({
+            "content": [{"type": "text", "text": "All done, the fix is in place."}],
+            "stop_reason": "end_turn",
+        });
+        assert_eq!(
+            orphan_announcement(&done),
+            None,
+            "a completion note with no announcement is not an orphan"
+        );
+
+        let cut_short = json!({
+            "content": [{"type": "text", "text": "I'll investigate that now."}],
+            "stop_reason": "max_tokens",
+        });
+        assert_eq!(
+            orphan_announcement(&cut_short),
+            None,
+            "a truncated turn is a different failure, not an orphan"
         );
     }
 

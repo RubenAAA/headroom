@@ -112,17 +112,26 @@ fn should_keep(tool: &Value, policy: &PrunePolicy) -> bool {
 }
 
 /// Prune `tools[]` in place per `policy`, preserving the relative order of
-/// survivors. Returns the number of tools removed.
+/// survivors. Returns the names of the tools removed, in array order.
 ///
 /// Deterministic and idempotent: re-running on already-pruned input removes
-/// nothing and yields byte-identical bytes.
-pub fn prune_tools(tools: &mut Vec<Value>, policy: &PrunePolicy) -> usize {
+/// nothing and yields byte-identical bytes. Names (not just a count) so the
+/// prune log line can say WHAT left the request: a turn that announces an
+/// action and then emits no tool call is only explicable if the log shows
+/// whether the tool it needed survived this function.
+pub fn prune_tools(tools: &mut Vec<Value>, policy: &PrunePolicy) -> Vec<String> {
     if policy.is_noop() {
-        return 0;
+        return Vec::new();
     }
-    let before = tools.len();
-    tools.retain(|tool| should_keep(tool, policy));
-    before - tools.len()
+    let mut removed = Vec::new();
+    tools.retain(|tool| {
+        let keep = should_keep(tool, policy);
+        if !keep {
+            removed.push(tool_name(tool).unwrap_or("?").to_string());
+        }
+        keep
+    });
+    removed
 }
 
 #[cfg(test)]
@@ -149,7 +158,7 @@ mod tests {
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(removed, 1);
+        assert_eq!(removed, vec!["WebSearch"]);
         assert_eq!(names(&tools), vec!["Read", "Bash"]);
     }
 
@@ -167,7 +176,7 @@ mod tests {
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(removed, 2);
+        assert_eq!(removed.len(), 2);
         assert_eq!(names(&tools), vec!["Read", "mcp__tmux__capture", "Bash"]);
     }
 
@@ -181,8 +190,8 @@ mod tests {
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(
-            removed, 0,
+        assert!(
+            removed.is_empty(),
             "marker-bearing tool must survive even off-allowlist"
         );
         assert_eq!(names(&tools), vec!["Read", "WebSearch"]);
@@ -199,7 +208,7 @@ mod tests {
         assert_eq!(names(&tools), vec!["Bash", "Read"]);
         let snapshot = tools.clone();
         let removed2 = prune_tools(&mut tools, &policy);
-        assert_eq!(removed2, 0);
+        assert!(removed2.is_empty());
         assert_eq!(tools, snapshot, "second pass must be byte-identical");
     }
 
@@ -209,7 +218,7 @@ mod tests {
         assert!(policy.is_noop());
         let mut tools = vec![t("Read"), t("mcp__chrome__x")];
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(removed, 0);
+        assert!(removed.is_empty());
         assert_eq!(names(&tools), vec!["Read", "mcp__chrome__x"]);
     }
 
@@ -229,7 +238,7 @@ mod tests {
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(removed, 2);
+        assert_eq!(removed.len(), 2);
         assert_eq!(names(&tools), vec!["Read", "Bash"]);
     }
 
@@ -248,7 +257,11 @@ mod tests {
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(removed, 1, "only the exact name goes; no prefix matching");
+        assert_eq!(
+            removed.len(),
+            1,
+            "only the exact name goes; no prefix matching"
+        );
         assert_eq!(names(&tools), vec!["ReadMcpResourceDirTool", "Read"]);
     }
 
@@ -270,7 +283,7 @@ mod tests {
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(removed, 2, "both drop lists apply");
+        assert_eq!(removed.len(), 2, "both drop lists apply");
         assert_eq!(names(&tools), vec!["Read", "mcp__tmux__capture", "Bash"]);
     }
 
@@ -289,10 +302,7 @@ mod tests {
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(
-            removed, 1,
-            "allowlist decides alone; Bash is the only casualty"
-        );
+        assert_eq!(removed, vec!["Bash"], "allowlist decides alone");
         assert_eq!(names(&tools), vec!["Read", "ListMcpResourcesTool"]);
     }
 
@@ -317,7 +327,7 @@ mod tests {
         assert_eq!(names(&tools), vec!["Task", "Bash", "Glob", "Read"]);
         // Determinism: a second pass over the same input is byte-identical.
         let snapshot = tools.clone();
-        assert_eq!(prune_tools(&mut tools, &policy), 0);
+        assert!(prune_tools(&mut tools, &policy).is_empty());
         assert_eq!(tools, snapshot);
     }
 
@@ -331,7 +341,7 @@ mod tests {
         let mut tools = vec![t("Read"), t("ListMcpResourcesTool")];
         let before = serde_json::to_vec(&tools).unwrap();
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(removed, 0);
+        assert!(removed.is_empty());
         assert_eq!(
             serde_json::to_vec(&tools).unwrap(),
             before,
@@ -352,7 +362,10 @@ mod tests {
             ..Default::default()
         };
         let removed = prune_tools(&mut tools, &policy);
-        assert_eq!(removed, 0, "customer breakpoint outranks the drop list");
+        assert!(
+            removed.is_empty(),
+            "customer breakpoint outranks the drop list"
+        );
         assert_eq!(names(&tools), vec!["Read", "ListMcpResourcesTool"]);
     }
 

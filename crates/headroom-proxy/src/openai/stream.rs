@@ -233,6 +233,10 @@ pub(crate) struct StreamTranslator {
     /// answer instead (the Chat `delta.content` path and the message-item
     /// recovery below emit text without touching the per-item flags).
     saw_text_ever: bool,
+    /// First ~240 chars of text emitted this turn, for the completion log.
+    /// A turn that announces an action and then emits no tool call is only
+    /// diagnosable if the log shows what it announced.
+    text_head: String,
     /// Same, for `response.refusal.delta` on the current item.
     saw_refusal_delta: bool,
     /// Whether any `function_call_arguments.delta` arrived for the tool call
@@ -376,6 +380,7 @@ impl StreamTranslator {
             saw_tool_use: false,
             saw_text_delta: false,
             saw_text_ever: false,
+            text_head: String::new(),
             saw_refusal_delta: false,
             saw_arg_delta: false,
             saw_thinking_text: false,
@@ -704,10 +709,12 @@ impl StreamTranslator {
             Some(OpenBlock::Thinking) => "thinking",
             None => return,
         };
-        let (request_id, egress_slot, model, provider, stream_age_s) = self.terminal_attribution();
+        let (request_id, egress_slot, model, provider, stream_age_s, session_id) =
+            self.terminal_attribution();
         tracing::warn!(
             event = "routed_done_with_open_block",
             request_id = %request_id,
+            session_id = session_id.as_deref().unwrap_or("none"),
             egress_slot,
             upstream_model = %model,
             routed_provider = %provider,
@@ -814,7 +821,7 @@ impl StreamTranslator {
             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                 self.open_block(OpenBlock::Text, &mut events);
                 events.push(self.emit_text_delta(text));
-                self.saw_text_ever = true;
+                self.record_text_emitted(text);
             }
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -962,7 +969,7 @@ impl StreamTranslator {
             self.open_block(OpenBlock::Text, events);
             events.push(self.emit_text_delta(delta));
             self.saw_text_delta = true;
-            self.saw_text_ever = true;
+            self.record_text_emitted(delta);
         }
     }
 
@@ -979,7 +986,7 @@ impl StreamTranslator {
             events.push(self.emit_text_delta(text));
             self.close_block(events);
             self.saw_text_delta = true;
-            self.saw_text_ever = true;
+            self.record_text_emitted(text);
         }
     }
 
@@ -993,7 +1000,7 @@ impl StreamTranslator {
             self.open_block(OpenBlock::Text, events);
             events.push(self.emit_text_delta(delta));
             self.saw_refusal_delta = true;
-            self.saw_text_ever = true;
+            self.record_text_emitted(delta);
         }
     }
 
@@ -1008,7 +1015,7 @@ impl StreamTranslator {
             events.push(self.emit_text_delta(refusal));
             self.close_block(events);
             self.saw_refusal_delta = true;
-            self.saw_text_ever = true;
+            self.record_text_emitted(refusal);
         }
     }
 
@@ -1139,7 +1146,7 @@ impl StreamTranslator {
                     );
                     self.open_block(OpenBlock::Text, events);
                     events.push(self.emit_text_delta(&text));
-                    self.saw_text_ever = true;
+                    self.record_text_emitted(&text);
                     self.close_block(events);
                 }
             }
@@ -1250,11 +1257,12 @@ impl StreamTranslator {
             "end_turn"
         };
         if !truncated && incomplete_reason.is_some() {
-            let (request_id, egress_slot, model, provider, stream_age_s) =
+            let (request_id, egress_slot, model, provider, stream_age_s, session_id) =
                 self.terminal_attribution();
             tracing::warn!(
                 event = "routed_response_completed_incomplete",
                 request_id = %request_id,
+                session_id = session_id.as_deref().unwrap_or("none"),
                 egress_slot,
                 upstream_model = %model,
                 routed_provider = %provider,
@@ -1275,18 +1283,32 @@ impl StreamTranslator {
         events.push(self.emit_message_stop());
     }
 
+    /// Record emitted text: sticky flag for the completion log plus the
+    /// first ~240 chars of the turn, so an announced-but-unrun action is
+    /// diagnosable from the log without a body capture.
+    fn record_text_emitted(&mut self, text: &str) {
+        self.saw_text_ever = true;
+        if self.text_head.len() < 240 {
+            let room = 240 - self.text_head.len();
+            self.text_head.extend(text.chars().take(room));
+        }
+    }
+
     /// One INFO line per clean completion. Extracted so `on_completed`
     /// stays under the complexity ratchet; see the call-site comment.
     fn log_completion(&self, stop_reason: &str) {
-        let (request_id, egress_slot, model, provider, stream_age_s) = self.terminal_attribution();
+        let (request_id, egress_slot, model, provider, stream_age_s, session_id) =
+            self.terminal_attribution();
         tracing::info!(
             event = "routed_response_completed",
             request_id = %request_id,
+            session_id = session_id.as_deref().unwrap_or("none"),
             egress_slot,
             upstream_model = %model,
             routed_provider = %provider,
             stream_age_s,
             output_tokens = self.total_output_tokens,
+            text_head = self.text_head.as_str(),
             saw_text = self.saw_text_ever,
             saw_tool_use = self.saw_tool_use,
             stop_reason,
@@ -1307,7 +1329,7 @@ impl StreamTranslator {
     /// Attribution shared by the non-clean terminal log lines, so the next
     /// "the turn just stopped" report joins to a lane, a stream age, and a
     /// token count instead of a bare request id.
-    fn terminal_attribution(&self) -> (String, Option<usize>, String, String, f64) {
+    fn terminal_attribution(&self) -> (String, Option<usize>, String, String, f64, Option<String>) {
         match self.outcome.as_ref() {
             Some(ctx) => (
                 ctx.request_id.clone(),
@@ -1315,6 +1337,7 @@ impl StreamTranslator {
                 ctx.model.clone(),
                 ctx.provider.clone(),
                 ctx.started_at.elapsed().as_secs_f64(),
+                ctx.session_id.clone(),
             ),
             None => (
                 self.request_id.clone().unwrap_or_else(|| "unknown".into()),
@@ -1322,6 +1345,7 @@ impl StreamTranslator {
                 "unknown".into(),
                 "unknown".into(),
                 -1.0,
+                None,
             ),
         }
     }
@@ -1365,10 +1389,12 @@ impl StreamTranslator {
             .and_then(|v| v.get("message"))
             .and_then(|v| v.as_str())
             .unwrap_or("upstream response failed");
-        let (request_id, egress_slot, model, provider, stream_age_s) = self.terminal_attribution();
+        let (request_id, egress_slot, model, provider, stream_age_s, session_id) =
+            self.terminal_attribution();
         tracing::warn!(
             event = "routed_response_failed",
             request_id = %request_id,
+            session_id = session_id.as_deref().unwrap_or("none"),
             egress_slot,
             upstream_model = %model,
             routed_provider = %provider,
@@ -1401,10 +1427,12 @@ impl StreamTranslator {
             Some("max_output_tokens") => "max_tokens",
             _ => "end_turn",
         };
-        let (request_id, egress_slot, model, provider, stream_age_s) = self.terminal_attribution();
+        let (request_id, egress_slot, model, provider, stream_age_s, session_id) =
+            self.terminal_attribution();
         tracing::warn!(
             event = "routed_response_incomplete",
             request_id = %request_id,
+            session_id = session_id.as_deref().unwrap_or("none"),
             egress_slot,
             upstream_model = %model,
             routed_provider = %provider,
