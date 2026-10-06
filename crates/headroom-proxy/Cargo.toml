@@ -192,7 +192,7 @@ url = "2"
 # headroom CLI: URL-encoding for query params.
 urlencoding = "2"
 uuid = { workspace = true }
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 zstd = "0.14"
 
