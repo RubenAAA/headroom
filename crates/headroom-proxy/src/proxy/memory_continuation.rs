@@ -30,8 +30,8 @@ use std::sync::Arc;
 
 use super::forward;
 use super::{
-    AppState, CcrRoundUsage, MEMORY_CONTINUATION_RETRIES, continuation_api_kind,
-    continuation_cut_retryable, continuation_turn_from_body, extend_or_push,
+    AppState, CcrRoundUsage, ContinuationClient, MEMORY_CONTINUATION_RETRIES,
+    continuation_api_kind, continuation_cut_retryable, continuation_turn_from_body, extend_or_push,
     header_map_to_lowercase_strings, memory_continuation_backoff, read_continuation_body,
     retail_continuation_breakpoint,
 };
@@ -193,7 +193,7 @@ async fn defer_mixed_memory_turn(
 /// same way), `Failed` covers timeouts and transport errors.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_memory_continuation(
-    client: &reqwest::Client,
+    client: &ContinuationClient,
     upstream_url: &url::Url,
     outgoing_headers: &http::HeaderMap,
     continuation_body: Vec<u8>,
@@ -208,12 +208,17 @@ pub(super) async fn send_memory_continuation(
     let zen_route = outgoing_headers.contains_key("x-opencode-request");
     loop {
         let sent = forward::send_memory_continuation_once(
-            client,
+            &client.http(),
             upstream_url,
             outgoing_headers,
             &continuation_body,
         )
         .await;
+        if let Ok(Ok(r)) = &sent
+            && client.moved_after(r.status(), request_id)
+        {
+            continue;
+        }
         match forward::classify_memory_send(
             sent,
             attempt,
@@ -941,7 +946,7 @@ pub(crate) async fn handle_memory_response(
     body_bytes: &bytes::Bytes,
     forwarded_request: &bytes::Bytes,
     upstream_url: &url::Url,
-    client: &reqwest::Client,
+    client: &ContinuationClient,
     memory: &MemoryToolContext,
     config: &Config,
     request_id: &str,

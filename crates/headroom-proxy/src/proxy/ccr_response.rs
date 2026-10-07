@@ -937,7 +937,7 @@ pub(super) struct CcrSendOutcome {
 /// with an unanswered `headroom_retrieve`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_ccr_continuation(
-    client: &reqwest::Client,
+    client: &ContinuationClient,
     upstream_url: &url::Url,
     outgoing_headers: &http::HeaderMap,
     continuation_body: Vec<u8>,
@@ -983,7 +983,7 @@ pub(super) async fn send_ccr_continuation(
         let continuation_headers =
             fresh_ccr_send_headers(outgoing_headers, attempt, round, request_id);
         let outcome = await_ccr_headers(
-            client,
+            &client.http(),
             upstream_url,
             &continuation_headers,
             continuation_body.clone(),
@@ -992,6 +992,11 @@ pub(super) async fn send_ccr_continuation(
             request_id,
         )
         .await;
+        if let Ok(r) = &outcome
+            && client.moved_after(r.status(), request_id)
+        {
+            continue;
+        }
         let retryable = match &outcome {
             Err(_) => true,
             Ok(r) => {

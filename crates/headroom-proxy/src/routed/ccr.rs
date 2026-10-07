@@ -202,7 +202,7 @@ pub(crate) struct RoutedCcr {
     /// it the call streamed on to the client, which has never heard of
     /// `memory_search` and answered `No such tool available: memory_search`.
     pub memory: Option<crate::proxy::MemoryToolContext>,
-    pub client: reqwest::Client,
+    pub client: crate::proxy::ContinuationClient,
     pub upstream_url: String,
     pub headers: HeaderMap,
     /// The request as translated and sent upstream, in the upstream's shape.
@@ -260,6 +260,7 @@ impl RoutedCcr {
         request_id: &str,
         responses_shape: bool,
         redact_session_key: &str,
+        zen_lane_key: Option<&str>,
     ) -> Option<RoutedCcr> {
         let routed_memory = crate::proxy::memory_tool_context(
             state,
@@ -275,7 +276,7 @@ impl RoutedCcr {
             store,
             stores: ccr_stores,
             memory: routed_memory,
-            client: state.client.clone(),
+            client: continuation_client(state, zen_lane_key),
             upstream_url,
             headers: upstream_headers,
             request_body,
@@ -298,6 +299,25 @@ impl RoutedCcr {
                     session_key: redact_session_key.to_string(),
                 }),
         })
+    }
+}
+
+/// The client a turn's continuations go out on: a Zen turn's own pool lane,
+/// else the default client. On the default client every Spark session's
+/// memory and retrieve continuations shared the machine's one IP: on
+/// 2026-10-07, 14 of 15 memory continuations came back 429
+/// FreeUsageLimitError while the turns themselves, spread across lanes, were
+/// answered.
+fn continuation_client(
+    state: &crate::proxy::AppState,
+    zen_lane_key: Option<&str>,
+) -> crate::proxy::ContinuationClient {
+    let lane = zen_lane_key.and_then(|lane| state.zen_client_for_lane(Some(lane)).ok());
+    match (lane, state.zen_egresses.as_ref()) {
+        (Some((client, slot, ..)), Some(pool)) => {
+            crate::proxy::ContinuationClient::zen_lane(pool.clone(), slot, client.clone())
+        }
+        _ => state.client.clone().into(),
     }
 }
 
@@ -392,7 +412,7 @@ mod resolver_alternation_tests {
             stores: None,
             store: Arc::new(store),
             memory: Some(memory_ctx()),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::new().into(),
             upstream_url: format!("{}/v1/chat/completions", server.uri()),
             headers: HeaderMap::new(),
             request_body: Bytes::from(
@@ -430,6 +450,73 @@ mod resolver_alternation_tests {
         );
     }
 
+    /// A memory continuation whose lane answers 429 moves to another lane
+    /// instead of retrying the limited one and stranding the call. Each lane
+    /// is a proxy; the upstream host does not resolve, so only a send
+    /// through a lane gets an answer.
+    #[tokio::test]
+    async fn a_rate_limited_memory_continuation_moves_to_another_lane() {
+        let limited = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .expect(1)
+            .mount(&limited)
+            .await;
+        let open = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 6},
+            })))
+            .expect(1)
+            .mount(&open)
+            .await;
+        let via = |proxy: &MockServer| {
+            reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(proxy.uri()).unwrap())
+                .build()
+                .unwrap()
+        };
+        let first = via(&limited);
+        let pool = Arc::new(crate::proxy::ProviderEgressPool::new(
+            vec![first.clone(), via(&open)],
+            vec!["proxy-a".to_string(), "proxy-b".to_string()],
+        ));
+        let ccr = RoutedCcr {
+            client_toolless: false,
+            stores: None,
+            store: Arc::new(InMemoryCcrStore::new()),
+            memory: Some(memory_ctx()),
+            client: crate::proxy::ContinuationClient::zen_lane(pool, 0, first),
+            upstream_url: "http://muse-zen.invalid/v1/chat/completions".to_string(),
+            headers: HeaderMap::new(),
+            request_body: Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "gpt-x",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .unwrap(),
+            ),
+            config: Arc::new(crate::config::Config::for_test(
+                "http://muse-zen.invalid".parse().unwrap(),
+            )),
+            request_id: "req-lane".to_string(),
+            responses_shape: false,
+            redact: None,
+        };
+
+        let opening = turn_calling("memory_save", "{\"content\":\"a fact\"}");
+        let (resolved, _) = resolve_routed_proxy_tools(&opening, &ccr).await;
+
+        assert_eq!(
+            resolved["choices"][0]["message"]["content"], "done",
+            "the continuation was not moved off the limited lane: {resolved}"
+        );
+    }
+
     /// A turn with nothing for either resolver must not cost an upstream call,
     /// or the loop would tax every ordinary turn for a case that is rare.
     #[tokio::test]
@@ -440,7 +527,7 @@ mod resolver_alternation_tests {
             stores: None,
             store: Arc::new(InMemoryCcrStore::new()),
             memory: Some(memory_ctx()),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::new().into(),
             upstream_url: format!("{}/v1/chat/completions", server.uri()),
             headers: HeaderMap::new(),
             request_body: Bytes::from(b"{}".to_vec()),
@@ -509,7 +596,7 @@ mod resolver_alternation_tests {
             stores: None,
             store: Arc::new(InMemoryCcrStore::new()),
             memory: Some(memory_ctx()),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::new().into(),
             upstream_url: format!("{}/v1/responses", server.uri()),
             headers: HeaderMap::new(),
             request_body: Bytes::from(
@@ -609,7 +696,7 @@ mod resolver_alternation_tests {
             stores: None,
             store: Arc::new(store),
             memory: Some(memory_ctx()),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::new().into(),
             upstream_url: format!("{}/v1/responses", server.uri()),
             headers: HeaderMap::new(),
             request_body: Bytes::from(
@@ -695,7 +782,7 @@ mod resolver_alternation_tests {
             stores: None,
             store: Arc::new(InMemoryCcrStore::new()),
             memory: Some(memory_ctx()),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::new().into(),
             upstream_url: format!("{}/v1/responses", server.uri()),
             headers: HeaderMap::new(),
             request_body: Bytes::from(
@@ -811,7 +898,7 @@ mod resolver_alternation_tests {
             stores: None,
             store: Arc::new(InMemoryCcrStore::new()),
             memory: Some(memory),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::new().into(),
             upstream_url: format!("{}/v1/chat/completions", server.uri()),
             headers: HeaderMap::new(),
             request_body: Bytes::from(
@@ -849,6 +936,53 @@ mod resolver_alternation_tests {
         assert!(
             sent.contains("__HR_SECRET_"),
             "the continuation carries the placeholder: {sent}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod continuation_client_tests {
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A Zen turn's continuation leaves through the turn's pool lane. The
+    /// host does not resolve, so only a client routed through the lane's
+    /// proxy gets an answer.
+    #[tokio::test]
+    async fn a_zen_continuation_goes_out_on_the_turns_lane() {
+        let lane_proxy = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("via-lane"))
+            .mount(&lane_proxy)
+            .await;
+        let mut state = crate::test_support::test_state(|_| {});
+        state.zen_egresses = Some(Arc::new(crate::proxy::ProviderEgressPool::new(
+            vec![
+                reqwest::Client::builder()
+                    .proxy(reqwest::Proxy::all(lane_proxy.uri()).unwrap())
+                    .build()
+                    .unwrap(),
+            ],
+            vec!["proxy-a".to_string()],
+        )));
+        let send = |client: reqwest::Client| async move {
+            client
+                .post("http://muse-zen.invalid/v1/chat/completions")
+                .body("{}")
+                .send()
+                .await
+        };
+
+        let via_lane = send(continuation_client(&state, Some("lane-1")).http())
+            .await
+            .expect("the lane's proxy answers");
+        assert_eq!(via_lane.text().await.unwrap(), "via-lane");
+        assert!(
+            send(continuation_client(&state, None).http())
+                .await
+                .is_err(),
+            "a non-Zen turn keeps the default client"
         );
     }
 }

@@ -462,6 +462,7 @@ pub async fn handle_messages(
         &request_id,
         is_responses,
         &prepared.redact_session_key,
+        is_zen.then_some(egress_lane_key.as_str()),
     )
     .await;
 

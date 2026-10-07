@@ -199,7 +199,7 @@ pub(super) async fn maybe_rewrite_anthropic_stream(
             ),
         };
         let ctx = crate::sse::ccr_stream::CcrStreamContext {
-            client: upstream_client.clone(),
+            client: upstream_client.clone().into(),
             upstream_url: upstream_url.clone(),
             outgoing_headers: outgoing_headers.clone(),
             forwarded_request: continuation_base.clone(),

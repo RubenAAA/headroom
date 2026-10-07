@@ -314,6 +314,97 @@ pub(crate) fn attach_egress_guard(
     reqwest::Response::from(rebuilt)
 }
 
+/// The transport a proxy-tool continuation (`headroom_retrieve`, `memory_*`,
+/// shadow tools) sends on. A routed Zen turn's carries its pool lane, so a
+/// 429 marks that lane limited and moves the next send to another lane, as
+/// the turn's own send does. Retrying the limited lane after 250 and 500 ms
+/// could not work: a limited lane answers 429 again within 10 s about half
+/// the time (see [`LANE_LIMITED_MS`]). Anything else is a plain client.
+pub(crate) struct ContinuationClient {
+    pool: Option<Arc<ProviderEgressPool>>,
+    lane: Mutex<ContinuationLane>,
+}
+
+struct ContinuationLane {
+    client: reqwest::Client,
+    slot: usize,
+    tried: Vec<usize>,
+}
+
+impl From<reqwest::Client> for ContinuationClient {
+    fn from(client: reqwest::Client) -> Self {
+        Self {
+            pool: None,
+            lane: Mutex::new(ContinuationLane {
+                client,
+                slot: 0,
+                tried: Vec::new(),
+            }),
+        }
+    }
+}
+
+impl ContinuationClient {
+    /// Continuations of a Zen turn whose lane is `slot`, sent with `client`.
+    pub(crate) fn zen_lane(
+        pool: Arc<ProviderEgressPool>,
+        slot: usize,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            pool: Some(pool),
+            lane: Mutex::new(ContinuationLane {
+                client,
+                slot,
+                tried: vec![slot],
+            }),
+        }
+    }
+
+    /// The client for the next send.
+    pub(crate) fn http(&self) -> reqwest::Client {
+        self.lane
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .client
+            .clone()
+    }
+
+    /// Record the status a send got. `true` when it was a Zen 429 and the
+    /// next send moved to a lane this turn has not tried: resend at once,
+    /// without spending a retry. Moves stop when every lane has been tried.
+    pub(crate) fn moved_after(&self, status: http::StatusCode, request_id: &str) -> bool {
+        let Some(pool) = self.pool.as_ref() else {
+            return false;
+        };
+        let mut lane = self.lane.lock().unwrap_or_else(|e| e.into_inner());
+        if status.is_success() {
+            pool.mark_answered(lane.slot);
+            return false;
+        }
+        if status != http::StatusCode::TOO_MANY_REQUESTS {
+            return false;
+        }
+        pool.mark_limited(lane.slot);
+        // The guard is not kept: continuations never held one.
+        let Some((slot, _guard)) = pool.failover(lane.slot, &lane.tried) else {
+            return false;
+        };
+        tracing::warn!(
+            event = "zen_continuation_lane_moved",
+            request_id = %request_id,
+            from_slot = lane.slot,
+            to_slot = slot,
+            to_egress_id = pool.egress_ids[slot].as_str(),
+            "continuation got 429; moving it to another Zen lane"
+        );
+        lane.tried.push(slot);
+        lane.slot = slot;
+        lane.client = pool.clients[slot].clone();
+        true
+    }
+}
+
 pub(super) fn provider_egress_id(proxy_url: Option<&str>) -> String {
     let Some(proxy_url) = proxy_url else {
         return "direct".to_string();

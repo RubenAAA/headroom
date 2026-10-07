@@ -238,7 +238,7 @@ tokio::task_local! {
 
 /// Everything the rewriter needs to run a continuation round.
 pub(crate) struct CcrStreamContext {
-    pub client: reqwest::Client,
+    pub client: crate::proxy::ContinuationClient,
     pub upstream_url: url::Url,
     pub outgoing_headers: http::HeaderMap,
     /// The request as forwarded upstream, in that upstream's own shape.
@@ -1874,6 +1874,7 @@ async fn orphan_nudge_round(
 ) -> Option<Value> {
     let resp = ctx
         .client
+        .http()
         .post(ctx.upstream_url.clone())
         .headers(ctx.outgoing_headers.clone())
         .body(seed_bytes)

@@ -40,6 +40,7 @@ pub(crate) async fn resolve_ccr_memory_rounds(
     } = memory;
     let mut ccr_round_usage = CcrRoundUsage::default();
     let answered = body_bytes.clone();
+    let continuation_client = ContinuationClient::from(upstream_client.clone());
     for _ in 0..MAX_RESOLVER_ALTERNATIONS {
         let before = body_bytes.clone();
 
@@ -70,7 +71,7 @@ pub(crate) async fn resolve_ccr_memory_rounds(
                     &body_bytes,
                     continuation_base,
                     upstream_url,
-                    upstream_client,
+                    &continuation_client,
                     ccr_store.as_ref(),
                     Some(&ccr_stores),
                     &state.config,
@@ -92,7 +93,7 @@ pub(crate) async fn resolve_ccr_memory_rounds(
                 &body_bytes,
                 continuation_base,
                 upstream_url,
-                upstream_client,
+                &continuation_client,
                 memory,
                 &state.config,
                 request_id,

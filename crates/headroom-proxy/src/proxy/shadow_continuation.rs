@@ -20,6 +20,8 @@
 
 use std::sync::Arc;
 
+use super::ContinuationClient;
+
 use super::memory_continuation::{
     MemoryRoundRead, append_round_messages, continuation_is_doomed, note_continuation_send,
     read_memory_round_body, send_memory_continuation,
@@ -55,7 +57,7 @@ pub(crate) async fn handle_shadow_response(
     body_bytes: &bytes::Bytes,
     forwarded_request: &bytes::Bytes,
     upstream_url: &url::Url,
-    client: &reqwest::Client,
+    client: &ContinuationClient,
     config: &Arc<Config>,
     request_id: &str,
     outgoing_headers: &http::HeaderMap,

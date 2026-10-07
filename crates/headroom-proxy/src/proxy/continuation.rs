@@ -533,7 +533,7 @@ pub(crate) async fn handle_ccr_response(
     body_bytes: &bytes::Bytes,
     forwarded_request: &bytes::Bytes,
     upstream_url: &url::Url,
-    client: &reqwest::Client,
+    client: &ContinuationClient,
     ccr_store: &dyn headroom_core::ccr::CcrStore,
     stores: Option<&std::sync::Arc<crate::ctx::projects::ProjectStores>>,
     config: &Config,
