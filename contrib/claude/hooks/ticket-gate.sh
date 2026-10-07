@@ -62,6 +62,19 @@ ticket_alive() {
   tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "ticket-gate"
 }
 
+# When this session first asked for a ticket. The worker takes any ticket
+# the token owner filed in the project since then as this session's, so a
+# retry adopts it instead of filing again. A session that has ticket state
+# but no stamp (it ran before the stamp existed) is backdated to its oldest
+# state file: stamping at the retry would hide what an earlier run filed.
+stamp_first_attempt() {
+  local f="$OUTDIR/$SESSION_ID.ticket.first-attempt" oldest
+  [ -e "$f" ] && return 0
+  oldest=$(stat -c %Y "$OUTDIR/$SESSION_ID".ticket.* 2>/dev/null | sort -n | head -1)
+  if [ -n "$oldest" ] && touch -d "@$oldest" "$f" 2>/dev/null; then return 0; fi
+  touch "$f"
+}
+
 backend_config_error() {
   python3 "$TICKET_WORKER" --check-backend
 }
@@ -168,6 +181,7 @@ spawn_ticket_worker() {
     echo "ticket filing is not configured: set YOUTRACK_PROJECT_ID (or YOUTRACK_PROJECT_MAP=\"prefix=id,...\" for cwd-based routing) in ~/.config/offload-workers/env (legacy spark-poster/env also works)" >"$OUTDIR/$SESSION_ID.ticket.failed"
     return 1
   fi
+  stamp_first_attempt
   touch "$OUTDIR/$SESSION_ID.ticket.diverted"
   # The cwd routing above runs inside spawn too (UserPromptSubmit and
   # PreToolUse both pass .cwd), so persist the resolved project next to the
@@ -180,8 +194,10 @@ spawn_ticket_worker() {
 
   (
     SESSLOG="$OUTDIR/$SESSION_ID.ticket.worker.log"
+    # Appended, not overwritten: a retry must not erase why the last run
+    # failed, or whether it filed anything.
     {
-      echo "=== ticket worker start: session $SESSION_ID ==="
+      echo "=== ticket worker start: session $SESSION_ID at $(date -Is) ==="
       # 10-minute supervisor; ticket_file caps each model/CLI call at 9 minutes.
       if OFFLOADED_TICKET_WORKER=1 timeout 600 \
           python3 "$TICKET_WORKER" "$SESSION_ID" "$TRANSCRIPT" "$OUTDIR"; then
@@ -206,8 +222,8 @@ spawn_ticket_worker() {
         } >"$OUTDIR/$SESSION_ID.ticket.failed"
         touch "$OUTDIR/$SESSION_ID.ticket.done"
       fi
-    } >"$SESSLOG" 2>&1
-    echo "session $SESSION_ID: ticket worker finished (see $SESSION_ID.ticket.worker.log)" >>"$OUTDIR/ticket-workers.log" 2>&1
+    } >>"$SESSLOG" 2>&1
+    echo "session $SESSION_ID: ticket worker finished at $(date -Is), $( [ -f "$OUTDIR/$SESSION_ID.ticket.proof.json" ] && echo filed || echo failed) (see $SESSION_ID.ticket.worker.log)" >>"$OUTDIR/ticket-workers.log" 2>&1
     rm -f "$OUTDIR/$SESSION_ID.ticket.started"
   ) >>"$OUTDIR/ticket-workers.log" 2>&1 &
   echo $! >"$OUTDIR/$SESSION_ID.ticket.started"
@@ -247,8 +263,12 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
     touch "$OUTDIR/$SESSION_ID.ticket.reported"
   fi
 
-  PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null |
-           tr '[:upper:]' '[:lower:]')
+  # Blocks the harness injects into the prompt are not the user speaking. A
+  # cross-session message that quoted "file the ticket" once started a retry
+  # in the session it was sent to.
+  PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty
+      | gsub("<(?<t>cross-session-message|task-notification)[^>]*>[\\s\\S]*?(</\\k<t>>|\\z)"; "")' \
+      2>/dev/null | tr '[:upper:]' '[:lower:]')
 
   # Said outright: "file the ticket", "file the ticket in youtrack",
   # "file the youtrack ticket", "create a youtrack issue".
@@ -276,7 +296,17 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   echo "$PROMPT" | grep -qE "^(no|nope|not? |don'?t|do not|stop|wait|hold|not yet|нет|не |не надо|погоди|стоп)" &&
     INTENT=""
 
+  # A failed run nobody has been told about rides on the next prompt too.
+  # Without it the session learned of a failure only by asking again, and a
+  # later filing-shaped command started a retry that deleted the reason.
+  if [ -z "$INTENT" ] && [ "$(ticket_state)" = "failed" ] &&
+      [ ! -f "$OUTDIR/$SESSION_ID.ticket.reported" ]; then
+    echo "TICKET WORKER FAILED: $(head -3 "$OUTDIR/$SESSION_ID.ticket.failed" | tr '\n' ' ')-- full reason in $OUTDIR/$SESSION_ID.ticket.failed. Saying 'file the ticket' retries; the retry checks YouTrack for a ticket an earlier attempt filed before it files one."
+    touch "$OUTDIR/$SESSION_ID.ticket.reported"
+  fi
+
   if [ -n "$INTENT" ]; then
+    stamp_first_attempt
     touch "$OUTDIR/$SESSION_ID.ticket.armed"
     ST=$(ticket_state)
     # Diverted but no live worker is a crash, not a running worker. Saying
@@ -372,8 +402,21 @@ if [ "$TOOL" = "Bash" ]; then
   # The flags count only inside curl's own pipeline segment: `tr -d`,
   # `cut -d` and `date -d` share the letter, not the meaning. Continuation
   # lines are joined first so a curl split over `\` lines stays one segment.
-  CURL_LINE=$(printf '%s\n' "$LOW" | sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta')
-  echo "$CURL_LINE" | grep -qE 'curl[^|;&]*[[:space:]](-x (post|put|patch)|--data|-d[[:space:]@"'"'"'])' && WRITES=1
+  # -G/--get (or -X GET) turns the data flags into query parameters on a GET:
+  # `curl -G .../api/issues --data-urlencode "query=..."` is a search, and
+  # treating it as a filing once spawned a second worker that filed a ticket.
+  # Case matters there (-g is --globoff), so each curl segment is checked in
+  # its original case.
+  CURL_LINE=$(printf '%s\n' "$CMD" | sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta')
+  while IFS= read -r SEG; do
+    SEG_LOW=$(printf '%s' "$SEG" | tr '[:upper:]' '[:lower:]')
+    echo "$SEG_LOW" | grep -qE '[[:space:]](-x (post|put|patch)|--data|-d[[:space:]@"'"'"'])' || continue
+    if echo "$SEG" | grep -qE '[[:space:]](-G|--get|-X GET)([[:space:]]|$)' &&
+        ! echo "$SEG_LOW" | grep -qE '[[:space:]]-x (post|put|patch)'; then
+      continue
+    fi
+    WRITES=1
+  done < <(printf '%s\n' "$CURL_LINE" | grep -oE 'curl[^|;&]*')
   echo "$LOW" | grep -qE 'requests\.post' && WRITES=1
   echo "$LOW" | grep -qE 'ai-youtrack(\.py)? +(create|publish)' && WRITES=1
 
@@ -387,8 +430,11 @@ if [ "$TOOL" = "Bash" ]; then
     # A worker that cannot run must not brick the manual call: the spawn
     # refuses (reason in .ticket.failed) when token/URL/project are missing,
     # and then the call goes through instead of exit 2.
+    PREV=""
+    [ "$(ticket_state)" = "failed" ] &&
+      PREV=" Previous attempt failed: $(head -3 "$OUTDIR/$SESSION_ID.ticket.failed" | tr '\n' ' ')"
     if spawn_ticket_worker >/dev/null 2>&1; then
-      echo "TICKET WRITE DIVERTED: the ticket worker files by itself from the session turns, then pings with the ticket id. This blocks the entire Bash command; nothing in that command ran, including local file writes. Do not compose or send the API call yourself." >&2
+      echo "TICKET WRITE DIVERTED: the ticket worker files by itself from the session turns, then pings with the ticket id. This blocks the entire Bash command; nothing in that command ran, including local file writes. Do not compose or send the API call yourself.$PREV" >&2
       exit 2
     else
       echo "TICKET WORKER NOT STARTED: $(head -3 "$OUTDIR/$SESSION_ID.ticket.failed" 2>/dev/null). Proceeding with your own API call."

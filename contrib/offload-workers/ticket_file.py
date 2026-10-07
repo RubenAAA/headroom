@@ -37,6 +37,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 import model_call as model
 
@@ -111,7 +112,10 @@ split("\n") | map(select(length > 0) | fromjson?)
       text: (.message.content
              | if type == "string" then .
                elif type == "array"
-               then (map(select(.type == "text") | .text // "") | join("\n"))
+               then (map(if .type == "text" then .text // ""
+                         elif .type == "tool_use" and (.name == "Write" or .name == "Edit")
+                         then "[\(.name) \(.input.file_path // "?")]"
+                         else empty end) | join("\n"))
                else "" end)})
 | map(select(.text != ""))
 | (reduce .[] as $m ([];
@@ -196,6 +200,9 @@ unless the turns explicitly say to leave it as a draft.
    expected behavior, affected files, acceptance criteria -- only the
    parts the turns actually support). If the turns hold no filable
    content, print NOTHING_TO_FILE and stop without calling anything.
+   A line like "[Write /path]" or "[Edit /path]" means the session wrote
+   that file. When the ticket text lives in such a file, read its current
+   version; it beats any older wording quoted in the turns.
 2. Type: default "TYPE_DEFAULT". Use "TYPE_BUG" when the turns describe a
    production defect, "TYPE_SUBTASK" only when the turns name a parent
    issue, "TYPE_EPIC" only for a container of tasks. NEVER use archived
@@ -285,12 +292,46 @@ def parse_model_json(output):
     return None
 
 
-def _clean_cli_error(text):
+def _redact(text):
     token = os.environ.get("YOUTRACK_TOKEN", "")
     text = (text or "").strip()
     if token:
         text = text.replace(token, "[redacted]")
-    return text[-500:]
+    return text
+
+
+def _clean_cli_error(text):
+    return _redact(text)[-500:]
+
+
+def filed_since(bin_path, project, since_ms):
+    """Published issues the token owner created in PROJECT since SINCE_MS.
+
+    YouTrack, not the agent's reply, says whether a run filed anything. A
+    reply that lost its TICKET line once recorded a filed epic as a failure,
+    and the retry that followed could have filed it twice. Returns None
+    when YouTrack cannot be asked.
+    """
+    def cli(*args):
+        proc = subprocess.run([bin_path, *args], capture_output=True, text=True,
+                              timeout=120, env=os.environ.copy())
+        return json.loads(proc.stdout) if proc.returncode == 0 else None
+    try:
+        projects = cli("list-projects")
+        short = next((p.get("shortName") for p in projects or []
+                      if isinstance(p, dict) and p.get("id") == project), None)
+        if not short:
+            return None
+        # A day early: the query's dates are in the account's timezone.
+        day = time.strftime("%Y-%m-%d", time.localtime(since_ms / 1000 - 86400))
+        issues = cli("search", "--project=" + short,
+                     "--query=reporter: me created: %s .. Today" % day)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    if not isinstance(issues, list):
+        return None
+    return [i for i in issues if isinstance(i, dict) and i.get("idReadable")
+            and isinstance(i.get("created"), int) and i["created"] >= since_ms]
 
 
 def file_ticket_locally(plan, outdir, bin_path, project):
@@ -396,6 +437,49 @@ def main():
         cfg_url, cfg_project, cfg_bin = youtrack_url(), project_id(outdir, session), ai_youtrack()
     except RuntimeError as e:
         return fail(outdir, session, str(e))
+
+    # One ticket per session: anything the token owner filed in the project
+    # since the first attempt is this session's ticket. Every run checks
+    # first, so a run that filed and then failed (lost id, timeout) is not
+    # filed again. ticket-gate.sh stamps the first attempt when the session
+    # asks; the fallback here covers a run started by hand.
+    attempt_path = os.path.join(outdir, session + ".ticket.first-attempt")
+    if not os.path.exists(attempt_path):
+        open(attempt_path, "a").close()
+    since_ms = int(os.path.getmtime(attempt_path) * 1000) - 120000  # clock skew
+
+    def record(ticket_id, note):
+        # Filing means published: only a readable MC-XXXX id counts. A bare
+        # draft id means the publish step never ran -- fail loud, do not
+        # report a draft as filed.
+        if not re.match(r"^[A-Z]+-[0-9]+$", ticket_id):
+            return fail(outdir, session,
+                        "draft created but not published; worker said: %s"
+                        % _clean_cli_error(ticket_id))
+        url = cfg_url + "/issue/" + ticket_id
+        draft = {"session_id": session, "idReadable": ticket_id, "url": url}
+        with open(draft_path, "w") as f:
+            json.dump(draft, f, indent=2)
+        proof = dict(draft, summary=note)
+        with open(proof_path, "w") as f:
+            json.dump(proof, f, indent=2)
+        log("filed %s; proof at %s" % (ticket_id, proof_path))
+        print("proof: " + proof_path)
+        return 0
+
+    def adopt(found, why):
+        if len(found) > 1:
+            return fail(outdir, session,
+                        "%s; several tickets filed since the first attempt, check for "
+                        "duplicates: %s" % (why, ", ".join(i["idReadable"] for i in found)))
+        return record(found[0]["idReadable"],
+                      "%s; found in YouTrack: %s" % (why, found[0].get("summary") or ""))
+
+    log("checking YouTrack for a ticket an earlier attempt filed")
+    found = filed_since(cfg_bin, cfg_project, since_ms)
+    if found:
+        return adopt(found, "filed by an earlier attempt, not filed again")
+
     log("extracting last %d turns" % TURNS)
     try:
         turns = extract_turns(transcript)
@@ -449,29 +533,20 @@ def main():
             if line.startswith("TICKET ") and " " in line:
                 ticket_id = line.split(None, 1)[1].strip()
                 break
-        if (not ticket_id
-                or ticket_id in ("NOTHING_TO_FILE", "TOKEN_MISSING", "TOKEN_INVALID")):
-            return fail(outdir, session,
-                        "no ticket filed; worker said: %s"
-                        % (ticket_id or _clean_cli_error(output)))
+        if ticket_id in ("NOTHING_TO_FILE", "TOKEN_MISSING", "TOKEN_INVALID"):
+            return fail(outdir, session, "no ticket filed; worker said: " + ticket_id)
+        if not ticket_id:
+            found = filed_since(cfg_bin, cfg_project, since_ms)
+            if found:
+                return adopt(found, "the worker reply named no ticket")
+            # The whole reply, head included: its first line is where an
+            # agent summarises what it did.
+            what = ("no ticket filed (YouTrack shows none)" if found is not None else
+                    "no ticket id in the reply, and the YouTrack lookup failed: "
+                    "check YouTrack before retrying")
+            return fail(outdir, session, "%s; worker said: %s" % (what, _redact(output)))
 
-    # Filing means published: only a readable MC-XXXX id counts. A bare
-    # draft id means the publish step never ran -- fail loud, do not
-    # report a draft as filed.
-    if not re.match(r"^[A-Z]+-[0-9]+$", ticket_id):
-        return fail(outdir, session,
-                    "draft created but not published; worker said: %s"
-                    % _clean_cli_error(ticket_id))
-    url = cfg_url + "/issue/" + ticket_id
-    draft = {"session_id": session, "idReadable": ticket_id, "url": url}
-    with open(draft_path, "w") as f:
-        json.dump(draft, f, indent=2)
-    proof = dict(draft, summary="ticket filed and published from session turns")
-    with open(proof_path, "w") as f:
-        json.dump(proof, f, indent=2)
-    log("filed %s; proof at %s" % (ticket_id, proof_path))
-    print("proof: " + proof_path)
-    return 0
+    return record(ticket_id, "ticket filed and published from session turns")
 
 
 if __name__ == "__main__":

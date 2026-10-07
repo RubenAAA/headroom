@@ -124,6 +124,15 @@ supervisor timeout fired one thread short):
 - The ticket supervisor budget is 10 minutes. Each ticket model or CLI call
   is capped at 9 minutes, leaving time for the worker to save a failure; a
   timed-out Claude child call also records its stderr tail.
+- YouTrack, not the agent's reply, settles whether a ticket was filed. A
+  reply without its `TICKET <id>` line triggers a search for issues the token
+  owner created in the project since the session's first attempt
+  (`<session>.ticket.first-attempt`, stamped when the session first asks).
+  Every run searches before filing, so a run that filed and then failed is
+  not filed twice. Cross-session messages and task notifications in a prompt
+  never count as asking. Each run
+  appends to `<session>.ticket.worker.log`, and a failure reaches the session
+  on its next prompt.
 
 ## Modes
 

@@ -116,6 +116,18 @@ ticket_hook "T=\$(tr -d '\n' <tok); curl https://yt.example/api/issues -d @body.
 diverts || fail "a create after a tr -d segment was not treated as a write (rc=$RC out=$OUT)"
 ok "creates still divert across continuation lines and after other segments"
 
+# -G turns --data into query parameters on a GET. A search for the id of a
+# filed ticket was once diverted and started a second filing worker.
+ticket_hook "curl -s -G \"\$D/api/issues\" --data-urlencode \"query=created: Today\" -H \"Authorization: Bearer \$T\""
+[[ $RC -eq 0 && -z $OUT ]] || fail "a curl -G search was treated as a write (rc=$RC out=$OUT)"
+ticket_hook "curl -s -X GET https://yt.example/api/issues --data-urlencode 'query=x'"
+[[ $RC -eq 0 && -z $OUT ]] || fail "a curl -X GET search was treated as a write (rc=$RC out=$OUT)"
+ticket_hook "curl -g https://yt.example/api/issues -d @body.json"
+diverts || fail "curl -g (globoff, not --get) hid a create (rc=$RC out=$OUT)"
+ticket_hook "curl -G https://yt.example/api/issues --data-urlencode q=x; curl https://yt.example/api/issues -d @body.json"
+diverts || fail "a GET in one segment hid a create in the next (rc=$RC out=$OUT)"
+ok "curl -G and -X GET searches are reads; -g and later segments are not"
+
 # A prompt that asks for a filing is diverted; one that posts a report to an
 # existing ticket is not. YOUTRACK_TOKEN is unset, so a match prints
 # "TICKET DIVERT NOT STARTED" and a non-match prints nothing.
@@ -155,7 +167,7 @@ YOUTRACK_URL=https://yt.example
 YOUTRACK_PROJECT_MAP=/w/alpha=0-1,/w/alpha/inner=0-2,/w/beta/=0-3
 EOF
 routed() { # cwd -> project id the hook wrote for a "file the ticket" prompt, or empty
-  local sid="route$((PROMPTS += 1))"
+  local sid="route${1//\//_}"  # per cwd: routed runs in a subshell, so a counter would not advance
   jq -nc --arg c "$1" --arg t "$T/transcript.jsonl" --arg s "$sid" \
     '{hook_event_name:"UserPromptSubmit",session_id:$s,cwd:$c,
       transcript_path:$t,prompt:"file the ticket"}' |
@@ -188,6 +200,33 @@ ticket_prompt "file the ticket" a1
 ticket_hook "$FILING" a1
 [[ $OUT == *"TICKET WORKER NOT STARTED"* ]] || fail "an armed filing did not reach the worker (rc=$RC out=$OUT)"
 ok "after \"file the ticket\" a filing goes to the worker"
+
+# A finished, failed run is relayed on the next prompt, once. Before, the
+# session heard of it only by asking again.
+touch "$STATE/f1.ticket.diverted" "$STATE/f1.ticket.done"
+echo "no ticket filed (YouTrack shows none); worker said: hm" >"$STATE/f1.ticket.failed"
+ticket_prompt "what happened?" f1
+[[ $OUT == *"TICKET WORKER FAILED: no ticket filed"* ]] || fail "a failed run was not relayed (rc=$RC out=$OUT)"
+ticket_prompt "and now?" f1
+[[ -z $OUT ]] || fail "a failed run was relayed twice (out=$OUT)"
+ok "a failed run is relayed on the next prompt, once"
+
+# Text the harness injects is not the user asking. A cross-session message
+# that quoted the phrase once started a retry in the session it reached.
+ticket_prompt "$(printf '<cross-session-message from="x">\nif anyone says "file the ticket" there\n</cross-session-message>')" c1
+[[ -z $OUT && ! -e $STATE/c1.ticket.armed ]] || fail "a cross-session message armed the session (out=$OUT)"
+ticket_prompt "$(printf '<task-notification>done</task-notification>\nfile the ticket')" c2
+[[ $OUT == *"TICKET DIVERT"* ]] || fail "a filing prompt after a notification was not diverted (out=$OUT)"
+ok "injected cross-session text does not arm; the user's own words still do"
+
+# A session with ticket state from before the stamp existed is backdated to
+# that state, not stamped at the retry, so the lookup still sees what an
+# earlier run filed.
+touch -d @1000000 "$STATE/b1.ticket.done"
+ticket_prompt "file the ticket" b1
+[[ $(stat -c %Y "$STATE/b1.ticket.first-attempt") == 1000000 ]] ||
+  fail "first attempt stamped at $(stat -c %Y "$STATE/b1.ticket.first-attempt"), want 1000000"
+ok "the first attempt is backdated to the session's oldest ticket state"
 
 # ── review-gate ─────────────────────────────────────────────────────────────
 # Arming pins the MR from the last review command's own args, never from an
@@ -262,6 +301,49 @@ PY
 ok "the ticket id is read from the CLI's JSON"
 [[ $(tail -1 <<<"$GOT") == "('draft-1', None, False)" ]] || fail "an unpublished draft was not a success: $(tail -1 <<<"$GOT")"
 ok "a draft the turns asked to leave unpublished is a success, not a failure"
+
+# An agent reply without its TICKET line is not a failure when YouTrack shows
+# the ticket: the id comes from YouTrack, and a retry adopts it instead of
+# filing again. Files the session wrote reach the agent as paths.
+cat >"$T/ytsearch" <<CLI
+#!/bin/sh
+case "\$1" in
+  list-projects) echo '[{"id":"0-39","shortName":"MC"}]' ;;
+  search) echo "\$@" >>"$T/yt.search"
+    # Nothing filed before the first run; the agent's ticket after it.
+    if [ "\$(wc -l <"$T/yt.search")" -eq 1 ]; then echo '[]'; exit 0; fi
+    printf '[{"idReadable":"MC-1","created":1000},{"idReadable":"MC-3979","created":%s,"summary":"epic"}]' "\$(date +%s)000" ;;
+esac
+CLI
+chmod +x "$T/ytsearch"
+{ jq -nc '{message:{role:"user",content:"file the ticket"}}'
+  jq -nc '{message:{role:"assistant",content:[{type:"tool_use",name:"Write",input:{file_path:"/tmp/epic.md",content:"x"}},{type:"text",text:"draft ready"}]}}'
+} >"$T/w.jsonl"
+GOT=$(cd "$REPO_DIR/contrib/offload-workers" && PYTHONDONTWRITEBYTECODE=1 YOUTRACK_TOKEN=x \
+  YOUTRACK_URL=https://yt.example YOUTRACK_PROJECT_ID=0-39 AI_YOUTRACK_BIN="$T/ytsearch" \
+  python3 - "$T" 2>"$T/w.err" <<'PY'
+import json, os, sys
+import ticket_file as t
+out = sys.argv[1]
+t.backend_config_error = lambda: None
+t.model.TRANSPORT = "headroom"
+replies = ["ам и турнирам: filed the epic.\nVerified: links added."]
+def call(prompt, timeout, marker):
+    assert "[Write /tmp/epic.md]" in prompt, "Write path missing from the context"
+    return replies.pop(0), None
+t.model.call = call
+sys.argv = ["ticket_file.py", "s9", out + "/w.jsonl", out]
+proof = out + "/s9.ticket.proof.json"
+print(t.main(), json.load(open(proof))["idReadable"])
+os.remove(proof)
+print(t.main(), json.load(open(proof))["summary"])
+PY
+) || fail "worker run crashed: $(tail -5 "$T/w.err")"
+GOT=$(grep -v '^proof: ' <<<"$GOT")
+[[ $(head -1 <<<"$GOT") == "0 MC-3979" ]] || fail "a reply without TICKET was not resolved from YouTrack: $GOT"
+[[ $(tail -1 <<<"$GOT") == "0 filed by an earlier attempt"* ]] || fail "a retry did not adopt the earlier ticket: $GOT"
+grep -q -- "--project=MC" "$T/yt.search" || fail "the lookup did not search the session's project"
+ok "a reply without its TICKET line is resolved from YouTrack, and a retry does not file again"
 
 # ── gitlab_api.py ───────────────────────────────────────────────────────────
 # The token reaches curl in a private header file, not in argv, and no payload
