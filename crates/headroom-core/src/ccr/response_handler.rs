@@ -329,8 +329,8 @@ impl CCRResponseHandler {
                 let Some(blocks) = response.get_mut("content").and_then(Value::as_array_mut) else {
                     return 0;
                 };
-                let mut spliced = 0;
-                for block in blocks.iter_mut() {
+                let mut spliced_at = Vec::new();
+                for (i, block) in blocks.iter_mut().enumerate() {
                     if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                         continue;
                     }
@@ -342,9 +342,10 @@ impl CCRResponseHandler {
                         "type": "text",
                         "text": format!("<retrieved_context>\n{}\n</retrieved_context>", result.content),
                     });
-                    spliced += 1;
+                    spliced_at.push(i);
                 }
-                spliced
+                lead_spliced_text(blocks, &spliced_at);
+                spliced_at.len()
             }
             "openai" => {
                 let hits: Vec<(String, String)> = response
@@ -1048,6 +1049,39 @@ impl StreamingCcrHandler {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
+
+/// Move answers spliced in after a `tool_use` ahead of the first one.
+///
+/// The splice leaves each answer where its `headroom_retrieve` call was, so a
+/// turn that called a client tool first ends on text after a `tool_use`.
+/// When the turn also carries server tool blocks (tool search), Anthropic
+/// reads that trailing text as prefill and rejects any replay of the turn:
+/// "This model does not support assistant message prefill". Measured on
+/// claude-opus-5-5, 2026-10-07: `[server_tool_use, tool_search_tool_result,
+/// tool_use, text]` + a `tool_result` draws the 400; the same text placed
+/// before the `tool_use` passes, and so does the trailing text with no server
+/// blocks. It stranded memory continuations that shared a turn with a
+/// retrieval. Order among the moved answers is kept.
+fn lead_spliced_text(blocks: &mut Vec<Value>, spliced_at: &[usize]) {
+    let Some(first_use) = blocks
+        .iter()
+        .position(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+    else {
+        return;
+    };
+    let late: Vec<usize> = spliced_at
+        .iter()
+        .copied()
+        .filter(|&i| i > first_use)
+        .collect();
+    if late.is_empty() {
+        return;
+    }
+    let moved: Vec<Value> = late.iter().rev().map(|&i| blocks.remove(i)).collect();
+    for block in moved {
+        blocks.insert(first_use, block);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1900,6 +1934,45 @@ mod splice_tests {
             handler.residual_ccr_status(&response, "anthropic"),
             RESIDUAL_CCR_RESOLVED
         );
+    }
+
+    #[test]
+    fn an_answer_spliced_after_a_client_call_moves_ahead_of_it() {
+        // The 2026-10-07 shape: tool search, a real call, then the retrieval.
+        // Left in place the answer trails the tool_use, and with server
+        // blocks in the turn Anthropic rejects the replay as prefill.
+        let handler = CCRResponseHandler::new(None);
+        let mut response = json!({"content": [
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "tool_search_tool_regex",
+             "input": {"pattern": "memory"}},
+            {"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": {}},
+            {"type": "tool_use", "id": "toolu_2", "name": "memory_search", "input": {"query": "x"}},
+            retrieve_block("toolu_1"),
+            retrieve_block("toolu_3"),
+        ]});
+
+        let spliced = handler.splice_ccr_results_as_text(
+            &mut response,
+            &[result("toolu_1", "first"), result("toolu_3", "second")],
+            "anthropic",
+        );
+
+        assert_eq!(spliced, 2);
+        let blocks = response["content"].as_array().unwrap();
+        let kinds: Vec<&str> = blocks.iter().map(|b| b["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "server_tool_use",
+                "tool_search_tool_result",
+                "text",
+                "text",
+                "tool_use"
+            ]
+        );
+        assert!(blocks[2]["text"].as_str().unwrap().contains("first"));
+        assert!(blocks[3]["text"].as_str().unwrap().contains("second"));
+        assert_eq!(blocks[4]["id"], "toolu_2");
     }
 
     #[test]

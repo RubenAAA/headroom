@@ -7,6 +7,10 @@ retests), with status in the file.
 Measurement-led files (`recache-*`, `savings-*`, `proxy-*`) scope every
 number to its window; do not quote across windows.
 
+- [`trailing-text-after-tool-use-is-prefill.md`](trailing-text-after-tool-use-is-prefill.md):
+  with server tool blocks in a turn, text after a `tool_use` draws a
+  "prefill" 400 on replay; the CCR splice put answers there and stranded
+  memory continuations.
 - [`offload-loses-at-2000-bytes.md`](offload-loses-at-2000-bytes.md): at a
   2,000-byte floor, retrievals and re-reads cost more than offload saves;
   two thirds of retrievals repeat one from an earlier turn.
