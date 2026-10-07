@@ -228,6 +228,25 @@ ticket_prompt "file the ticket" b1
   fail "first attempt stamped at $(stat -c %Y "$STATE/b1.ticket.first-attempt"), want 1000000"
 ok "the first attempt is backdated to the session's oldest ticket state"
 
+# ── scrub-secrets ───────────────────────────────────────────────────────────
+# A secret-store read passes only when its output goes to a file. A `>` in
+# quoted text is not a redirect: it once let a sed or awk pipe print values.
+scrub() { # command -> $RC
+  RC=0
+  jq -nc --arg c "$1" '{tool_input:{command:$c}}' | bash "$HOOKS/scrub-secrets.sh" >/dev/null 2>&1 || RC=$?
+}
+SSM="aws ssm get-parameter --name p --with-decryption"
+for c in "$SSM | grep '^base_url='" "$SSM | sed -E 's/=.*/=<redacted>/'" \
+         "$SSM | awk '\$1>0'" "$SSM > /dev/stdout" "$SSM 2>&1"; do
+  scrub "$c"
+  [[ $RC -eq 2 ]] || fail "a secret-store read that prints was let through: $c"
+done
+for c in "$SSM > /tmp/p.json" "$SSM >/tmp/p.json 2>&1" "$SSM --query 'a>b' > \"/tmp/p q.json\""; do
+  scrub "$c"
+  [[ $RC -eq 0 ]] || fail "a secret-store read into a file was blocked: $c"
+done
+ok "secret-store reads pass only into a file; quoted > is not a redirect"
+
 # ── review-gate ─────────────────────────────────────────────────────────────
 # Arming pins the MR from the last review command's own args, never from an
 # unrelated !NNN elsewhere in the transcript, and never guesses between two.

@@ -11,6 +11,9 @@ number to its window; do not quote across windows.
   with server tool blocks in a turn, text after a `tool_use` draws a
   "prefill" 400 on replay; the CCR splice put answers there and stranded
   memory continuations.
+- [`small-search-compression-pays.md`](small-search-compression-pays.md):
+  compressing tool output pays at every size down to the 512-byte floor and
+  shows no re-run jump there; path-only `grep -l` lists are the soft spot.
 - [`offload-loses-at-2000-bytes.md`](offload-loses-at-2000-bytes.md): at a
   2,000-byte floor, retrievals and re-reads cost more than offload saves;
   two thirds of retrievals repeat one from an earlier turn.

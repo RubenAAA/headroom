@@ -54,7 +54,12 @@ for pattern in "${BLOCKED_PATTERNS[@]}"; do
 done
 
 # A redirect to a file is the escape hatch: `> out.json`, not `2>&1`.
-if ! echo "$COMMAND" | grep -qE '>[[:space:]]*[^|&>[:space:]]'; then
+# Quoted text is masked first: a `>` inside `sed 's/=.*/=<redacted>/'` or
+# `awk '$1>0'` once counted as a redirect and let the values print. A
+# redirect to the terminal is not a file.
+UNQUOTED=$(echo "$COMMAND" | sed -E "s/'[^']*'/Q/g; s/\"[^\"]*\"/Q/g")
+if ! echo "$UNQUOTED" | grep -qE '>[[:space:]]*[^|&>[:space:]]' ||
+    echo "$UNQUOTED" | grep -qE '>[[:space:]]*/dev/(stdout|stderr|tty|fd/)'; then
   for pattern in "${SECRET_STORE_PATTERNS[@]}"; do
     if echo "$COMMAND_LOWER" | grep -qiE "$pattern"; then
       echo "BLOCKED: this reads a secret store and would print the values into the transcript." >&2
