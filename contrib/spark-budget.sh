@@ -15,10 +15,11 @@
 # running, including the current session if it is a Spark and the new ones
 # about to start. The proxy cannot count idle-but-alive sessions from the
 # outside, so no hook enforces this — the spawner checks before each fan-out.
-# When the relay is unreachable, budget for eight.
+# When the relay is unreachable, every Spark request leaves from this
+# machine's one address, so budget for one.
 set -euo pipefail
 
-FALLBACK_LANES=8
+FALLBACK_LANES=1
 
 lanes() {
   local n

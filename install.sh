@@ -293,6 +293,31 @@ else
 fi
 unset _wp_ver _wp_asset _wp_sum _wp_tmp
 
+# ── OpenCode CLI (Muse Spark) ───────────────────────────────────────────
+# Zen's free tier serves only requests carrying a real OpenCode session. The
+# proxy reads the newest one from the CLI's database, or runs `opencode run`
+# to create one; without the CLI every Spark request is refused upstream.
+# OpenCode's own script installs it to ~/.opencode/bin with shell profiles
+# untouched, and a link in $BIN_DIR puts it on the proxy's PATH. Never fatal:
+# every other route works without it.
+step "OpenCode CLI (Muse Spark)"
+if command -v opencode >/dev/null 2>&1; then
+    say "opencode already installed: $(command -v opencode)"
+else
+    if [ ! -x "$HOME/.opencode/bin/opencode" ]; then
+        say "installing the OpenCode CLI (Muse Spark needs it for a Zen session)"
+        curl -fsSL --proto '=https' --tlsv1.2 https://opencode.ai/install \
+            | bash -s -- --no-modify-path >/dev/null 2>&1 || true
+    fi
+    if [ -x "$HOME/.opencode/bin/opencode" ]; then
+        ln -sfn "$HOME/.opencode/bin/opencode" "$BIN_DIR/opencode"
+        say "linked $BIN_DIR/opencode -> ~/.opencode/bin/opencode"
+    else
+        say "WARNING: could not install the OpenCode CLI — Muse Spark stays unavailable."
+        say "  Install it by hand: curl -fsSL https://opencode.ai/install | bash"
+    fi
+fi
+
 # ── flag set ──────────────────────────────────────────────────────────────
 # contrib/headroom-flags.sh is the measured flag set — every option the
 # maintainer runs with, paths written as $HOME. An existing file is kept: it

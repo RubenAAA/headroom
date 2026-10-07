@@ -29,7 +29,7 @@ cclaude --context
 `--context` routes through the proxy: the launcher starts it if nothing is listening on 8787 (with the measured flags from `~/.headroom-flags.sh`), sets `ANTHROPIC_BASE_URL`, and execs `claude` with the rest of your arguments.
 
 !!! warning "Always `cclaude --context`, never bare `claude`"
-    Plain `claude` talks straight to the API and the proxy does nothing. Bare `cclaude` without `--context` is plain passthrough too — `--context` is what puts the proxy in the path (see `contrib/claude-launcher`).
+    Plain `claude` talks straight to the API and the proxy does nothing. `cclaude` adds `--context` itself, which is what puts the proxy in the path; `cclaude --no-context` skips it (see `contrib/claude-launcher`).
 
 ## 3. Verify
 

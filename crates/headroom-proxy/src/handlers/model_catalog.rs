@@ -30,6 +30,9 @@ const CURSOR_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 enum Access {
     /// Anonymous upstream: nothing to sign up for.
     Free,
+    /// OpenCode Zen's free tier: no account, but it serves only requests
+    /// carrying a real OpenCode session, which takes the OpenCode CLI.
+    ZenFree,
     /// A bearer token in the named environment variable of the proxy.
     ApiKey(String),
     /// The ChatGPT login in `--codex-auth-file`.
@@ -51,6 +54,14 @@ fn access(config: &Config, route: &ProviderRoute) -> Access {
         return Access::Cursor(config.cursor_agent_binary.clone());
     }
     match route.auth_env.as_deref() {
+        Some("none")
+            if route.upstream.as_ref().is_some_and(|u| {
+                crate::routed::quirks::classify_upstream(u, false)
+                    == crate::routed::quirks::UpstreamKind::OpenCodeZen
+            }) =>
+        {
+            Access::ZenFree
+        }
         Some("none") => Access::Free,
         Some(var) => Access::ApiKey(var.to_string()),
         // Mirrors `resolve_upstream_auth`: only a translated route takes the
@@ -70,6 +81,7 @@ fn access(config: &Config, route: &ProviderRoute) -> Access {
 async fn connected(access: &Access, cursor: &mut Option<Option<bool>>) -> Option<bool> {
     match access {
         Access::Free => Some(true),
+        Access::ZenFree => Some(crate::routed::quirks::zen_session_source_available()),
         Access::ApiKey(var) => Some(std::env::var(var).is_ok_and(|v| !v.trim().is_empty())),
         Access::ChatGpt(file) => Some(crate::codex::read_codex_access_token(file).is_some()),
         Access::Cursor(binary) => match *cursor {
@@ -105,6 +117,7 @@ async fn cursor_logged_in(binary: &str) -> Option<bool> {
 fn needs(access: &Access) -> String {
     match access {
         Access::Free => "free, no login".to_string(),
+        Access::ZenFree => "free, no login; needs the OpenCode CLI".to_string(),
         Access::ApiKey(var) => format!("API key in {var}"),
         Access::ChatGpt(_) => "ChatGPT subscription (Codex login)".to_string(),
         Access::Cursor(_) => "Cursor subscription".to_string(),
@@ -118,6 +131,10 @@ fn fix(access: &Access) -> Option<String> {
         Access::ApiKey(var) => Some(format!("export {var} and restart-headroom.sh")),
         Access::ChatGpt(file) => Some(format!("run `codex login` (proxy reads {file})")),
         Access::Cursor(binary) => Some(format!("run `{binary} login`")),
+        Access::ZenFree => Some(
+            "install the OpenCode CLI (rerun install.sh, or https://opencode.ai/install)"
+                .to_string(),
+        ),
         Access::Free | Access::Client => None,
     }
 }
@@ -138,7 +155,7 @@ async fn catalog(config: &Config) -> Vec<Value> {
             "model": route.model_prefix,
             "upstream_model": real,
             "needs": needs(&access),
-            "free": matches!(access, Access::Free),
+            "free": matches!(access, Access::Free | Access::ZenFree),
             "connected": connected,
             "fix": if connected == Some(false) { fix(&access) } else { None },
         }));
@@ -177,7 +194,7 @@ fn status_line(row: &Value, width: usize) -> String {
     let model = row["model"].as_str().unwrap_or_default();
     let needs = row["needs"].as_str().unwrap_or_default();
     let state = match row["connected"].as_bool() {
-        _ if row["free"].as_bool() == Some(true) => String::new(),
+        Some(true) if row["free"].as_bool() == Some(true) => String::new(),
         Some(true) => ": connected".to_string(),
         Some(false) => match row["fix"].as_str() {
             Some(fix) => format!(": not connected, {fix}"),

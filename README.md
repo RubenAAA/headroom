@@ -66,7 +66,8 @@ to your home directory, wires the token statusline into
 the memory-tool instructions from
 [`contrib/claude/CLAUDE.headroom.md`](contrib/claude/CLAUDE.headroom.md) into
 `~/.claude/CLAUDE.md` between marker comments. Existing agent files are left
-alone. The statusline helpers live in `contrib/`, so keep the checkout where it
+alone. It also installs the OpenCode CLI when missing, which the free Muse
+Spark route needs. The statusline helpers live in `contrib/`, so keep the checkout where it
 is.
 
 To edit the checkout, use `./install.sh --link`, which is how the maintainer
@@ -86,7 +87,9 @@ update-headroom.sh          # installed to ~/.local/bin by install.sh
 update-headroom.sh --link   # override the detected mode either way
 ```
 
-Sessions started inside the checkout also say so: a SessionStart hook
+`cclaude` tells you when to run it. Once a day it fetches the checkout's
+upstream in the background, and any launch after that prints how many
+commits you are behind. Sessions started inside the checkout also say so: a SessionStart hook
 prints a one-time STALE INSTALL notice when installed copies differ from
 the checkout (or the built binary is newer than the installed one).
 

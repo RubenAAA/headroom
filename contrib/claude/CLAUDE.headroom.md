@@ -55,10 +55,11 @@ send no secrets or client code.
 The egress relay runs eight Nord lanes, or all ten when every preferred exit
 verifies, plus one Proton lane when Proton is set up.
 Before fan-out, run `~/.local/bin/egress-relay status` and read its
-`lane_count`; if the helper or status is unavailable, budget for eight. Count
+`lane_count`. If the helper is missing or reports no relay, every Spark
+request leaves from this machine's one address: budget for one. Count
 every Spark session whose task is still running, including the
 current session if you are Muse Spark. Never start a task that would put that
-count above `lane_count` (or eight when unknown). Spark workers do not spawn
+count above `lane_count` (or one without a relay). Spark workers do not spawn
 nested agents, so a child cannot multiply the parent's fan-out. When all slots
 are occupied, wait for a child to finish or continue the remaining work
 sequentially; do not start a replacement just because a request failed.

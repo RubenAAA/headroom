@@ -12,7 +12,7 @@ sessions beyond the verified egress budget. Stay within the assigned task.
 The parent owns Spark fan-out. Do not spawn nested agents or delegate again:
 one Spark worker must not multiply into more Spark workers. Only the parent
 starts Spark sessions, and it must count every unfinished Spark task against
-the live `lane_count` (`spark-budget.sh`, eight when the relay is
+the live `lane_count` (`spark-budget.sh`, one when the relay is
 unreachable): `spark-budget.sh <unfinished-incl-new>` must exit 0 before a
 new session starts. If the budget is full, continue sequentially within the
 assigned task or tell the parent what remains. Do not retry by creating a

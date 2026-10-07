@@ -81,8 +81,8 @@ WireGuard configs, or both, create it once:
 restart-headroom.sh
 ```
 
-After a reboot the relay is down. `cclaude --context` (and the profiles that
-default to it) starts it again, and rewrites the file when it is also the one
+After a reboot the relay is down. `cclaude` (and the other profiles, all of
+which default to `--context`) starts it again, and rewrites the file when it is also the one
 starting the proxy. `restart-headroom.sh` rewrites the file on every restart,
 starting the relay only if it is down.
 

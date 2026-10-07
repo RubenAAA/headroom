@@ -343,6 +343,16 @@ pub(crate) fn resolve_zen_session(request_id: &str) -> String {
     mint_zen_session(request_id)
 }
 
+/// Whether the Zen free route can get a real session: the override, an
+/// OpenCode database to read one from, or the CLI to mint one. With none of
+/// them every request carries the fallback id, which the free tier refuses,
+/// so `/models-status` reports the route as not connected.
+pub(crate) fn zen_session_source_available() -> bool {
+    std::env::var(ZEN_SESSION_ENV).is_ok_and(|v| !v.trim().is_empty())
+        || zen_session_db_path().is_some()
+        || resolve_opencode_bin().is_some()
+}
+
 /// The legacy minted id, kept as the last-resort fallback. Well-formed
 /// but unknown to Zen, so the free tier gates it — better than no
 /// header (which fails closed as `MissingSessionID`), worse than a real

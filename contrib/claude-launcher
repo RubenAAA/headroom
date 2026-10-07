@@ -9,13 +9,14 @@
 # Usage:
 #   claude-personal [--context] [--qwen] [proxy flags...] [claude args...]
 #   claude-work     [--context] [--qwen] [proxy flags...] [claude args...]
-#   cclaude         [--context] [--qwen] [proxy flags...] [claude args...]   # default account
+#   cclaude         [--no-context] [--qwen] [proxy flags...] [claude args...]   # default account
 #
-#   claude-personal and claude-work carry defaults (see the profile table).
-#   cclaude does not — it is the bare launcher.
+#   Every profile carries defaults (see the profile table). cclaude's is
+#   --context alone, so a fresh install routes through the proxy untold.
 #
 #   --context  route through the headroom proxy (starts it if not running;
 #              reuses the running instance otherwise — it is multi-tenant)
+#   --no-context  talk straight to Anthropic, overriding a profile's --context
 #   --qwen     start the local Qwen server if not running and expose it as a
 #              custom model option (requires --context for the proxy routing)
 #
@@ -49,15 +50,17 @@ QWEN_MODEL="qwen3.6-uncensored"
 
 # ── profile from invocation name ──────────────────────────────────────────
 # DEFAULT_FLAGS is prepended to the command line, so anything typed still wins
-# for flags named twice. cclaude keeps none of them — it is the bare launcher,
-# and the one to reach for when a profile's defaults are in the way.
+# for flags named twice. cclaude carries only --context: the README and the
+# installer tell people to type bare `cclaude`, and before it did, that bare
+# call bypassed the proxy with no error. `--no-context` opts out.
 DEFAULT_FLAGS=()
 case "$(basename "$0")" in
     claude-personal) CONFIG_DIR="$HOME/.claude-personal"
                      DEFAULT_FLAGS=(--context --dangerously-skip-permissions) ;;
     claude-work)     CONFIG_DIR="$HOME/.claude-work"
                      DEFAULT_FLAGS=(--context --dangerously-skip-permissions) ;;
-    cclaude)         CONFIG_DIR="" ;;   # default ~/.claude account
+    cclaude)         CONFIG_DIR=""      # default ~/.claude account
+                     DEFAULT_FLAGS=(--context) ;;
     *) echo "claude-launcher: invoke via a profile symlink (claude-personal|claude-work|cclaude)" >&2
        exit 1 ;;
 esac
@@ -100,6 +103,7 @@ while [ "$i" -lt "${#args[@]}" ]; do
     arg="${args[$i]}"
     case "$arg" in
         --context) use_context=1 ;;
+        --no-context) use_context=0 ;;
         --qwen)    use_qwen=1 ;;
         --*=*)
             if [ -n "${proxy_flag[${arg%%=*}]:-}" ]; then
@@ -337,6 +341,30 @@ fi
 unset HEADROOM_HTTP_PROXY
 unset HEADROOM_ZEN_HTTP_PROXY_POOL
 unset HEADROOM_ZEN_EGRESS_ROTATE_COMMAND
+
+# ── update notice ─────────────────────────────────────────────────────────
+# A copy-mode install changes only when someone runs update-headroom.sh, and
+# nothing else says origin has moved on. Compare the checkout with its
+# upstream as of the last fetch (local, instant), then refresh that fetch in
+# the background at most once a day; what it finds shows on the next launch.
+update_notice() {
+    local repo="" stamp="$HOME/.local/state/headroom/update-check" behind
+    # shellcheck disable=SC1091
+    [ -r "$HOME/.headroom-paths.sh" ] &&
+        repo=$( (source "$HOME/.headroom-paths.sh" 2>/dev/null; printf '%s' "${HEADROOM_REPO:-}") )
+    [ -n "$repo" ] && [ -e "$repo/.git" ] || return 0
+    behind=$(git -C "$repo" rev-list --count 'HEAD..@{upstream}' 2>/dev/null) || behind=0
+    if [ "${behind:-0}" -gt 0 ]; then
+        echo "headroom: $behind new commit(s) on $(git -C "$repo" rev-parse --abbrev-ref '@{upstream}'). Run update-headroom.sh to pull, reinstall and restart." >&2
+    fi
+    if [ -z "$(find "$stamp" -mmin -1440 2>/dev/null)" ]; then
+        mkdir -p "${stamp%/*}" && touch "$stamp"
+        GIT_TERMINAL_PROMPT=0 setsid nohup git -C "$repo" fetch --quiet \
+            >/dev/null 2>&1 </dev/null &
+        disown
+    fi
+}
+update_notice || true
 
 # ── assemble env and exec claude ──────────────────────────────────────────
 env_vars=()

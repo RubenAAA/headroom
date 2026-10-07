@@ -166,12 +166,25 @@ The Rust `egress-relay` binary turns VPN egresses into loopback SOCKS5 lanes
 for Headroom's per-egress rotation hook. Each provider is optional; the relay
 runs the lanes of whichever are set up and refuses to start with none.
 
-- **Nord** (eight or ten lanes): Nord's remote SOCKS5 service. The relay reads
-  `USERNAME=...` and `PASSWORD=...` from
+- **Nord** (eight or ten lanes): Nord's remote SOCKS5 service, which needs a
+  paid NordVPN plan. It takes the plan's service credentials, not your login:
+  in Nord Account, open NordVPN, then manual setup, and copy the service
+  username and password. The relay reads them from
   `~/.config/headroom/nord-socks-credentials.json` (or the path in
-  `HEADROOM_NORD_SOCKS_CREDENTIALS_FILE`). Keep that file `0600` and its parent
-  directory `0700`. Credentials are not placed in the process command line,
-  exported Headroom pool, or relay logs. Details below.
+  `HEADROOM_NORD_SOCKS_CREDENTIALS_FILE`) as two lines, not JSON, whatever
+  the file name says:
+
+  ```text
+  USERNAME=<service username>
+  PASSWORD=<service password>
+  ```
+
+  Any other shape fails with "expected exactly one USERNAME= and PASSWORD=
+  line". Write it with an editor rather than `echo`, so the password stays
+  out of shell history. Keep the file `0600` and its parent directory `0700`
+  (`chmod 700 ~/.config/headroom`, `chmod 600` on the file). Credentials are
+  not placed in the process command line, exported Headroom pool, or relay
+  logs. Details below.
 - **Proton** (one lane): see [Proton lane](#proton-lane).
 
 Lanes are numbered from `HEADROOM_EGRESS_RELAY_BASE_PORT` (default 18600):

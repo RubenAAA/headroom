@@ -73,11 +73,12 @@ for m in "${MODEL_LIST[@]}"; do
   echo "$uuid" > "$STATE/$m.uuid"
   : > "$STATE/$m.tasklog"
 
-  # `--context` is what puts the session on the proxy. Bare `cclaude` is the
-  # launcher with no profile: it sets no ANTHROPIC_BASE_URL and no gateway
-  # discovery, so the pane talks straight to Anthropic and every routed alias
-  # is unknown to it. A whole probe run scored two clean passes that way, on
-  # claude-opus-5, for a pane that was meant to be testing Grok.
+  # `--context` is what puts the session on the proxy. `cclaude` now adds it
+  # by default, but it stays explicit here: a launcher without it sets no
+  # ANTHROPIC_BASE_URL and no gateway discovery, so the pane talks straight to
+  # Anthropic and every routed alias is unknown to it. A whole probe run scored
+  # two clean passes that way, on claude-opus-5, for a pane that was meant to
+  # be testing Grok.
   #
   # Routed aliases are not accepted as `--model` on the command line either:
   # Claude Code validates that against its own list at startup and answers

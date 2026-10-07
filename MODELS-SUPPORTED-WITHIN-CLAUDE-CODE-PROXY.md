@@ -32,6 +32,10 @@ Notes:
   limits, and Meta may train on prompts/completions — keep sensitive files out
   of spark sessions. `spark-explore` is read-only reconnaissance on the same
   model.
+- Spark needs the OpenCode CLI, though no OpenCode account. Zen's free tier
+  serves only requests that carry a real OpenCode session, and the proxy
+  takes one from the CLI. `install.sh` installs it; without it `/models`
+  shows Spark as not connected.
 - Union Alpha uses Zen's Anthropic Messages endpoint with the
   `OPENCODE_API_KEY` environment variable. Its upstream model ID is `union-alpha`.
 - `/models` shows which of these this machine can use right now, read from
