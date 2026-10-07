@@ -16,6 +16,9 @@ number to its window; do not quote across windows.
 - [`zen-retry-after-guidance.md`](zen-retry-after-guidance.md): use bounded
   provider guidance, but preserve the measured guard against Zen's stale,
   oversized Retry-After value.
+- [`zen-fresh-opencode-session.md`](zen-fresh-opencode-session.md): a
+  never-logged-in OpenCode install mints a session Zen's free tier accepts
+  (200; a made-up id 403s), so Spark needs the CLI but no account.
 - [`egress-rotation-handoff.md`](egress-rotation-handoff.md): close the
   per-lane admission race before dropping old SOCKS tunnels; reactive lane
   rotations must not postpone the pool-wide timed pass.
