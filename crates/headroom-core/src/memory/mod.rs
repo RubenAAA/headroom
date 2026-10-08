@@ -7,4 +7,5 @@
 
 pub mod backend;
 pub mod models;
+pub mod recall;
 pub mod router;

@@ -23,6 +23,12 @@
 //! - [`backends::RedisCcrStore`] — multi-worker opt-in (cfg-gated
 //!   behind `feature = "redis"`). No sticky-session required at the
 //!   load balancer.
+//! - [`memory::recall::RecallStore`](crate::memory::recall::RecallStore) —
+//!   queryable lossless store over the ctx FTS5 index plus the memory
+//!   record table (P1 `headroom-recall`). Persistent, no expiry;
+//!   retrieve-by-query over stashed payloads via `search_payloads`.
+//!   Selected as
+//!   [`CcrBackendConfig::Recall`](backends::CcrBackendConfig).
 //!
 //! [`backends::from_config`] selects one at startup and surfaces every
 //! init error to the caller (per `feedback_no_silent_fallbacks.md`).

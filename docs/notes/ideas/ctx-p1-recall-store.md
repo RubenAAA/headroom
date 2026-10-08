@@ -3,6 +3,12 @@
 - **Status:** open (IP gate cleared 2026-09-11 by owner: both repos open
   source, personal use only, no third-party hosting/distribution — revisit if
   derived code is ever distributed; lands inside Phase B)
+- **Status:** sliced 2026-10-08: `RecallStore` (`crates/headroom-core/src/memory/recall.rs`)
+  implements core `MemoryBackend` + `CcrStore` over `CtxStore`/`MemoryRecordStore`
+  (record-first writes, BM25/trigram search, entity-expansion `include_related`);
+  `CcrBackendConfig::Recall` + `from_config` arm wire the CCR seam; untested — tree
+  conflicts block builds, verify with `make test-touched` + `make ci-precheck`
+  once clear; proxy backend-name mapping + plugin-authoring doc still open
 - **Source:** `docs/context-mode-integration-analysis.md` §4 P1 (2026-07-29)
 - **Summary:** port context-mode's `store.ts` (tokenized + trigram FTS5,
   auto-externalize >100 KB, nothing discarded) behind the existing

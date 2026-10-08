@@ -1,5 +1,6 @@
 //! Pluggable CCR backends — in-memory (test default), SQLite (prod
-//! default), Redis (multi-worker opt-in).
+//! default), Redis (multi-worker opt-in), recall (queryable lossless store,
+//! P1 `headroom-recall`).
 //!
 //! Selection is driven by [`CcrBackendConfig`]. The [`from_config`]
 //! factory surfaces every backend-init failure to the caller — there
@@ -31,6 +32,11 @@ pub enum CcrBackendConfig {
     InMemory { capacity: usize, ttl_seconds: u64 },
     /// SQLite-backed (prod default). DB file at `path`; persistent.
     Sqlite { path: PathBuf, ttl_seconds: u64 },
+    /// Recall (queryable lossless store). `recall.db` + `recall_index.db`
+    /// under `dir`; persistent, entries never expire. Retrieve-by-query
+    /// over the same payloads lives on the store itself
+    /// (`RecallStore::search_payloads`), not on the `CcrStore` trait.
+    Recall { dir: PathBuf },
     /// Redis-backed (multi-worker opt-in). Cfg-gated; surfaces an
     /// `UnsupportedBackend` error if the feature is not compiled in.
     Redis {
@@ -120,6 +126,16 @@ pub fn from_config(config: &CcrBackendConfig) -> Result<Box<dyn CcrStore>, CcrBa
                 backend = "sqlite",
                 path = %path.display(),
                 ttl_seconds = *ttl_seconds,
+                "ccr_backend_initialized"
+            );
+            Ok(Box::new(store))
+        }
+        CcrBackendConfig::Recall { dir } => {
+            let store = crate::memory::recall::RecallStore::open(dir)?;
+            tracing::info!(
+                target = "ccr.backend",
+                backend = "recall",
+                dir = %dir.display(),
                 "ccr_backend_initialized"
             );
             Ok(Box::new(store))
