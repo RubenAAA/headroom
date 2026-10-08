@@ -36,6 +36,11 @@ pub const DEFAULT_EXCLUDE_TOOLS: &[&str] = &[
     // inverts it. Named below as well, because protecting a tool needs
     // both halves.
     "Skill",
+    // Caveman's recovery tool: like headroom_retrieve, it returns the stored
+    // original of something Caveman compressed upstream of us. Compressing it
+    // again hands the model a marker-wrapped original and breaks its
+    // "complete original" contract, so keep the whole result out.
+    "caveman_retrieve",
     // Lowercase variants for case-insensitive matching.
     "read",
     "glob",
@@ -58,8 +63,7 @@ pub const DEFAULT_EXCLUDE_TOOLS: &[&str] = &[
 /// search matched. Compressing those trades a few thousand tokens for the risk
 /// of the model acting on a summary of a file rather than the file. Pass
 /// `--exclude-tools ""` to compress them anyway.
-pub const DEFAULT_EXCLUDE_TOOLS_CSV: &str =
-    "Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,read_file,Skill,headroom_retrieve";
+pub const DEFAULT_EXCLUDE_TOOLS_CSV: &str = "Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,read_file,Skill,headroom_retrieve,caveman_retrieve";
 
 /// Excluded tools whose results must stay *byte-faithful* — not merely
 /// uncompressed. Even the excluded-tool lossless fold rewrites formatted JSON,
@@ -75,6 +79,9 @@ pub const DEFAULT_VERBATIM_EXCLUDE_TOOLS: &[&str] = &[
     "web_fetch",
     "view",
     "headroom_retrieve",
+    // Caveman's recovery tool: returns a stored original, so even lossless
+    // folding would corrupt the "complete original" it promises.
+    "caveman_retrieve",
 ];
 
 /// File-READ tools whose output the excluded-tool lossless fold must never
@@ -477,9 +484,22 @@ mod tests {
     #[test]
     fn verbatim_set_covers_retrieval_and_web_tools() {
         assert!(is_verbatim_excluded("headroom_retrieve"));
+        assert!(is_verbatim_excluded("caveman_retrieve"));
         assert!(is_verbatim_excluded("WebFetch"));
         // Read is excluded from compression but is not verbatim-protected.
         assert!(!is_verbatim_excluded("Read"));
+    }
+
+    #[test]
+    fn lossy_exclusion_covers_caveman_retrieve() {
+        // Caveman's recovery tool returns a stored original: keep it out of
+        // lossy compression like headroom_retrieve (#4010).
+        for name in ["caveman_retrieve", "CAVEMAN_RETRIEVE"] {
+            assert!(
+                is_tool_excluded(name, DEFAULT_EXCLUDE_TOOLS.iter().copied()),
+                "{name} must be excluded from lossy compression"
+            );
+        }
     }
 
     #[test]

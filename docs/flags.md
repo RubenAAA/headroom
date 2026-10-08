@@ -1107,7 +1107,7 @@ Options:
           Honored on all three live-zone paths — Anthropic `/v1/messages`, OpenAI Chat Completions, and OpenAI Responses (FINDING-017 fixed): an excluded tool's output never reaches a lossy compressor (verbatim/byte-exact members pass through untouched, others get the reversible lossless fold only).
           
           [env: HEADROOM_EXCLUDE_TOOLS=]
-          [default: Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,read_file,Skill,headroom_retrieve]
+          [default: Read,Glob,Grep,Write,Edit,WebSearch,WebFetch,view,read_file,Skill,headroom_retrieve,caveman_retrieve]
 
       --protect-tool-results <PROTECT_TOOL_RESULTS>
           Comma-separated tool names whose results must not be lossy-compressed
@@ -1127,7 +1127,7 @@ Options:
       --read-maturation <READ_MATURATION>
           Enable read maturation (hold fresh reads out of prefix cache).
           
-          NO-OP (2026-09-14, FINDING-019): `ReadMaturationManager` and `relocate_cache_breakpoint` have zero proxy callers — the Python handler wiring (anthropic.py:2290) was never ported. Same status as `--read-lifecycle` above: kept declared for flag-file compat, wiring needs an A/B first.
+          NO-OP (2026-09-14, FINDING-019): `ReadMaturationManager` has zero proxy callers — the Python handler wiring (anthropic.py:2290) was never ported. Same status as `--read-lifecycle` above: kept declared for flag-file compat, wiring needs an A/B first.
           
           [env: HEADROOM_READ_MATURATION=]
           [default: false]

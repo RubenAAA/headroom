@@ -2084,13 +2084,12 @@ pub struct CliArgs {
     #[arg(long = "read-lifecycle", env = "HEADROOM_READ_LIFECYCLE", default_value_t = false, action = clap::ArgAction::Set)]
     pub read_lifecycle: bool,
 
-    /// Enable read maturation (hold fresh reads out of prefix cache).
+    /// Enable read maturation (hold fresh reads verbatim, mature when quiet).
     ///
-    /// NO-OP (2026-09-14, FINDING-019): `ReadMaturationManager` and
-    /// `relocate_cache_breakpoint` have zero proxy callers — the Python
-    /// handler wiring (anthropic.py:2290) was never ported. Same status as
-    /// `--read-lifecycle` above: kept declared for flag-file compat,
-    /// wiring needs an A/B first.
+    /// NO-OP (2026-09-14, FINDING-019): `ReadMaturationManager` has zero
+    /// proxy callers — the Python handler wiring (anthropic.py:2290) was
+    /// never ported. Same status as `--read-lifecycle` above: kept declared
+    /// for flag-file compat, wiring needs an A/B first.
     #[arg(long = "read-maturation", env = "HEADROOM_READ_MATURATION", default_value_t = false, action = clap::ArgAction::Set)]
     pub read_maturation: bool,
 

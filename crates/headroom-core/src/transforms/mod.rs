@@ -114,7 +114,6 @@ pub use read_lifecycle::{
 };
 pub use read_maturation::{
     MaturationResult, MaturedRead, ReadMaturationConfig, ReadMaturationManager,
-    relocate_cache_breakpoint,
 };
 pub use recommendations::{RECOMMENDATIONS_PATH_ENV_VAR, Recommendation, RecommendationStore};
 pub use safety::{ToolPair, tool_pair_indices};

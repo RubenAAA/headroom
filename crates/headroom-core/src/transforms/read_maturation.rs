@@ -1,13 +1,18 @@
-//! Mechanism B: hold-back Read maturation — compress before cache entry.
+//! Mechanism B: hold-back Read maturation — compress a Read once it is done.
 //!
-//! The prefix cache bills you for everything *after* the first changed byte,
-//! so mutating an already-cached Read is ruinously expensive — but bytes that
-//! have never been cache-written have no cache entry to bust. This module
-//! exploits the one safe window: a fresh Read is deliberately held *out of*
-//! the provider cache while its file is active. Once the file has been quiet
-//! for `quiesce_turns`, the content is replaced with a CCR-backed marker.
+//! A fresh Read is held verbatim while its file is active, so the model sees
+//! the full content the whole time it is working with the file. Once the
+//! file has been quiet for `quiesce_turns`, the content is replaced with a
+//! CCR-backed marker.
+//!
+//! Held Reads are cached normally with the turn — the client's cache
+//! breakpoints are forwarded untouched. Upstream once held them *out of* the
+//! provider cache via a `relocate_cache_breakpoint` step; that was measured
+//! harmful (held turns re-sent the whole uncached tail at full input rate)
+//! and deleted. There is deliberately no relocation helper here: a Read
+//! covered by the frozen prefix stays verbatim for good.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -390,92 +395,6 @@ impl ReadMaturationManager {
     }
 }
 
-/// Park the trailing message-level cache breakpoint before held Reads.
-///
-/// Strips `cache_control` from every block at or after the earliest
-/// holding message, and re-places that breakpoint — marker and all — on
-/// the last block of the latest *eligible* message before it.
-pub fn relocate_cache_breakpoint(messages: &[Value], holding_msg_indices: &[usize]) -> Vec<Value> {
-    if holding_msg_indices.is_empty() {
-        return messages.to_vec();
-    }
-
-    let earliest = *holding_msg_indices.iter().min().unwrap();
-    let mut out: Vec<Value> = messages.to_vec();
-    let mut stripped_any = false;
-    // The marker we strip, kept whole. Re-anchoring with a bare
-    // `{"type": "ephemeral"}` would silently downgrade a client's
-    // `ttl: "1h"` breakpoint to the 5m default — the request still
-    // succeeds, so the only symptom is a full prefix re-write on every
-    // idle gap past five minutes.
-    let mut held_marker: Option<Value> = None;
-
-    // 1. Strip breakpoints from the held region [earliest:].
-    for message in out.iter_mut().skip(earliest) {
-        let content = match message.get("content").and_then(Value::as_array) {
-            Some(arr) => arr,
-            None => continue,
-        };
-
-        let has_bp = content
-            .iter()
-            .any(|b| b.is_object() && b.get("cache_control").is_some());
-
-        if has_bp {
-            for b in content {
-                if let Some(cc) = b.get("cache_control")
-                    && cc.is_object()
-                {
-                    held_marker = Some(cc.clone());
-                }
-            }
-            let new_content: Vec<Value> = content
-                .iter()
-                .map(|b| {
-                    if b.is_object() {
-                        let mut cleaned = b.clone();
-                        if let Some(obj) = cleaned.as_object_mut() {
-                            obj.remove("cache_control");
-                        }
-                        cleaned
-                    } else {
-                        b.clone()
-                    }
-                })
-                .collect();
-            message["content"] = Value::Array(new_content);
-            stripped_any = true;
-        }
-    }
-
-    if !stripped_any {
-        return out;
-    }
-
-    // 2. Re-anchor: put the stripped breakpoint back on the last block of
-    //    the latest block-style message before the held region. Fall back
-    //    to a bare ephemeral only when the client sent no marker of its own.
-    for i in (0..earliest).rev() {
-        if let Some(content) = out[i].get("content").and_then(Value::as_array)
-            && let Some(last) = content.last()
-            && last.is_object()
-        {
-            let mut new_content = content.clone();
-            let last_idx = new_content.len() - 1;
-            if let Some(obj) = new_content[last_idx].as_object_mut() {
-                let marker = held_marker
-                    .clone()
-                    .unwrap_or_else(|| json!({"type": "ephemeral"}));
-                obj.insert("cache_control".to_string(), marker);
-            }
-            out[i]["content"] = Value::Array(new_content);
-            break;
-        }
-    }
-
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,11 +655,11 @@ mod tests {
     }
 
     #[test]
-    fn client_breakpoint_on_fresh_read_is_held_and_relocated() {
+    fn client_breakpoint_on_fresh_read_is_held_and_forwarded() {
         // Claude Code parks its tail breakpoint on the newest block —
-        // right after a Read, that's the Read result itself. The read must
-        // still be held (verbatim) and relocation must move the breakpoint
-        // off it, otherwise the verbatim form gets cache-written.
+        // right after a Read, that's the Read result itself. The read is
+        // still held (verbatim), and the breakpoint is forwarded
+        // untouched: held Reads are cached normally with the turn.
         let lc = large_content();
         let mut msgs = base_conv(&lc);
         // Add cache_control to the Read result block
@@ -753,17 +672,8 @@ mod tests {
         let res = m.apply(&msgs, 0);
         assert_eq!(res.holding_msg_indices, vec![2]);
         assert_eq!(read_content(&res, 2), &lc);
-
-        let out = relocate_cache_breakpoint(&res.messages, &res.holding_msg_indices);
-        // Breakpoint stripped from the held read, re-anchored before it.
-        assert!(out[2]["content"][0].get("cache_control").is_none());
         assert_eq!(
-            out[1]["content"]
-                .as_array()
-                .unwrap()
-                .last()
-                .unwrap()
-                .get("cache_control"),
+            res.messages[2]["content"][0].get("cache_control"),
             Some(&json!({"type": "ephemeral"}))
         );
     }
@@ -815,115 +725,5 @@ mod tests {
         assert!(first.contains("compressed after use"));
         assert!(second.contains("compressed after use"));
         assert_eq!(first, second);
-    }
-
-    // ── Breakpoint Relocation ────────────────────────────────────────────
-
-    fn msgs_with_tail_breakpoint() -> Vec<Value> {
-        let lc = large_content();
-        let mut msgs =
-            vec![json!({"role": "user", "content": [{"type": "text", "text": "earlier turn"}]})];
-        msgs.extend(anthropic_read("r1", "/x/foo.py", &lc));
-        // Add cache_control to the last block
-        let last = msgs.len() - 1;
-        let content = msgs[last]["content"].as_array().unwrap().clone();
-        let mut new_content = content;
-        let last_block = new_content.last_mut().unwrap();
-        last_block["cache_control"] = json!({"type": "ephemeral"});
-        msgs[last]["content"] = Value::Array(new_content);
-        msgs
-    }
-
-    fn breakpoint_indices(msgs: &[Value]) -> Vec<usize> {
-        msgs.iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                m.get("content")
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .any(|b| b.is_object() && b.get("cache_control").is_some())
-                    })
-                    .unwrap_or(false)
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    #[test]
-    fn relocate_noop_without_holds() {
-        let msgs = msgs_with_tail_breakpoint();
-        let out = relocate_cache_breakpoint(&msgs, &[]);
-        assert_eq!(out, msgs);
-    }
-
-    #[test]
-    fn relocate_before_held_read() {
-        let msgs = msgs_with_tail_breakpoint();
-        let out = relocate_cache_breakpoint(&msgs, &[2]);
-
-        // Held region [2:] carries no breakpoint; re-anchored on the
-        // latest eligible message before it (index 1 — the assistant
-        // tool_use message).
-        assert_eq!(breakpoint_indices(&out), vec![1]);
-        assert_eq!(
-            out[1]["content"]
-                .as_array()
-                .unwrap()
-                .last()
-                .unwrap()
-                .get("cache_control"),
-            Some(&json!({"type": "ephemeral"}))
-        );
-        assert!(breakpoint_indices(&out).len() <= breakpoint_indices(&msgs).len());
-    }
-
-    #[test]
-    fn relocate_preserves_cache_control_ttl() {
-        let mut msgs = msgs_with_tail_breakpoint();
-        // Client asked for the 1h cache tier on the breakpoint we relocate.
-        let last = msgs.len() - 1;
-        let mut content = msgs[last]["content"].as_array().unwrap().clone();
-        *content
-            .last_mut()
-            .unwrap()
-            .get_mut("cache_control")
-            .unwrap() = json!({"type": "ephemeral", "ttl": "1h"});
-        msgs[last]["content"] = Value::Array(content);
-
-        let out = relocate_cache_breakpoint(&msgs, &[2]);
-
-        assert_eq!(breakpoint_indices(&out), vec![1]);
-        assert_eq!(
-            out[1]["content"]
-                .as_array()
-                .unwrap()
-                .last()
-                .unwrap()
-                .get("cache_control"),
-            Some(&json!({"type": "ephemeral", "ttl": "1h"}))
-        );
-    }
-
-    #[test]
-    fn relocate_noop_when_no_breakpoint_in_held_region() {
-        let msgs = vec![
-            json!({"role": "user", "content": [{"type": "text", "text": "x"}]}),
-            json!({
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "data"}]
-            }),
-        ];
-        let out = relocate_cache_breakpoint(&msgs, &[1]);
-        assert!(breakpoint_indices(&out).is_empty());
-    }
-
-    #[test]
-    fn relocate_originals_not_mutated() {
-        let msgs = msgs_with_tail_breakpoint();
-        let before: Vec<String> = msgs.iter().map(|m| m.to_string()).collect();
-        relocate_cache_breakpoint(&msgs, &[2]);
-        let after: Vec<String> = msgs.iter().map(|m| m.to_string()).collect();
-        assert_eq!(before, after);
     }
 }
