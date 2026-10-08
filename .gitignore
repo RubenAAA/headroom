@@ -299,3 +299,16 @@ proton-wg/
 *.conf
 .headroom-zen-pool.env
 headroom-zen-pool.env
+# Side-proxy investigation kits (kits/): scripts, manifests and small
+# reports are tracked; bulky regenerable outputs stay local (rerun
+# commands in kits/README.md).
+kits/**/captures*/
+kits/**/capture/
+kits/**/state-*/
+kits/**/run1-superseded/
+kits/**/logs/
+kits/**/*.log
+!kits/**/turns.log
+kits/jev-refresh/sizes.jsonl
+kits/jev-refresh/exchange.jsonl
+kits/**/__pycache__/

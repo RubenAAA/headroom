@@ -1,0 +1,122 @@
+COMMIT 9de2abb8a
+
+diff --git a/contrib/claude/hooks/scrub-secrets.sh b/contrib/claude/hooks/scrub-secrets.sh
+index 6f528f08a..b99b76889 100755
+--- a/contrib/claude/hooks/scrub-secrets.sh
++++ b/contrib/claude/hooks/scrub-secrets.sh
+@@ -54,7 +54,12 @@ for pattern in "${BLOCKED_PATTERNS[@]}"; do
+ done
+ 
+ # A redirect to a file is the escape hatch: `> out.json`, not `2>&1`.
+-if ! echo "$COMMAND" | grep -qE '>[[:space:]]*[^|&>[:space:]]'; then
++# Quoted text is masked first: a `>` inside `sed 's/=.*/=<redacted>/'` or
++# `awk '$1>0'` once counted as a redirect and let the values print. A
++# redirect to the terminal is not a file.
++UNQUOTED=$(echo "$COMMAND" | sed -E "s/'[^']*'/Q/g; s/\"[^\"]*\"/Q/g")
++if ! echo "$UNQUOTED" | grep -qE '>[[:space:]]*[^|&>[:space:]]' ||
++    echo "$UNQUOTED" | grep -qE '>[[:space:]]*/dev/(stdout|stderr|tty|fd/)'; then
+   for pattern in "${SECRET_STORE_PATTERNS[@]}"; do
+     if echo "$COMMAND_LOWER" | grep -qiE "$pattern"; then
+       echo "BLOCKED: this reads a secret store and would print the values into the transcript." >&2
+diff --git a/docs/notes/learnings/README.md b/docs/notes/learnings/README.md
+index a70c4c73f..538c56c48 100644
+--- a/docs/notes/learnings/README.md
++++ b/docs/notes/learnings/README.md
+@@ -11,6 +11,9 @@ number to its window; do not quote across windows.
+   with server tool blocks in a turn, text after a `tool_use` draws a
+   "prefill" 400 on replay; the CCR splice put answers there and stranded
+   memory continuations.
++- [`small-search-compression-pays.md`](small-search-compression-pays.md):
++  compressing tool output pays at every size down to the 512-byte floor and
++  shows no re-run jump there; path-only `grep -l` lists are the soft spot.
+ - [`offload-loses-at-2000-bytes.md`](offload-loses-at-2000-bytes.md): at a
+   2,000-byte floor, retrievals and re-reads cost more than offload saves;
+   two thirds of retrievals repeat one from an earlier turn.
+diff --git a/docs/notes/learnings/small-search-compression-pays.md b/docs/notes/learnings/small-search-compression-pays.md
+new file mode 100644
+index 000000000..dff90f739
+--- /dev/null
++++ b/docs/notes/learnings/small-search-compression-pays.md
+@@ -0,0 +1,52 @@
++# Compressing small tool outputs pays; no re-run jump at the 512-byte floor
++
++- **Status:** measured 2026-10-07; no change made. Answers a peer report that
++  short grep output (a 43-line `grep -rl`, a 36-line `grep -n`) came back cut
++  to five lines and cost a retrieval or a re-run each time.
++- **Window:** proxy logs 2026-10-03 08:58Z to 10-07 16:05Z (2,599 compressed
++  blocks, 357 retrieval calls, 53 paid continuation rounds); Claude Code
++  transcripts of the last 5 days (10,878 grep/rg outputs of 3+ lines).
++- **Floor:** the live zone skips a search-results block under 512 bytes
++  (`THRESHOLD_SEARCH_RESULTS`, `transforms/live_zone.rs`), about 140 tokens.
++  `--min-tokens-to-crush 200` in the flags file is a no-op, as its comment
++  says. Smallest compressed search block in the window: 139 tokens.
++
++## Money: positive at every size
++
++Each block's saving is counted once per request that re-sent it, times 0.1
++(cache read). A retrieval call is charged its share of the continuation
++rounds its own request paid, at API weights (as in
++`offload-loses-at-2000-bytes.md`). Only 13 of 357 calls sat in a request that
++paid a round; the rest were answered in place beside other tool calls.
++
++| original tokens | blocks | turns re-sent | saved | retrieval | net |
++|---|---|---|---|---|---|
++| 0–250 | 248 | 66.2 | 63K | 0 | +63K |
++| 250–500 | 598 | 40.5 | 170K | 0 | +170K |
++| 500–1000 | 838 | 28.0 | 610K | 85K | +525K |
++| 1000–2000 | 525 | 25.6 | 791K | 0 | +791K |
++| 2000–5000 | 338 | 23.2 | 933K | 28K | +905K |
++
++Charging every call a full 35K round instead turns every bucket under 2,000
++tokens negative. That overcharges by about 25 times and is the wrong model
++for this path.
++
++## Re-runs: no jump at the floor
++
++Outputs just under 512 bytes reach the model whole; those just over are
++compressed. If compression caused re-runs, the rate would step at 512.
++
++| bytes | n | related search in next 2 calls | same command again |
++|---|---|---|---|
++| 384–512 | 788 | 54.4% | 0.3% |
++| 512–640 | 671 | 54.8% | 0.1% |
++| 640–800 | 731 | 54.7% | 0.7% |
++
++**File lists are the soft spot.** `grep -l` outputs: 66% follow-up searches
++below 512 bytes (n=480), 71% above (n=1,096). About 2 SE, on small samples,
++and bigger lists draw more follow-ups anyway. Keeping 5 of 43 paths is a loss
++ranking cannot repair, so exempting path-only lists from the search
++compressor is the idea to test if this comes up again. Not done here.
++
++`headroom_retrieve` calls are answered by the proxy and rarely reach client
++transcripts, so the "same command" column is mostly exact re-runs.
+diff --git a/scripts/test-hooks.sh b/scripts/test-hooks.sh
+index 903cc6e6d..c4dbff0d0 100755
+--- a/scripts/test-hooks.sh
++++ b/scripts/test-hooks.sh
+@@ -228,6 +228,25 @@ ticket_prompt "file the ticket" b1
+   fail "first attempt stamped at $(stat -c %Y "$STATE/b1.ticket.first-attempt"), want 1000000"
+ ok "the first attempt is backdated to the session's oldest ticket state"
+ 
++# ── scrub-secrets ───────────────────────────────────────────────────────────
++# A secret-store read passes only when its output goes to a file. A `>` in
++# quoted text is not a redirect: it once let a sed or awk pipe print values.
++scrub() { # command -> $RC
++  RC=0
++  jq -nc --arg c "$1" '{tool_input:{command:$c}}' | bash "$HOOKS/scrub-secrets.sh" >/dev/null 2>&1 || RC=$?
++}
++SSM="aws ssm get-parameter --name p --with-decryption"
++for c in "$SSM | grep '^base_url='" "$SSM | sed -E 's/=.*/=<redacted>/'" \
++         "$SSM | awk '\$1>0'" "$SSM > /dev/stdout" "$SSM 2>&1"; do
++  scrub "$c"
++  [[ $RC -eq 2 ]] || fail "a secret-store read that prints was let through: $c"
++done
++for c in "$SSM > /tmp/p.json" "$SSM >/tmp/p.json 2>&1" "$SSM --query 'a>b' > \"/tmp/p q.json\""; do
++  scrub "$c"
++  [[ $RC -eq 0 ]] || fail "a secret-store read into a file was blocked: $c"
++done
++ok "secret-store reads pass only into a file; quoted > is not a redirect"
++
+ # ── review-gate ─────────────────────────────────────────────────────────────
+ # Arming pins the MR from the last review command's own args, never from an
+ # unrelated !NNN elsewhere in the transcript, and never guesses between two.

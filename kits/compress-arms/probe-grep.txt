@@ -1,0 +1,2 @@
+crates/headroom-core/src/transforms/log_compressor.rs:1152:    pub fn compress(&self, content: &str, bias: f64) -> (LogCompressionResult, LogCompressorStats) {
+crates/headroom-core/src/transforms/log_compressor.rs:1156:    pub fn compress_with_store(

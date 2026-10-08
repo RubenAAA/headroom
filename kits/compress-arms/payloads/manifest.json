@@ -1,0 +1,122 @@
+[
+ {
+  "file": "p01-log-small.json",
+  "shape": "log-small",
+  "target_bytes": 2200,
+  "actual_bytes": 2515
+ },
+ {
+  "file": "p02-log-medium.json",
+  "shape": "log-medium",
+  "target_bytes": 10000,
+  "actual_bytes": 10282
+ },
+ {
+  "file": "p03-log-large.json",
+  "shape": "log-large",
+  "target_bytes": 29000,
+  "actual_bytes": 28949
+ },
+ {
+  "file": "p04-search-small.json",
+  "shape": "search-small",
+  "target_bytes": 3000,
+  "actual_bytes": 3228
+ },
+ {
+  "file": "p05-search-medium.json",
+  "shape": "search-medium",
+  "target_bytes": 12500,
+  "actual_bytes": 12798
+ },
+ {
+  "file": "p06-diff-small.json",
+  "shape": "diff-small",
+  "target_bytes": 3600,
+  "actual_bytes": 3950
+ },
+ {
+  "file": "p07-diff-medium.json",
+  "shape": "diff-medium",
+  "target_bytes": 15500,
+  "actual_bytes": 15989
+ },
+ {
+  "file": "p08-diff-large.json",
+  "shape": "diff-large",
+  "target_bytes": 46000,
+  "actual_bytes": 46866
+ },
+ {
+  "file": "p09-prose-small.json",
+  "shape": "prose-small",
+  "target_bytes": 2300,
+  "actual_bytes": 2370
+ },
+ {
+  "file": "p10-prose-medium.json",
+  "shape": "prose-medium",
+  "target_bytes": 13000,
+  "actual_bytes": 13331
+ },
+ {
+  "file": "p11-prose-large.json",
+  "shape": "prose-large",
+  "target_bytes": 32500,
+  "actual_bytes": 33282
+ },
+ {
+  "file": "p12-code-medium.json",
+  "shape": "code-medium",
+  "target_bytes": 11500,
+  "actual_bytes": 12079
+ },
+ {
+  "file": "p13-code-large.json",
+  "shape": "code-large",
+  "target_bytes": 38500,
+  "actual_bytes": 40301
+ },
+ {
+  "file": "p14-json-medium.json",
+  "shape": "json-medium",
+  "target_bytes": 9500,
+  "actual_bytes": 10847
+ },
+ {
+  "file": "p15-mixed-turns.json",
+  "shape": "mixed-turns",
+  "target_bytes": 19000,
+  "actual_bytes": 19606
+ },
+ {
+  "file": "p16-mixed-small.json",
+  "shape": "mixed-small",
+  "target_bytes": 3200,
+  "actual_bytes": 3152
+ },
+ {
+  "file": "p17-excl-read-code.json",
+  "shape": "excl-read-code",
+  "target_bytes": 14500,
+  "actual_bytes": 15175
+ },
+ {
+  "file": "p18-excl-grep-search.json",
+  "shape": "excl-grep-search",
+  "target_bytes": 7500,
+  "actual_bytes": 7688
+ },
+ {
+  "file": "p19-tiny-prose.json",
+  "shape": "tiny-prose",
+  "target_bytes": 1900,
+  "actual_bytes": 1931
+ },
+ {
+  "file": "p20-tiny-log.json",
+  "shape": "tiny-log",
+  "target_bytes": 2100,
+  "actual_bytes": 2333
+ }
+]
