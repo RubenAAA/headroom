@@ -902,6 +902,10 @@ pub(crate) fn build_outcome_context(
 ///
 /// Returns the client-facing response stream. Extracted from forward_http
 /// without behavior change.
+///
+/// The pending ledger event rides into the parser tee and is finalized
+/// when the stream closes; non-SSE responses finalize from a JSON usage
+/// capture instead (see `spawn_sse_parser_tee`).
 pub(crate) fn tee_response_stream<S>(
     upstream_body: S,
     sse_kind: SseStreamKind,
@@ -910,6 +914,8 @@ pub(crate) fn tee_response_stream<S>(
     ccr_round_usage: Option<Arc<Mutex<CcrRoundUsage>>>,
     status: StatusCode,
     request_id: &str,
+    pending_stats: Option<capture::PendingRecord>,
+    path_for_log: &str,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + use<S>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send,
@@ -924,6 +930,8 @@ where
         status,
         request_id,
         &parser_telemetry,
+        pending_stats,
+        path_for_log,
     );
     tee_stream_to_parser(upstream_body, parser_tx, parser_telemetry, rid)
 }

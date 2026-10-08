@@ -39,12 +39,15 @@
 //! revisit if multi-process aggregation lands.
 
 pub mod cache_hit_rate;
+pub mod capture;
 pub mod ccr_retrieval;
 pub mod ccr_splice;
 pub mod compression_ratio;
 pub mod ctx_metrics;
 pub mod ctx_offload_by_tool;
+pub mod ledger;
 pub mod metric_names;
+pub mod pricing;
 pub mod prometheus;
 pub mod proxy_counters;
 pub mod proxy_metrics;
@@ -52,6 +55,7 @@ pub mod recache;
 pub mod redact_metrics;
 pub mod replay_alternates;
 pub mod sidecar;
+pub mod stats_http;
 pub mod tail_breakpoint;
 pub mod upstream_health;
 

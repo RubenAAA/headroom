@@ -265,3 +265,17 @@ pub mod tracing_capture {
         SERIAL.blocking_lock()
     }
 }
+
+/// Static, obviously-fake AWS credentials for SigV4-signing tests.
+/// Shared by every Bedrock test binary — the mock upstream never
+/// validates the signature, only that one is present.
+#[allow(dead_code)]
+pub fn test_credentials() -> aws_credential_types::Credentials {
+    aws_credential_types::Credentials::new(
+        "AKIAEXAMPLEAKIDFORTEST",
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        None,
+        None,
+        "test",
+    )
+}

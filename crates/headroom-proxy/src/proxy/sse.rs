@@ -75,6 +75,8 @@ pub(super) fn spawn_sse_parser_tee(
     status: StatusCode,
     request_id: &str,
     parser_telemetry: &std::sync::Arc<ParserTelemetry>,
+    pending_stats: Option<capture::PendingRecord>,
+    path_for_log: &str,
 ) -> Option<tokio::sync::mpsc::Sender<bytes::Bytes>> {
     if !matches!(sse_kind, SseStreamKind::None) {
         let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(SSE_PARSER_QUEUE_DEPTH);
@@ -99,6 +101,7 @@ pub(super) fn spawn_sse_parser_tee(
             replay_store_for_parser,
             ccr_round_usage,
             status,
+            pending_stats,
         ));
         // Keep the parser detached from response forwarding, but do not drop
         // its JoinHandle: a panic would otherwise erase the only completion
@@ -148,7 +151,18 @@ pub(super) fn spawn_sse_parser_tee(
         });
         Some(tx)
     } else {
-        None
+        // Non-SSE responses never reach the state machine: tee their bytes
+        // into a bounded JSON capture that parses the usage block at body
+        // end and finalizes the ledger event. Best-effort, never blocking
+        // the client byte path. (Upstream stats feature.)
+        pending_stats.map(|p| {
+            let shape = match SseStreamKind::for_request_path(path_for_log) {
+                SseStreamKind::OpenAiChat => capture::ResponseShape::OpenAiChat,
+                SseStreamKind::OpenAiResponses => capture::ResponseShape::OpenAiResponses,
+                _ => capture::ResponseShape::Anthropic,
+            };
+            capture::spawn_json_usage_capture(shape, p)
+        })
     }
 }
 
@@ -467,10 +481,17 @@ pub(super) async fn run_sse_state_machine(
     // arms stamp it onto the outcome so a 5xx served as SSE books failed
     // instead of success. `Copy`, so the spawn site just moves it in.
     upstream_status: StatusCode,
+    // Pending savings-ledger event (upstream stats feature). Each close
+    // arm finalizes it with the streamed usage; the `None` arm records
+    // what the request side knew.
+    pending_stats: Option<capture::PendingRecord>,
 ) {
     use crate::sse::framing::SseFramer;
 
-    let framer = SseFramer::new();
+    // Capped: this task is a telemetry tee off the byte path (usage
+    // observer + outcome booking), so an unterminated stream must not
+    // grow the buffer without bound. See `SseFramer::new_capped`.
+    let framer = SseFramer::new_capped();
     // Time to first byte from upstream. Only the first chunk marks it, so it is
     // latched once and never overwritten. Declared outside the match because
     // every arm needs it — leaving it in one arm made the other providers
@@ -523,6 +544,19 @@ pub(super) async fn run_sse_state_machine(
             sse_anthropic::log_anthropic_close(&close);
             sse_anthropic::book_anthropic_incomplete(&close);
             sse_anthropic::emit_anthropic_outcome(&close);
+            if let Some(mut p) = pending_stats {
+                if let Some(model) = state.model.as_deref() {
+                    p.set_model_if_unknown(model);
+                }
+                // A 200 OK stream can still fail in-band: Anthropic
+                // emits `{"type":"error"}` mid-stream (e.g. overloaded
+                // instead of a 529). Mark it failed so a later retry
+                // of the same turn can't inflate savings.
+                if state.status == crate::sse::anthropic::StreamStatus::Errored {
+                    p.mark_failed();
+                }
+                p.finalize(capture::usage_from_anthropic_state(&state));
+            }
         }
         SseStreamKind::OpenAiChat => {
             let state = sse_openai::drive_openai_chat_stream(
@@ -540,6 +574,19 @@ pub(super) async fn run_sse_state_machine(
                 &outcome_ctx,
                 upstream_status,
             );
+            if let Some(mut p) = pending_stats {
+                if let Some(model) = state.model.as_deref() {
+                    p.set_model_if_unknown(model);
+                }
+                let usage = state
+                    .usage
+                    .as_ref()
+                    .and_then(|u| {
+                        capture::usage_from_usage_block(capture::ResponseShape::OpenAiChat, u)
+                    })
+                    .unwrap_or_default();
+                p.finalize(usage);
+            }
             // Commit the parked replay turn, on clean completion only, as
             // the Anthropic arm does. Chat reports cache reads, no writes.
             if let Some(store) = replay_store.as_ref()
@@ -565,7 +612,32 @@ pub(super) async fn run_sse_state_machine(
                 &outcome_ctx,
                 upstream_status,
             );
+            if let Some(mut p) = pending_stats {
+                if let Some(model) = state.model.as_deref() {
+                    p.set_model_if_unknown(model);
+                }
+                // `response.failed` / `response.incomplete` are not
+                // billable successes — count them as failures even
+                // though the HTTP status was 2xx.
+                if matches!(state.terminal_status(), Some("failed") | Some("incomplete")) {
+                    p.mark_failed();
+                }
+                let usage = state
+                    .usage
+                    .as_ref()
+                    .and_then(|u| {
+                        capture::usage_from_usage_block(capture::ResponseShape::OpenAiResponses, u)
+                    })
+                    .unwrap_or_default();
+                p.finalize(usage);
+            }
         }
-        SseStreamKind::None => {}
+        SseStreamKind::None => {
+            if let Some(p) = pending_stats {
+                // No parser for this stream — record what the
+                // request side knew (compression estimates only).
+                p.finalize(ledger::Usage::default());
+            }
+        }
     }
 }

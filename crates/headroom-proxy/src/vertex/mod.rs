@@ -90,6 +90,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use std::net::SocketAddr;
 
+use crate::observability::{capture, ledger};
 use crate::proxy::AppState;
 
 /// Split the trailing `model_action` segment, 404ing when it carries no
@@ -97,6 +98,7 @@ use crate::proxy::AppState;
 /// Extracted from `handle_vertex_predict_dispatch` without behavior change.
 #[allow(clippy::result_large_err)]
 fn parse_model_action<'a>(
+    state: &AppState,
     model_action: &'a str,
     uri: &Uri,
     request_id: &str,
@@ -111,6 +113,15 @@ fn parse_model_action<'a>(
                 segment = %model_action,
                 "vertex path final segment missing `:verb` separator"
             );
+            // A proxy-side rejection is still an outcome for this
+            // request. The model id is whatever the caller sent (it
+            // is what failed to parse); the ledger clamps it.
+            capture::finalize_rejected(capture::start_pending(
+                state,
+                ledger::provider::VERTEX,
+                model_action,
+                request_id,
+            ));
             Err(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from("vertex path: bad model_action"))
@@ -123,7 +134,12 @@ fn parse_model_action<'a>(
 /// — never a silent fallback to a "default" verb.
 /// Extracted from `handle_vertex_predict_dispatch` without behavior change.
 #[allow(clippy::result_large_err)]
-fn parse_vertex_verb(verb_str: &str, request_id: &str) -> Result<VertexVerb, Response> {
+fn parse_vertex_verb(
+    state: &AppState,
+    model_id: &str,
+    verb_str: &str,
+    request_id: &str,
+) -> Result<VertexVerb, Response> {
     match VertexVerb::parse(verb_str) {
         Some(v) => Ok(v),
         None => {
@@ -133,6 +149,12 @@ fn parse_vertex_verb(verb_str: &str, request_id: &str) -> Result<VertexVerb, Res
                 verb = %verb_str,
                 "vertex path verb not recognized; only rawPredict / streamRawPredict are supported"
             );
+            capture::finalize_rejected(capture::start_pending(
+                state,
+                ledger::provider::VERTEX,
+                model_id,
+                request_id,
+            ));
             Err(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from("vertex: unknown verb"))
@@ -212,12 +234,12 @@ pub async fn handle_vertex_predict_dispatch(
         }
     }
 
-    let (model_id, verb_str) = match parse_model_action(&model_action, &uri, &request_id) {
+    let (model_id, verb_str) = match parse_model_action(&state, &model_action, &uri, &request_id) {
         Ok(parts) => parts,
         Err(response) => return response,
     };
 
-    let verb = match parse_vertex_verb(verb_str, &request_id) {
+    let verb = match parse_vertex_verb(&state, model_id, verb_str, &request_id) {
         Ok(v) => v,
         Err(response) => return response,
     };

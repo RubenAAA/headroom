@@ -64,6 +64,7 @@ use crate::config::Config;
 use crate::error::ProxyError;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
 use crate::health::{health, healthz, healthz_upstream, livez, readyz, rollout_status};
+use crate::observability::{capture, ledger};
 use crate::websocket::ws_handler;
 // Phase F PR-F1: imported as `classify_auth_mode` to make the call
 // site self-documenting. `AuthMode` is re-exported under the same
@@ -300,10 +301,10 @@ pub(crate) async fn forward_http(
         true,
         true,
     );
-    let should_intercept = gate_decision.should_compress
-        && method == axum::http::Method::POST
+    let is_llm_json_post = method == axum::http::Method::POST
         && compression::is_compressible_path(uri.path())
         && is_application_json(req.headers());
+    let should_intercept = gate_decision.should_compress && is_llm_json_post;
 
     // Every POST to a compressible path tees the response into the SSE
     // state machine (usage observer, hit-rate metrics, re-cache watchdog),
@@ -339,6 +340,33 @@ pub(crate) async fn forward_http(
 
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| ProxyError::InvalidHeader(e.to_string()))?;
+
+    // Savings ledger. Deliberately NOT gated on `should_intercept`:
+    // spend/caching stats are worth answering on a pure passthrough
+    // deployment too (compression savings are truthfully 0 there),
+    // so the gate is the LLM-endpoint shape alone and the model id
+    // is learned from the response when the request didn't carry it.
+    // Finalized exactly once, when the response is fully observed.
+    let should_record = state.config.stats && is_llm_json_post;
+    let mut pending_stats = should_record
+        .then(|| compression::classify_compressible_path(uri.path()))
+        .flatten()
+        .map(|endpoint| {
+            let provider = match endpoint {
+                compression::CompressibleEndpoint::AnthropicMessages => ledger::provider::ANTHROPIC,
+                compression::CompressibleEndpoint::OpenAiChatCompletions => {
+                    ledger::provider::OPENAI_CHAT
+                }
+                compression::CompressibleEndpoint::OpenAiResponses => {
+                    ledger::provider::OPENAI_RESPONSES
+                }
+            };
+            capture::PendingRecord::new(
+                state.stats.clone(),
+                ledger::RequestEvent::new(provider, "", &request_id),
+                start,
+            )
+        });
 
     // Populated inside the intercept block; consumed by the SSE state-machine
     // task to build RequestOutcome at stream close.
@@ -389,7 +417,10 @@ pub(crate) async fn forward_http(
             forward::read_buffered_body(req, max, body_bytes_hint, &request_id, &path_for_log)
                 .await;
         stage_timer.record("buffer", body_read_start.elapsed().as_secs_f64() * 1000.0);
-        let buffered = buffered?;
+        let buffered = buffered.map_err(|e| {
+            capture::finalize_rejected(pending_stats.take());
+            e
+        })?;
         // Plan 2 step 1: `parse` gap starts where the buffer stage ends.
         // Recorded unconditionally after the ctx block closes below, so an
         // early return between here and there yields a null placeholder.
@@ -438,6 +469,7 @@ pub(crate) async fn forward_http(
         )
         .await
         {
+            capture::finalize_rejected(pending_stats.take());
             return Ok(resp);
         }
         // PR-C2: dispatch on the endpoint classification so each
@@ -573,6 +605,7 @@ pub(crate) async fn forward_http(
                     outgoing_headers: &mut outgoing_headers,
                 },
             ) {
+                capture::finalize_rejected(pending_stats.take());
                 return Ok(shed);
             }
         }
@@ -591,6 +624,7 @@ pub(crate) async fn forward_http(
                 headers_snapshot.as_ref(),
             )
         {
+            capture::finalize_rejected(pending_stats.take());
             return Ok(hit);
         }
         let (
@@ -667,7 +701,11 @@ pub(crate) async fn forward_http(
             &headers_snapshot,
             &state,
             &request_id,
-        )?;
+        )
+        .map_err(|e| {
+            capture::finalize_rejected(pending_stats.take());
+            e
+        })?;
 
         // Per-request tags for RequestOutcome: operator `x-headroom-*` slicing
         // tags plus the canonical `passthrough_reason` when this request was
@@ -943,6 +981,19 @@ pub(crate) async fn forward_http(
             );
         }
 
+        // Savings ledger: the request carried the model id (learned from the
+        // sanitized buffered body via the outcome context) and the compression
+        // stage already measured before/after — record both before the send.
+        if let Some(p) = pending_stats.as_mut() {
+            if let Some(ctx) = outcome_ctx.as_ref() {
+                p.set_model(&ctx.model);
+            }
+            p.set_compression(
+                compress_tokens_before.max(0) as u64,
+                (compress_tokens_before - compress_tokens_saved).max(0) as u64,
+                compress_strategies.clone(),
+            );
+        }
         // Forward the request with retry on transient errors (429, 529, 5xx).
         forward::send_buffered_with_retry(
             &state,
@@ -957,7 +1008,11 @@ pub(crate) async fn forward_http(
             &body_to_send,
             &mut outcome_ctx,
         )
-        .await?
+        .await
+        .map_err(|e| {
+            capture::finalize_rejected(pending_stats.take());
+            e
+        })?
     } else {
         // Pure streaming path — the original passthrough behaviour. No peek
         // here: passthrough is byte-faithful by contract, and this path has no
@@ -979,7 +1034,11 @@ pub(crate) async fn forward_http(
                 .headers(outgoing_headers.clone())
                 .body(reqwest_body)
                 .send()
-                .await?,
+                .await
+                .map_err(|e| {
+                    capture::finalize_rejected(pending_stats.take());
+                    e
+                })?,
             bytes::Bytes::new(),
         )
     };
@@ -1003,6 +1062,13 @@ pub(crate) async fn forward_http(
         state.config.enable_responses_streaming,
         configured_http_proxy,
     );
+    // A non-2xx upstream is a failed request: it counts in the
+    // ledger but accrues no savings (enforced there on the flag).
+    if !status.is_success() {
+        if let Some(p) = pending_stats.as_mut() {
+            p.mark_failed();
+        }
+    }
 
     let (upstream_body, is_sse, sse_kind, ccr_round_usage, continuation_base) =
         forward::assemble_response_stream(
@@ -1038,6 +1104,8 @@ pub(crate) async fn forward_http(
         ccr_round_usage.clone(),
         status,
         &request_id,
+        pending_stats.take(),
+        &path_for_log,
     );
     let (body, status, resp_headers) = forward::build_response_body(
         resp_stream,

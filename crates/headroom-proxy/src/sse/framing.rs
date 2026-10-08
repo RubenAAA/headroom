@@ -95,6 +95,12 @@ pub struct SseFramer {
     /// into a complete event. Always holds at most one in-flight
     /// event's worth of data plus any partial trailing bytes.
     buf: BytesMut,
+    /// Hard ceiling on `buf`, or `None` for unbounded. Only telemetry
+    /// tees (which can be fed a non-SSE body for the life of a stream)
+    /// set this, via [`SseFramer::new_capped`]. Client-path framers
+    /// stay unbounded: dropping bytes there would corrupt the stream
+    /// the client sees.
+    max_buffered_bytes: Option<usize>,
     /// Once we see `[DONE]` we still tolerate further events (some
     /// providers append a final empty `\n\n`), but the state machine
     /// can use this to gate "no more useful events expected".
@@ -105,6 +111,27 @@ impl SseFramer {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// A framer that drops its buffer (and the triggering chunk) once
+    /// more than [`SseFramer::MAX_BUFFERED_BYTES`] accumulate without
+    /// an event terminator. Only for telemetry tees off the byte path:
+    /// usage observers, savings-ledger state machines. Parsing resumes
+    /// mid-stream at an arbitrary offset, so at most one truncated
+    /// event per overflow — a wrong usage number for one stream, never
+    /// client-visible corruption. Never use on the client path.
+    pub fn new_capped() -> Self {
+        Self {
+            max_buffered_bytes: Some(Self::MAX_BUFFERED_BYTES),
+            ..Self::default()
+        }
+    }
+
+    /// Accumulator ceiling for capped framers. A real SSE event is a
+    /// few KB; 4 MiB is orders of magnitude past any legitimate frame.
+    /// A stream that never emits a blank-line terminator (a non-SSE
+    /// body routed here, or a hostile upstream) trips this instead of
+    /// growing the buffer for the life of the stream.
+    pub const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
 
     /// True after the framer has yielded an event whose `data` is the
     /// `[DONE]` sentinel. Once this is set, additional bytes pushed
@@ -123,6 +150,28 @@ impl SseFramer {
     pub fn push(&mut self, chunk: &[u8]) {
         if chunk.is_empty() {
             return;
+        }
+        // Capped framers (telemetry tees only — see `new_capped`)
+        // drop the buffer and the triggering chunk on overflow, so
+        // parsing resumes mid-stream at an arbitrary byte offset.
+        // Usually that garbage forms a prefix-less line the parser
+        // ignores; it CAN also resume on a syntactically valid
+        // `data:` line and yield one truncated event. The worst case
+        // is a wrong usage number for one stream, bounded further by
+        // the ledger's own per-event token ceiling. Client bytes are
+        // never touched because capped framers are never on the
+        // client path.
+        if let Some(max) = self.max_buffered_bytes {
+            if self.buf.len() + chunk.len() > max {
+                tracing::warn!(
+                    event = "sse_framer_buffer_overflow",
+                    buffered = self.buf.len(),
+                    "no event terminator within 4 MiB; discarding buffered \
+                     bytes (telemetry-only consumer — client stream unaffected)"
+                );
+                self.buf.clear();
+                return;
+            }
         }
         self.buf.extend_from_slice(chunk);
     }
@@ -390,5 +439,29 @@ mod tests {
         let ev = f.next_event().unwrap().unwrap();
         assert!(ev.is_done_sentinel());
         assert!(f.done_seen());
+    }
+
+    #[test]
+    fn unbounded_framer_keeps_oversize_buffer() {
+        // Client path: a data line whose payload runs past 4 MiB
+        // before its terminator arrives must still parse whole.
+        let mut f = SseFramer::new();
+        f.push(b"data: ");
+        f.push(&vec![b'x'; SseFramer::MAX_BUFFERED_BYTES + 1]);
+        f.push(b"\n\n");
+        let ev = f.next_event().unwrap().unwrap();
+        assert!(ev.data.len() > SseFramer::MAX_BUFFERED_BYTES);
+    }
+
+    #[test]
+    fn capped_framer_drops_oversize_buffer() {
+        // Telemetry tee: an unterminated flood is discarded, and the
+        // framer recovers on the next well-formed event.
+        let mut f = SseFramer::new_capped();
+        f.push(&vec![b'x'; SseFramer::MAX_BUFFERED_BYTES + 1]);
+        assert!(f.next_event().is_none());
+        f.push(b"data: ok\n\n");
+        let ev = f.next_event().unwrap().unwrap();
+        assert_eq!(ev.data.as_ref(), b"ok");
     }
 }

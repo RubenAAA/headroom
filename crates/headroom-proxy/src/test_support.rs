@@ -107,5 +107,8 @@ pub(crate) fn test_state(configure: impl FnOnce(&mut crate::config::Config)) -> 
             std::time::Duration::from_secs(86_400),
             10_000,
         )),
+        // Same as upstream's hand-built test states: an inert in-memory
+        // ledger. `Config::stats` is false in tests, so nothing records.
+        stats: std::sync::Arc::new(crate::observability::ledger::Ledger::in_memory()),
     }
 }

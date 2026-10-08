@@ -93,7 +93,7 @@ pub async fn handle_stats(
         }
     }
 
-    Json(serde_json::json!({
+    let mut val = serde_json::json!({
         "cost": cost_stats,
         "persistent_savings": savings_preview,
         // Durable cache counters, and the one derived number that says whether
@@ -136,7 +136,23 @@ pub async fn handle_stats(
             .codex_rate_limits
             .snapshot()
             .map(|s| s.to_json()),
-    }))
+    });
+    // Native savings ledger (upstream stats feature): merge its payload in
+    // when recording. Keys are disjoint from the tracker payload above
+    // except `recent_requests`, where the fork's request-log rows win —
+    // statusline and holdout tests consume that shape, and the ledger's
+    // recent list stays available at `/stats/events`.
+    if state.config.stats {
+        let ledger = state.stats.stats_payload(can_view);
+        if let (Some(dst), Some(src)) = (val.as_object_mut(), ledger.as_object()) {
+            for (k, v) in src {
+                if k != "recent_requests" {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    Json(val)
 }
 
 // ── /codex-limits ──

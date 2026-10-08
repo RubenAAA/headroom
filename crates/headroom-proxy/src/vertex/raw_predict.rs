@@ -36,6 +36,8 @@ use std::net::SocketAddr;
 
 use crate::compression;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
+use crate::observability::capture::TEE_QUEUE_DEPTH as VERTEX_SSE_QUEUE_DEPTH;
+use crate::observability::{capture, ledger};
 use crate::proxy::AppState;
 use crate::vertex::{VertexVerb, adc::TokenSourceError, envelope};
 
@@ -76,14 +78,25 @@ pub(crate) async fn forward_vertex_request(
 ) -> Response {
     let path_for_log = uri.path().to_string();
 
+    // Constructed at handler ENTRY so every exit — including
+    // proxy-side rejections (oversized body, envelope mismatch, ADC
+    // failure) — records exactly once. An ADC outage must show in
+    // /stats as a failure spike, not zero traffic.
+    let mut pending_stats =
+        capture::start_pending(&state, ledger::provider::VERTEX, &ctx.model_id, &request_id);
+
     // ─── 1. BUFFER BODY ────────────────────────────────────────────────
     let buffered = match buffer_vertex_body(&state, body, &request_id, &path_for_log).await {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => {
+            capture::finalize_rejected(pending_stats.take());
+            return resp;
+        }
     };
 
     // ─── 2. ENVELOPE PARSE ─────────────────────────────────────────────
     if let Err(resp) = check_vertex_envelope(&buffered, &ctx, &request_id, &path_for_log) {
+        capture::finalize_rejected(pending_stats.take());
         return resp;
     }
 
@@ -94,12 +107,20 @@ pub(crate) async fn forward_vertex_request(
     // The dispatcher uses RawValue-based surgery so `anthropic_version`
     // (and any other non-`messages` top-level field) round-trips
     // byte-equal. Compression off → buffered bytes used unchanged.
-    let body_to_send = compress_vertex_body(&state, buffered, &request_id, &path_for_log);
+    let (body_to_send, stats_compression) =
+        compress_vertex_body(&state, buffered, &request_id, &path_for_log);
+    if let Some(p) = pending_stats.as_mut() {
+        let (before, after, transforms) = stats_compression;
+        p.set_compression(before, after, transforms);
+    }
 
     // ─── 4. RESOLVE BEARER TOKEN ───────────────────────────────────────
     let bearer = match fetch_vertex_bearer(&state, &ctx, &request_id, &path_for_log).await {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => {
+            capture::finalize_rejected(pending_stats.take());
+            return resp;
+        }
     };
 
     // ─── 5. BUILD UPSTREAM URL ─────────────────────────────────────────
@@ -118,14 +139,20 @@ pub(crate) async fn forward_vertex_request(
     // observability only.
     let upstream_url = match build_vertex_upstream_url(&state, &uri, &request_id) {
         Ok(u) => u,
-        Err(resp) => return resp,
+        Err(resp) => {
+            capture::finalize_rejected(pending_stats.take());
+            return resp;
+        }
     };
 
     // ─── 6. BUILD HEADERS ──────────────────────────────────────────────
     let outgoing_headers =
         match build_vertex_headers(&state, &headers, client_addr, &bearer, &request_id) {
             Ok(h) => h,
-            Err(resp) => return resp,
+            Err(resp) => {
+                capture::finalize_rejected(pending_stats.take());
+                return resp;
+            }
         };
 
     // ─── 6b. REDACTION SEAM ──────────────────────────────────────────
@@ -148,11 +175,15 @@ pub(crate) async fn forward_vertex_request(
         body_to_send,
         &request_id,
         &path_for_log,
+        &mut pending_stats,
     )
     .await
     {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => {
+            capture::finalize_rejected(pending_stats.take());
+            return resp;
+        }
     };
 
     // ─── 8. STREAM RESPONSE ────────────────────────────────────────────
@@ -163,6 +194,7 @@ pub(crate) async fn forward_vertex_request(
         path_for_log,
         &ctx,
         attach_sse_tee,
+        &mut pending_stats,
     )
 }
 
@@ -249,12 +281,15 @@ fn check_vertex_envelope(
 /// credentials, so the PAYG/OAuth/subscription classification doesn't apply:
 /// hard-code `AuthMode::OAuth` (PR-E3).
 /// Extracted from `forward_vertex_request` without behavior change.
+/// Also returns `(tokens_before, tokens_after, strategies)` for the
+/// savings ledger (upstream stats feature); `(0, 0, [])` when the
+/// body passes through uncompressed.
 fn compress_vertex_body(
     state: &AppState,
     buffered: bytes::Bytes,
     request_id: &str,
     path_for_log: &str,
-) -> bytes::Bytes {
+) -> (bytes::Bytes, (u64, u64, Vec<String>)) {
     if !state.config.compression {
         tracing::info!(
             event = "vertex_compression_skipped",
@@ -263,7 +298,7 @@ fn compress_vertex_body(
             reason = "compression_off",
             "compression master switch off; vertex body forwarded unchanged"
         );
-        return buffered;
+        return (buffered, (0, 0, Vec::new()));
     }
     // PR-E3: Vertex uses GCP ADC bearer-token auth downstream, not
     // Anthropic credentials, so the PAYG/OAuth/subscription
@@ -302,7 +337,7 @@ fn report_compression_outcome(
     state: &AppState,
     request_id: &str,
     path_for_log: &str,
-) -> bytes::Bytes {
+) -> (bytes::Bytes, (u64, u64, Vec<String>)) {
     match outcome {
         compression::Outcome::NoCompression => {
             tracing::info!(
@@ -313,7 +348,7 @@ fn report_compression_outcome(
                 reason = "no_compression",
                 "vertex live-zone dispatcher returned NoCompression"
             );
-            buffered
+            (buffered, (0, 0, Vec::new()))
         }
         compression::Outcome::Compressed {
             body,
@@ -334,7 +369,14 @@ fn report_compression_outcome(
                 markers = markers_inserted.len(),
                 "vertex live-zone compression applied"
             );
-            body
+            (
+                body,
+                (
+                    tokens_before as u64,
+                    tokens_after as u64,
+                    strategies_applied.iter().map(|s| s.to_string()).collect(),
+                ),
+            )
         }
         compression::Outcome::Passthrough { reason } => {
             tracing::warn!(
@@ -344,7 +386,7 @@ fn report_compression_outcome(
                 reason = ?reason,
                 "vertex live-zone dispatcher passthrough on parse/serialize"
             );
-            buffered
+            (buffered, (0, 0, Vec::new()))
         }
     }
 }
@@ -492,6 +534,7 @@ async fn send_vertex_request(
     body: bytes::Bytes,
     request_id: &str,
     path_for_log: &str,
+    pending_stats: &mut Option<capture::PendingRecord>,
 ) -> Result<reqwest::Response, Response> {
     let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(m) => m,
@@ -519,6 +562,9 @@ async fn send_vertex_request(
     {
         Ok(r) => Ok(r),
         Err(e) => {
+            if let Some(p) = pending_stats.take() {
+                p.finalize_failed();
+            }
             tracing::warn!(
                 event = "vertex_upstream_error",
                 request_id = %request_id,
@@ -544,9 +590,15 @@ fn stream_vertex_response(
     path_for_log: String,
     ctx: &VertexCallContext,
     attach_sse_tee: bool,
+    mut pending_stats: &mut Option<capture::PendingRecord>,
 ) -> Response {
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !upstream_status.is_success() {
+        if let Some(p) = pending_stats.as_mut() {
+            p.mark_failed();
+        }
+    }
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
     // PR-C1 reuse: when `attach_sse_tee` is set AND the upstream
@@ -555,7 +607,12 @@ fn stream_vertex_response(
     // as the `/v1/messages` SSE telemetry tee in
     // `crate::proxy::forward_http`. The byte-passthrough path is
     // unaffected by the tee (best-effort `try_send`, bounded channel).
-    let parser_tx = engage_sse_tee(attach_sse_tee, &upstream_resp, &request_id);
+    let parser_tx = engage_sse_tee(
+        attach_sse_tee,
+        &upstream_resp,
+        &request_id,
+        &mut pending_stats,
+    );
 
     use futures_util::StreamExt as _;
     let rid_for_stream = request_id.clone();
@@ -627,21 +684,17 @@ fn error_response(status: StatusCode, msg: &'static str) -> Response {
         .expect("static error response")
 }
 
-/// Bound on the in-flight queue between the byte-passthrough and the
-/// SSE state-machine task. Mirrors the
-/// `crate::proxy::SSE_PARSER_QUEUE_DEPTH` rationale (256 events ≈ 5
-/// seconds of typical Anthropic streaming under the per-100ms event
-/// rate; keeps memory bounded even if the parser stalls).
-const VERTEX_SSE_QUEUE_DEPTH: usize = 256;
-
-/// Engage the SSE telemetry tee when asked and the upstream response is
-/// `text/event-stream`: bounded channel, spawned state machine, best-effort
-/// sends that never block the byte path.
-/// Extracted from `stream_vertex_response` without behavior change.
+/// Engage the stats-tee when asked: for `text/event-stream` responses a
+/// bounded channel plus a spawned SSE state machine; otherwise a bounded
+/// JSON-usage capture over the buffered body. Sends never block the byte
+/// path. Extracted from `stream_vertex_response` without behavior change;
+/// the non-SSE capture arm is the upstream stats feature.
+/// Queue bound is the shared [`capture::TEE_QUEUE_DEPTH`].
 fn engage_sse_tee(
     attach_sse_tee: bool,
     upstream_resp: &reqwest::Response,
     request_id: &str,
+    pending_stats: &mut Option<capture::PendingRecord>,
 ) -> Option<tokio::sync::mpsc::Sender<bytes::Bytes>> {
     let is_sse = upstream_resp
         .headers()
@@ -653,11 +706,20 @@ fn engage_sse_tee(
         })
         .unwrap_or(false);
     if !(attach_sse_tee && is_sse) {
-        return None;
+        // Non-SSE (rawPredict, or a JSON error on the streaming
+        // verb): tee the body into a bounded buffer and parse the
+        // Anthropic-shape usage block when it completes.
+        return pending_stats
+            .take()
+            .map(|p| capture::spawn_json_usage_capture(capture::ResponseShape::Anthropic, p));
     }
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(VERTEX_SSE_QUEUE_DEPTH);
     let rid = request_id.to_string();
-    tokio::spawn(run_anthropic_sse_state_machine(rx, rid));
+    tokio::spawn(run_anthropic_sse_state_machine(
+        rx,
+        rid,
+        pending_stats.take(),
+    ));
     tracing::info!(
         event = "vertex_sse_tee_engaged",
         request_id = %request_id,
@@ -673,9 +735,12 @@ fn engage_sse_tee(
 async fn run_anthropic_sse_state_machine(
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     request_id: String,
+    pending_stats: Option<capture::PendingRecord>,
 ) {
     use crate::sse::framing::SseFramer;
-    let mut framer = SseFramer::new();
+    // Capped: this task is a telemetry tee off the byte path, so an
+    // unterminated stream must not grow the buffer without bound.
+    let mut framer = SseFramer::new_capped();
     let mut state = crate::sse::anthropic::AnthropicStreamState::new();
     while let Some(chunk) = rx.recv().await {
         framer.push(&chunk);
@@ -695,6 +760,14 @@ async fn run_anthropic_sse_state_machine(
         blocks = state.blocks.len(),
         "vertex sse stream closed"
     );
+    if let Some(mut p) = pending_stats {
+        // In-band `{"type":"error"}` on a 200 OK stream is not a
+        // billable success (same rule as the direct Anthropic lane).
+        if matches!(state.status, crate::sse::anthropic::StreamStatus::Errored) {
+            p.mark_failed();
+        }
+        p.finalize(capture::usage_from_anthropic_state(&state));
+    }
 }
 
 /// Apply one framed SSE event to the telemetry state machine.

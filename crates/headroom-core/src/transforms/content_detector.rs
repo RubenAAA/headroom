@@ -10,6 +10,7 @@
 //! - **BuildOutput**: Compiler / test / lint logs
 //! - **GitDiff**: Unified diff format → `DiffCompressor`
 //! - **Html**: Web pages (needs extraction, not compression)
+//! - **Tabular**: lossless route for tables and human-readable Git status
 //! - **PlainText**: Generic fallback
 //!
 //! Detection is **regex-based** — no ML, no model loading, no I/O.
@@ -351,6 +352,95 @@ static HTML_STRUCTURAL_TAGS: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+/// Human-readable `git status` (upstream #4020): `On branch …` plus a
+/// section heading and a real path route `Tabular` (lossless, conf 1.0).
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitStatusSection {
+    Staged,
+    Unstaged,
+    Untracked,
+    Unmerged,
+}
+
+fn try_detect_git_status(content: &str) -> Option<DetectionResult> {
+    let mut lines = content.lines();
+    let first = lines.next()?;
+    if !first.starts_with("On branch ")
+        && !first.starts_with("HEAD detached at ")
+        && !first.starts_with("HEAD detached from ")
+    {
+        return None;
+    }
+
+    let mut has_heading = false;
+    let mut has_path = false;
+    let mut section = None;
+    for line in lines {
+        section = match line {
+            "Changes to be committed:" => {
+                has_heading = true;
+                Some(GitStatusSection::Staged)
+            }
+            "Changes not staged for commit:" => {
+                has_heading = true;
+                Some(GitStatusSection::Unstaged)
+            }
+            "Untracked files:" => {
+                has_heading = true;
+                Some(GitStatusSection::Untracked)
+            }
+            "Unmerged paths:" => {
+                has_heading = true;
+                Some(GitStatusSection::Unmerged)
+            }
+            _ => section,
+        };
+
+        if section == Some(GitStatusSection::Untracked)
+            && line
+                .strip_prefix('\t')
+                .is_some_and(|path| !path.trim().is_empty())
+        {
+            has_path = true;
+        } else if matches!(
+            section,
+            Some(
+                GitStatusSection::Staged | GitStatusSection::Unstaged | GitStatusSection::Unmerged
+            )
+        ) {
+            let Some((state, path)) = line.trim_start().split_once(": ") else {
+                continue;
+            };
+            if !path.trim().is_empty()
+                && matches!(
+                    state,
+                    "new file"
+                        | "modified"
+                        | "deleted"
+                        | "renamed"
+                        | "copied"
+                        | "typechange"
+                        | "both modified"
+                        | "both added"
+                        | "both deleted"
+                        | "added by us"
+                        | "deleted by us"
+                        | "added by them"
+                        | "deleted by them"
+                )
+            {
+                has_path = true;
+            }
+        }
+    }
+
+    (has_heading && has_path).then(|| {
+        let mut metadata = Map::new();
+        metadata.insert("format".into(), Value::String("git_status".into()));
+        DetectionResult::new(ContentType::Tabular, 1.0, metadata)
+    })
+}
 
 // ─── Public entry point ────────────────────────────────────────────────
 
@@ -362,12 +452,13 @@ static HTML_STRUCTURAL_TAGS: LazyLock<Regex> = LazyLock::new(|| {
 /// 2. JSON array (highest priority for `SmartCrusher`)
 /// 3. Git diff (≥ 0.7 confidence required)
 /// 4. HTML (≥ 0.7 confidence required)
-/// 5. Search results (≥ 0.6 confidence required)
-/// 6. Build / log output (≥ 0.5 confidence required)
-/// 7. Tabular (≥ 0.6 confidence required; runs after search/log so those claim content first)
-/// 8. Structured config (≥ 0.6 confidence required; runs after tabular, before code)
-/// 9. Source code (≥ 0.5 confidence required)
-/// 10. Fallback to `PlainText` confidence 0.5
+/// 5. Human-readable Git status → `Tabular` (lossless)
+/// 6. Search results (≥ 0.6 confidence required)
+/// 7. Build / log output (≥ 0.5 confidence required)
+/// 8. Tabular (≥ 0.6 confidence required; runs after search/log so those claim content first)
+/// 9. Structured config (≥ 0.6 confidence required; runs after tabular, before code)
+/// 10. Source code (≥ 0.5 confidence required)
+/// 11. Fallback to `PlainText` confidence 0.5
 pub fn detect_content_type(content: &str) -> DetectionResult {
     if content.is_empty() || content.trim().is_empty() {
         return DetectionResult::plain_text(0.0);
@@ -384,6 +475,9 @@ pub fn detect_content_type(content: &str) -> DetectionResult {
     if let Some(r) = try_detect_html(content)
         && r.confidence >= 0.7
     {
+        return r;
+    }
+    if let Some(r) = try_detect_git_status(content) {
         return r;
     }
     if let Some(r) = try_detect_search(content)
@@ -1372,19 +1466,14 @@ pub(crate) mod tests {
 
     #[test]
     fn fixed_width_does_not_claim_non_tables() {
-        let git_status = format!(
-            "On branch main\nChanges not staged for commit:\n  (use \"git add <file>...\" to update what will be committed)\n{}",
-            (0..10)
-                .map(|i| format!("\tmodified:   src/m_{i}.py"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        // NOTE: git status is absent here on purpose — upstream #4020 routes
+        // it Tabular (lossless, format "git_status"), covered by the
+        // git_status_* tests. This test guards the fixed-width stage only.
         for (name, content) in [
             ("bullets", "- first item in the list\n- second item in the list\n- third item in the list\n- fourth item in the list".to_string()),
             ("numbered", "1. install the package\n2. run the proxy\n3. wrap the agent\n4. check the stats".to_string()),
             ("sql", "SELECT id, name\nFROM users\nWHERE active = 1\nORDER BY name;\n-- comment\nLIMIT 10;".to_string()),
             ("c_defines", "#define FOO 1\n#define BAR 2\n#define BAZ 3\n#define QUX 4".to_string()),
-            ("git_status", git_status),
             ("git_log", "3aa5012 perf(memory/budget): precompute word sets once\nc81378c fix(grok): preserve xAI model context metadata\nb0c19a2 fix(security): reject unauthenticated public proxy binds\n871bbde fix(proxy): reject Anthropic batch operations on Copilot\na29162b fix(dashboard): separate rolling cache economics by owner".to_string()),
             ("wrapped_prose", "Headroom compresses tool output before it reaches the model, which saves\ntokens on long agent sessions. The router picks a compressor per content\ntype, and plain prose goes to Kompress, an ML model that drops words it\npredicts the reader can do without. That is fine for prose and wrong for\nrecords, where every field matters to whatever command runs next, so the\ndetector has to tell the two apart before anything is dropped at all.".to_string()),
         ] {
@@ -1601,6 +1690,57 @@ pub(crate) mod tests {
             .is_none()
         );
         assert!(try_detect_search("timeout=30:12:retried\ntimeout=31:12:retried").is_none());
+    }
+
+    #[test]
+    fn git_status_with_staged_unstaged_and_untracked_paths_is_tabular() {
+        let content = "\
+On branch feature/status
+Changes to be committed:
+  (use \"git restore --staged <file>...\" to unstage)
+\tnew file:   staged file.txt
+
+Changes not staged for commit:
+  (use \"git add <file>...\" to update what will be committed)
+\tmodified:   path with spaces.txt
+
+Untracked files:
+  (use \"git add <file>...\" to include in what will be committed)
+\tuntracked path.txt
+";
+        let result = detect_content_type(content);
+        assert_eq!(result.content_type, ContentType::Tabular);
+        assert_eq!(
+            result.metadata.get("format").and_then(Value::as_str),
+            Some("git_status")
+        );
+    }
+
+    #[test]
+    fn untracked_only_git_status_is_tabular() {
+        let content = "\
+On branch feature/status
+
+Untracked files:
+  (use \"git add <file>...\" to include in what will be committed)
+\tuntracked path with spaces.txt
+\tuntracked α.rs
+";
+        let result = detect_content_type(content);
+        assert_eq!(result.content_type, ContentType::Tabular);
+        assert_eq!(
+            result.metadata.get("format").and_then(Value::as_str),
+            Some("git_status")
+        );
+    }
+
+    #[test]
+    fn ordinary_bullet_list_is_not_git_status() {
+        let prose = "The branch has many changes:\n- modified: item one\n- modified: item two";
+        assert_eq!(
+            detect_content_type(prose).content_type,
+            ContentType::PlainText
+        );
     }
 
     #[test]

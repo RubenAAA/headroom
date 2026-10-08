@@ -80,6 +80,13 @@ pub struct AppState {
     /// route hits `bearer()`. Tests override via
     /// [`AppState::with_token_source`].
     pub vertex_token_source: Arc<dyn crate::vertex::TokenSource>,
+    /// Native savings ledger (one per process). Loaded from
+    /// `Config::stats_path` when persistence is configured, else
+    /// in-memory. Handlers record into it after each finished
+    /// request; `/stats*` and `/dashboard` read from it. Recording
+    /// call sites gate on `Config::stats` — when stats are disabled
+    /// this is an inert in-memory ledger.
+    pub stats: Arc<crate::observability::ledger::Ledger>,
     /// Freeze-replay: per-session store of the previously-forwarded
     /// (compressed) messages so the next turn can replay the prefix
     /// byte-identical (ports Python `PrefixCacheTracker`). Cloneable
@@ -759,6 +766,15 @@ impl AppState {
         let vertex_token_source: Arc<dyn crate::vertex::TokenSource> =
             Arc::new(crate::vertex::adc::GcpAdcTokenSource::new());
 
+        let stats = if config.stats {
+            match config.stats_path.clone() {
+                Some(path) => Arc::new(crate::observability::ledger::Ledger::load(path)),
+                None => Arc::new(crate::observability::ledger::Ledger::in_memory()),
+            }
+        } else {
+            Arc::new(crate::observability::ledger::Ledger::in_memory())
+        };
+
         // CTX flags imply interception (Config::from_cli forces `compression`
         // on when any is set); say so once at startup so operators see why
         // bodies are being buffered.
@@ -899,6 +915,7 @@ impl AppState {
                 cache_stabilization::beta_sticky::BETA_TRACKER_CAPACITY,
             ),
             vertex_token_source,
+            stats,
             // Tell the classifier which TTL we actually pin. Left at the
             // 5-minute default it files every bust in a 5m..1h gap as a
             // legitimate expiry, which hid ~3% of daily creation.

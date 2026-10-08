@@ -519,6 +519,32 @@ pub fn build_app(state: AppState) -> Router {
         post(crate::foundry::handle_foundry_messages),
     );
 
+    // Native savings stats + dashboard (upstream stats feature). Served
+    // locally so the proxy is self-sufficient for savings observability.
+    // Gated on `--stats`; the fork's own `/stats` (tracker payload) stays
+    // unconditional above and merges the ledger in when recording.
+    let router = if state.config.stats {
+        router
+            .route(
+                "/stats/timeseries",
+                get(crate::observability::stats_http::handle_timeseries),
+            )
+            .route(
+                "/stats/events",
+                get(crate::observability::stats_http::handle_events),
+            )
+            .route(
+                "/dashboard",
+                get(crate::observability::stats_http::handle_dashboard),
+            )
+    } else {
+        tracing::warn!(
+            event = "stats_disabled",
+            "native savings stats disabled by --stats=false;              /stats/timeseries, /stats/events and /dashboard are not served              and no request telemetry is recorded"
+        );
+        router
+    };
+
     // Model routing: intercept /v1/messages only when configured.
     let router = mount_model_routes(router, &state);
 

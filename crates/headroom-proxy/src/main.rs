@@ -353,6 +353,42 @@ async fn serve(
     }
 
     let savings_tracker = state.savings_tracker.clone();
+    // Savings observability: with the master compression switch on
+    // but the mode off, the dispatcher passes every body through and
+    // tokens_saved reads 0 on the dashboard with no hint why. Say so
+    // once at startup instead of letting the zero look like a bug.
+    if config.compression
+        && matches!(
+            config.compression_mode,
+            headroom_proxy::config::CompressionMode::Off
+        )
+    {
+        tracing::warn!(
+            event = "compression_mode_off",
+            "--compression is on but --compression-mode is `off`: bodies \
+             pass through unmodified and the dashboard's compression \
+             savings will read 0. Set --compression-mode live_zone to \
+             engage the dispatcher."
+        );
+    }
+
+    // Savings ledger: background persistence while serving, plus a
+    // best-effort final flush after the server drains (capture tasks
+    // are detached, so a request finishing in the same instant as
+    // shutdown may still miss it — see observability::capture docs).
+    let stats_ledger = state.stats.clone();
+    if config.stats {
+        // Pay the vendored price-table parse now, not on the first
+        // recorded request.
+        headroom_proxy::observability::pricing::warm();
+        tracing::info!(
+            event = "stats_enabled",
+            path = ?stats_ledger.path().map(|p| p.display().to_string()),
+            "native savings stats active (/stats, /dashboard)"
+        );
+        headroom_proxy::observability::ledger::spawn_flusher(stats_ledger.clone());
+    }
+
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -371,7 +407,11 @@ async fn serve(
         drain_started_tx,
         grace,
     ));
-    drive_serve(serve, &signalled_at, drain_started_rx, grace).await
+    let result = drive_serve(serve, &signalled_at, drain_started_rx, grace).await;
+    // Best-effort final ledger flush after the server drains (the
+    // flusher task stops with the runtime; see above).
+    stats_ledger.flush().await;
+    result
 }
 
 /// Serve the app on a Unix domain socket instead of TCP. Request handling
@@ -385,6 +425,11 @@ async fn serve_uds(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let resolved = headroom_proxy::uds::prepare_uds_path(uds_path).await?;
     let savings_tracker = state.savings_tracker.clone();
+    let stats_ledger = state.stats.clone();
+    if config.stats {
+        headroom_proxy::observability::pricing::warm();
+        headroom_proxy::observability::ledger::spawn_flusher(stats_ledger.clone());
+    }
     let app = headroom_proxy::uds::uds_router(state).into_make_service();
 
     let listener = tokio::net::UnixListener::bind(&resolved)?;
@@ -407,6 +452,7 @@ async fn serve_uds(
         grace,
     ));
     let result = drive_serve(serve, &signalled_at, drain_started_rx, grace).await;
+    stats_ledger.flush().await;
     // The listener is gone here, so no live socket can exist at the path;
     // remove the file the way upstream does on server exit.
     headroom_proxy::uds::remove_uds_path(&resolved);
