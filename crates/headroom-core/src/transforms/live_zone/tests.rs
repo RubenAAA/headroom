@@ -363,6 +363,167 @@ fn ccr_retrieve_tool_result_is_never_compressed() {
     }
 }
 
+/// Port of the caveman half of `test_verbatim_and_byte_exact_tools` (#4010):
+/// a `caveman_retrieve` result carries a stored original Caveman compressed
+/// upstream of us, so with the default exclusion set it leaves the live zone
+/// untouched — same shape as the CCR test above, `ExcludedTool` reason.
+#[test]
+fn caveman_retrieve_tool_result_is_never_compressed() {
+    let b = body(json!({
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "cave1", "name": "caveman_retrieve",
+                 "input": {"hash": "abc"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "cave1",
+                 "content": compressible_payload()}
+            ]},
+        ]
+    }));
+    let config = DispatchConfig {
+        exclude_tools: crate::tool_exclusion::DEFAULT_EXCLUDE_TOOLS_CSV
+            .split(',')
+            .map(str::to_string)
+            .collect(),
+        ..Default::default()
+    };
+    let out =
+        compress_anthropic_live_zone_with_ccr(&b, 0, AuthMode::Payg, DEFAULT_MODEL, None, &config)
+            .unwrap();
+    assert!(
+        matches!(out, LiveZoneOutcome::NoChange { .. }),
+        "caveman_retrieve result must be forwarded unmodified"
+    );
+    assert!(
+        matches!(
+            outcome_block_actions(&out).as_slice(),
+            [BlockAction::Excluded {
+                reason: ExclusionReason::ExcludedTool
+            }]
+        ),
+        "got {:?}",
+        outcome_block_actions(&out)
+    );
+}
+
+/// Port of `test_small_mcp_result_is_verbatim`: 1200 characters of the
+/// same compressible JSON the positive control above shrinks — past the
+/// 512 threshold, under the 4000 floor — under an MCP tool name, so the
+/// exemption (not smallness) is what keeps it verbatim.
+#[test]
+fn small_mcp_result_stays_verbatim() {
+    let text = "{\"k\": \"v\", \"n\": 1}\n".repeat(60);
+    assert!(text.len() > 512 && text.len() < 4000);
+    let b = body(json!({
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "mcp__shop__get-price",
+                 "input": {"issue_key": "BENCH-42"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": text}
+            ]},
+        ]
+    }));
+    let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+    assert!(
+        matches!(out, LiveZoneOutcome::NoChange { .. }),
+        "small MCP result must be forwarded unmodified"
+    );
+    assert!(
+        outcome_block_actions(&out).iter().any(|a| matches!(
+            a,
+            BlockAction::Excluded {
+                reason: ExclusionReason::SmallMcpResult
+            }
+        )),
+        "got {:?}",
+        outcome_block_actions(&out)
+    );
+}
+
+/// The floor is a floor: the same MCP tool with 6000 characters falls
+/// through to normal dispatch and compresses.
+#[test]
+fn long_mcp_result_falls_through_to_dispatch() {
+    let text = "{\"k\": \"v\", \"n\": 1}\n".repeat(300);
+    assert!(text.len() > 4000);
+    let b = body(json!({
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "mcp__shop__get-price",
+                 "input": {"issue_key": "BENCH-42"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": text}
+            ]},
+        ]
+    }));
+    let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+    assert!(
+        matches!(out, LiveZoneOutcome::Modified { .. }),
+        "long MCP result must compress, got {out:?}"
+    );
+    assert!(
+        !outcome_block_actions(&out).iter().any(|a| matches!(
+            a,
+            BlockAction::Excluded {
+                reason: ExclusionReason::SmallMcpResult
+            }
+        )),
+        "got {:?}",
+        outcome_block_actions(&out)
+    );
+}
+
+/// Exclusion wins over the MCP exemption (Python checks exclusion
+/// first): an MCP tool the operator excluded gets the exclusion
+/// treatment — a lossless fold — not the verbatim pass.
+#[test]
+fn excluded_mcp_tool_keeps_its_exclusion_verdict() {
+    // Repetitive log lines: the lossless fold's "log" kind shrinks them,
+    // so `Compressed` pins the exclusion treatment rather than a fold
+    // that declined and fell back to `Excluded`.
+    let text = "2024-01-01 12:00:01 WARN  worker: retrying connection\n".repeat(40);
+    assert!(text.len() > 512 && text.len() < 4000);
+    let b = body(json!({
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "mcp__shop__get-price",
+                 "input": {"issue_key": "BENCH-42"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": text}
+            ]},
+        ]
+    }));
+    let config = DispatchConfig {
+        exclude_tools: vec!["mcp__shop__get-price".to_string()],
+        ..Default::default()
+    };
+    let out =
+        compress_anthropic_live_zone_with_ccr(&b, 0, AuthMode::Payg, DEFAULT_MODEL, None, &config)
+            .unwrap();
+    assert!(
+        outcome_block_actions(&out)
+            .iter()
+            .any(|a| matches!(a, BlockAction::Compressed { .. })),
+        "excluded MCP tool must take the lossless fold, got {:?}",
+        outcome_block_actions(&out)
+    );
+    assert!(
+        !outcome_block_actions(&out).iter().any(|a| matches!(
+            a,
+            BlockAction::Excluded {
+                reason: ExclusionReason::SmallMcpResult
+            }
+        )),
+        "got {:?}",
+        outcome_block_actions(&out)
+    );
+}
+
 /// Port of `TestOrchestratorWrapperCcrRetrieveExemption`: a retrieval result
 /// delivered through an orchestrator wrapper (`execute` on the wire, the
 /// retrieve call inside its script payload) keeps the CCR exemption, while

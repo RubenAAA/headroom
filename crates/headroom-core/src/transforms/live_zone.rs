@@ -121,7 +121,8 @@ use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{CcrStore, compute_key, marker_for};
 use crate::tokenizer::{MemoizingTokenizer, get_tokenizer};
 use crate::tool_exclusion::{
-    is_byte_exact_excluded, is_ccr_retrieve_tool, is_tool_excluded, is_verbatim_excluded,
+    is_byte_exact_excluded, is_ccr_retrieve_tool, is_mcp_tool_name, is_small_mcp_result,
+    is_tool_excluded, is_verbatim_excluded, mcp_result_is_small, mcp_result_min_chars,
     unwrap_tool_call_name,
 };
 

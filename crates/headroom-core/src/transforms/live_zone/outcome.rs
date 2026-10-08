@@ -207,6 +207,12 @@ pub enum ExclusionReason {
     /// content is not confidently data, and `HEADROOM_PROTECT_READS` is on.
     /// The agent is about to patch these bytes and needs them exactly.
     ProtectedRead,
+    /// Block is an MCP tool's result under `HEADROOM_MCP_RESULT_MIN_CHARS`
+    /// (default 4000) characters. Small MCP results — tool schemas,
+    /// status reads — compress badly for the tokens they cost, so they
+    /// stay verbatim (#4003). Runs after exclusion: an excluded MCP tool
+    /// keeps its exclusion verdict, like Python.
+    SmallMcpResult,
     /// Text the caller wrote into a user message: the prompt, a
     /// continuation summary, a relayed message. Lossy compression here
     /// rewrote what the model was asked to do (upstream `aceff2ea`); live,

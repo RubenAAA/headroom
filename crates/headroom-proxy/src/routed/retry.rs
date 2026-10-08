@@ -915,6 +915,22 @@ async fn backoff_retryable_status(
     is_zen: bool,
 ) -> StatusRetry {
     let status = r.status();
+    // Upstream explicitly refuses the retry (#3992 half): `x-should-retry:
+    // false` means no same-key wait outlasts the window, so break at once
+    // instead of sleeping through the backoff for the same error. Checked
+    // before the Zen carve-out — an explicit refusal owns even the hold.
+    if headroom_core::retry::upstream_refuses_retry(r.headers(), status.as_u16()) {
+        tracing::warn!(
+            event = "routed_retry_refused",
+            status = status.as_u16(),
+            attempt,
+            max_attempts,
+            request_id = %request_id,
+            session_key_hash = %session_key.map(crate::cache_stabilization::drift_detector::session_key_log_prefix).unwrap_or_default(),
+            "upstream sent x-should-retry: false; returning the response without retry"
+        );
+        return StatusRetry::Break(r);
+    }
     let retry_after_uncapped = r
         .headers()
         .get(http::header::RETRY_AFTER)
@@ -2285,5 +2301,44 @@ mod tests {
         let send = sent.expect("a 400 is still a response");
         assert_eq!(send.resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(bodies.lock().unwrap().len(), 1);
+    }
+
+    /// `x-should-retry: false` (#3992) breaks the loop at once — on the main
+    /// path and on the Zen path, where an explicit refusal owns even the
+    /// hold. Attempts left and a 1h Retry-After: still no wait.
+    #[tokio::test]
+    async fn refused_retry_breaks_at_once() {
+        let config =
+            crate::config::Config::for_test("http://127.0.0.1:9/unreachable".parse().unwrap());
+        let state = AppState::new(config).expect("app state");
+        for is_zen in [false, true] {
+            let http_resp = http::Response::builder()
+                .status(429)
+                .header("x-should-retry", "false")
+                .header(http::header::RETRY_AFTER, "3600")
+                .body(reqwest::Body::from("exhausted"))
+                .unwrap();
+            match backoff_retryable_status(
+                &state,
+                reqwest::Response::from(http_resp),
+                1,
+                3,
+                30_000,
+                "http://127.0.0.1:9/unreachable",
+                "gate",
+                "test",
+                None,
+                is_zen,
+            )
+            .await
+            {
+                StatusRetry::Break(r) => {
+                    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS)
+                }
+                StatusRetry::Waited => {
+                    panic!("is_zen={is_zen}: a refused 429 must not wait")
+                }
+            }
+        }
     }
 }

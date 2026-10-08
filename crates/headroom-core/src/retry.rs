@@ -12,6 +12,20 @@ pub fn is_retryable_overload(status: u16) -> bool {
     RETRYABLE_OVERLOAD_STATUSES.contains(&status)
 }
 
+/// `true` when upstream explicitly refuses a retry (`#3992`). Anthropic sends
+/// `x-should-retry: false` with 429/529s whose window a same-key retry cannot
+/// outwait — an exhausted subscription answers with a reset hours away.
+/// Compare trimmed and case-insensitively, like Python's
+/// `overload_retry_is_futile`; only the `Retry-After` multiplier half of that
+/// helper stays unported (the Rust loops compare against one cap by design).
+pub fn upstream_refuses_retry(headers: &http::HeaderMap, status: u16) -> bool {
+    is_retryable_overload(status)
+        && headers
+            .get("x-should-retry")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("false"))
+}
+
 /// Exponential backoff with 50-150% jitter:
 /// `min(base_ms * 2**attempt, max_ms) * (0.5 + jitter)`.
 ///
@@ -194,5 +208,22 @@ mod tests {
         // A date far in the past → clamped to 0.
         let past = "Wed, 21 Oct 2015 07:28:00 GMT";
         assert_eq!(retry_after_ms(past, 10_000), Some(0.0));
+    }
+
+    #[test]
+    fn upstream_refusal_needs_overload_status_and_false_header() {
+        let headers = |value: Option<&str>| {
+            let mut map = http::HeaderMap::new();
+            if let Some(v) = value {
+                map.insert("x-should-retry", v.parse().unwrap());
+            }
+            map
+        };
+        assert!(upstream_refuses_retry(&headers(Some("false")), 429));
+        assert!(upstream_refuses_retry(&headers(Some("False")), 529));
+        assert!(upstream_refuses_retry(&headers(Some("  FALSE ")), 429));
+        assert!(!upstream_refuses_retry(&headers(Some("false")), 500));
+        assert!(!upstream_refuses_retry(&headers(Some("true")), 429));
+        assert!(!upstream_refuses_retry(&headers(None), 429));
     }
 }

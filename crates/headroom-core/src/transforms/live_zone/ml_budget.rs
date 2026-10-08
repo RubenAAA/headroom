@@ -194,7 +194,10 @@ impl MlBudget {
     pub fn armed() -> Option<Self> {
         let raw = std::env::var(ML_STAGE_DEADLINE_ENV).ok();
         let ceiling = ml_stage_deadline_seconds_from(raw.as_deref());
-        if ceiling > 0.0 {
+        // A non-finite ceiling admits everything and then panics turning the
+        // infinite cap into a `Duration`. Python treats it as unbounded (an
+        // infinite deadline never fires), so do we.
+        if ceiling > 0.0 && ceiling.is_finite() {
             Some(Self::with_ceiling(ceiling))
         } else {
             None
@@ -202,7 +205,8 @@ impl MlBudget {
     }
 
     /// Deterministic constructor for tests and callers that already resolved
-    /// the ceiling.
+    /// the ceiling. Only meaningful for positive, finite ceilings; anything
+    /// else should stay `None` (unbounded) at the call site.
     pub fn with_ceiling(ceiling_secs: f64) -> Self {
         Self {
             inner: Some(Arc::new(Mutex::new(RequestMlBudget::with_ceiling(
@@ -344,5 +348,24 @@ mod tests {
         assert!(!budget.warned());
         // Charging a missing ledger is a silent no-op, not a panic.
         budget.charge(Duration::from_secs(60), 100);
+    }
+
+    #[test]
+    fn non_finite_ceiling_means_unbounded() {
+        // `Duration::from_secs_f64(inf)` panics, so an infinite ceiling must
+        // never arm: Python treats it as unbounded and so do we. Serial-test
+        // guard: this owns the process env for the ceiling variable.
+        let key = ML_STAGE_DEADLINE_ENV;
+        let prev = std::env::var(key).ok();
+        for raw in ["inf", "-inf", "NaN"] {
+            unsafe { std::env::set_var(key, raw) };
+            assert!(MlBudget::armed().is_none(), "{raw} must not arm a budget");
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }

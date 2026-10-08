@@ -233,6 +233,21 @@ pub(super) async fn maybe_retry_status(
 ) -> bool {
     // 429 = rate-limited, 529 = Anthropic overloaded, 5xx = server error
     let is_retryable = status == 429 || status == 529 || (500..600).contains(&status);
+    // Upstream explicitly refuses the retry (#3992 half): `x-should-retry:
+    // false` means no same-key wait outlasts the window, so forward at once
+    // instead of sleeping through the backoff for the same error.
+    if is_retryable && headroom_core::retry::upstream_refuses_retry(r.headers(), status) {
+        tracing::warn!(
+            event = "upstream_retry_refused",
+            request_id = %request_id,
+            status,
+            attempt = attempt + 1,
+            max_attempts,
+            session_key_hash = %cache_stabilization::drift_detector::session_key_log_prefix(request_session_key),
+            "upstream sent x-should-retry: false; returning the response without retry"
+        );
+        return false;
+    }
     if is_retryable && attempt + 1 < max_attempts {
         let max_delay = state.config.retry_max_delay_ms;
         let retry_after_header = r.headers().contains_key("retry-after");
@@ -601,5 +616,46 @@ where
             }
             Body::empty()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        let mut config = crate::config::Config::for_test("http://127.0.0.1:9".parse().unwrap());
+        config.retry_base_delay_ms = 1;
+        config.retry_max_delay_ms = 1;
+        AppState::new(config).expect("test app state")
+    }
+
+    fn fake_response(status: u16, extra_headers: &[(&str, &str)]) -> reqwest::Response {
+        let mut builder = http::Response::builder().status(status);
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        reqwest::Response::from(builder.body(reqwest::Body::from("limited")).unwrap())
+    }
+
+    /// `x-should-retry: false` (#3992) must answer `false` — forward at once —
+    /// even with two attempts left and no over-cap Retry-After. The same 429
+    /// without the header would sleep through the backoff first.
+    #[tokio::test]
+    async fn refused_retry_returns_without_sleeping() {
+        let state = test_state();
+        let r = fake_response(429, &[("x-should-retry", "false")]);
+        let retry = maybe_retry_status(&state, "test", "sess", &r, 429, 0, 3).await;
+        assert!(!retry);
+    }
+
+    /// Control for the above: the same 429 without the refusal retries
+    /// (budget left, no Retry-After). The 1ms backoff keeps the sleep trivial.
+    #[tokio::test]
+    async fn plain_retryable_status_still_retries() {
+        let state = test_state();
+        let r = fake_response(429, &[]);
+        let retry = maybe_retry_status(&state, "test", "sess", &r, 429, 0, 3).await;
+        assert!(retry);
     }
 }

@@ -1125,7 +1125,7 @@ Options:
           [possible values: true, false]
 
       --read-maturation <READ_MATURATION>
-          Enable read maturation (hold fresh reads out of prefix cache).
+          Enable read maturation (hold fresh reads verbatim, mature when quiet).
           
           NO-OP (2026-09-14, FINDING-019): `ReadMaturationManager` has zero proxy callers — the Python handler wiring (anthropic.py:2290) was never ported. Same status as `--read-lifecycle` above: kept declared for flag-file compat, wiring needs an A/B first.
           

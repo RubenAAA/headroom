@@ -97,6 +97,13 @@ pub(super) enum ToolGuard {
     /// CONTENT of the result, which the planner only has further down, so it
     /// does not short-circuit here.
     ProtectedRead,
+    /// An MCP tool's result, provisionally held for the length check:
+    /// under `min_chars` characters it stays verbatim (#4003), at or
+    /// past the threshold it falls through to normal dispatch. The
+    /// threshold rides the guard so the environment is read once per
+    /// request in `collect_tool_guards`, not once per block at the
+    /// settle site.
+    SmallMcpResult { min_chars: usize },
 }
 
 /// Map assistant `tool_use` ids to the guard their `tool_result` needs.
@@ -127,6 +134,7 @@ pub(super) fn collect_tool_guards(
     // Read once per request rather than per block: the flag cannot change
     // mid-walk, and every `tool_use` would otherwise re-read the environment.
     let protect_reads = read_protection_enabled();
+    let mcp_min_chars = mcp_result_min_chars();
     for msg in messages {
         let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
             continue;
@@ -168,6 +176,14 @@ pub(super) fn collect_tool_guards(
                 ToolGuard::ProtectedRead
             } else if excluded {
                 ToolGuard::LosslessOnly
+            } else if is_mcp_tool_name(name) {
+                // After exclusion, like Python: an excluded MCP tool keeps
+                // its exclusion verdict; this guard only catches the rest.
+                // Provisional — settled by content length at the plan site,
+                // like ProtectedRead.
+                ToolGuard::SmallMcpResult {
+                    min_chars: mcp_min_chars,
+                }
             } else {
                 continue;
             };
@@ -377,10 +393,17 @@ pub(super) fn plan_block_replacements(
                 });
                 continue;
             }
-            Some(ToolGuard::LosslessOnly) | Some(ToolGuard::ProtectedRead) | None => {}
+            Some(ToolGuard::LosslessOnly)
+            | Some(ToolGuard::ProtectedRead)
+            | Some(ToolGuard::SmallMcpResult { .. })
+            | None => {}
         }
         let lossless_only = tool_guard == Some(ToolGuard::LosslessOnly);
         let protected_read = tool_guard == Some(ToolGuard::ProtectedRead);
+        let small_mcp_min = match tool_guard {
+            Some(ToolGuard::SmallMcpResult { min_chars }) => Some(min_chars),
+            _ => None,
+        };
 
         if HOT_ZONE_BLOCK_TYPES.iter().any(|t| *t == block_type) {
             slots.push(PlanSlot {
@@ -484,6 +507,21 @@ pub(super) fn plan_block_replacements(
                 kind: SlotKind::Excluded {
                     block_type,
                     reason: ExclusionReason::ProtectedRead,
+                },
+            });
+            continue;
+        }
+
+        // The name said this was an MCP tool; the length decides whether it
+        // stays verbatim. The guard already proved the name, so only the
+        // size check runs here. Content at or past the threshold falls
+        // through to normal dispatch, like Python (#4003).
+        if small_mcp_min.is_some_and(|min| mcp_result_is_small(&unescaped, min)) {
+            slots.push(PlanSlot {
+                block_index: block_idx,
+                kind: SlotKind::Excluded {
+                    block_type,
+                    reason: ExclusionReason::SmallMcpResult,
                 },
             });
             continue;

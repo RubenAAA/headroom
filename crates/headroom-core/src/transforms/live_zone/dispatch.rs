@@ -384,15 +384,20 @@ pub(super) fn dispatch_compressor_uncached(
             // through (NoOp) when the model keeps everything or the input is
             // too short (engine returns the input unchanged).
             Some(model) => {
-                crate::transforms::observability::observe_kompress_size_gate("within");
                 // Request budget (#3711): the size gate above bounds one
                 // block, this bounds the request. A refused block passes
                 // through unchanged (memoized as a skip, like Python caching
                 // the verdict) so its bytes stay stable on later turns.
+                // `est_tokens` feeds both the admission projection and the
+                // charge below: Python projects AND bills in estimated
+                // tokens, and mixing the engine's real count into the
+                // charge would warp the worst-rate the next block projects
+                // with.
+                let est_tokens = (text.len() / 4) as u64;
                 let cap = match config
                     .ml_budget
                     .as_ref()
-                    .map_or(Admission::Unbounded, |b| b.admit((text.len() / 4) as u64))
+                    .map_or(Admission::Unbounded, |b| b.admit(est_tokens))
                 {
                     Admission::Unbounded => None,
                     Admission::Admitted { cap_secs } => Some(cap_secs),
@@ -409,6 +414,10 @@ pub(super) fn dispatch_compressor_uncached(
                         };
                     }
                 };
+                // Only blocks that reach the compressor count as "within":
+                // Python observes the label after the budget check, not
+                // before, so a refused block emits `deadline` alone.
+                crate::transforms::observability::observe_kompress_size_gate("within");
                 let started = std::time::Instant::now();
                 let result = model.compress_with_deadline(
                     text,
@@ -417,7 +426,7 @@ pub(super) fn dispatch_compressor_uncached(
                         .map(|d| started + d),
                 );
                 if let Some(budget) = config.ml_budget.as_ref() {
-                    budget.charge(started.elapsed(), result.original_tokens as u64);
+                    budget.charge(started.elapsed(), est_tokens);
                 }
                 if result.compressed == text {
                     return DispatchResult::NoOp {

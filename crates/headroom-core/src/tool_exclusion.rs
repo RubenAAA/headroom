@@ -236,6 +236,67 @@ pub fn is_byte_exact_excluded(name: &str) -> bool {
     is_tool_excluded(name, DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS.iter().copied())
 }
 
+/// Env var tuning the small-MCP-result exemption; `0` disables it.
+pub const MCP_RESULT_MIN_CHARS_ENV: &str = "HEADROOM_MCP_RESULT_MIN_CHARS";
+
+/// Below this many characters an MCP tool result is never compressed.
+/// Mirrors Python `_mcp_result_min_chars`'s default.
+pub const DEFAULT_MCP_RESULT_MIN_CHARS: usize = 4000;
+
+/// Parse the small-MCP-result threshold the way Python's
+/// `_mcp_result_min_chars` does: missing, blank, or unparseable reads as
+/// the 4000 default; negatives clamp to 0 (disabled — no text is
+/// shorter than 0 characters). Pure so tests need no process-env games.
+pub fn mcp_result_min_chars_from(raw: Option<&str>) -> usize {
+    match raw {
+        None => DEFAULT_MCP_RESULT_MIN_CHARS,
+        Some(s) if s.trim().is_empty() => DEFAULT_MCP_RESULT_MIN_CHARS,
+        Some(s) => s
+            .trim()
+            .parse::<i64>()
+            .map(|v| v.max(0) as usize)
+            .unwrap_or(DEFAULT_MCP_RESULT_MIN_CHARS),
+    }
+}
+
+/// The live threshold, read from the environment once per request.
+pub fn mcp_result_min_chars() -> usize {
+    mcp_result_min_chars_from(std::env::var(MCP_RESULT_MIN_CHARS_ENV).ok().as_deref())
+}
+
+/// True if `name` is an MCP tool: `mcp__server__tool` (Claude Code) or
+/// `mcp--server--tool`. Case-insensitive, like Python's
+/// `_is_small_mcp_result`.
+///
+/// Note the double dash: Python's docstring names `mcp-server-tool` as a
+/// seen spelling, but its `startswith(("mcp_", "mcp--"))` never matches a
+/// single dash, so neither do we — the code is the contract.
+pub fn is_mcp_tool_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() >= 4
+        && b[0].eq_ignore_ascii_case(&b'm')
+        && b[1].eq_ignore_ascii_case(&b'c')
+        && b[2].eq_ignore_ascii_case(&b'p')
+        && (b[3] == b'_' || (b.len() >= 5 && b[3] == b'-' && b[4] == b'-'))
+}
+
+/// True when `text` is short enough to keep verbatim: strictly fewer
+/// than `min_chars` characters. Python `len(text)` counts characters,
+/// so `.chars()` keeps parity on non-ASCII text where bytes would
+/// overcount.
+pub fn mcp_result_is_small(text: &str, min_chars: usize) -> bool {
+    text.chars().count() < min_chars
+}
+
+/// True if this tool result must stay verbatim (#4003): an MCP tool's
+/// output under the size threshold. Small MCP results (tool schemas,
+/// status reads) compress badly for the tokens they cost, so both
+/// live-zone paths keep them byte-identical instead of rewriting them.
+/// Mirrors Python `_is_small_mcp_result`.
+pub fn is_small_mcp_result(tool_name: &str, text: &str, min_chars: usize) -> bool {
+    is_mcp_tool_name(tool_name) && mcp_result_is_small(text, min_chars)
+}
+
 /// The CCR retrieval tool's canonical name. Results carrying this name are the
 /// bytes the model just asked to have restored; compressing them again reopens
 /// the loop the retrieval closed.
@@ -657,5 +718,70 @@ return r;"#;
                 "{name} must keep reaching the lossless fold"
             );
         }
+    }
+
+    #[test]
+    fn mcp_tool_name_matches_both_wire_spellings() {
+        for name in [
+            "mcp__shop__get-price",
+            "mcp--shop--get-price",
+            "MCP__X",
+            "Mcp--X",
+            "mcp_",
+        ] {
+            assert!(is_mcp_tool_name(name), "{name} must read as an MCP tool");
+        }
+        // A single dash never matches: Python's startswith(("mcp_",
+        // "mcp--")) says so, whatever its docstring claims.
+        for name in [
+            "mcp-server-tool",
+            "mcp",
+            "mcp-",
+            "Bash",
+            "headroom_retrieve",
+            "",
+        ] {
+            assert!(!is_mcp_tool_name(name), "{name} must not read as MCP");
+        }
+    }
+
+    #[test]
+    fn mcp_threshold_parse_matches_python() {
+        assert_eq!(mcp_result_min_chars_from(None), 4000);
+        assert_eq!(mcp_result_min_chars_from(Some("")), 4000);
+        assert_eq!(mcp_result_min_chars_from(Some("   ")), 4000);
+        assert_eq!(mcp_result_min_chars_from(Some("6000")), 6000);
+        assert_eq!(mcp_result_min_chars_from(Some(" 4000 ")), 4000);
+        assert_eq!(mcp_result_min_chars_from(Some("+100")), 100);
+        // Zero and negatives disable the floor (Python's max(0, ...)).
+        assert_eq!(mcp_result_min_chars_from(Some("0")), 0);
+        assert_eq!(mcp_result_min_chars_from(Some("-5")), 0);
+        // Unparseable falls back to the default.
+        assert_eq!(mcp_result_min_chars_from(Some("soon")), 4000);
+        assert_eq!(mcp_result_min_chars_from(Some("4.5")), 4000);
+    }
+
+    #[test]
+    fn small_mcp_result_needs_mcp_name_and_short_text() {
+        let short = "x".repeat(3999);
+        let at_floor = "x".repeat(4000);
+        assert!(is_small_mcp_result("mcp__shop__price", &short, 4000));
+        // The floor is strict: exactly 4000 characters compresses.
+        assert!(!is_small_mcp_result("mcp__shop__price", &at_floor, 4000));
+        assert!(!is_small_mcp_result("Bash", &short, 4000));
+        // A zero floor exempts nothing.
+        assert!(!is_small_mcp_result("mcp__shop__price", &short, 0));
+        assert!(!is_small_mcp_result("mcp__shop__price", "", 0));
+        // Characters, not bytes: 3999 é's are 7998 bytes but still small.
+        assert!(is_small_mcp_result(
+            "mcp__shop__price",
+            &"é".repeat(3999),
+            4000
+        ));
+        assert!(!is_small_mcp_result(
+            "mcp__shop__price",
+            &"é".repeat(4000),
+            4000
+        ));
     }
 }

@@ -290,6 +290,12 @@ pub fn nudge_response_usage(
     request_id: &str,
 ) -> Option<bytes::Bytes> {
     let mut payload: serde_json::Value = serde_json::from_slice(body).ok()?;
+    // Only Anthropic message bodies carry the usage this nudges. Gateways echo
+    // a `usage` shape on error and control payloads; Python gates on
+    // `type == "message"` and so do we.
+    if payload.get("type").and_then(|t| t.as_str()) != Some("message") {
+        return None;
+    }
     let usage = payload.get_mut("usage")?.as_object_mut()?;
     let new_input = nudged_input_tokens(usage, believed_limit, effective_limit)?;
     let num = |usage: &serde_json::Map<String, serde_json::Value>, key: &str| {
@@ -632,8 +638,10 @@ impl StreamUsageGuard {
 /// `outbound_beta` is the upstream-bound `anthropic-beta` header (post-auth
 /// rewrite); `client_beta` is what the client sent — the client's gauge follows
 /// the beta the client sent, while session-sticky merging can add context-1m
-/// to the outbound header after the client dropped it. `None` falls back to the
-/// outbound header.
+/// to the outbound header after the client dropped it. `None` means the client
+/// sent no beta to believe (Python's live call sites pass `client_beta or ""`);
+/// the believed limit never rises on the outbound header alone, or a sticky 1M
+/// outbound beta would report calm fractions against a smaller client window.
 pub fn guard_limits_for(
     model: &str,
     outbound_beta: Option<&str>,
@@ -647,7 +655,7 @@ pub fn guard_limits_for(
     if model_limit == 0 {
         return None;
     }
-    let believed = believed_context_limit(model_limit, client_beta.or(outbound_beta));
+    let believed = believed_context_limit(model_limit, client_beta);
     let effective = effective_context_limit(model, model_limit, outbound_beta, scope);
     Some((believed, effective))
 }
@@ -678,34 +686,43 @@ pub fn request_model(body: &[u8]) -> Option<String> {
 /// Wraps a client-bound stream with an optional [`StreamUsageGuard`].
 ///
 /// `None` is a pure passthrough, so the streaming assembly always wraps and
-/// the guard-or-not decision stays at the construction site. Upstream errors
-/// pass through untouched; the guard's held-back tail is released when the
-/// stream ends.
-pub struct GuardedStream<S> {
+/// the guard-or-not decision stays at the construction site. An upstream error
+/// flushes the guard's held-back tail first and surfaces on the next poll —
+/// Python's rewriter flushes in a `finally` before the exception propagates,
+/// and emitting the error first would strand the tail behind a dead body.
+pub struct GuardedStream<S, E> {
     inner: std::pin::Pin<Box<S>>,
     guard: Option<StreamUsageGuard>,
+    pending_error: Option<E>,
 }
 
-impl<S> GuardedStream<S> {
+impl<S, E> GuardedStream<S, E> {
     pub fn new(inner: S, guard: Option<StreamUsageGuard>) -> Self {
         Self {
             inner: Box::pin(inner),
             guard,
+            pending_error: None,
         }
     }
 }
 
-impl<S> futures_util::Stream for GuardedStream<S>
+impl<S, E> futures_util::Stream for GuardedStream<S, E>
 where
-    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send,
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send,
+    // Never pinned — only stashed and re-emitted — but `Unpin` keeps the
+    // wrapper itself `Unpin` so `poll_next` can reach its fields.
+    E: Unpin,
 {
-    type Item = Result<bytes::Bytes, reqwest::Error>;
+    type Item = Result<bytes::Bytes, E>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = &mut *self;
+        if let Some(e) = this.pending_error.take() {
+            return std::task::Poll::Ready(Some(Err(e)));
+        }
         match this.inner.as_mut().poll_next(cx) {
             std::task::Poll::Ready(Some(Ok(chunk))) => {
                 let out = this
@@ -714,7 +731,18 @@ where
                     .map_or_else(|| chunk.clone(), |g| g.feed(&chunk));
                 std::task::Poll::Ready(Some(Ok(out)))
             }
-            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(Some(Err(e))) => {
+                let rest = this.guard.as_mut().map(|g| g.flush()).unwrap_or_default();
+                if rest.is_empty() {
+                    std::task::Poll::Ready(Some(Err(e)))
+                } else {
+                    // The guard held back an unterminated tail: emit it now,
+                    // surface the error on the next poll.
+                    this.guard = None;
+                    this.pending_error = Some(e);
+                    std::task::Poll::Ready(Some(Ok(rest)))
+                }
+            }
             std::task::Poll::Ready(None) => {
                 let rest = this.guard.as_mut().map(|g| g.flush()).unwrap_or_default();
                 if rest.is_empty() {
@@ -1123,5 +1151,92 @@ mod tests {
         );
         assert_eq!(request_model(b"{}"), None);
         assert_eq!(request_model(b"nope"), None);
+    }
+
+    #[test]
+    fn believed_limit_ignores_outbound_beta_alone() {
+        // Unknown model: the registry default (128k) sits below the 1M raise,
+        // so a believed-side leak would show. The outbound leg carries a
+        // session-sticky context-1m beta the client never sent.
+        let (believed, effective) = guard_limits_for(
+            "guard-test-unknown-model-believed",
+            Some("context-1m-2025-08-07"),
+            None,
+            "guard-test-scope-believed",
+        )
+        .expect("guard on by default");
+        assert_eq!(
+            believed, 128_000,
+            "no client beta, no raise: the client's gauge is the base window"
+        );
+        assert_eq!(
+            effective, 1_000_000,
+            "the trigger side still sees the outbound window"
+        );
+    }
+
+    #[test]
+    fn upstream_error_flushes_held_tail_first() {
+        #[derive(Debug, PartialEq)]
+        struct TestErr;
+        // An unterminated first event: the guard holds it back, waiting for
+        // the rest that never comes.
+        let partial =
+            bytes::Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\"}");
+        let inner = futures_util::stream::iter(vec![
+            Ok::<bytes::Bytes, TestErr>(partial.clone()),
+            Err(TestErr),
+        ]);
+        let guard = StreamUsageGuard::new(200_000, 200_000, "r1");
+        let mut stream = Box::pin(GuardedStream::new(inner, Some(guard)));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut next = || futures_util::Stream::poll_next(stream.as_mut(), &mut cx);
+        assert!(
+            matches!(next(), std::task::Poll::Ready(Some(Ok(out))) if out.is_empty()),
+            "the unterminated event stays held"
+        );
+        assert!(
+            matches!(next(), std::task::Poll::Ready(Some(Ok(out))) if out == partial),
+            "the error flushes the held tail first, like Python's finally"
+        );
+        assert!(
+            matches!(next(), std::task::Poll::Ready(Some(Err(TestErr)))),
+            "the error surfaces on the next poll"
+        );
+        assert!(
+            matches!(next(), std::task::Poll::Ready(None)),
+            "the stream ends after the flushed error"
+        );
+    }
+
+    #[test]
+    fn nudge_ignores_non_message_bodies() {
+        // 920 of 1000 sits in the trigger band, so a bare `usage` check
+        // would rewrite either body.
+        let error_body = serde_json::json!({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "nope"},
+            "usage": {"input_tokens": 920},
+        });
+        assert!(
+            nudge_response_usage(&serde_json::to_vec(&error_body).unwrap(), 1000, 1000, "r1")
+                .is_none(),
+            "error bodies keep their bytes"
+        );
+        let message_body = serde_json::json!({
+            "type": "message",
+            "usage": {"input_tokens": 920},
+        });
+        assert!(
+            nudge_response_usage(
+                &serde_json::to_vec(&message_body).unwrap(),
+                1000,
+                1000,
+                "r1"
+            )
+            .is_some(),
+            "message bodies still nudge"
+        );
     }
 }

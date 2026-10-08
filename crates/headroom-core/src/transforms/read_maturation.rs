@@ -345,7 +345,7 @@ impl ReadMaturationManager {
 
         if quiet_turns < self.config.quiesce_turns && held_turns < self.config.max_hold_turns {
             result.holding_reads += 1;
-            return (None, true); // file still active — keep verbatim, uncached
+            return (None, true); // file still active — keep verbatim; the turn still caches normally
         }
 
         // File quiesced (or hold cap hit): mature.
@@ -635,6 +635,21 @@ mod tests {
         msgs.extend(quiet(10));
         let mut m = manager(5, 25);
         let res = m.apply(&msgs, msgs.len());
+        assert!(res.holding_msg_indices.is_empty());
+        assert_eq!(read_content(&res, 2), &lc);
+    }
+
+    #[test]
+    fn frozen_boundary_is_exclusive() {
+        // The gate is `i < frozen_message_count`: the message AT the
+        // boundary stays live.
+        let lc = large_content();
+        let mut m = manager(5, 25);
+        let res = m.apply(&base_conv(&lc), 2);
+        assert_eq!(res.holding_msg_indices, vec![2]);
+        assert_eq!(read_content(&res, 2), &lc);
+        let mut m = manager(5, 25);
+        let res = m.apply(&base_conv(&lc), 3);
         assert!(res.holding_msg_indices.is_empty());
         assert_eq!(read_content(&res, 2), &lc);
     }

@@ -911,6 +911,41 @@ mod tests {
     }
 
     #[test]
+    fn output_bound_reason_names_the_declared_budget() {
+        let cfg = ModelRouterConfig {
+            enabled: true,
+            cooldown: None,
+            routes: vec![CostRule {
+                to_model: "mini".into(),
+                max_output_tokens: Some(512),
+                ..Default::default()
+            }],
+        };
+        let d = ModelRouter::new(Some(cfg)).select("big", 10, false, Some(64));
+        assert!(d.matched);
+        assert_eq!(
+            d.reason,
+            "matched rule 'mini': big -> mini (input_tokens=10, has_tools=False, max_tokens=64)"
+        );
+    }
+
+    #[test]
+    fn malformed_max_output_tokens_disables_only_that_rule() {
+        // Strict parse, same as max_input_tokens: an unparseable bound drops
+        // the rule (fail closed) rather than widening into "no cap".
+        let cfg = ModelRouterConfig::from_env(
+            Some("1"),
+            Some(r#"[{"to_model": "mini", "max_output_tokens": "many"}]"#),
+        );
+        assert!(
+            cfg.routes.is_empty(),
+            "a malformed bound drops the rule, not the router"
+        );
+        let d = ModelRouter::new(Some(cfg)).select("big", 10, false, Some(64));
+        assert!(!d.matched);
+    }
+
+    #[test]
     fn no_rule_matched() {
         let cfg = ModelRouterConfig {
             enabled: true,

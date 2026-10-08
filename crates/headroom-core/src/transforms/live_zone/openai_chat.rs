@@ -165,6 +165,8 @@ pub fn compress_openai_chat_live_zone_with_config(
             Some((id, name))
         })
         .collect();
+    // Read once per request: the threshold cannot change mid-walk.
+    let mcp_min_chars = mcp_result_min_chars();
 
     for (msg_idx, slot) in all_slots {
         // Operator + builtin guard for tool outputs only (user prose has no
@@ -211,6 +213,22 @@ pub fn compress_openai_chat_live_zone_with_config(
                     &tokenizer,
                     &mut replacements,
                 ));
+                continue;
+            }
+            // Small MCP results stay verbatim (#4003): twin of the
+            // Anthropic `SmallMcpResult` guard. Runs after exclusion, like
+            // Python — an excluded MCP tool keeps its verdict above.
+            if tool_name
+                .is_some_and(|name| is_small_mcp_result(name, &slot.content_text, mcp_min_chars))
+            {
+                block_outcomes.push(BlockOutcome {
+                    message_index: msg_idx,
+                    block_index: slot.block_index,
+                    block_type: slot.block_type,
+                    action: BlockAction::Excluded {
+                        reason: ExclusionReason::SmallMcpResult,
+                    },
+                });
                 continue;
             }
         }
@@ -616,6 +634,65 @@ mod openai_chat_tests {
                 panic!("control: unattributed tool payload must still compress")
             }
         }
+    }
+
+    /// Port of `test_small_mcp_result_is_verbatim_openai_format`: a short
+    /// MCP tool result stays verbatim with the `SmallMcpResult` reason,
+    /// while the same payload unattributed still compresses.
+    #[test]
+    fn small_mcp_tool_result_stays_verbatim() {
+        // Over the 512-byte threshold so the exemption (not the size
+        // gate) owns the verdict, under the 4000-char floor.
+        let payload = "2024-01-01 12:00:01 WARN  worker: retrying connection\n".repeat(20);
+        assert!(payload.len() > 512 && payload.len() < 4000);
+        let b = body(json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "reading",
+                 "tool_calls": [{"id": "t1", "type": "function",
+                                "function": {"name": "mcp__shop__get-price",
+                                             "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": payload},
+            ]
+        }));
+        let out = compress_openai_chat_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+        match &out {
+            LiveZoneOutcome::NoChange { manifest } => {
+                let tool_block = manifest
+                    .block_outcomes
+                    .iter()
+                    .find(|b| b.block_type == "tool_content")
+                    .expect("tool block recorded");
+                assert!(
+                    matches!(
+                        tool_block.action,
+                        BlockAction::Excluded {
+                            reason: ExclusionReason::SmallMcpResult
+                        }
+                    ),
+                    "got {:?}",
+                    tool_block.action
+                );
+            }
+            LiveZoneOutcome::Modified { .. } => {
+                panic!("small MCP tool message must not rewrite the body")
+            }
+        }
+        // Control: an unattributed payload still compresses — the gate is
+        // name-based, not a blanket tool skip. Uses the module's bulky
+        // fixture: small repetitive logs die in tokenizer validation
+        // (bytes shrink, tokens don't), which would prove nothing.
+        let b = body(json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "tool_call_id": "t9", "content": bulky_log_payload()},
+            ]
+        }));
+        let out = compress_openai_chat_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+        assert!(
+            matches!(out, LiveZoneOutcome::Modified { .. }),
+            "control: unattributed tool payload must still compress"
+        );
     }
 
     /// Prose long enough for the plain-text path, which only Kompress serves.
