@@ -1,11 +1,51 @@
 # Idea: tell the client Spark's real token usage, and settle how /compact works there
 
-- **Status:** open, undecided. Nothing changed. Needs a one-session test first.
 - **Status:** step 2 implemented 2026-10-08 behind `--report-true-usage`
   (default ON): terminal `message_delta` on streamed translated routes now
   carries the provider's own input/output/cached counts; routed CCR turns
   report first round plus every continuation round. Still wants a one-session
   test.
+- **Status:** `[1m]` probe 2026-10-08, INCONCLUSIVE on the window: client
+  2.1.294 strips `claude-muse-spark-1.3[1m]` to the plain id before sending
+  (`[claude-code:unrecognized_model]`, `query_source: sdk`; zero `[1m]`
+  `from_model` rows in the proxy log — the proxy itself routes it fine).
+  Both arms compacted at ~294k preTokens, not the learned ~126k, with all
+  env knobs absent. Open: why `-p` mode compacts at 294k (different
+  threshold? different assumed window?), and whether the `/model` picker
+  sends `[1m]` verbatim where `--model` does not. Turn logs:
+  `kits/probe-1m/`.
+- **Status:** 294k-vs-126k discrepancy RESOLVED 2026-10-08 (corrected
+  same day — NOT an entrypoint effect): the probe arms ran turn 1 on
+  Spark and turns 2+ on `claude-haiku-5-5` because `--continue` without
+  `--model` falls back to the default model (transcript sequence +
+  `sys informational` line at 14:11:24). Haiku 5-5 is client-known, so
+  those sessions honored `autoCompactWindow: 306000` and compacted at
+  ~96% of it. The `[1m]` question got exactly one Spark turn per arm
+  (model id stripped anyway) — a redo must pass `--model` on every
+  `-p` invocation. The 14:11–14:20 Haiku recaches + c/r spike are this
+  probe's own traffic, not a fleet alert.
+- **Status:** picker gap FIXED 2026-10-08. Custom routes never appeared in
+  `/model` because the launcher gated `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`
+  on routes passed on the command line, and flags-file routes never reach that
+  variable. Now gated on the proxy being in play (`use_context=1`); stub-tested
+  all four profiles, installed live. New sessions list every `claude-*` route
+  including both sparks. The installed launcher was also stale (bare `cclaude`
+  bypassed the proxy); it now matches the checkout. Only `[1m]` wire row ever:
+  one unattributed single-turn request 14:15:21 (routed and served fine —
+  proxy side proven); the user's picker turns left no trace anywhere (no pid,
+  transcript, or proxy rows — how they were launched is still open).
+- **Status:** `[1m]` route idea DEAD 2026-10-08. The user's picker turns
+  (14:45:31/45/54 + 14:46:14, rids `7668db8e`/`c26cd140`/`67f36128`/
+  `6288918d`, all four sharing session key `d015b5f5…`) show the plain id
+  on the wire — the client strips `[1m]` on the picker path too, same as
+  `--model`. Not proxy normalization: `from_model` is the raw pre-rewrite
+  client model (`routed/routing.rs`: `before = parsed["model"]`), and the
+  only request in the log that ever sent `[1m]` literally — the 14:15:21
+  synthetic route check, key-authed, tool-less, fresh session key — was
+  logged verbatim. Every Claude-driven request (probe arms, picker turns)
+  shows plain. Route line
+  removed from the live flags file (takes effect at
+  the next proxy restart; no restart for this alone).
 - **Source:** 2026-09-30 audit of the Spark path. `openai/stream.rs`
   `emit_message_start` (`input_tokens: 0`) and `emit_message_delta`
   (`output_tokens` only).
@@ -68,6 +108,19 @@ Claude Code does with it (auto-compaction), not whether it can be given.
   and `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` (restores the
   previous wait-for-the-API behavior = no auto-compact, the pre-regression
   state).
-- **Shipped:** launcher exports the DISABLE flag (live since 2026-10-05, new
-  sessions only). Rejected: `muse-spark-1.3[1m]` rename (invasive),
-  MAX_CONTEXT_TOKENS alone (still compacts, only later).
+- **2026-10-08 verdict: the DISABLE knob is dead.** Transcript census of
+  4,577 jsonl, Oct 3–8: flagged top-level sessions still compact at
+  125–137k (21 compacted vs 2 marginal non-compacted), with the flag present
+  in the launcher and in every live claude process's environ. It shipped Oct
+  5 with no verification — no evidence it ever worked. Full numbers:
+  `docs/notes/learnings/spark-auto-compact-200k-window-2026-10-08.md`.
+  Rejected: `muse-spark-1.3[1m]` rename (invasive). Now under test:
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000` (expect compaction to move ~126k
+  to ~630k preTokens if the ~63% trigger holds).
+- **Status 2026-10-08:** `[1m]` probe route live as an *addition* (not the
+  rejected rename): `claude-muse-spark-1.3[1m]` in `~/.headroom-flags.sh`
+  maps to the same Spark upstream/target as `claude-muse-spark-1.3` and
+  appears in `/v1/models` discovery; proxy restarted, healthz ok,
+  cache-health verdict healthy. Probe session: run
+  `env -u CLAUDE_CODE_MAX_CONTEXT_TOKENS cclaude`, pick the `[1m]` entry
+  via `/model`, grow past 150k, record preTokens at compaction.

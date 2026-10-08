@@ -384,6 +384,8 @@ env_vars=()
 # wait-for-the-API behavior (no auto-compact), which is what Spark
 # sessions had before the regression.
 env_vars+=("CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1")
+# Experiment 2026-10-08: expect compaction to move ~126k to ~630k preTokens if the ~63% trigger holds.
+env_vars+=("CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000")
 if [ "$use_qwen" -eq 1 ]; then
     env_vars+=(
         "ANTHROPIC_CUSTOM_MODEL_OPTION=$QWEN_MODEL"
@@ -419,7 +421,10 @@ while [ "$i" -lt "${#proxy_flags[@]}" ]; do
     i=$((i + 1))
 done
 
-if [ "${#route_models[@]}" -gt 0 ]; then
+if [ "$use_context" -eq 1 ]; then
+    # Gated on the proxy being in play, not on routes passed on this command
+    # line: flags-file routes (the normal case) never reach route_models, so
+    # the old condition left the picker stock forever. 2026-10-08.
     env_vars+=("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1")
     # Discovery drops any id not starting with claude/anthropic, so a lone
     # route named otherwise (the MiMo-V2.5 example above) still needs the

@@ -1,0 +1,40 @@
+=== turn 1 (offset=0 bytes=60000) 2026-10-08T14:10:43Z ===
+turn=1 elapsed=38s session=b13493a1-58e4-4db0-8b2f-5990cbb04abf bytes_fed=60000
+candidates=2 newest=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl
+transcript=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl size=297257 compact_boundaries=0 preTokens=[]
+=== turn 2 (offset=100000 bytes=60000) 2026-10-08T14:11:22Z ===
+turn=2 elapsed=10s session=b13493a1-58e4-4db0-8b2f-5990cbb04abf bytes_fed=60000
+candidates=2 newest=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl
+transcript=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl size=443607 compact_boundaries=0 preTokens=[]
+=== turn 3 (offset=200000 bytes=60000) 2026-10-08T14:11:32Z ===
+turn=3 elapsed=10s session=b13493a1-58e4-4db0-8b2f-5990cbb04abf bytes_fed=60000
+candidates=2 newest=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl
+transcript=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl size=585016 compact_boundaries=0 preTokens=[]
+=== turn 4 (offset=300000 bytes=60000) 2026-10-08T14:11:42Z ===
+turn=4 elapsed=9s session=b13493a1-58e4-4db0-8b2f-5990cbb04abf bytes_fed=60000
+candidates=2 newest=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl
+transcript=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl size=726785 compact_boundaries=0 preTokens=[]
+=== turn 5 (offset=400000 bytes=60000) 2026-10-08T14:11:51Z ===
+turn=5 elapsed=9s session=b13493a1-58e4-4db0-8b2f-5990cbb04abf bytes_fed=60000
+candidates=2 newest=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl
+transcript=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl size=868388 compact_boundaries=0 preTokens=[]
+=== turn 6 (offset=500000 bytes=60000) 2026-10-08T14:12:00Z ===
+turn=6 elapsed=10s session=b13493a1-58e4-4db0-8b2f-5990cbb04abf bytes_fed=60000
+candidates=2 newest=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl
+transcript=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl size=1010035 compact_boundaries=0 preTokens=[]
+=== turn 7 (offset=600000 bytes=60000) 2026-10-08T14:12:10Z ===
+turn=7 elapsed=8s session=b13493a1-58e4-4db0-8b2f-5990cbb04abf bytes_fed=60000
+candidates=2 newest=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl
+transcript=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl size=1151360 compact_boundaries=0 preTokens=[]
+=== turn 8 (offset=700000 bytes=60000) 2026-10-08T14:12:18Z ===
+turn=8 elapsed=9s session=b13493a1-58e4-4db0-8b2f-5990cbb04abf bytes_fed=60000
+candidates=2 newest=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl
+transcript=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl size=1292763 compact_boundaries=0 preTokens=[]
+=== turn 9 (offset=800000 bytes=60000) 2026-10-08T14:12:27Z ===
+turn=9 elapsed=6s session=b13493a1-58e4-4db0-8b2f-5990cbb04abf bytes_fed=60000
+candidates=2 newest=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl
+transcript=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl size=1434322 compact_boundaries=0 preTokens=[]
+=== turn 10 (offset=900000 bytes=60000) 2026-10-08T14:12:33Z ===
+turn=10 elapsed=15s session=b13493a1-58e4-4db0-8b2f-5990cbb04abf bytes_fed=60000
+candidates=2 newest=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl
+transcript=b13493a1-58e4-4db0-8b2f-5990cbb04abf.jsonl size=1683799 compact_boundaries=1 preTokens=[{}]
