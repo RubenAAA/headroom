@@ -308,6 +308,37 @@ pub fn store() -> &'static std::sync::Mutex<DeferredMemory> {
     STORE.get_or_init(|| std::sync::Mutex::new(DeferredMemory::new()))
 }
 
+/// True when `block` is a `tool_use` for a proxy-owned memory tool.
+///
+/// One predicate for both halves of the defer contract: `split_tool_calls`
+/// holds these calls, `strip_memory_tool_calls` hides them, so the strip set
+/// can never drift from the hold set.
+pub fn is_memory_tool_call(block: &Value) -> bool {
+    if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+        return false;
+    }
+    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+    super::tool_adapter::MEMORY_TOOL_NAMES.contains(&name)
+        || name == super::tool_adapter::NATIVE_MEMORY_TOOL_NAME
+}
+
+/// Remove the proxy's already-run memory calls from a turn going back to the client.
+///
+/// The mixed-turn defer holds the memory answers for the next request; the
+/// client meanwhile answers its own calls. It must never see the memory
+/// `tool_use` blocks: it declared no such tools (`No such tool available`
+/// otherwise), and echoing them back unanswered would fail `place` with
+/// `Unusable` and drop the held answers. Mirrors the live-stream
+/// suppression (`CcrStreamState.suppressed`) and Python's mixed-branch
+/// strip (#4009) — except Python also drops the answers, while the hold
+/// here keeps them.
+pub fn strip_memory_tool_calls(response: &mut Value) {
+    let Some(blocks) = response.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    blocks.retain(|b| !is_memory_tool_call(b));
+}
+
 /// Split an Anthropic turn's tool calls into the proxy's and the client's.
 ///
 /// The client's calls are what make a continuation impossible: they have no
@@ -319,15 +350,14 @@ pub fn split_tool_calls(response: &Value) -> (Vec<Value>, Vec<String>) {
         return (ours, theirs);
     };
     for b in blocks {
+        if is_memory_tool_call(b) {
+            ours.push(b.clone());
+            continue;
+        }
         if b.get("type").and_then(Value::as_str) != Some("tool_use") {
             continue;
         }
-        let name = b.get("name").and_then(Value::as_str).unwrap_or("");
-        if super::tool_adapter::MEMORY_TOOL_NAMES.contains(&name)
-            || name == super::tool_adapter::NATIVE_MEMORY_TOOL_NAME
-        {
-            ours.push(b.clone());
-        } else if let Some(id) = b.get("id").and_then(Value::as_str) {
+        if let Some(id) = b.get("id").and_then(Value::as_str) {
             theirs.push(id.to_string());
         }
     }

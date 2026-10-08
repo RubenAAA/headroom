@@ -139,11 +139,13 @@ pub(super) enum MemoryRoundRead {
 /// whole request, losing the memory answer with it. Answer the memory call
 /// now and hold the answer for the next request, which carries that result.
 /// Anthropic only: the holding area works in Anthropic block shapes.
-/// Returns true when the turn was deferred (caller leaves it alone so the
-/// client's own tool call reaches it untouched).
+/// Returns true when the turn was deferred. The held memory calls are
+/// stripped from `response` first, so the client sees only its own calls —
+/// echoing a memory `tool_use` back unanswered would fail the restore with
+/// `Unusable` and drop the held answer (#4009).
 /// Extracted from `handle_memory_response` without behavior change.
 async fn defer_mixed_memory_turn(
-    response: &serde_json::Value,
+    response: &mut serde_json::Value,
     memory: &MemoryToolContext,
     request_id: &str,
     provider: &str,
@@ -176,8 +178,10 @@ async fn defer_mixed_memory_turn(
         "memory: turn also calls a client tool; holding the answer for \
          the next request"
     );
-    // The calls have run. Leave the turn alone so the client's own tool
-    // call reaches it untouched.
+    // The calls have run. Strip them from the client-bound turn: the
+    // client declared no such tools, and `place` needs the echoed turn
+    // without them to restore the held answer on the next request.
+    crate::memory::deferred::strip_memory_tool_calls(response);
     true
 }
 
@@ -963,7 +967,7 @@ pub(crate) async fn handle_memory_response(
         "messages"
     };
 
-    let Some((response, mut current_request)) =
+    let Some((mut response, mut current_request)) =
         parse_memory_turn(body_bytes, forwarded_request, memory, request_id)
     else {
         return (body_bytes.clone(), round_usage);
@@ -977,8 +981,12 @@ pub(crate) async fn handle_memory_response(
 
     // A client tool call sharing the turn makes a continuation impossible.
     // Answer the memory call now and hold the answer for the next request.
-    if defer_mixed_memory_turn(&response, memory, request_id, provider).await {
-        return (body_bytes.clone(), round_usage);
+    // The deferred turn goes back stripped of the memory calls, so the
+    // client sees only tools it declared (#4009); the held answers restore
+    // into its next request.
+    if defer_mixed_memory_turn(&mut response, memory, request_id, provider).await {
+        let stripped = serde_json::to_vec(&response).unwrap_or_else(|_| body_bytes.to_vec());
+        return (bytes::Bytes::from(stripped), round_usage);
     }
 
     // Reused purely for its provider-aware message shaping — the CCR handler

@@ -15,6 +15,9 @@ mod memory_round_trip;
 #[path = "suites/state/memory_real_corpus.rs"]
 mod memory_real_corpus;
 
+#[path = "suites/state/memory_buffered_mixed_turn.rs"]
+mod memory_buffered_mixed_turn;
+
 #[path = "suites/state/memory_routed_mixed_turn.rs"]
 mod memory_routed_mixed_turn;
 
