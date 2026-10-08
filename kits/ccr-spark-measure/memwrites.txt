@@ -1,0 +1,26 @@
+round_usage events: 2012 | markers-reqs: 790 | skipped-reqs: 365
+('ccr-path', 'post', 'superseded', False) n= 332 NO-COUNTS
+('ccr-path', 'post', 'superseded', True) n= 82 NO-COUNTS
+('ccr-path', 'post', 'terminal', False) n= 5 NO-COUNTS
+('ccr-path', 'post', 'terminal', True) n= 332 | write p50 0.0 mean 0 max 0 | read p50 72253.5
+('ccr-path', 'pre', 'superseded', False) n= 201 NO-COUNTS
+('ccr-path', 'pre', 'superseded', True) n= 198 | write p50 0 mean 7545 max 22637 | read p50 115983
+('ccr-path', 'pre', 'terminal', False) n= 3 NO-COUNTS
+('ccr-path', 'pre', 'terminal', True) n= 201 | write p50 5058.0 mean 5491 max 17911 | read p50 83173.0
+('memory-only', 'post', 'orphan', True) n= 22 | write p50 0 mean 0 max 0 | read p50 80750
+('memory-only', 'post', 'superseded', False) n= 70 NO-COUNTS
+('memory-only', 'post', 'superseded', True) n= 9 | write p50 0.0 mean 4523 max 18094 | read p50 284750.5
+('memory-only', 'post', 'terminal', False) n= 177 NO-COUNTS
+('memory-only', 'post', 'terminal', True) n= 69 | write p50 0 mean 1885 max 20563 | read p50 184433
+('memory-only', 'pre', 'superseded', False) n= 30 NO-COUNTS
+('memory-only', 'pre', 'superseded', True) n= 9 | write p50 9175 mean 9846 max 18667 | read p50 267404
+('memory-only', 'pre', 'terminal', False) n= 114 NO-COUNTS
+('memory-only', 'pre', 'terminal', True) n= 30 | write p50 15808.5 mean 18294 max 47064 | read p50 126422.0
+('server-tool', 'post', 'superseded', False) n= 21 NO-COUNTS
+('server-tool', 'post', 'superseded', True) n= 8 | write p50 0.0 mean 4953 max 34408 | read p50 180237.5
+('server-tool', 'post', 'terminal', False) n= 11 NO-COUNTS
+('server-tool', 'post', 'terminal', True) n= 21 | write p50 0 mean 3376 max 20961 | read p50 109845
+('server-tool', 'pre', 'superseded', False) n= 25 NO-COUNTS
+('server-tool', 'pre', 'superseded', True) n= 8 | write p50 11666.5 mean 12687 max 25781 | read p50 169562.5
+('server-tool', 'pre', 'terminal', False) n= 9 NO-COUNTS
+('server-tool', 'pre', 'terminal', True) n= 25 | write p50 13199 mean 16234 max 75262 | read p50 120377

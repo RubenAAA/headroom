@@ -456,18 +456,18 @@ Options:
       --ccr-keep-client-boundary-rounds <CCR_KEEP_CLIENT_BOUNDARY_ROUNDS>
           Hidden CCR continuation rounds that leave the newest message breakpoint where the client's own request put it.
           
-          Default `0`: every round moves the marker onto the appended messages. A retrieval round appends messages the client never sees, so a marker moved onto them writes a cache entry the next client turn cannot read. Whether that costs more than it saves is not settled: the ledger totals of streamed CCR turns are exactly twice round 0's usage, so the final round is not visible there, and the per-round `ccr_round_usage` events are the evidence to read before raising this. `1` keeps the marker put for the first round only. Memory continuations have their own knob, `--memory-keep-client-boundary-rounds`.
+          Default `1`: the first round leaves the marker where the client's own request put it. A retrieval round appends messages the client never sees, so a marker moved onto them writes a cache entry the next client turn cannot read; the 2026-10-02..08 window cut aftershock waste 96% with no growth in the hidden rounds' own writes. `0` moves the marker onto the appended messages every round (the pre-1 default). Memory continuations have their own knob, `--memory-keep-client-boundary-rounds`.
           
           [env: HEADROOM_PROXY_CCR_KEEP_CLIENT_BOUNDARY_ROUNDS=]
-          [default: 0]
+          [default: 1]
 
       --memory-keep-client-boundary-rounds <MEMORY_KEEP_CLIENT_BOUNDARY_ROUNDS>
           Hidden memory-tool continuation rounds that leave the cache marker on the client's last block.
           
-          Default `0`: every round moves the marker onto the appended memory tool call and result, which the next client turn never sends. 15 of 16 `aftershock_of_continuation` recaches from 2026-09-30 to 10-02 (112,606 tokens) followed a memory continuation, not a CCR one. `1` keeps the marker put for the first round, as `--ccr-keep-client-boundary-rounds 1` does for CCR.
+          Default `1`: the first round leaves the marker on the client's last block. 15 of 16 `aftershock_of_continuation` recaches from 2026-09-30 to 10-02 (112,606 tokens) followed a memory continuation, not a CCR one, and the post-restart window cut that waste 96%. `0` restores the old behavior of moving the marker every round.
           
           [env: HEADROOM_PROXY_MEMORY_KEEP_CLIENT_BOUNDARY_ROUNDS=]
-          [default: 0]
+          [default: 1]
 
       --split-cache-ttl <SPLIT_CACHE_TTL>
           Split the cache TTL: 1h on the tools and system prefix, 5m on messages.

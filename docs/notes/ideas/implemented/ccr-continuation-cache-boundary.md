@@ -1,13 +1,9 @@
 # Idea: keep hidden CCR continuations behind the client-visible cache boundary
 
-- **Status:** first-round policy shipped behind `--ccr-keep-client-boundary-rounds`
-  (default 1) 2026-09-29. After-deploy window read 2026-09-30 (last section):
-  0 aftershock events, but the summed-usage fix shipped with it, so the policy's
-  own effect is not separable. Keep open only for a CCR-only comparison.
-  2026-10-02: aftershocks came back, nearly all after memory-tool
-  continuations, which the flag never covered. The same policy now ships for
-  them as `--memory-keep-client-boundary-rounds` (flag file sets 1); see
-  the last section.
+- **Status:** SHIPPED 2026-10-08. Gate passed per /tmp/ccr-spark-measure/
+  numbers: memory aftershock waste fell 112,606 to 4,121 tokens with no
+  growth in memory rounds' own writes. Both defaults flipped to 1
+  (`--ccr-keep-client-boundary-rounds`, `--memory-keep-client-boundary-rounds`).
 - **Source:** live recache audit in
   `recache-provider-reasons.md` (2026-09-29 window); code in
   `crates/headroom-proxy/src/proxy/ccr_response.rs` and

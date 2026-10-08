@@ -1,0 +1,7 @@
+usage events: 129
+('ccr-path', 'post') n= 16 | write/turn p50 0.0 mean 0 | rounds p50 1.0 | write/round p50 0.0 mean 0.0
+('ccr-path', 'pre') n= 19 | write/turn p50 8392 mean 7430 | rounds p50 1 | write/round p50 8392.0 mean 5955.0
+('memory-only', 'post') n= 22 | write/turn p50 0.0 mean 2622 | rounds p50 1.0 | write/round p50 0.0 mean 1163.0
+('memory-only', 'pre') n= 26 | write/turn p50 16945.0 mean 20945 | rounds p50 1.0 | write/round p50 15808.5 mean 19305.0
+('server-tool', 'post') n= 21 | write/turn p50 0 mean 5263 | rounds p50 1 | write/round p50 0.0 mean 2331.0
+('server-tool', 'pre') n= 25 | write/turn p50 17327 mean 20294 | rounds p50 1 | write/round p50 13207.0 mean 18035.0
