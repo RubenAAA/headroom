@@ -151,7 +151,11 @@ pub fn compress_anthropic_live_zone_with_ccr(
     // the body via `RawValue` borrowed slices. The Vec<Replacement>
     // produced here is the surgery plan; we do *not* mutate `body_raw`
     // while computing it.
-    let tool_guards = collect_tool_guards(messages, &dispatch_config.exclude_tools);
+    let tool_guards = collect_tool_guards(
+        messages,
+        &dispatch_config.exclude_tools,
+        dispatch_config.lossless,
+    );
 
     let protect_text = !answers_fenced_command(messages, target_idx);
     let plan = match plan_block_replacements(body_raw, target_idx, &tool_guards, protect_text) {
@@ -351,7 +355,11 @@ pub fn compress_anthropic_all_messages(
     // `--exclude-tools` guards apply here exactly as they do on the
     // live-zone path; the unconditional CCR guard rides along inside
     // `collect_tool_guards`.
-    let tool_guards = collect_tool_guards(messages, &dispatch_config.exclude_tools);
+    let tool_guards = collect_tool_guards(
+        messages,
+        &dispatch_config.exclude_tools,
+        dispatch_config.lossless,
+    );
     let mut block_outcomes: Vec<BlockOutcome> = Vec::new();
     let mut replacements: Vec<Replacement> = Vec::new();
 
@@ -482,6 +490,11 @@ pub fn compress_anthropic_all_messages(
 ///    original_tokens` keep the original and tag `RejectedNotSmaller`
 ///    (note: tokens, not bytes, drive the gate).
 /// 4. Otherwise record the replacement and tag `Compressed`.
+///
+/// In lossless-only mode (`DispatchConfig::lossless`) steps 2-4 are
+/// replaced by the reversible fold: the block takes the same
+/// `compact_one_block_lossless` path a `LosslessOnly` slot takes, so no
+/// lossy arm runs. The byte-threshold gate above still applies first.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compress_one_block(
     content_text: &str,
@@ -510,6 +523,20 @@ pub(super) fn compress_one_block(
                 threshold_bytes: threshold_for(content_type),
             },
         };
+    }
+
+    // `--lossless`: the reversible fold (or passthrough) replaces the lossy
+    // sequence below — the same call a `LosslessOnly` slot makes.
+    if dispatch_config.lossless {
+        return compact_one_block_lossless(
+            content_text,
+            content_byte_range,
+            message_index,
+            block_index,
+            block_type,
+            tokenizer,
+            replacements,
+        );
     }
 
     match dispatch_compressor_with_config(content_text, content_type, dispatch_config) {

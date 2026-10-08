@@ -69,6 +69,12 @@ pub struct DispatchConfig {
     /// names, globs and MCP spellings all work. Empty — the default — leaves
     /// dispatch exactly as it was before the flag was wired.
     pub exclude_tools: Vec<String>,
+    /// Lossless-only mode (`--lossless`): every block takes the
+    /// reversible-lossless path — the same routing `--exclude-tools` gives
+    /// excluded tools — and no lossy arm runs. Copied per request from the
+    /// process-wide gate, which is fixed at startup, so the all-messages
+    /// determinism invariant still holds.
+    pub lossless: bool,
     /// Request-scoped ML time budget (#3711), armed by the live-zone entry
     /// points. `None` — the default — leaves dispatch unbounded, matching
     /// Python's `compress()`-without-`apply()` callers.
@@ -103,8 +109,8 @@ pub(super) fn dispatch_cache() -> &'static crate::transforms::content_router::Co
 /// Every input that can change the output is included: the text, the content
 /// type that selects the compressor, `target_ratio` — the only
 /// [`DispatchConfig`] field this function reads (the rest are role gates applied
-/// by callers, and `exclude_tools`, which the planner consumes before a block
-/// ever reaches this cache) — and the global Kompress and CodeAware enable
+/// by callers, and `exclude_tools`/`lossless`, which the planner and
+/// `compress_one_block` consume before a block ever reaches this cache) — and the global Kompress and CodeAware enable
 /// flags. This extends Python's `hash((content, _runtime_target_ratio))`.
 ///
 /// The Kompress flag has to be part of the key even though it is not an

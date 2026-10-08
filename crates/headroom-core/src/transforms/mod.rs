@@ -92,8 +92,9 @@ pub use live_zone::{
     compress_anthropic_live_zone_with_ccr, compress_block_for_offload,
     compress_openai_chat_live_zone, compress_openai_chat_live_zone_with_config,
     compress_openai_responses_live_zone, compress_openai_responses_live_zone_with_config,
-    kompress_disabled_for_anthropic, kompress_disabled_for_openai, set_code_aware_enabled,
-    set_kompress_disabled_per_provider, set_kompress_enabled, set_smart_crusher_max_items,
+    kompress_disabled_for_anthropic, kompress_disabled_for_openai, lossless_only_enabled,
+    set_code_aware_enabled, set_kompress_disabled_per_provider, set_kompress_enabled,
+    set_lossless_only_enabled, set_smart_crusher_max_items,
     summarize_openai_responses_no_change_reason, warm_live_zone_compressors,
 };
 pub use log_compressor::{

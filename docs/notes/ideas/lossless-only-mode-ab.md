@@ -1,6 +1,11 @@
 # Idea: lossless-only mode A/B (`--lossless true`)
 
 - **Status:** open (needs a quiet-moment A/B, not a blind flip)
+- **Status 2026-10-08:** wired. `--lossless` now feeds live-zone dispatch:
+  `main.rs` copies it into a process gate at startup, the three proxy
+  adapters copy the gate into `DispatchConfig.lossless` per request, and
+  dispatch routes every block losslessly (every tool lands in `LosslessOnly`;
+  all other blocks take the reversible fold via `compact_one_block_lossless`).
 - **Source:** 2026-09-18 lossless audit. `--lossless` is `false` live
   (`config.rs:1742-1744`, `contrib/headroom-flags.sh:601`), so lossy
   SmartCrusher/Log/Search/Diff arms run. Every other lossless stabilizer is

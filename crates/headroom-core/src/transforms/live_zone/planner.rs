@@ -129,6 +129,7 @@ pub(super) enum ToolGuard {
 pub(super) fn collect_tool_guards(
     messages: &[Value],
     exclude_tools: &[String],
+    lossless: bool,
 ) -> HashMap<String, ToolGuard> {
     let mut guards = HashMap::new();
     // Read once per request rather than per block: the flag cannot change
@@ -154,7 +155,10 @@ pub(super) fn collect_tool_guards(
             // retrieval tool when the call itself invokes it, so the
             // exemption below survives the wrapper.
             let name = unwrap_tool_call_name(wire_name, block.get("input"));
-            let excluded = is_tool_excluded(name, exclude_tools.iter().map(String::as_str));
+            // `--lossless` excludes every tool, so each `tool_result` lands in
+            // `LosslessOnly` (or a stricter guard) and never reaches a lossy arm.
+            let excluded =
+                lossless || is_tool_excluded(name, exclude_tools.iter().map(String::as_str));
             let guard = if is_ccr_retrieve_tool(name) {
                 ToolGuard::CcrRetrieve
             } else if excluded && is_verbatim_excluded(name) {

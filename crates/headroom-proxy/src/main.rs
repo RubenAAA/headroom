@@ -257,6 +257,7 @@ fn init_live_zone_compressors(config: &Config) {
     headroom_core::transforms::set_code_aware_enabled(config.code_aware_enabled);
     let kompress_on = config.enable_kompress && !config.disable_kompress;
     headroom_core::transforms::set_kompress_enabled(kompress_on);
+    headroom_core::transforms::set_lossless_only_enabled(config.lossless);
     headroom_core::transforms::set_kompress_disabled_per_provider(
         config.disable_kompress_anthropic,
         config.disable_kompress_openai,

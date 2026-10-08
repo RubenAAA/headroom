@@ -181,12 +181,14 @@ pub fn compress_openai_chat_live_zone_with_config(
                 .and_then(Value::as_str)
                 .and_then(|id| tool_name_by_call_id.get(id))
                 .copied();
-            let excluded = tool_name.is_some_and(|name| {
-                is_tool_excluded(
-                    name,
-                    dispatch_config.exclude_tools.iter().map(String::as_str),
-                )
-            });
+            // `--lossless` excludes every tool, mirroring `collect_tool_guards`.
+            let excluded = dispatch_config.lossless
+                || tool_name.is_some_and(|name| {
+                    is_tool_excluded(
+                        name,
+                        dispatch_config.exclude_tools.iter().map(String::as_str),
+                    )
+                });
             let verbatim = tool_name.is_some_and(is_verbatim_excluded);
             let byte_exact = tool_name.is_some_and(is_byte_exact_excluded);
             // Builtin byte-exact always holds (pre-existing behavior);

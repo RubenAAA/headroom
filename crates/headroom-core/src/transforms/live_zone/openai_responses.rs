@@ -343,17 +343,19 @@ pub fn compress_openai_responses_live_zone_with_config(
         // already passed through above; other excluded tools get the
         // reversible lossless fold only. Unresolvable `call_id`s fail open.
         if slot.is_output_item {
-            let excluded = items
-                .get(msg_idx)
-                .and_then(|item| item.get("call_id"))
-                .and_then(Value::as_str)
-                .and_then(|id| call_name_by_id.get(id))
-                .is_some_and(|name| {
-                    is_tool_excluded(
-                        name,
-                        dispatch_config.exclude_tools.iter().map(String::as_str),
-                    )
-                });
+            // `--lossless` excludes every tool, mirroring `collect_tool_guards`.
+            let excluded = dispatch_config.lossless
+                || items
+                    .get(msg_idx)
+                    .and_then(|item| item.get("call_id"))
+                    .and_then(Value::as_str)
+                    .and_then(|id| call_name_by_id.get(id))
+                    .is_some_and(|name| {
+                        is_tool_excluded(
+                            name,
+                            dispatch_config.exclude_tools.iter().map(String::as_str),
+                        )
+                    });
             if excluded {
                 block_outcomes.push(compact_one_block_lossless(
                     &slot.content_text,

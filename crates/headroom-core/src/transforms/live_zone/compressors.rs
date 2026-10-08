@@ -93,6 +93,25 @@ pub fn set_kompress_enabled(enabled: bool) {
     KOMPRESS_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+// Process-wide gate for lossless-only mode (`--lossless`). Default OFF: the
+// lossy SmartCrusher/Log/Search/Diff arms run. The proxy sets this once at
+// startup and copies it into each request's `DispatchConfig::lossless`.
+// Mirrors the `KOMPRESS_ENABLED` pattern above.
+pub(super) static LOSSLESS_ONLY_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable lossless-only mode process-wide. Call once at startup
+/// (before serving) from config. When enabled, live-zone dispatch routes
+/// every block through the reversible lossless fold — never a lossy arm —
+/// the same path `--exclude-tools` gives excluded tools.
+pub fn set_lossless_only_enabled(enabled: bool) {
+    LOSSLESS_ONLY_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Current state of the lossless-only process-wide gate (default `false`).
+pub fn lossless_only_enabled() -> bool {
+    LOSSLESS_ONLY_ENABLED.load(Ordering::Relaxed)
+}
+
 // Per-provider Kompress off switches (`--disable-kompress-anthropic`,
 // `--disable-kompress-openai`). They only ever turn Kompress off: a provider
 // never gets it while `KOMPRESS_ENABLED` is false. The proxy sets them once at

@@ -302,6 +302,7 @@ pub fn compress_anthropic_request_with_policy(
     let dispatch_config = DispatchConfig {
         exclude_tools: exclude_tools.to_vec(),
         disable_kompress: headroom_core::transforms::kompress_disabled_for_anthropic(),
+        lossless: headroom_core::transforms::lossless_only_enabled(),
         ..DispatchConfig::default()
     };
     // `AllMessages` compresses every eligible block in every user
