@@ -542,6 +542,51 @@ pub struct CliArgs {
     #[arg(long = "prune-drop-tools", env = "HEADROOM_PROXY_PRUNE_DROP_TOOLS")]
     pub prune_drop_tools: Option<String>,
 
+    /// Phase E passes to run on Anthropic `/v1/messages`
+    /// (comma-separated `e1,e2,e3`). E1 sorts `tools[]`, E2 sorts
+    /// schema keys, E3 auto-places `cache_control`. Default runs all
+    /// three; empty disables every Anthropic pass. A pass listed for
+    /// a path it never runs on (e.g. `e4` here) is inert.
+    ///
+    /// Source priority: CLI flag →
+    /// `HEADROOM_PROXY_PHASE_E_ANTHROPIC_PASSES` env var → default.
+    #[arg(
+        long = "phase-e-anthropic-passes",
+        env = "HEADROOM_PROXY_PHASE_E_ANTHROPIC_PASSES",
+        default_value = "e1,e2,e3",
+        value_parser = parse_phase_e_passes,
+    )]
+    pub phase_e_anthropic_passes: String,
+
+    /// Phase E passes to run on OpenAI chat completions
+    /// (comma-separated `e1,e2,e4`). E1 sorts `tools[]`, E2 sorts
+    /// schema keys, E4 injects `prompt_cache_key`. Default runs all
+    /// three; empty disables every chat pass.
+    ///
+    /// Source priority: CLI flag →
+    /// `HEADROOM_PROXY_PHASE_E_CHAT_PASSES` env var → default.
+    #[arg(
+        long = "phase-e-chat-passes",
+        env = "HEADROOM_PROXY_PHASE_E_CHAT_PASSES",
+        default_value = "e1,e2,e4",
+        value_parser = parse_phase_e_passes,
+    )]
+    pub phase_e_chat_passes: String,
+
+    /// Phase E passes to run on OpenAI responses
+    /// (comma-separated `e1,e2,e4`). Same passes as chat; default
+    /// runs all three; empty disables every responses pass.
+    ///
+    /// Source priority: CLI flag →
+    /// `HEADROOM_PROXY_PHASE_E_RESPONSES_PASSES` env var → default.
+    #[arg(
+        long = "phase-e-responses-passes",
+        env = "HEADROOM_PROXY_PHASE_E_RESPONSES_PASSES",
+        default_value = "e1,e2,e4",
+        value_parser = parse_phase_e_passes,
+    )]
+    pub phase_e_responses_passes: String,
+
     /// Tool pruning (A4): keep ONLY these tool names (comma-separated
     /// allowlist). When set, every tool not listed is dropped (most
     /// aggressive); takes precedence over --prune-drop-mcp. Off by default.
@@ -2226,6 +2271,107 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
         .map_err(|e| format!("invalid byte size `{s}`: {e}"))
 }
 
+/// One Phase E byte-mutating pass. See [`PhaseEPassPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PhaseEPass {
+    /// PR-E1: deterministic `tools[]` sort.
+    E1,
+    /// PR-E2: recursive schema-key sort.
+    E2,
+    /// PR-E3: Anthropic `cache_control` auto-placement.
+    E3,
+    /// PR-E4: OpenAI `prompt_cache_key` injection.
+    E4,
+}
+
+impl PhaseEPass {
+    fn parse_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "e1" => Some(Self::E1),
+            "e2" => Some(Self::E2),
+            "e3" => Some(Self::E3),
+            "e4" => Some(Self::E4),
+            _ => None,
+        }
+    }
+}
+
+/// Phase E per-pass, per-path enable set, parsed once from the
+/// `--phase-e-*-passes` flags. A pass listed for a path runs on that
+/// path (subject to the usual auth-mode + marker gates); a pass
+/// absent for a path is skipped with `reason = "pass_disabled"`.
+/// Tokens naming passes that never run on a path (e.g. `e3` for
+/// chat) are inert. Mirrors the [`PrunePolicy`][crate::cache_stabilization::tool_prune::PrunePolicy]
+/// precedent: CLI strings parsed once in the constructor, struct
+/// consulted on the hot path.
+#[derive(Debug, Clone)]
+pub struct PhaseEPassPolicy {
+    pub anthropic: std::collections::BTreeSet<PhaseEPass>,
+    pub chat: std::collections::BTreeSet<PhaseEPass>,
+    pub responses: std::collections::BTreeSet<PhaseEPass>,
+}
+
+impl PhaseEPassPolicy {
+    pub fn allows_anthropic(&self, pass: PhaseEPass) -> bool {
+        self.anthropic.contains(&pass)
+    }
+    pub fn allows_chat(&self, pass: PhaseEPass) -> bool {
+        self.chat.contains(&pass)
+    }
+    pub fn allows_responses(&self, pass: PhaseEPass) -> bool {
+        self.responses.contains(&pass)
+    }
+}
+
+impl Default for PhaseEPassPolicy {
+    /// All passes on every path — the pre-selector behavior. Tests
+    /// and non-forward callers (batch, gemini, bedrock) run through
+    /// this default.
+    fn default() -> Self {
+        use PhaseEPass::{E1, E2, E3, E4};
+        Self {
+            anthropic: [E1, E2, E3, E4].into_iter().collect(),
+            chat: [E1, E2, E3, E4].into_iter().collect(),
+            responses: [E1, E2, E3, E4].into_iter().collect(),
+        }
+    }
+}
+
+/// Validate one `--phase-e-*-passes` value: comma-separated
+/// `e1..e4` tokens (case-insensitive); empty disables every pass on
+/// that path.
+fn parse_phase_e_passes(value: &str) -> Result<String, String> {
+    let unknown: Vec<_> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .filter(|t| PhaseEPass::parse_token(t).is_none())
+        .collect();
+    if unknown.is_empty() {
+        Ok(value.to_owned())
+    } else {
+        Err(format!(
+            "unknown phase-e pass(es): {}; valid: e1, e2, e3, e4",
+            unknown.join(", ")
+        ))
+    }
+}
+
+/// Build the Phase E policy from the three validated CLI/env flag
+/// values. Runs in the constructor; the `value_parser` already
+/// rejected unknown tokens, so unknown entries are unreachable and
+/// filtered defensively.
+fn parse_phase_e_policy(anthropic: &str, chat: &str, responses: &str) -> PhaseEPassPolicy {
+    fn split(raw: &str) -> std::collections::BTreeSet<PhaseEPass> {
+        raw.split(',').filter_map(PhaseEPass::parse_token).collect()
+    }
+    PhaseEPassPolicy {
+        anthropic: split(anthropic),
+        chat: split(chat),
+        responses: split(responses),
+    }
+}
+
 /// Build the tool-pruning policy from the three comma-separated CLI/env flags.
 /// Empty / whitespace-only entries are ignored; an absent flag is an empty set.
 /// When all are `None`, the resulting policy `is_noop()` (passthrough).
@@ -2634,6 +2780,11 @@ pub struct Config {
     /// Tool-pruning (A4) policy, parsed once from `--prune-keep-tools` /
     /// `--prune-drop-mcp`. `is_noop()` when neither flag is set (passthrough).
     pub tool_prune_policy: crate::cache_stabilization::tool_prune::PrunePolicy,
+    /// Phase E per-pass, per-path enable set, parsed once from
+    /// `--phase-e-anthropic-passes` / `--phase-e-chat-passes` /
+    /// `--phase-e-responses-passes`. Defaults run every pass that
+    /// exists on each path.
+    pub phase_e_passes: PhaseEPassPolicy,
     /// Cost-aware model routing (issue #1706). Disabled unless
     /// `HEADROOM_MODEL_ROUTER_ENABLED` is truthy and `HEADROOM_MODEL_ROUTES`
     /// parses. Distinct from `model_routes`, which selects an *upstream* by
@@ -3039,6 +3190,11 @@ impl Config {
                 args.prune_drop_mcp.as_deref(),
                 args.prune_drop_tools.as_deref(),
             ),
+            phase_e_passes: parse_phase_e_policy(
+                &args.phase_e_anthropic_passes,
+                &args.phase_e_chat_passes,
+                &args.phase_e_responses_passes,
+            ),
             model_router: crate::model_router::ModelRouterConfig::from_env(
                 std::env::var("HEADROOM_MODEL_ROUTER_ENABLED")
                     .ok()
@@ -3336,6 +3492,7 @@ impl Config {
             context_edit_clear_at_least: None,
             context_edit_keep_thinking: None,
             tool_prune_policy: Default::default(),
+            phase_e_passes: Default::default(),
             model_router: Default::default(),
             // Match production default so the cache-control walker is
             // exercised under test without per-test opt-in.
@@ -3595,6 +3752,43 @@ mod prune_policy_tests {
     fn drop_tools_alone_is_not_noop_but_absent_is() {
         assert!(!parse_prune_policy(None, None, Some("WebSearch")).is_noop());
         assert!(parse_prune_policy(None, None, Some(" , ")).is_noop());
+    }
+}
+
+#[cfg(test)]
+mod phase_e_policy_tests {
+    use super::{PhaseEPass, parse_phase_e_passes, parse_phase_e_policy};
+
+    #[test]
+    fn rejects_unknown_tokens() {
+        assert!(parse_phase_e_passes("e1,e2").is_ok());
+        assert!(parse_phase_e_passes("").is_ok());
+        let err = parse_phase_e_passes("e1,e5").unwrap_err();
+        assert!(err.contains("e5"), "{err}");
+    }
+
+    #[test]
+    fn empty_disables_every_pass_on_that_path() {
+        let p = parse_phase_e_policy("e1,e2,e3", "", "e1,e2,e4");
+        assert!(p.allows_anthropic(PhaseEPass::E1));
+        assert!(!p.allows_chat(PhaseEPass::E1));
+        assert!(!p.allows_chat(PhaseEPass::E4));
+        assert!(p.allows_responses(PhaseEPass::E4));
+    }
+
+    #[test]
+    fn default_allows_everything() {
+        let p = super::PhaseEPassPolicy::default();
+        for pass in [
+            PhaseEPass::E1,
+            PhaseEPass::E2,
+            PhaseEPass::E3,
+            PhaseEPass::E4,
+        ] {
+            assert!(p.allows_anthropic(pass));
+            assert!(p.allows_chat(pass));
+            assert!(p.allows_responses(pass));
+        }
     }
 }
 

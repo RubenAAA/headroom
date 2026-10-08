@@ -1116,7 +1116,7 @@ pub(super) fn finish_key_injection(
 pub(crate) fn maybe_inject_openai_prompt_cache_key(
     body: bytes::Bytes,
     shape: cache_stabilization::openai_cache_key::OpenAiShape,
-    auth_mode: AuthMode,
+    effective_auth_mode: AuthMode,
     request_id: &str,
     path: &str,
 ) -> bytes::Bytes {
@@ -1127,13 +1127,13 @@ pub(crate) fn maybe_inject_openai_prompt_cache_key(
     // cache keys would look like cache-evasion to the upstream
     // and could void OAuth scopes pinned to `(account, model,
     // session)`.
-    if !matches!(auth_mode, AuthMode::Payg) {
+    if !matches!(effective_auth_mode, AuthMode::Payg) {
         tracing::info!(
             event = "e4_skipped",
             request_id = %request_id,
             path = %path,
             reason = "auth_mode",
-            auth_mode = auth_mode.as_str(),
+            auth_mode = effective_auth_mode.as_str(),
             "PR-E4: skipped prompt_cache_key injection (non-PAYG auth mode)"
         );
         return body;

@@ -730,7 +730,6 @@ pub(crate) async fn forward_http(
             state: &state,
             decision: &decision,
             effective_auth_mode,
-            auth_mode,
             request_id: &request_id,
             path_for_log: &path_for_log,
         });

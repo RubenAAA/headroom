@@ -63,6 +63,31 @@ pub fn compress_openai_responses_request(
     request_id: &str,
     exclude_tools: &[String],
 ) -> Outcome {
+    // Tests run every pass; the forward path calls `_with_policy`
+    // with the CLI-built set.
+    compress_openai_responses_request_with_policy(
+        body,
+        mode,
+        auth_mode,
+        request_id,
+        exclude_tools,
+        &crate::config::PhaseEPassPolicy::default(),
+    )
+}
+
+/// [`compress_openai_responses_request`] with the Phase E per-pass,
+/// per-path policy. `effective_auth_mode` is the enforcement-folded
+/// mode: the F1-classified mode when
+/// `--auth-mode-policy-enforcement` is on, `Payg` otherwise. Only
+/// the forward path calls this.
+pub fn compress_openai_responses_request_with_policy(
+    body: &Bytes,
+    mode: CompressionMode,
+    effective_auth_mode: RequestAuthMode,
+    request_id: &str,
+    exclude_tools: &[String],
+    phase_e_passes: &crate::config::PhaseEPassPolicy,
+) -> Outcome {
     if let Some(outcome) = mode_off_passthrough(&mode, body, request_id) {
         return outcome;
     }
@@ -99,8 +124,13 @@ pub fn compress_openai_responses_request(
         .unwrap_or(DEFAULT_MODEL);
 
     // ── Phase E PR-E1: tool-array deterministic sort ────────────
-    let (dispatch_body, normalization_applied) =
-        normalize_tool_definitions_responses(body, &parsed, auth_mode, request_id);
+    let (dispatch_body, normalization_applied) = normalize_tool_definitions_responses(
+        body,
+        &parsed,
+        effective_auth_mode,
+        phase_e_passes,
+        request_id,
+    );
 
     // F2.1 c2/6: forward F1's classified auth_mode into the dispatcher
     // instead of the hard-coded `Payg`. See live_zone_anthropic.rs for
@@ -112,7 +142,7 @@ pub fn compress_openai_responses_request(
     };
     match compress_openai_responses_live_zone_with_config(
         &dispatch_body,
-        auth_mode.into(),
+        effective_auth_mode.into(),
         model,
         &dispatch_config,
     ) {
@@ -389,10 +419,38 @@ impl NormalizationApplied {
 fn normalize_tool_definitions_responses(
     body: &Bytes,
     parsed: &Value,
-    auth_mode: RequestAuthMode,
+    effective_auth_mode: RequestAuthMode,
+    phase_e_passes: &crate::config::PhaseEPassPolicy,
     request_id: &str,
 ) -> (Bytes, NormalizationApplied) {
-    if !is_payg_for_normalization_responses(auth_mode, request_id) {
+    // Policy gates first, per pass: a disabled pass reports
+    // `pass_disabled` even when the auth gate would also fire, so
+    // dashboards see operator intent rather than `auth_mode`.
+    let e1_allowed = phase_e_passes.allows_responses(crate::config::PhaseEPass::E1);
+    let e2_allowed = phase_e_passes.allows_responses(crate::config::PhaseEPass::E2);
+    if !e1_allowed {
+        tracing::info!(
+            event = "e1_skipped",
+            request_id = %request_id,
+            path = "/v1/responses",
+            reason = "pass_disabled",
+            "E1 not listed in --phase-e-responses-passes; tool-array sort skipped"
+        );
+    }
+    if !e2_allowed {
+        tracing::info!(
+            event = "e2_skipped",
+            request_id = %request_id,
+            path = "/v1/responses",
+            reason = "pass_disabled",
+            "E2 not listed in --phase-e-responses-passes; schema-key sort skipped"
+        );
+    }
+    if !e1_allowed && !e2_allowed {
+        return (body.clone(), NormalizationApplied::default());
+    }
+    if !is_payg_for_normalization_responses(effective_auth_mode, e1_allowed, e2_allowed, request_id)
+    {
         return (body.clone(), NormalizationApplied::default());
     }
 
@@ -412,8 +470,9 @@ fn normalize_tool_definitions_responses(
         .expect("tools array verified above");
 
     let applied = NormalizationApplied {
-        e1_tool_sort: sort_responses_tools_if_unmarked(tools, marker_present, request_id),
-        e2_schema_sort: sort_all_responses_parameters(tools),
+        e1_tool_sort: e1_allowed
+            && sort_responses_tools_if_unmarked(tools, marker_present, request_id),
+        e2_schema_sort: e2_allowed && sort_all_responses_parameters(tools),
     };
     if applied.e2_schema_sort {
         tracing::info!(
@@ -421,7 +480,7 @@ fn normalize_tool_definitions_responses(
             request_id = %request_id,
             path = "/v1/responses",
             tool_count = tools.len(),
-            "schema-key sort applied: function.parameters keys rewritten in alphabetic order"
+            "schema-key sort applied: parameters keys rewritten in alphabetic order"
         );
     }
 
@@ -429,28 +488,38 @@ fn normalize_tool_definitions_responses(
 }
 
 /// Auth-mode gate for Responses normalization: PAYG-only. Returns true when
-/// normalization may proceed.
+/// normalization may proceed. `e1_allowed` / `e2_allowed` mirror the policy
+/// gate above so a pass-disabled pass does not also log an `auth_mode` skip.
 /// Extracted from `normalize_tool_definitions_responses` without behavior change.
-fn is_payg_for_normalization_responses(auth_mode: RequestAuthMode, request_id: &str) -> bool {
+fn is_payg_for_normalization_responses(
+    auth_mode: RequestAuthMode,
+    e1_allowed: bool,
+    e2_allowed: bool,
+    request_id: &str,
+) -> bool {
     if matches!(auth_mode, RequestAuthMode::Payg) {
         return true;
     }
-    tracing::info!(
-        event = "e1_skipped",
-        request_id = %request_id,
-        path = "/v1/responses",
-        reason = "auth_mode",
-        auth_mode = auth_mode.as_str(),
-        "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
-    );
-    tracing::info!(
-        event = "e2_skipped",
-        request_id = %request_id,
-        path = "/v1/responses",
-        reason = "auth_mode",
-        auth_mode = auth_mode.as_str(),
-        "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
-    );
+    if e1_allowed {
+        tracing::info!(
+            event = "e1_skipped",
+            request_id = %request_id,
+            path = "/v1/responses",
+            reason = "auth_mode",
+            auth_mode = auth_mode.as_str(),
+            "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
+        );
+    }
+    if e2_allowed {
+        tracing::info!(
+            event = "e2_skipped",
+            request_id = %request_id,
+            path = "/v1/responses",
+            reason = "auth_mode",
+            auth_mode = auth_mode.as_str(),
+            "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
+        );
+    }
     false
 }
 
@@ -487,17 +556,25 @@ fn sort_responses_tools_if_unmarked(
     sorted
 }
 
-/// PR-E2: sort each tool's `function.parameters` keys recursively. Returns
-/// whether anything moved.
+/// PR-E2: sort each tool's `parameters` keys recursively — native
+/// `tool.parameters` first, chat-shape `tool.function.parameters`
+/// carried over second. Tools with neither are silently skipped.
+/// Returns whether anything moved.
 /// Extracted from `normalize_tool_definitions_responses` without behavior change.
 fn sort_all_responses_parameters(tools: &mut [Value]) -> bool {
-    // PR-E2: Responses tool schema lives at `tool.function.parameters`.
+    // PR-E2: native Responses tools carry the schema at
+    // `tool.parameters`; request bodies built for chat carry it at
+    // `tool.function.parameters`. Sort whichever is present (native
+    // wins when both are, matching E1's `tool.name` preference).
     let mut changed = false;
     for tool in tools.iter_mut() {
-        let Some(parameters) = tool
-            .get_mut("function")
-            .and_then(|f| f.get_mut("parameters"))
-        else {
+        let parameters = if tool.get("parameters").is_some() {
+            tool.get_mut("parameters")
+        } else {
+            tool.get_mut("function")
+                .and_then(|f| f.get_mut("parameters"))
+        };
+        let Some(parameters) = parameters else {
             continue;
         };
         // `sort_schema_keys_recursive` reports whether it moved anything,

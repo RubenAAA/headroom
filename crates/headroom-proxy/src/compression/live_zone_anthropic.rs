@@ -168,6 +168,34 @@ pub fn compress_anthropic_request(
     exclude_tools: &[String],
     ccr_store: Option<&dyn headroom_core::ccr::CcrStore>,
 ) -> Outcome {
+    // Non-forward callers (batch, bedrock) and tests run every pass;
+    // the forward path calls `_with_policy` with the CLI-built set.
+    compress_anthropic_request_with_policy(
+        body,
+        mode,
+        cache_control_policy,
+        auth_mode,
+        request_id,
+        exclude_tools,
+        ccr_store,
+        &crate::config::PhaseEPassPolicy::default(),
+    )
+}
+
+/// [`compress_anthropic_request`] with the Phase E per-pass, per-path
+/// policy. `effective_auth_mode` is the enforcement-folded mode: the
+/// F1-classified mode when `--auth-mode-policy-enforcement` is on,
+/// `Payg` otherwise. Only the forward path calls this.
+pub fn compress_anthropic_request_with_policy(
+    body: &Bytes,
+    mode: CompressionMode,
+    cache_control_policy: CacheControlAutoFrozen,
+    effective_auth_mode: RequestAuthMode,
+    request_id: &str,
+    exclude_tools: &[String],
+    ccr_store: Option<&dyn headroom_core::ccr::CcrStore>,
+    phase_e_passes: &crate::config::PhaseEPassPolicy,
+) -> Outcome {
     if matches!(mode, CompressionMode::Off) {
         tracing::info!(
             request_id = %request_id,
@@ -227,11 +255,12 @@ pub fn compress_anthropic_request(
 
     // PR-E1 + PR-E2: sort tools[] and schema keys in-place on the
     // parsed value.
-    let normalization_applied = normalize_tool_definitions(&mut parsed, auth_mode, request_id);
+    let normalization_applied =
+        normalize_tool_definitions(&mut parsed, effective_auth_mode, phase_e_passes, request_id);
 
     // PR-E3: auto-place anthropic cache_control on the last tool.
     let (e3_locations, e3_applied) =
-        run_phase_e3_auto_placement(&mut parsed, auth_mode, request_id);
+        run_phase_e3_auto_placement(&mut parsed, effective_auth_mode, phase_e_passes, request_id);
 
     // Re-serialize the parsed value once if any Phase E pass mutated
     // it. The live-zone dispatcher will re-parse internally — this
@@ -286,7 +315,7 @@ pub fn compress_anthropic_request(
     let dispatch_result = match mode {
         CompressionMode::AllMessages => headroom_core::transforms::compress_anthropic_all_messages(
             &dispatch_body,
-            auth_mode.into(),
+            effective_auth_mode.into(),
             model,
             ccr_store,
             &dispatch_config,
@@ -294,7 +323,7 @@ pub fn compress_anthropic_request(
         _ => compress_anthropic_live_zone_with_ccr(
             &dispatch_body,
             frozen_count,
-            auth_mode.into(),
+            effective_auth_mode.into(),
             model,
             ccr_store,
             &dispatch_config,
@@ -383,16 +412,29 @@ fn report_dispatch_error(
 /// Extracted from `compress_anthropic_request` without behavior change.
 fn run_phase_e3_auto_placement(
     parsed: &mut Value,
-    auth_mode: RequestAuthMode,
+    effective_auth_mode: RequestAuthMode,
+    phase_e_passes: &crate::config::PhaseEPassPolicy,
     request_id: &str,
 ) -> (Vec<String>, bool) {
-    if !matches!(auth_mode, RequestAuthMode::Payg) {
+    // Policy gate fires before the auth gate so dashboards see
+    // `pass_disabled` (operator intent) rather than `auth_mode`.
+    if !phase_e_passes.allows_anthropic(crate::config::PhaseEPass::E3) {
+        tracing::info!(
+            event = "e3_skipped",
+            request_id = %request_id,
+            path = "/v1/messages",
+            reason = "pass_disabled",
+            "E3 not listed in --phase-e-anthropic-passes; auto-placement skipped"
+        );
+        return (Vec::new(), false);
+    }
+    if !matches!(effective_auth_mode, RequestAuthMode::Payg) {
         tracing::info!(
             event = "e3_skipped",
             request_id = %request_id,
             path = "/v1/messages",
             reason = SkipReason::AuthMode.as_str(),
-            auth_mode = auth_mode.as_str(),
+            auth_mode = effective_auth_mode.as_str(),
             "non-PAYG auth mode; cache_control auto-placement skipped"
         );
         return (Vec::new(), false);
@@ -712,14 +754,42 @@ impl NormalizationApplied {
 /// dashboards can see how often each policy fires in production.
 pub(super) fn normalize_tool_definitions(
     parsed: &mut Value,
-    auth_mode: RequestAuthMode,
+    effective_auth_mode: RequestAuthMode,
+    phase_e_passes: &crate::config::PhaseEPassPolicy,
     request_id: &str,
 ) -> NormalizationApplied {
-    // Auth-mode gate first — both PR-E1 and PR-E2 mutate request
+    // Policy gates first, per pass: a disabled pass reports
+    // `pass_disabled` even when the auth gate would also fire, so
+    // dashboards see operator intent rather than `auth_mode`.
+    let e1_allowed = phase_e_passes.allows_anthropic(crate::config::PhaseEPass::E1);
+    let e2_allowed = phase_e_passes.allows_anthropic(crate::config::PhaseEPass::E2);
+    if !e1_allowed {
+        tracing::info!(
+            event = "e1_skipped",
+            request_id = %request_id,
+            path = "/v1/messages",
+            reason = "pass_disabled",
+            "E1 not listed in --phase-e-anthropic-passes; tool-array sort skipped"
+        );
+    }
+    if !e2_allowed {
+        tracing::info!(
+            event = "e2_skipped",
+            request_id = %request_id,
+            path = "/v1/messages",
+            reason = "pass_disabled",
+            "E2 not listed in --phase-e-anthropic-passes; schema-key sort skipped"
+        );
+    }
+    if !e1_allowed && !e2_allowed {
+        return NormalizationApplied::default();
+    }
+
+    // Auth-mode gate — both PR-E1 and PR-E2 mutate request
     // bytes, which is only safe under PAYG. OAuth and Subscription
     // clients pass through byte-equal so the proxy never looks
     // like a cache-evasion intermediary to the upstream.
-    if !is_payg_for_normalization(auth_mode, request_id) {
+    if !is_payg_for_normalization(effective_auth_mode, e1_allowed, e2_allowed, request_id) {
         return NormalizationApplied::default();
     }
 
@@ -747,8 +817,8 @@ pub(super) fn normalize_tool_definitions(
         .expect("tools array verified above");
 
     let applied = NormalizationApplied {
-        e1_tool_sort: sort_tools_if_unmarked(tools, marker_present, request_id),
-        e2_schema_sort: sort_all_schemas(tools),
+        e1_tool_sort: e1_allowed && sort_tools_if_unmarked(tools, marker_present, request_id),
+        e2_schema_sort: e2_allowed && sort_all_schemas(tools),
     };
     if applied.e2_schema_sort {
         tracing::info!(
@@ -766,28 +836,38 @@ pub(super) fn normalize_tool_definitions(
 /// Auth-mode gate for Phase E normalization: both PR-E1 and PR-E2 mutate
 /// request bytes, which is only safe under PAYG. OAuth and Subscription
 /// clients pass through byte-equal. Returns true when normalization may
-/// proceed.
+/// proceed. `e1_allowed` / `e2_allowed` mirror the policy gate above so a
+/// pass-disabled pass does not also log an `auth_mode` skip.
 /// Extracted from `normalize_tool_definitions` without behavior change.
-fn is_payg_for_normalization(auth_mode: RequestAuthMode, request_id: &str) -> bool {
+fn is_payg_for_normalization(
+    auth_mode: RequestAuthMode,
+    e1_allowed: bool,
+    e2_allowed: bool,
+    request_id: &str,
+) -> bool {
     if matches!(auth_mode, RequestAuthMode::Payg) {
         return true;
     }
-    tracing::info!(
-        event = "e1_skipped",
-        request_id = %request_id,
-        path = "/v1/messages",
-        reason = "auth_mode",
-        auth_mode = auth_mode.as_str(),
-        "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
-    );
-    tracing::info!(
-        event = "e2_skipped",
-        request_id = %request_id,
-        path = "/v1/messages",
-        reason = "auth_mode",
-        auth_mode = auth_mode.as_str(),
-        "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
-    );
+    if e1_allowed {
+        tracing::info!(
+            event = "e1_skipped",
+            request_id = %request_id,
+            path = "/v1/messages",
+            reason = "auth_mode",
+            auth_mode = auth_mode.as_str(),
+            "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
+        );
+    }
+    if e2_allowed {
+        tracing::info!(
+            event = "e2_skipped",
+            request_id = %request_id,
+            path = "/v1/messages",
+            reason = "auth_mode",
+            auth_mode = auth_mode.as_str(),
+            "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
+        );
+    }
     false
 }
 

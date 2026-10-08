@@ -63,6 +63,31 @@ pub fn compress_openai_chat_request(
     request_id: &str,
     exclude_tools: &[String],
 ) -> Outcome {
+    // Non-forward callers (batch, gemini) and tests run every pass;
+    // the forward path calls `_with_policy` with the CLI-built set.
+    compress_openai_chat_request_with_policy(
+        body,
+        mode,
+        auth_mode,
+        request_id,
+        exclude_tools,
+        &crate::config::PhaseEPassPolicy::default(),
+    )
+}
+
+/// [`compress_openai_chat_request`] with the Phase E per-pass,
+/// per-path policy. `effective_auth_mode` is the enforcement-folded
+/// mode: the F1-classified mode when
+/// `--auth-mode-policy-enforcement` is on, `Payg` otherwise. Only
+/// the forward path calls this.
+pub fn compress_openai_chat_request_with_policy(
+    body: &Bytes,
+    mode: CompressionMode,
+    effective_auth_mode: RequestAuthMode,
+    request_id: &str,
+    exclude_tools: &[String],
+    phase_e_passes: &crate::config::PhaseEPassPolicy,
+) -> Outcome {
     if let Some(outcome) = mode_off_passthrough(&mode, body, request_id) {
         return outcome;
     }
@@ -117,8 +142,13 @@ pub fn compress_openai_chat_request(
     // Same gate logic as the Anthropic walker (see that module's
     // `normalize_tool_definitions` for rationale). PAYG-only,
     // skipped when any tool already carries `cache_control`.
-    let (dispatch_body, normalization_applied) =
-        normalize_tool_definitions_openai_chat(body, &parsed, auth_mode, request_id);
+    let (dispatch_body, normalization_applied) = normalize_tool_definitions_openai_chat(
+        body,
+        &parsed,
+        effective_auth_mode,
+        phase_e_passes,
+        request_id,
+    );
 
     // F2.1 c2/6: forward F1's classified auth_mode into the dispatcher
     // instead of the hard-coded `Payg`. See live_zone_anthropic.rs for
@@ -130,7 +160,7 @@ pub fn compress_openai_chat_request(
     };
     match compress_openai_chat_live_zone_with_config(
         &dispatch_body,
-        auth_mode.into(),
+        effective_auth_mode.into(),
         model,
         &dispatch_config,
     ) {
@@ -353,10 +383,37 @@ impl NormalizationApplied {
 fn normalize_tool_definitions_openai_chat(
     body: &Bytes,
     parsed: &Value,
-    auth_mode: RequestAuthMode,
+    effective_auth_mode: RequestAuthMode,
+    phase_e_passes: &crate::config::PhaseEPassPolicy,
     request_id: &str,
 ) -> (Bytes, NormalizationApplied) {
-    if !is_payg_for_normalization_openai(auth_mode, request_id) {
+    // Policy gates first, per pass: a disabled pass reports
+    // `pass_disabled` even when the auth gate would also fire, so
+    // dashboards see operator intent rather than `auth_mode`.
+    let e1_allowed = phase_e_passes.allows_chat(crate::config::PhaseEPass::E1);
+    let e2_allowed = phase_e_passes.allows_chat(crate::config::PhaseEPass::E2);
+    if !e1_allowed {
+        tracing::info!(
+            event = "e1_skipped",
+            request_id = %request_id,
+            path = "/v1/chat/completions",
+            reason = "pass_disabled",
+            "E1 not listed in --phase-e-chat-passes; tool-array sort skipped"
+        );
+    }
+    if !e2_allowed {
+        tracing::info!(
+            event = "e2_skipped",
+            request_id = %request_id,
+            path = "/v1/chat/completions",
+            reason = "pass_disabled",
+            "E2 not listed in --phase-e-chat-passes; schema-key sort skipped"
+        );
+    }
+    if !e1_allowed && !e2_allowed {
+        return (body.clone(), NormalizationApplied::default());
+    }
+    if !is_payg_for_normalization_openai(effective_auth_mode, e1_allowed, e2_allowed, request_id) {
         return (body.clone(), NormalizationApplied::default());
     }
 
@@ -376,8 +433,9 @@ fn normalize_tool_definitions_openai_chat(
         .expect("tools array verified above");
 
     let applied = NormalizationApplied {
-        e1_tool_sort: sort_openai_tools_if_unmarked(tools, marker_present, request_id),
-        e2_schema_sort: sort_all_parameters(tools),
+        e1_tool_sort: e1_allowed
+            && sort_openai_tools_if_unmarked(tools, marker_present, request_id),
+        e2_schema_sort: e2_allowed && sort_all_parameters(tools),
     };
     if applied.e2_schema_sort {
         tracing::info!(
@@ -393,28 +451,39 @@ fn normalize_tool_definitions_openai_chat(
 }
 
 /// Auth-mode gate for OpenAI normalization: PAYG-only, like the Anthropic
-/// walker. Returns true when normalization may proceed.
+/// walker. Returns true when normalization may proceed. `e1_allowed` /
+/// `e2_allowed` mirror the policy gate above so a pass-disabled pass does
+/// not also log an `auth_mode` skip.
 /// Extracted from `normalize_tool_definitions_openai_chat` without behavior change.
-fn is_payg_for_normalization_openai(auth_mode: RequestAuthMode, request_id: &str) -> bool {
+fn is_payg_for_normalization_openai(
+    auth_mode: RequestAuthMode,
+    e1_allowed: bool,
+    e2_allowed: bool,
+    request_id: &str,
+) -> bool {
     if matches!(auth_mode, RequestAuthMode::Payg) {
         return true;
     }
-    tracing::info!(
-        event = "e1_skipped",
-        request_id = %request_id,
-        path = "/v1/chat/completions",
-        reason = "auth_mode",
-        auth_mode = auth_mode.as_str(),
-        "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
-    );
-    tracing::info!(
-        event = "e2_skipped",
-        request_id = %request_id,
-        path = "/v1/chat/completions",
-        reason = "auth_mode",
-        auth_mode = auth_mode.as_str(),
-        "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
-    );
+    if e1_allowed {
+        tracing::info!(
+            event = "e1_skipped",
+            request_id = %request_id,
+            path = "/v1/chat/completions",
+            reason = "auth_mode",
+            auth_mode = auth_mode.as_str(),
+            "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
+        );
+    }
+    if e2_allowed {
+        tracing::info!(
+            event = "e2_skipped",
+            request_id = %request_id,
+            path = "/v1/chat/completions",
+            reason = "auth_mode",
+            auth_mode = auth_mode.as_str(),
+            "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
+        );
+    }
     false
 }
 

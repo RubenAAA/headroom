@@ -52,11 +52,15 @@ pub use anthropic::resolve_frozen_count;
 pub use cross_turn::{apply_cross_turn_dedup, apply_cross_turn_dedup_with_user_text};
 pub use live_zone_anthropic::{
     Outcome, PassthroughReason, PerStrategyTokens, compress_anthropic_request,
+    compress_anthropic_request_with_policy,
 };
 pub use live_zone_openai::{
-    SkipCompressionReason, compress_openai_chat_request, should_skip_compression,
+    SkipCompressionReason, compress_openai_chat_request, compress_openai_chat_request_with_policy,
+    should_skip_compression,
 };
-pub use live_zone_responses::compress_openai_responses_request;
+pub use live_zone_responses::{
+    compress_openai_responses_request, compress_openai_responses_request_with_policy,
+};
 
 /// Which provider's compression dispatcher should run for a request
 /// path. PR-C2 wired `/v1/chat/completions`; PR-C3 adds

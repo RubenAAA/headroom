@@ -1,0 +1,230 @@
+[
+ {
+  "label": "A1-sub-unsorted-nomarkers",
+  "path": "/v1/messages",
+  "status": 200,
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/messages",
+    "tool_count": 3
+   },
+   {
+    "event": "e2_applied",
+    "path": "/v1/messages",
+    "tool_count": 3
+   },
+   {
+    "event": "e3_applied",
+    "path": "/v1/messages",
+    "placed_count": 1,
+    "locations": "[\"tools[2]\"]"
+   }
+  ]
+ },
+ {
+  "label": "A2-sub-sorted-nomarkers",
+  "path": "/v1/messages",
+  "status": 200,
+  "events": [
+   {
+    "event": "e2_applied",
+    "path": "/v1/messages",
+    "tool_count": 3
+   },
+   {
+    "event": "e3_applied",
+    "path": "/v1/messages",
+    "placed_count": 1,
+    "locations": "[\"tools[2]\"]"
+   }
+  ]
+ },
+ {
+  "label": "A3-sub-unsorted-markerpresent",
+  "path": "/v1/messages",
+  "status": 200,
+  "events": []
+ },
+ {
+  "label": "A4-sub-notools",
+  "path": "/v1/messages",
+  "status": 200,
+  "events": [
+   {
+    "event": "e3_no_target",
+    "path": "/v1/messages"
+   }
+  ]
+ },
+ {
+  "label": "A5-payg-unsorted-nomarkers",
+  "path": "/v1/messages",
+  "status": 200,
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/messages",
+    "tool_count": 3
+   },
+   {
+    "event": "e2_applied",
+    "path": "/v1/messages",
+    "tool_count": 3
+   },
+   {
+    "event": "e3_applied",
+    "path": "/v1/messages",
+    "placed_count": 1,
+    "locations": "[\"tools[2]\"]"
+   }
+  ]
+ },
+ {
+  "label": "C1-payg-chat-unsorted",
+  "path": "/v1/chat/completions",
+  "status": 200,
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 2
+   },
+   {
+    "event": "e2_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 2
+   },
+   {
+    "event": "e4_applied",
+    "path": "/v1/chat/completions",
+    "key_prefix": "e9e723fc"
+   }
+  ]
+ },
+ {
+  "label": "C2-payg-chat-stability-turn2",
+  "path": "/v1/chat/completions",
+  "status": 200,
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 2
+   },
+   {
+    "event": "e2_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 2
+   },
+   {
+    "event": "e4_applied",
+    "path": "/v1/chat/completions",
+    "key_prefix": "e9e723fc"
+   }
+  ]
+ },
+ {
+  "label": "C3-payg-chat-othertools",
+  "path": "/v1/chat/completions",
+  "status": 200,
+  "events": [
+   {
+    "event": "e2_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 1
+   },
+   {
+    "event": "e4_applied",
+    "path": "/v1/chat/completions",
+    "key_prefix": "27a9201f"
+   }
+  ]
+ },
+ {
+  "label": "C4-payg-chat-keypresent",
+  "path": "/v1/chat/completions",
+  "status": 200,
+  "events": []
+ },
+ {
+  "label": "C5-sub-chat-unsorted",
+  "path": "/v1/chat/completions",
+  "status": 200,
+  "events": [
+   {
+    "event": "e1_skipped",
+    "path": "/v1/chat/completions",
+    "reason": "auth_mode",
+    "auth_mode": "subscription"
+   },
+   {
+    "event": "e2_skipped",
+    "path": "/v1/chat/completions",
+    "reason": "auth_mode",
+    "auth_mode": "subscription"
+   },
+   {
+    "event": "e4_skipped",
+    "path": "/v1/chat/completions",
+    "reason": "auth_mode",
+    "auth_mode": "subscription"
+   }
+  ]
+ },
+ {
+  "label": "R1-payg-resp-unsorted",
+  "path": "/v1/responses",
+  "status": 200,
+  "events": [
+   {
+    "event": "e4_applied",
+    "path": "/v1/responses",
+    "key_prefix": "0eb8e335"
+   }
+  ]
+ },
+ {
+  "label": "R2-payg-resp-stability-turn2",
+  "path": "/v1/responses",
+  "status": 200,
+  "events": [
+   {
+    "event": "e4_applied",
+    "path": "/v1/responses",
+    "key_prefix": "0eb8e335"
+   }
+  ]
+ },
+ {
+  "label": "R3-payg-resp-othertools",
+  "path": "/v1/responses",
+  "status": 200,
+  "events": [
+   {
+    "event": "e4_applied",
+    "path": "/v1/responses",
+    "key_prefix": "e3c7dd99"
+   }
+  ]
+ },
+ {
+  "label": "R4-payg-resp-keypresent",
+  "path": "/v1/responses",
+  "status": 200,
+  "events": []
+ },
+ {
+  "label": "R5-sub-resp-unsorted",
+  "path": "/v1/responses",
+  "status": 200,
+  "events": [
+   {
+    "event": "e4_skipped",
+    "path": "/v1/responses",
+    "reason": "auth_mode",
+    "auth_mode": "subscription"
+   }
+  ]
+ }
+]

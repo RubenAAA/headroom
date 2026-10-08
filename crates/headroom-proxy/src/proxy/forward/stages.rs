@@ -298,7 +298,7 @@ pub(crate) fn run_endpoint_rewrite(
     body_to_send: bytes::Bytes,
     scope: RequestScope<'_>,
     path_for_log: &str,
-    auth_mode: AuthMode,
+    effective_auth_mode: AuthMode,
     selected_upstream_base: &str,
     skip_model_routing: bool,
     auto_mode_turn: bool,
@@ -319,10 +319,35 @@ pub(crate) fn run_endpoint_rewrite(
                 }
                 _ => cache_stabilization::openai_cache_key::OpenAiShape::ChatCompletions,
             };
+            // Policy gate before the helper so a disabled E4 reports
+            // `pass_disabled` (operator intent) rather than the
+            // helper's own `auth_mode` skip. Same E-gate as the
+            // compression stage: the enforcement-folded mode covers
+            // E4 too.
+            let e4_allowed = match endpoint {
+                compression::CompressibleEndpoint::OpenAiResponses => state
+                    .config
+                    .phase_e_passes
+                    .allows_responses(crate::config::PhaseEPass::E4),
+                _ => state
+                    .config
+                    .phase_e_passes
+                    .allows_chat(crate::config::PhaseEPass::E4),
+            };
+            if !e4_allowed {
+                tracing::info!(
+                    event = "e4_skipped",
+                    request_id = %request_id,
+                    path = %path_for_log,
+                    reason = "pass_disabled",
+                    "E4 not listed in --phase-e-chat-passes/--phase-e-responses-passes; prompt_cache_key injection skipped"
+                );
+                return body_to_send;
+            }
             maybe_inject_openai_prompt_cache_key(
                 body_to_send,
                 shape,
-                auth_mode,
+                effective_auth_mode,
                 request_id,
                 path_for_log,
             )

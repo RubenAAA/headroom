@@ -227,7 +227,6 @@ pub(crate) fn dispatch_compression(
     endpoint: compression::CompressibleEndpoint,
     state: &AppState,
     effective_auth_mode: AuthMode,
-    auth_mode: AuthMode,
     request_id: &str,
 ) -> compression::Outcome {
     let ccr_store_for_compression = state.ccr_store();
@@ -240,7 +239,7 @@ pub(crate) fn dispatch_compression(
             // `effective_auth_mode` folds in the enforcement-flag
             // override so `--auth-mode-policy-enforcement disabled`
             // also unlocks the Phase E passes for non-PAYG callers.
-            let outcome = compression::compress_anthropic_request(
+            let outcome = compression::compress_anthropic_request_with_policy(
                 buffered,
                 state.config.compression_mode,
                 state.config.cache_control_auto_frozen,
@@ -251,6 +250,7 @@ pub(crate) fn dispatch_compression(
                 // `headroom_retrieve` call can bring it back. Without
                 // it the lossy path is one-way.
                 ccr_store_for_compression.as_deref(),
+                &state.config.phase_e_passes,
             );
             // Cross-turn verbatim de-dup post-pass over the final
             // block forms (no-op unless
@@ -279,12 +279,17 @@ pub(crate) fn dispatch_compression(
                 );
                 compression::Outcome::NoCompression
             } else {
-                let outcome = compression::compress_openai_chat_request(
+                // Same E-gate as the Anthropic arm: the
+                // enforcement-folded mode covers chat too, so
+                // `--auth-mode-policy-enforcement disabled` unlocks
+                // E1/E2/E4 for non-PAYG chat callers as well.
+                let outcome = compression::compress_openai_chat_request_with_policy(
                     buffered,
                     state.config.compression_mode,
-                    auth_mode,
+                    effective_auth_mode,
                     request_id,
                     &state.config.exclude_tools,
+                    &state.config.phase_e_passes,
                 );
                 // Cross-turn verbatim de-dup post-pass over
                 // `role == "tool"` message content (no-op unless
@@ -334,12 +339,15 @@ pub(crate) fn dispatch_compression(
         // kind plus the latest `message` text. Cache hot zone is
         // every other item type (passthrough verbatim).
         compression::CompressibleEndpoint::OpenAiResponses => {
-            compression::compress_openai_responses_request(
+            // Same E-gate as the Anthropic arm: the
+            // enforcement-folded mode covers Responses too.
+            compression::compress_openai_responses_request_with_policy(
                 buffered,
                 state.config.compression_mode,
-                auth_mode,
+                effective_auth_mode,
                 request_id,
                 &state.config.exclude_tools,
+                &state.config.phase_e_passes,
             )
         }
     }
@@ -464,7 +472,6 @@ pub(crate) struct CompressionStageIn<'a> {
     pub(crate) state: &'a AppState,
     pub(crate) decision: &'a crate::compression_decision::CompressionDecision,
     pub(crate) effective_auth_mode: AuthMode,
-    pub(crate) auth_mode: AuthMode,
     pub(crate) request_id: &'a str,
     pub(crate) path_for_log: &'a str,
 }
@@ -491,7 +498,6 @@ pub(crate) fn run_compression_stage(input: CompressionStageIn<'_>) -> Compressio
         state,
         decision,
         effective_auth_mode,
-        auth_mode,
         request_id,
         path_for_log,
     } = input;
@@ -509,14 +515,7 @@ pub(crate) fn run_compression_stage(input: CompressionStageIn<'_>) -> Compressio
         );
         compression::Outcome::NoCompression
     } else {
-        forward::dispatch_compression(
-            buffered,
-            endpoint,
-            state,
-            effective_auth_mode,
-            auth_mode,
-            request_id,
-        )
+        forward::dispatch_compression(buffered, endpoint, state, effective_auth_mode, request_id)
     };
     // C2 fix: snapshot the original buffered byte-length AND the
     // dispatcher's "is this a passthrough arm?" decision BEFORE

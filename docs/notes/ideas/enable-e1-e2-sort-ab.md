@@ -6,6 +6,9 @@
   requests, every one `reason=auth_mode, auth_mode=subscription`. This is
   gate-blocked, not traffic-blocked — no amount of waiting produces a
   measurement, only a PAYG canary or a policy-enforcement window will.
+  Unification 2026-10-08: enforcement-folded mode now covers all paths
+  (Anthropic + Chat + Responses), so this doc's Anthropic-only gating
+  notes are stale.
 - **Source:** 2026-09-18 session; `tool_def_normalize.rs:70-95,207-234`,
   `live_zone_anthropic.rs:601-652`
 - **Value:** deterministic tool/schema order should cut prefix re-keys (tools
