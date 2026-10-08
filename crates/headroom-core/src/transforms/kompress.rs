@@ -531,17 +531,35 @@ impl Kompress {
     /// Model-decides compression (the proxy path): keep words scoring
     /// above `config.score_threshold`.
     pub fn compress(&self, content: &str) -> KompressResult {
-        self.compress_inner(content, None)
+        self.compress_inner(content, None, None)
     }
 
     /// Forced-ratio compression: keep the top `target_ratio` fraction of
     /// words by score (at least one). `None` defers to the threshold path.
     /// The proxy never sets this — only the user-facing API does.
     pub fn compress_with_ratio(&self, content: &str, target_ratio: Option<f64>) -> KompressResult {
-        self.compress_inner(content, target_ratio)
+        self.compress_inner(content, target_ratio, None)
     }
 
-    fn compress_inner(&self, content: &str, target_ratio: Option<f64>) -> KompressResult {
+    /// `compress_with_ratio` with the request budget's remainder as a
+    /// per-call cap (#3711). Checked at chunk boundaries; on expiry the
+    /// block passes through unchanged, like Python bailing a text with any
+    /// unprocessed chunk.
+    pub fn compress_with_deadline(
+        &self,
+        content: &str,
+        target_ratio: Option<f64>,
+        deadline: Option<std::time::Instant>,
+    ) -> KompressResult {
+        self.compress_inner(content, target_ratio, deadline)
+    }
+
+    fn compress_inner(
+        &self,
+        content: &str,
+        target_ratio: Option<f64>,
+        deadline: Option<std::time::Instant>,
+    ) -> KompressResult {
         let words: Vec<&str> = content.split_whitespace().collect();
         let n_words = words.len();
         if n_words < self.config.min_words.max(MIN_WORDS) {
@@ -554,6 +572,13 @@ impl Kompress {
         // progress below (end == chunk_start, += 0). Clamp to 1.
         let stride = self.config.chunk_words.max(1);
         while chunk_start < n_words {
+            // Request-budget cap (#3711): stop at the next chunk boundary
+            // past expiry. Python bails a text with any unprocessed chunk to
+            // passthrough, and a dispatch call holds exactly one text, so an
+            // expired cap returns the input unchanged.
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return self.passthrough(content, n_words);
+            }
             let end = (chunk_start + stride).min(n_words);
             let chunk_words = &words[chunk_start..end];
             match self.score_chunk(chunk_words) {

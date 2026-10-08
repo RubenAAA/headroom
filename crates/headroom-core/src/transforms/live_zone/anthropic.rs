@@ -113,6 +113,11 @@ pub fn compress_anthropic_live_zone_with_ccr(
     ccr_store: Option<&dyn CcrStore>,
     dispatch_config: &DispatchConfig,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
+    // Arm this request's ML budget (#3711). The clone keeps the caller's
+    // config untouched; every block below draws from the same ledger.
+    let mut dispatch_config = dispatch_config.clone();
+    dispatch_config.ml_budget = MlBudget::armed();
+    let dispatch_config = &dispatch_config;
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
     let messages = parsed
         .get("messages")

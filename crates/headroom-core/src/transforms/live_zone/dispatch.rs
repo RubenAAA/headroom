@@ -5,6 +5,9 @@
 //! keeps the parent's items and imports in reach; the parent re-exports
 //! this module, so callers keep their paths.
 
+#[cfg(feature = "ml")]
+use super::ml_budget::Admission;
+use super::ml_budget::MlBudget;
 use super::*;
 
 /// Per-block dispatch result — whether any compressor ran and what
@@ -66,6 +69,10 @@ pub struct DispatchConfig {
     /// names, globs and MCP spellings all work. Empty — the default — leaves
     /// dispatch exactly as it was before the flag was wired.
     pub exclude_tools: Vec<String>,
+    /// Request-scoped ML time budget (#3711), armed by the live-zone entry
+    /// points. `None` — the default — leaves dispatch unbounded, matching
+    /// Python's `compress()`-without-`apply()` callers.
+    pub ml_budget: Option<MlBudget>,
 }
 
 pub(super) fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {
@@ -378,7 +385,40 @@ pub(super) fn dispatch_compressor_uncached(
             // too short (engine returns the input unchanged).
             Some(model) => {
                 crate::transforms::observability::observe_kompress_size_gate("within");
-                let result = model.compress_with_ratio(text, config.target_ratio);
+                // Request budget (#3711): the size gate above bounds one
+                // block, this bounds the request. A refused block passes
+                // through unchanged (memoized as a skip, like Python caching
+                // the verdict) so its bytes stay stable on later turns.
+                let cap = match config
+                    .ml_budget
+                    .as_ref()
+                    .map_or(Admission::Unbounded, |b| b.admit((text.len() / 4) as u64))
+                {
+                    Admission::Unbounded => None,
+                    Admission::Admitted { cap_secs } => Some(cap_secs),
+                    Admission::Refused => {
+                        crate::transforms::observability::observe_kompress_size_gate("deadline");
+                        if config.ml_budget.as_ref().is_some_and(|b| b.take_warn()) {
+                            tracing::warn!(
+                                "kompress_ml_stage_budget_exceeded; passing remaining blocks through"
+                            );
+                        }
+                        return DispatchResult::NoOp {
+                            content_type: content_type.as_str(),
+                            declined_by: Some("ml_stage_budget"),
+                        };
+                    }
+                };
+                let started = std::time::Instant::now();
+                let result = model.compress_with_deadline(
+                    text,
+                    config.target_ratio,
+                    cap.map(std::time::Duration::from_secs_f64)
+                        .map(|d| started + d),
+                );
+                if let Some(budget) = config.ml_budget.as_ref() {
+                    budget.charge(started.elapsed(), result.original_tokens as u64);
+                }
                 if result.compressed == text {
                     return DispatchResult::NoOp {
                         content_type: content_type.as_str(),

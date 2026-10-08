@@ -257,6 +257,7 @@ mod anthropic;
 mod compressors;
 mod dispatch;
 mod embedded_json;
+mod ml_budget;
 mod openai_chat;
 mod openai_responses;
 mod outcome;
@@ -269,8 +270,8 @@ mod tests;
 // otherwise warn that they re-export nothing.
 #[allow(unused_imports)]
 pub use self::{
-    anthropic::*, compressors::*, dispatch::*, openai_chat::*, openai_responses::*, outcome::*,
-    planner::*,
+    anthropic::*, compressors::*, dispatch::*, ml_budget::*, openai_chat::*, openai_responses::*,
+    outcome::*, planner::*,
 };
 
 #[cfg(test)]
