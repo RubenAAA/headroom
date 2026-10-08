@@ -434,10 +434,10 @@ impl PersistedStats {
             }
             self.per_model = reclamped;
         }
-        if let Some(ts) = &self.first_seen_at {
-            if ts.len() > 64 || humantime::parse_rfc3339(ts).is_err() {
-                self.first_seen_at = None;
-            }
+        if let Some(ts) = &self.first_seen_at
+            && (ts.len() > 64 || humantime::parse_rfc3339(ts).is_err())
+        {
+            self.first_seen_at = None;
         }
         // Bucket keys must be well-formed date labels BEFORE the
         // trim below: `trim_oldest` evicts the lexicographically
@@ -565,21 +565,21 @@ impl Ledger {
         // (wrong --stats-path) — treat it like corruption instead of
         // allocating gigabytes at startup.
         const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > MAX_STATE_BYTES {
-                tracing::error!(
-                    event = "stats_state_oversized",
-                    path = %path.display(),
-                    bytes = meta.len(),
-                    "persisted stats file is implausibly large; refusing to load \
-                     it (check --stats-path) and starting fresh"
-                );
-                return Self::from_state(
-                    PersistedStats::default(),
-                    Some(path),
-                    Some("state file exceeds size cap".into()),
-                );
-            }
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.len() > MAX_STATE_BYTES
+        {
+            tracing::error!(
+                event = "stats_state_oversized",
+                path = %path.display(),
+                bytes = meta.len(),
+                "persisted stats file is implausibly large; refusing to load \
+                 it (check --stats-path) and starting fresh"
+            );
+            return Self::from_state(
+                PersistedStats::default(),
+                Some(path),
+                Some("state file exceeds size cap".into()),
+            );
         }
         let (state, error) = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<PersistedStats>(&bytes) {
@@ -1154,10 +1154,10 @@ fn accumulate_usd(base: &mut f64, inc: f64) {
 /// dir. Temp file removed on failure so retries don't litter.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     let result = (|| {
@@ -1165,12 +1165,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
         Ok(())
     })();

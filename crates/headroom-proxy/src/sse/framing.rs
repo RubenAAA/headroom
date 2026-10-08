@@ -161,17 +161,17 @@ impl SseFramer {
         // the ledger's own per-event token ceiling. Client bytes are
         // never touched because capped framers are never on the
         // client path.
-        if let Some(max) = self.max_buffered_bytes {
-            if self.buf.len() + chunk.len() > max {
-                tracing::warn!(
-                    event = "sse_framer_buffer_overflow",
-                    buffered = self.buf.len(),
-                    "no event terminator within 4 MiB; discarding buffered \
+        if let Some(max) = self.max_buffered_bytes
+            && self.buf.len() + chunk.len() > max
+        {
+            tracing::warn!(
+                event = "sse_framer_buffer_overflow",
+                buffered = self.buf.len(),
+                "no event terminator within 4 MiB; discarding buffered \
                      bytes (telemetry-only consumer — client stream unaffected)"
-                );
-                self.buf.clear();
-                return;
-            }
+            );
+            self.buf.clear();
+            return;
         }
         self.buf.extend_from_slice(chunk);
     }

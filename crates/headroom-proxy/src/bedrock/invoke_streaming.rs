@@ -567,6 +567,7 @@ async fn send_streaming_request(
 /// Decide the output mode from the client's `Accept` header, translate to
 /// SSE when asked, and finish the response (restoring redaction).
 /// Extracted from `handle_invoke_streaming` without behavior change.
+#[allow(clippy::too_many_arguments)]
 fn finish_streaming_response(
     upstream_resp: reqwest::Response,
     seam: Option<crate::redact::Seam>,
@@ -579,10 +580,10 @@ fn finish_streaming_response(
 ) -> Response {
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    if !status.is_success() {
-        if let Some(p) = pending_stats.as_mut() {
-            p.mark_failed();
-        }
+    if !status.is_success()
+        && let Some(p) = pending_stats.as_mut()
+    {
+        p.mark_failed();
     }
     let upstream_content_type = upstream_resp
         .headers()

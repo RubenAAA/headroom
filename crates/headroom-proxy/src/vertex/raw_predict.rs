@@ -526,6 +526,7 @@ fn build_vertex_headers(
 ///
 // See `buffer_vertex_body` for why the `Response` error is not boxed.
 #[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 async fn send_vertex_request(
     state: &AppState,
     method: Method,
@@ -590,14 +591,14 @@ fn stream_vertex_response(
     path_for_log: String,
     ctx: &VertexCallContext,
     attach_sse_tee: bool,
-    mut pending_stats: &mut Option<capture::PendingRecord>,
+    pending_stats: &mut Option<capture::PendingRecord>,
 ) -> Response {
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    if !upstream_status.is_success() {
-        if let Some(p) = pending_stats.as_mut() {
-            p.mark_failed();
-        }
+    if !upstream_status.is_success()
+        && let Some(p) = pending_stats.as_mut()
+    {
+        p.mark_failed();
     }
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
@@ -607,12 +608,7 @@ fn stream_vertex_response(
     // as the `/v1/messages` SSE telemetry tee in
     // `crate::proxy::forward_http`. The byte-passthrough path is
     // unaffected by the tee (best-effort `try_send`, bounded channel).
-    let parser_tx = engage_sse_tee(
-        attach_sse_tee,
-        &upstream_resp,
-        &request_id,
-        &mut pending_stats,
-    );
+    let parser_tx = engage_sse_tee(attach_sse_tee, &upstream_resp, &request_id, pending_stats);
 
     use futures_util::StreamExt as _;
     let rid_for_stream = request_id.clone();

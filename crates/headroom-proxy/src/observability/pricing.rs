@@ -229,10 +229,11 @@ fn candidates(model: &str) -> Vec<String> {
 
 /// Push `id` minus a trailing `:<digits>` revision, if it has one.
 fn push_revision_trimmed(push: &mut impl FnMut(String), id: &str) {
-    if let Some((head, rev)) = id.rsplit_once(':') {
-        if !rev.is_empty() && rev.bytes().all(|b| b.is_ascii_digit()) {
-            push(head.to_string());
-        }
+    if let Some((head, rev)) = id.rsplit_once(':')
+        && !rev.is_empty()
+        && rev.bytes().all(|b| b.is_ascii_digit())
+    {
+        push(head.to_string());
     }
 }
 

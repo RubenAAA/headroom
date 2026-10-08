@@ -296,10 +296,10 @@ fn merge_stream_usage_depth(acc: &mut Usage, payload: &Value, depth: u8) {
             );
             return;
         }
-        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) {
-            if let Ok(inner) = serde_json::from_slice::<Value>(&decoded) {
-                merge_stream_usage_depth(acc, &inner, depth + 1);
-            }
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64)
+            && let Ok(inner) = serde_json::from_slice::<Value>(&decoded)
+        {
+            merge_stream_usage_depth(acc, &inner, depth + 1);
         }
         return;
     }
@@ -312,10 +312,10 @@ fn merge_stream_usage_depth(acc: &mut Usage, payload: &Value, depth: u8) {
         merge_max(acc, u);
     }
     // message_delta (and some terminal frames) carry a bare `usage`.
-    if let Some(usage) = payload.get("usage") {
-        if let Some(u) = snake_usage(usage).or_else(|| camel_usage(usage)) {
-            merge_max(acc, u);
-        }
+    if let Some(usage) = payload.get("usage")
+        && let Some(u) = snake_usage(usage).or_else(|| camel_usage(usage))
+    {
+        merge_max(acc, u);
     }
 }
 

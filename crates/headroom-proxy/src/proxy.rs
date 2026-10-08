@@ -418,9 +418,8 @@ pub(crate) async fn forward_http(
             forward::read_buffered_body(req, max, body_bytes_hint, &request_id, &path_for_log)
                 .await;
         stage_timer.record("buffer", body_read_start.elapsed().as_secs_f64() * 1000.0);
-        let buffered = buffered.map_err(|e| {
+        let buffered = buffered.inspect_err(|_| {
             capture::finalize_rejected(pending_stats.take());
-            e
         })?;
         // Plan 2 step 1: `parse` gap starts where the buffer stage ends.
         // Recorded unconditionally after the ctx block closes below, so an
@@ -703,9 +702,8 @@ pub(crate) async fn forward_http(
             &state,
             &request_id,
         )
-        .map_err(|e| {
+        .inspect_err(|_| {
             capture::finalize_rejected(pending_stats.take());
-            e
         })?;
 
         // Per-request tags for RequestOutcome: operator `x-headroom-*` slicing
@@ -1010,9 +1008,8 @@ pub(crate) async fn forward_http(
             &mut outcome_ctx,
         )
         .await
-        .map_err(|e| {
+        .inspect_err(|_| {
             capture::finalize_rejected(pending_stats.take());
-            e
         })?
     } else {
         // Pure streaming path — the original passthrough behaviour. No peek
@@ -1036,9 +1033,8 @@ pub(crate) async fn forward_http(
                 .body(reqwest_body)
                 .send()
                 .await
-                .map_err(|e| {
+                .inspect_err(|_| {
                     capture::finalize_rejected(pending_stats.take());
-                    e
                 })?,
             bytes::Bytes::new(),
         )
@@ -1065,10 +1061,10 @@ pub(crate) async fn forward_http(
     );
     // A non-2xx upstream is a failed request: it counts in the
     // ledger but accrues no savings (enforced there on the flag).
-    if !status.is_success() {
-        if let Some(p) = pending_stats.as_mut() {
-            p.mark_failed();
-        }
+    if !status.is_success()
+        && let Some(p) = pending_stats.as_mut()
+    {
+        p.mark_failed();
     }
 
     let (upstream_body, is_sse, sse_kind, ccr_round_usage, continuation_base) =

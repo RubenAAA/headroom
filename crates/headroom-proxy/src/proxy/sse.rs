@@ -67,6 +67,7 @@ where
 /// panics/cancellation operator-visible instead of erasing the only completion
 /// record. The mpsc is bounded; when the parser falls behind `try_send` fails
 /// and chunks are logged + dropped — the byte path is never blocked.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_sse_parser_tee(
     sse_kind: SseStreamKind,
     state: &AppState,

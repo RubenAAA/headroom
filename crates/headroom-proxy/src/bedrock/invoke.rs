@@ -605,10 +605,10 @@ fn finish_invoke_response(
 ) -> Response {
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    if !status.is_success() {
-        if let Some(p) = pending_stats.as_mut() {
-            p.mark_failed();
-        }
+    if !status.is_success()
+        && let Some(p) = pending_stats.as_mut()
+    {
+        p.mark_failed();
     }
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
