@@ -227,15 +227,20 @@ fn park_conversation_identity(
         // stays out rather than inventing a premium never charged.
         state.usage_observer.note_stock_ineligible(request_id);
     } else {
-        // Parked for the conversation-concurrency cap alone: no drift dims,
-        // no fingerprint, and the stream hands it back through
-        // `end_unscored` instead of `complete`.
+        // Parked unscored — no drift dims, no fingerprint — but with the
+        // first-turn context, so the stream hands it back through
+        // `complete_translated_first_turn` and routed sessions delimit the
+        // way native ones do.
         state.usage_observer.begin_request(
             request_id,
             conversation_key.clone(),
             Some(session_key),
             None,
             None,
+        );
+        state.usage_observer.note_first_turn_context(
+            request_id,
+            crate::cache_stabilization::usage_observer::first_turn_context(parsed),
         );
     }
     conversation_key

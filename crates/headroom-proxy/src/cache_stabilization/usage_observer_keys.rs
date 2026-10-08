@@ -73,6 +73,11 @@ pub(super) const RECENT_SAMPLE_CAPACITY: usize = 100;
 /// [`first_turn_reason`]. Parallel subagents launch within seconds of each
 /// other, so a small window and a small table are enough.
 pub(super) const FIRST_TURN_OPENER_CAPACITY: usize = 256;
+/// Translated-route (Spark, Codex) conversation keys already past their first
+/// turn. Native turns learn "first under key" from the tracked-stream table,
+/// which translated turns never enter; this is their equivalent, sized the
+/// same.
+pub(super) const TRANSLATED_FIRST_TURN_CAPACITY: usize = 256;
 pub(super) const IDENTICAL_PROMPT_FANOUT_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 /// Watchdog conversation key — SHA-256 over the lane key (session key +

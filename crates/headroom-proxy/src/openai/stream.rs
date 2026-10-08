@@ -656,18 +656,6 @@ impl StreamTranslator {
         // same exclusion. Matched on the client-alias snapshot, since `model`
         // is the upstream name by now.
         //
-        // The request side still parks these turns so the concurrency cap
-        // can count them; hand the entry back unscored.
-        if self.translated_turn() {
-            if let Some(observer) = ctx.usage_observer.as_ref() {
-                observer.end_unscored(&ctx.request_id);
-            }
-            self.observation_completed = true;
-            return;
-        }
-        let Some(observer) = ctx.usage_observer.as_ref() else {
-            return;
-        };
         let get = |key: &str| -> u64 {
             usage
                 .and_then(|u| u.get(key))
@@ -682,16 +670,33 @@ impl StreamTranslator {
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        // A missing `cached_tokens` field is "the provider reported no cache
-        // data", not a miss: counting it as zero drags the fleet hit rate down
-        // on providers with no cache telemetry.
-        let cache_capable = cache_details.and_then(|d| d.get("cached_tokens")).is_some();
         // Both OpenAI shapes report an `input_tokens` that *includes* the
         // cached prefix; the observer's counter is Anthropic-shaped and
         // excludes it, and it adds `cache_read` back on to form the
         // denominator. Passing the provider's number straight through counts
         // the prefix twice and drags every routed turn's hit rate down.
         let provider_input = get("input_tokens").max(get("prompt_tokens"));
+        // The request side still parks these turns so the concurrency cap
+        // can count them; hand the entry back unscored, with the first-turn
+        // marker so routed sessions delimit the way native ones do.
+        if self.translated_turn() {
+            if let Some(observer) = ctx.usage_observer.as_ref() {
+                observer.complete_translated_first_turn(
+                    &ctx.request_id,
+                    cache_read,
+                    provider_input.saturating_sub(cache_read),
+                );
+            }
+            self.observation_completed = true;
+            return;
+        }
+        let Some(observer) = ctx.usage_observer.as_ref() else {
+            return;
+        };
+        // A missing `cached_tokens` field is "the provider reported no cache
+        // data", not a miss: counting it as zero drags the fleet hit rate down
+        // on providers with no cache telemetry.
+        let cache_capable = cache_details.and_then(|d| d.get("cached_tokens")).is_some();
         observer.note_output_tokens(&ctx.request_id, self.total_output_tokens);
         let class = observer.complete_with_cache_capability(
             &ctx.request_id,

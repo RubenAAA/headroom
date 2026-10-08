@@ -101,13 +101,13 @@ use self::keys::CACHE_WRITE_5M_MULTIPLIER;
 use self::keys::COMMIT_LATENCY_WINDOW;
 use self::keys::CONVERSATION_CAPACITY;
 use self::keys::DigestSink;
-use self::keys::FIRST_TURN_OPENER_CAPACITY;
 use self::keys::IDENTICAL_PROMPT_FANOUT_WINDOW;
 use self::keys::IN_FLIGHT_HORIZON;
 use self::keys::PENDING_CAPACITY;
 use self::keys::RECENT_COMPLETION_CAPACITY;
 use self::keys::RECENT_SAMPLE_CAPACITY;
 use self::keys::SIBLING_COMPLETION_WINDOW;
+use self::keys::{FIRST_TURN_OPENER_CAPACITY, TRANSLATED_FIRST_TURN_CAPACITY};
 use self::turn::MAX_STREAMS_PER_CONVERSATION;
 use self::turn::TurnClass;
 use self::turn::TurnRecord;
@@ -336,6 +336,11 @@ struct Inner {
     forgotten: LruCache<String, u64>,
     /// Message-0 hash of each recent first turn → `(seen, conversation_key)`.
     first_turn_openers: LruCache<String, (Instant, String)>,
+    /// Translated-route conversation keys that already emitted their
+    /// first-turn marker. LRU eviction can re-emit for a very old key; same
+    /// caveat as `forgotten`, and only the marker is at stake — no ledger,
+    /// no classification.
+    translated_first_turns_seen: LruCache<String, ()>,
     recent_hit_rates: VecDeque<RecentHitRateSample>,
     recent_cost_samples: VecDeque<CostSample>,
     recache_events_total: u64,
@@ -420,6 +425,10 @@ impl UsageObserver {
                 recently_completed: VecDeque::with_capacity(RECENT_COMPLETION_CAPACITY),
                 first_turn_openers: LruCache::new(
                     NonZeroUsize::new(FIRST_TURN_OPENER_CAPACITY).expect("capacity is non-zero"),
+                ),
+                translated_first_turns_seen: LruCache::new(
+                    NonZeroUsize::new(TRANSLATED_FIRST_TURN_CAPACITY)
+                        .expect("capacity is non-zero"),
                 ),
                 recent_hit_rates: VecDeque::with_capacity(RECENT_SAMPLE_CAPACITY),
                 recent_cost_samples: VecDeque::with_capacity(RECENT_SAMPLE_CAPACITY),
@@ -749,6 +758,42 @@ impl UsageObserver {
     /// without scoring it or counting it abandoned.
     pub fn end_unscored(&self, request_id: &str) {
         self.lock().pending.pop(request_id);
+    }
+
+    /// A translated-route turn (Spark, Codex) completed its stream. Same
+    /// unscored exit as [`end_unscored`](Self::end_unscored) — no hit-rate,
+    /// no ledger, no recache classification — plus the first-turn marker, so
+    /// routed sessions delimit the way native ones do. "Creation" here is
+    /// the provider's uncached input; the fleet first-turn counters include
+    /// it, split by conversation key offline (translated keys carry their
+    /// lane).
+    pub fn complete_translated_first_turn(
+        &self,
+        request_id: &str,
+        cache_read_input_tokens: u64,
+        uncached_input_tokens: u64,
+    ) {
+        let now_instant = Instant::now();
+        let mut inner = self.lock();
+        let Some(pending) = Self::pop_pending(&mut inner, request_id) else {
+            return;
+        };
+        if inner
+            .translated_first_turns_seen
+            .put(pending.conversation_key.clone(), ())
+            .is_some()
+        {
+            return;
+        }
+        Self::record_first_turn_write(
+            &mut inner,
+            &pending,
+            request_id,
+            cache_read_input_tokens,
+            uncached_input_tokens,
+            0,
+            now_instant,
+        );
     }
 
     /// Record the wire sizes and the arm this turn ran under.
@@ -3834,6 +3879,39 @@ mod tests {
         obs.complete("f1", 100, 0, 50_000, None);
         let snap = obs.snapshot();
         assert_eq!(snap.first_turn_writes_total, 1);
+        assert_eq!(snap.first_turn_contradictions_total, 0);
+    }
+
+    /// Translated turns exit unscored but still delimit their session: the
+    /// first turn under a key emits the marker, the second does not even
+    /// with uncached input over the slack, and a new key emits again.
+    #[test]
+    fn translated_turns_emit_one_first_turn_marker_per_key() {
+        let _guard = miss_metric_test_lock();
+        let obs = UsageObserver::new();
+        for (rid, key) in [
+            ("t1", "conv-spark-a"),
+            ("t2", "conv-spark-a"),
+            ("t3", "conv-spark-b"),
+        ] {
+            obs.begin_request(rid, key.into(), None, None, None);
+            obs.note_first_turn_context(
+                rid,
+                FirstTurnContext {
+                    msgs: 1,
+                    message_zero_hash: None,
+                    compaction_restart: false,
+                    model: Some("claude-muse-spark-1.3".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        obs.complete_translated_first_turn("t1", 0, 50_000);
+        obs.complete_translated_first_turn("t2", 40_000, 10_000);
+        obs.complete_translated_first_turn("t3", 0, 60_000);
+        let snap = obs.snapshot();
+        assert_eq!(snap.first_turn_writes_total, 2);
+        assert_eq!(snap.first_turn_write_tokens_total, 110_000);
         assert_eq!(snap.first_turn_contradictions_total, 0);
     }
 
