@@ -28,7 +28,7 @@ impl LocalMemoryBackend {
 
     /// Simple text relevance score: counts overlapping words between
     /// query and content, normalized by query length.
-    fn text_relevance(query: &str, content: &str) -> f64 {
+    pub(crate) fn text_relevance(query: &str, content: &str) -> f64 {
         let query_words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
         if query_words.is_empty() {
             return 0.0;

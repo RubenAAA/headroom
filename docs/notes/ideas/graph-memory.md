@@ -30,3 +30,5 @@ wired beside the document store via `headroom/memory/storage_router.py`
    Test with our own memory corpus, not upstream's fixtures.
 
 Do not port before both conditions hold.
+
+Status 2026-10-08: storage half built — `GraphMemoryBackend` (first `GraphBackend` impl; `query_subgraph` BFS, `supports_graph() == true`); ranking merge and the beat-document-retrieval gate still open, do-not-port conditions unchanged.
