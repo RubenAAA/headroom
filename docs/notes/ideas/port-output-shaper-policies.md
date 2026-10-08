@@ -3,6 +3,8 @@
 - **Status:** open, narrowed 2026-09-30 — the 9 pure file splits need no Rust
   move; steering for Responses and chat shipped; only `/stats output_reduction`
   is left.
+- **Status:** shaped-only ledger rule + `/stats output_reduction` ported
+  2026-10-08 (upstream `074f0ae9`); unverified — tree conflicts block builds.
 - **Source:** `docs/notes/upstream-port-backlog.md` group A (range
   `42ebbc6c..904bc675`)
 - **Summary:** upstream split output-shaping into single-purpose policy modules

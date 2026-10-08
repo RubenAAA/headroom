@@ -395,6 +395,11 @@ pub struct SavingsLedger {
     pub treatment: HashMap<String, Accum>,
     #[serde(default)]
     pub control: HashMap<String, Accum>,
+    /// Marks arms accumulated under the shaped-only recording rule (see
+    /// [`SavingsRecorder::record_from_labels`]). Absent = written before that
+    /// rule, so the arms may hold unshaped observations (upstream `074f0ae9`).
+    #[serde(default)]
+    pub shaped_only: bool,
 }
 
 impl SavingsLedger {
@@ -595,7 +600,11 @@ impl SavingsLedger {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string());
+        let mut snapshot = self.clone();
+        // `load` marks every ledger it returns, so anything we persist was
+        // accumulated under the shaped-only rule; say so for the next reader.
+        snapshot.shaped_only = true;
+        let json = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
         static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("tmp.{}.{sequence}", std::process::id()));
@@ -633,8 +642,32 @@ impl SavingsLedger {
                 return SavingsLedger::default();
             }
         };
-        match serde_json::from_str(&text) {
-            Ok(ledger) => ledger,
+        match serde_json::from_str::<SavingsLedger>(&text) {
+            Ok(mut ledger) => {
+                if !ledger.shaped_only {
+                    // Pre-rule arms cannot be told apart from shaped ones
+                    // entry by entry, so drop them and re-accumulate from
+                    // live traffic. The offline baseline is kept: it is
+                    // learned from pre-shaper history, costs real analysis to
+                    // rebuild, and never held the contaminated quantity
+                    // anyway (upstream `074f0ae9`).
+                    let arms = ledger.treatment.len() + ledger.control.len();
+                    if arms > 0 {
+                        tracing::warn!(
+                            event = "output_savings_ledger_predates_shaped_only",
+                            treatment_arms = ledger.treatment.len(),
+                            control_arms = ledger.control.len(),
+                            "output-savings ledger predates the shaped-only rule; \
+                             dropping arms and re-accumulating from live traffic \
+                             (baseline kept)",
+                        );
+                        ledger.treatment.clear();
+                        ledger.control.clear();
+                    }
+                    ledger.shaped_only = true;
+                }
+                ledger
+            }
             Err(error) => {
                 tracing::warn!(
                     event = "output_savings_ledger_corrupt",
@@ -654,6 +687,9 @@ const STRATUM_LABEL: &str = "output_shaper:stratum:";
 const CONTROL_LABEL: &str = "output_shaper:control:";
 const CONVERSATION_LABEL: &str = "output_shaper:conv:";
 const CONVERSATION_LABEL_CHARS: usize = 12;
+// Emitted by `output_shaper::shape_request` only when it actually changed the
+// request, so its presence is the per-request proof that shaping happened.
+const SHAPED_LABEL_PREFIX: &str = "output_shaper:verbosity:";
 
 /// Encode (arm, stratum) as a transforms_applied label.
 pub fn stratum_label(arm: &str, key: &str) -> String {
@@ -729,8 +765,18 @@ impl SavingsRecorder {
     /// The conversation label may sit either side of the stratum label. A
     /// request without one still records its output tokens; it just does not
     /// advance the stratum's cluster count.
+    ///
+    /// Treatment additionally requires proof of shaping — an
+    /// `output_shaper:verbosity:` label, which the shaper emits only when it
+    /// actually changed the request. Without it the request flowed through a
+    /// treatment-shaped context but was never steered (level 0, unshaped
+    /// channel), and recording it would dilute the estimate toward zero
+    /// (upstream `074f0ae9`). Control records regardless.
     pub fn record_from_labels(&self, labels: &[String], output_tokens: i64) -> bool {
         let Some((arm, key)) = labels.iter().find_map(|l| parse_stratum_label(l)) else {
+            return false;
+        };
+        if arm == "treatment" && !labels.iter().any(|l| l.starts_with(SHAPED_LABEL_PREFIX)) {
             return false;
         };
         let conversation = labels.iter().find_map(|l| parse_conversation_label(l));
@@ -1140,6 +1186,7 @@ mod tests {
         let loaded = SavingsLedger::load(&path);
         assert_eq!(loaded.baseline.total_samples(), 1);
         assert_eq!(loaded.treatment.get("k").unwrap().n, 1);
+        assert!(loaded.shaped_only);
         // Missing file → empty.
         assert_eq!(
             SavingsLedger::load(dir.path().join("nope.json").as_path())
@@ -1154,13 +1201,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rec.json");
         let rec = SavingsRecorder::new(path.clone(), 2);
-        let label = stratum_label("treatment", "sonnet|c|s|tools");
-        assert!(rec.record_from_labels(std::slice::from_ref(&label), 50));
+        let labels = vec![
+            stratum_label("treatment", "sonnet|c|s|tools"),
+            "output_shaper:verbosity:L2".to_string(),
+        ];
+        assert!(rec.record_from_labels(&labels, 50));
         // Non-shaping labels ignored.
         assert!(!rec.record_from_labels(&["router:x".to_string()], 10));
         // Second shaping record hits flush_every=2 → file written.
-        assert!(rec.record_from_labels(&[label], 60));
+        assert!(rec.record_from_labels(&labels, 60));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn treatment_without_proof_of_shaping_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = SavingsRecorder::new(dir.path().join("os.json"), 1_000);
+        // Treatment-arm request that was never steered (level 0, unshaped
+        // channel) carries no verbosity label: dropped, not recorded.
+        assert!(!rec.record_from_labels(&[stratum_label("treatment", "k")], 100));
+        assert_eq!(rec.estimate_with_level(None).n_requests, 0);
+        // Same arm WITH the shaped proof records.
+        assert!(rec.record_from_labels(
+            &[
+                stratum_label("treatment", "k"),
+                "output_shaper:verbosity:L2".to_string(),
+            ],
+            100
+        ));
+        // Control needs no proof: it is unshaped by definition.
+        assert!(rec.record_from_labels(&[stratum_label("control", "k")], 100));
+    }
+
+    #[test]
+    fn load_drops_pre_rule_arms_but_keeps_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.json");
+        // A ledger written before the shaped-only rule: no marker, arms that
+        // may hold unshaped observations, and a learned baseline.
+        std::fs::write(
+            &path,
+            r#"{"baseline":{"strata":{"k":{"n":2,"sum":200.0,"sumsq":20000.0}},"glob":{"n":2,"sum":200.0,"sumsq":20000.0}},"treatment":{"k":{"n":1,"sum":70.0,"sumsq":4900.0}},"control":{}}"#,
+        )
+        .unwrap();
+        let loaded = SavingsLedger::load(&path);
+        assert!(loaded.shaped_only);
+        assert!(loaded.treatment.is_empty());
+        assert!(loaded.control.is_empty());
+        assert_eq!(loaded.baseline.total_samples(), 2);
     }
 
     #[test]

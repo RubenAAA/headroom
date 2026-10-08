@@ -93,6 +93,19 @@ pub async fn handle_stats(
         }
     }
 
+    // Output-token reduction from verbosity steering, gated on the shaper
+    // being live: the ledger survives restarts, so an inactive deployment
+    // must not publish its persisted estimate as a live layer effect
+    // (upstream `074f0ae9`).
+    let shaper_active = state.config.output_shaper_enabled && state.config.verbosity_level > 0;
+    let shaper_level = state
+        .config
+        .output_shaper_enabled
+        .then_some(state.config.verbosity_level);
+    let reduction = headroom_core::output_savings::get_recorder().estimate_with_level(shaper_level);
+    let output_reduction =
+        crate::output_shaper::output_reduction_payload(shaper_active, Some(&reduction));
+
     let mut val = serde_json::json!({
         "cost": cost_stats,
         "persistent_savings": savings_preview,
@@ -129,6 +142,10 @@ pub async fn handle_stats(
             "requests": tool_schema_requests,
             "window": window.len(),
         }),
+        // Output tokens the verbosity steering saved (counterfactual
+        // estimate over the output-savings ledger). `active: false` means
+        // the shaper is off; `available: false` means not measured yet.
+        "output_reduction": output_reduction,
         // Per-language AST-compression pauses. Empty on a healthy install;
         // non-empty is the explanation for a savings drop in one language.
         "code_syntax_breaker": headroom_core::transforms::code_compressor::syntax_breaker_status(),

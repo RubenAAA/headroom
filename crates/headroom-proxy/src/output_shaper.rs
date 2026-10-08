@@ -16,7 +16,8 @@
 //! flags) — no content regexes or keyword patterns. It is retained for
 //! stratum labelling; the shaper itself no longer branches on it.
 
-use serde_json::Value;
+use headroom_core::output_savings::SavingsEstimate;
+use serde_json::{Value, json};
 
 /// Ordering for output_config.effort values.
 ///
@@ -723,6 +724,59 @@ pub fn shape_response_create_frame(
         return raw;
     }
     serde_json::to_string(&frame).unwrap_or(raw)
+}
+
+/// `/stats` payload for the output-shaping layer (upstream `074f0ae9`).
+///
+/// A deployment whose shaper is off is shaping nothing, so `/stats` must not
+/// publish the persisted ledger's estimate as this deployment's live layer
+/// effect — the ledger survives restarts and can span periods the shaper was
+/// never active for. `shaper_active` is the claim gate and `est` the
+/// strongest available estimate; every branch returns the same key set so
+/// downstream consumers never branch on shape.
+pub fn output_reduction_payload(shaper_active: bool, est: Option<&SavingsEstimate>) -> Value {
+    // Same key set on every branch: the shape of "we shape nothing" and
+    // "we have not measured yet" must not differ from the live number.
+    let blank = |active: bool, available: bool| {
+        json!({
+            "available": available,
+            "active": active,
+            "method": Value::Null,
+            "band_is_ci": Value::Null,
+            "tokens_saved": 0,
+            "baseline_tokens": 0,
+            "reduction_percent": 0.0,
+            "ci_low_percent": Value::Null,
+            "ci_high_percent": Value::Null,
+            "requests": 0,
+        })
+    };
+    if !shaper_active {
+        let mut payload = blank(false, true);
+        payload["method"] = json!("inactive");
+        return payload;
+    }
+    let Some(est) = est else {
+        return blank(true, false);
+    };
+    if est.n_requests <= 0 {
+        return blank(true, false);
+    }
+    // The modelled band is the spread between two benchmarked models, not a
+    // sampling CI — there is no sample there. Consumers must not label it one.
+    let round1 = |x: f64| (x * 10.0).round_ties_even() / 10.0;
+    json!({
+        "available": true,
+        "active": true,
+        "method": est.kind,
+        "band_is_ci": est.kind != "modelled",
+        "tokens_saved": est.tokens_saved.round_ties_even() as i64,
+        "baseline_tokens": est.baseline_tokens.round_ties_even() as i64,
+        "reduction_percent": round1(est.pct),
+        "ci_low_percent": round1(est.ci_low_pct),
+        "ci_high_percent": round1(est.ci_high_pct),
+        "requests": est.n_requests,
+    })
 }
 
 #[cfg(test)]
