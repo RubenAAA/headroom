@@ -734,6 +734,15 @@ pub(crate) async fn apply_ctx_request_transforms(
     // Spark history. Reads the body, never changes it.
     crate::ctx::refresh::observe(state, parsed, &session_key, request_id);
 
+    // Jev refresh, apply mode: replays the persisted base plus the live tail,
+    // and past the trigger starts a background build of a new base. Off
+    // unless `--ctx-refresh-apply-tokens` is set; see `ctx/refresh.rs`.
+    if crate::ctx::refresh::apply(state, parsed, &session_key, request_id) {
+        report
+            .transforms_applied
+            .push("ctx_refresh_apply".to_string());
+    }
+
     // Tool-definition + recall stages on the still-Anthropic-shaped body.
     inject_turn_tools(state, parsed, &mut report);
 

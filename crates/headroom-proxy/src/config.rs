@@ -1277,6 +1277,19 @@ pub struct CliArgs {
     )]
     pub ctx_refresh_jev_url: String,
 
+    /// Jev context refresh, apply mode: past this many estimated tokens, a
+    /// Spark turn builds a shorter base history in the background (Jev scores
+    /// each exchange, the lowest quarter is stubbed) and later turns forward
+    /// that base plus the new tail. `0` (the default) is off. See
+    /// `docs/notes/ideas/jev-context-refresh.md`. Needs `ctx_offload`: the
+    /// stubbed originals live in the CCR store for `headroom_retrieve`.
+    #[arg(
+        long = "ctx-refresh-apply-tokens",
+        env = "HEADROOM_PROXY_CTX_REFRESH_APPLY_TOKENS",
+        default_value_t = 0
+    )]
+    pub ctx_refresh_apply_tokens: usize,
+
     /// CTX-3: TTL (seconds) for offloaded originals in the CCR store. Long by
     /// design (retrieval outlives a session); default `604_800` (7 days).
     #[arg(
@@ -2892,6 +2905,8 @@ pub struct Config {
     pub ctx_refresh_observe_tokens: usize,
     /// Jev endpoint the refresh observer asks.
     pub ctx_refresh_jev_url: String,
+    /// Jev refresh apply-mode trigger, in estimated tokens; `0` is off.
+    pub ctx_refresh_apply_tokens: usize,
     /// CTX-3: CCR-store TTL (seconds) for offloaded originals.
     pub ctx_offload_ttl_seconds: u64,
     /// CTX-3: offload large `tool_use` input strings too. Needs `ctx_offload`.
@@ -3246,6 +3261,7 @@ impl Config {
             ctx_offload_stale_window: args.ctx_offload_stale_window,
             ctx_refresh_observe_tokens: args.ctx_refresh_observe_tokens,
             ctx_refresh_jev_url: args.ctx_refresh_jev_url,
+            ctx_refresh_apply_tokens: args.ctx_refresh_apply_tokens,
             ctx_offload_ttl_seconds: args.ctx_offload_ttl_seconds,
             ctx_offload_tool_use: args.ctx_offload_tool_use,
             ctx_offload_cross_session_seed: args.ctx_offload_cross_session_seed,
@@ -3558,6 +3574,7 @@ impl Config {
             ctx_offload_stale_window: 0,
             ctx_refresh_observe_tokens: 0,
             ctx_refresh_jev_url: "http://127.0.0.1:1/".to_string(),
+            ctx_refresh_apply_tokens: 0,
             ctx_offload_ttl_seconds: 604_800,
             ctx_offload_tool_use: false,
             ctx_offload_cross_session_seed: false,

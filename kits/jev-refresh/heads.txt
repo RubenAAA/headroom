@@ -1,0 +1,93 @@
+distinct exchanges scored: 115 (from 1410 lines)
+
+=== DISTINCT exchanges ever scoring < 0.3 (min score, max score, n_obs, tokens, head) ===
+count: 39
+sess=c6413c47 idx= 74 min=0.15 max=0.67 n=14 tok=  1305 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head14" color="pink"> {"
+sess=c6413c47 idx= 67 min=0.16 max=0.75 n=14 tok=  1512 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7b-head5" color="pink" sum
+sess=c6413c47 idx=141 min=0.17 max=0.87 n=14 tok=  1533 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="sonnet-7b-3" color="cyan" summ
+sess=c6413c47 idx=120 min=0.19 max=0.64 n=14 tok=  1352 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head12" color="purple"> 
+sess=c6413c47 idx= 88 min=0.22 max=0.59 n=14 tok=  1286 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head9" color="yellow"> 
+sess=c6413c47 idx=117 min=0.22 max=0.65 n=13 tok=  1087 msg=  2 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head12" color="red" sum
+sess=c6413c47 idx=147 min=0.22 max=0.59 n=14 tok=  1322 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head16" color="red"> {"t
+sess=c6413c47 idx= 31 min=0.23 max=0.33 n=14 tok=  1674 msg=  2 | is the rate gettinng faster? since now there are less worklanes, while the num of workers is the sam
+sess=c6413c47 idx= 70 min=0.23 max=0.77 n=14 tok=  1348 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head12" color="red" summ
+sess=c6413c47 idx= 35 min=0.24 max=0.58 n=14 tok=  2241 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head5" color="blue"> {"
+sess=c6413c47 idx= 40 min=0.24 max=0.86 n=14 tok=  1915 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head7" color="green" sum
+sess=c6413c47 idx=115 min=0.25 max=0.70 n=14 tok=  1338 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head11" color="orange">
+sess=c6413c47 idx=149 min=0.25 max=0.65 n=14 tok=  1356 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head19" color="purple">
+sess=c6413c47 idx= 14 min=0.26 max=0.68 n=14 tok=  2104 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head2" color="green"> {"
+sess=c6413c47 idx= 43 min=0.26 max=0.85 n=14 tok=  2225 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane1-head2" color="purple" su
+sess=c6413c47 idx= 89 min=0.26 max=0.72 n=14 tok=  1581 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane1-head5" color="green"> {"
+sess=c6413c47 idx=128 min=0.26 max=0.68 n=14 tok=  1931 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head13" color="pink"> {
+sess=c6413c47 idx= 27 min=0.27 max=0.56 n=14 tok=  1736 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head5" color="orange"> {
+sess=c6413c47 idx= 34 min=0.27 max=0.70 n=14 tok=  1715 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head6" color="cyan"> {"t
+sess=c6413c47 idx= 45 min=0.27 max=0.69 n= 4 tok=  1046 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane1-head2" color="purple" su
+sess=c6413c47 idx= 98 min=0.27 max=0.75 n=14 tok=  1592 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane1-head6" color="yellow"> {
+sess=c6413c47 idx= 66 min=0.28 max=0.64 n=14 tok=  1844 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head11" color="orange"> 
+sess=c6413c47 idx= 73 min=0.28 max=0.76 n=14 tok=  1950 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="sonnet-7a-1" color="pink" summ
+sess=c6413c47 idx=103 min=0.28 max=0.73 n=14 tok=  1237 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane1-head7" color="pink"> {"t
+sess=c6413c47 idx=104 min=0.28 max=0.83 n=14 tok=  1528 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane1-head8" color="blue" summ
+sess=c6413c47 idx=114 min=0.28 max=0.75 n=14 tok=  1392 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head11" color="orange" 
+sess=c6413c47 idx=123 min=0.28 max=0.81 n=13 tok=  1214 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head17" color="orange" s
+sess=c6413c47 idx=127 min=0.28 max=0.74 n=14 tok=  2093 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="sonnet-7a-3" color="pink"> {"t
+sess=c6413c47 idx=130 min=0.28 max=0.70 n=14 tok=  1371 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head13" color="blue"> {"
+sess=c6413c47 idx= 18 min=0.29 max=0.74 n=14 tok=  2117 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="lane7b-head" color="cyan" summ
+sess=c6413c47 idx= 32 min=0.29 max=0.72 n=14 tok=  3609 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head4" color="red" summ
+sess=c6413c47 idx= 39 min=0.29 max=0.62 n=14 tok=  1664 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="lane7b-head4" color="green"> {
+sess=c6413c47 idx= 86 min=0.29 max=0.77 n=14 tok=  1305 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane1-head4" color="green" sum
+sess=c6413c47 idx=102 min=0.29 max=0.74 n=14 tok=  1548 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head9" color="orange"> {
+sess=c6413c47 idx=108 min=0.29 max=0.76 n=14 tok=  1951 msg=  7 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head10" color="cyan" su
+sess=c6413c47 idx=112 min=0.29 max=0.79 n=14 tok=  1793 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head16" color="yellow" s
+sess=c6413c47 idx=131 min=0.29 max=0.65 n=14 tok=  1650 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head16" color="orange">
+sess=c6413c47 idx=135 min=0.29 max=0.76 n=14 tok=  1426 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head14" color="cyan" sum
+sess=aae70305 idx=  2 min=0.29 max=0.29 n= 1 tok= 32631 msg=  3 | [bf7a0cd0] Restyle the dashboard sidebar: switch the palette to slate, round the card corners to 12p
+
+=== DISTINCT exchanges with min in [0.3, 0.4): count only + token stats ===
+count: 47, tokens total=145708
+sess=c6413c47 idx= 37 min=0.30 max=0.71 n=14 tok=  1803 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head2" color="blue"> {"t
+sess=c6413c47 idx= 63 min=0.30 max=0.73 n=14 tok=  1680 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head4" color="purple" su
+sess=c6413c47 idx= 84 min=0.30 max=0.76 n=14 tok=  1904 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="sonnet-7b-1" color="cyan" summ
+sess=c6413c47 idx=101 min=0.30 max=0.79 n=14 tok=  1977 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="sonnet-7a-2" color="cyan"> {"t
+sess=c6413c47 idx=134 min=0.30 max=0.71 n=14 tok=  1798 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head17" color="red"> {"
+sess=c6413c47 idx=  2 min=0.31 max=0.77 n=14 tok= 13029 msg= 20 | <command-name>/goal</command-name>             <command-message>goal</command-message>             <
+sess=c6413c47 idx= 16 min=0.31 max=0.75 n=14 tok=  6625 msg= 10 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head" color="orange"> {
+sess=c6413c47 idx= 19 min=0.31 max=0.74 n=14 tok=  2794 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7b-head" color="cyan"> {"t
+sess=c6413c47 idx= 23 min=0.31 max=0.67 n=14 tok=  1582 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head4" color="yellow"> {
+sess=c6413c47 idx= 24 min=0.31 max=0.80 n=14 tok=  1344 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="owner-queue-6" color="pink" su
+sess=c6413c47 idx= 47 min=0.31 max=0.74 n=14 tok=  1690 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head7" color="red"> {"t
+sess=c6413c47 idx= 69 min=0.31 max=0.69 n=14 tok=  1732 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head13" color="orange" s
+sess=c6413c47 idx=107 min=0.31 max=0.74 n=14 tok=  1791 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head10" color="red"> {"t
+sess=c6413c47 idx=118 min=0.31 max=0.74 n=14 tok=  1821 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7b-head6" color="blue"> {"
+sess=c6413c47 idx=143 min=0.31 max=0.76 n=14 tok=  1518 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head15" color="yellow" s
+sess=c6413c47 idx=148 min=0.31 max=0.73 n=14 tok=  2359 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head20" color="orange" 
+sess=c6413c47 idx= 15 min=0.32 max=0.72 n=14 tok=  2798 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7b-head3" color="orange" s
+sess=c6413c47 idx= 28 min=0.32 max=0.82 n=14 tok=  2095 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="owner-queue-7" color="pink" su
+sess=c6413c47 idx= 38 min=0.32 max=0.73 n=14 tok=  1488 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7b-head4" color="green" su
+sess=c6413c47 idx= 48 min=0.32 max=0.77 n=14 tok=  1452 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head8" color="cyan" summ
+sess=c6413c47 idx= 54 min=0.32 max=0.32 n= 1 tok=  1044 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane1-head3" color="red" summa
+sess=c6413c47 idx=119 min=0.32 max=0.67 n=14 tok=  1340 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head11" color="purple"> 
+sess=c6413c47 idx=126 min=0.32 max=0.72 n=14 tok=  7198 msg= 16 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head14" color="cyan"> {
+sess=c6413c47 idx= 22 min=0.33 max=0.63 n=14 tok=  1955 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head2" color="red"> {"t
+sess=c6413c47 idx= 57 min=0.33 max=0.82 n=14 tok=  1588 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head10" color="green" su
+sess=c6413c47 idx= 77 min=0.33 max=0.75 n=14 tok=  1733 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head6" color="purple" su
+sess=c6413c47 idx= 95 min=0.33 max=0.81 n=14 tok=  1448 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head7" color="red" summa
+sess=c6413c47 idx=106 min=0.33 max=0.79 n=14 tok=  1625 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane1-head9" color="green"> {"
+sess=c6413c47 idx=132 min=0.33 max=0.76 n=14 tok=  1563 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head19" color="pink" sum
+sess=c6413c47 idx=155 min=0.33 max=0.75 n=14 tok=  2559 msg= 10 | Another Claude session sent a message: <teammate-message teammate_id="sonnet-7a-4" color="purple"> {
+sess=c6413c47 idx=  5 min=0.35 max=0.82 n=14 tok=  2118 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head" color="pink" summa
+sess=c6413c47 idx= 11 min=0.35 max=0.78 n=14 tok=  1556 msg=  4 | Another Claude session sent a message: <teammate-message teammate_id="owner-queue-5" color="purple" 
+sess=c6413c47 idx=137 min=0.35 max=0.73 n=14 tok=  1397 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head15" color="yellow" 
+sess=c6413c47 idx=  3 min=0.36 max=0.68 n=14 tok=  5388 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="lane7b-tail" color="green"> {"
+sess=c6413c47 idx=  8 min=0.36 max=0.65 n=14 tok=  3318 msg=  9 | Another Claude session sent a message: <teammate-message teammate_id="lane5-tail" color="yellow"> {"
+sess=c6413c47 idx= 20 min=0.36 max=0.68 n=14 tok=  1809 msg=  7 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head" color="orange"> {
+sess=c6413c47 idx= 55 min=0.36 max=0.81 n=14 tok=  2342 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7a-head8" color="yellow" s
+sess=c6413c47 idx= 97 min=0.36 max=0.77 n=14 tok=  1848 msg=  7 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head8" color="purple"> {
+sess=c6413c47 idx=145 min=0.36 max=0.82 n=14 tok=  1760 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head21" color="pink" sum
+sess=c6413c47 idx=154 min=0.36 max=0.72 n=14 tok=  1827 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane7b-head8" color="cyan"> {"
+sess=c6413c47 idx=129 min=0.37 max=0.73 n=14 tok=  1630 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head18" color="green"> {
+sess=c6413c47 idx=140 min=0.37 max=0.76 n=14 tok=  4657 msg= 10 | Another Claude session sent a message: <teammate-message teammate_id="lane7b-head7" color="red"> {"t
+sess=c6413c47 idx=  4 min=0.38 max=0.68 n=14 tok=  1926 msg=  8 | Another Claude session sent a message: <teammate-message teammate_id="lane4-tail" color="purple"> {"
+sess=c6413c47 idx= 50 min=0.38 max=0.82 n=14 tok=  1732 msg= 10 | Another Claude session sent a message: <teammate-message teammate_id="lane5-head9" color="blue" summ
+sess=c6413c47 idx=160 min=0.38 max=0.75 n=10 tok=  1330 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head18" color="purple" s
+sess=aae70305 idx=  8 min=0.38 max=0.38 n= 1 tok= 32625 msg=  3 | [bf7a0cd0] Migrate the users table: add a nullable locale column, backfill from the signup country, 
+sess=c6413c47 idx=152 min=0.39 max=0.77 n=14 tok=  3112 msg=  6 | Another Claude session sent a message: <teammate-message teammate_id="lane4-head17" color="blue" sum

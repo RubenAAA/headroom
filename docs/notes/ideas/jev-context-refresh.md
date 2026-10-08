@@ -9,6 +9,7 @@
 - **Source:** request 2026-10-01 (Spark sessions run to "crazy" context);
   `docs/jev-model.md` for what Jev can do and its limits;
   `spark-usage-and-compaction.md` for the context sizes.
+- **Status 2026-10-08:** apply half built, untested (tree conflicts block builds): `--ctx-refresh-apply-tokens` (off by default), base persist/replay in `ctx/refresh.rs`, wired in `routed/transforms.rs`. Stubs the lowest-scoring quarter per run (percentile, not a fixed cutoff); originals in the CCR store under `<<ctx:HASH>>`. Still open: live single-session trial, `docs/flags.md` regen.
 - **Idea:** when a session passes a token trigger, Jev judges which parts of
   the history the current task still needs. The proxy keeps those verbatim,
   swaps the rest for stubs the model can fetch back (`headroom_retrieve`), and

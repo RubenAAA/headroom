@@ -1,0 +1,26 @@
+=== distinct NON-teammate-msg exchanges (min/max score, tokens, head prefix) ===
+sess=c6413c47 idx= 31 min=0.23 max=0.33 n=14 tok=   1674 | is the rate gettinng faster? since now there are less worklanes, while the num of workers 
+sess=aae70305 idx=  2 min=0.29 max=0.29 n= 1 tok=  32631 | [bf7a0cd0] Restyle the dashboard sidebar: switch the palette to slate, round the card corn
+sess=c6413c47 idx=  2 min=0.31 max=0.77 n=14 tok=  13029 | <command-name>/goal</command-name>             <command-message>goal</command-message>    
+sess=aae70305 idx=  8 min=0.38 max=0.38 n= 1 tok=  32625 | [bf7a0cd0] Migrate the users table: add a nullable locale column, backfill from the signup
+sess=c6413c47 idx= 62 min=0.40 max=0.74 n=13 tok=   1220 | so now you should have 8 spark and 2 sonnet helping out. lets get this done
+sess=c6413c47 idx= 65 min=0.41 max=0.88 n=14 tok=   1466 | Goal check-in: «.audit/FIX-ORCHESTRATOR-PROMPT.md» is still active, and evaluation has bee
+sess=c6413c47 idx= 26 min=0.42 max=0.69 n=14 tok=   3088 | kill idle agents
+sess=aae70305 idx= 10 min=0.43 max=0.43 n= 1 tok=  32625 | [bf7a0cd0] Draft the onboarding email: friendly tone, three bullet points about the first 
+sess=aae70305 idx=  6 min=0.44 max=0.44 n= 1 tok=  32629 | [bf7a0cd0] The invoice PDF puts the VAT line under the totals; move it above, right-align 
+sess=c6413c47 idx= 52 min=0.46 max=0.57 n=14 tok=   3434 | kill the idle agents
+sess=c6413c47 idx=  7 min=0.48 max=0.82 n=14 tok=  14368 | Goal check-in: «.audit/FIX-ORCHESTRATOR-PROMPT.md» is still active, and evaluation has bee
+sess=c6413c47 idx= 61 min=0.48 max=0.72 n=14 tok=   5349 | you can now use 2 sonnet agents to help out.
+sess=aae70305 idx=  4 min=0.48 max=0.48 n= 1 tok=  32630 | [bf7a0cd0] Write the kubernetes ingress annotations for the billing service: rewrite-targe
+sess=aae70305 idx=  7 min=0.50 max=0.50 n= 1 tok=  32634 | [bf7a0cd0] Add a regression test where the mock Zen answers 429 first and then refuses the
+sess=c6413c47 idx=125 min=0.52 max=0.79 n=14 tok=   4058 | i see 23 subagents, are you sure you killed all the idle ones
+sess=aae70305 idx=  5 min=0.53 max=0.53 n= 1 tok=  32641 | [bf7a0cd0] Reasoning encrypted_content is bound to the lane that issued it, so a failover 
+sess=c6413c47 idx=163 min=0.54 max=0.54 n= 1 tok=  34029 | and set for yourself the /goal that was there before
+sess=aae70305 idx=  3 min=0.54 max=0.54 n= 1 tok=  32629 | [bf7a0cd0] The retry loop in routed/retry.rs fails over to another egress lane on a 429; c
+sess=c6413c47 idx= 30 min=0.55 max=0.79 n=14 tok=   2711 | the rest are all working? are there agents to kill? lanes to fill?
+sess=c6413c47 idx= 94 min=0.56 max=0.69 n=14 tok=   4634 | kill idle agents
+sess=c6413c47 idx= 53 min=0.57 max=0.67 n=14 tok=   4405 | The user sent a new message while you were working: this is about you btw:   <pasted_conte
+sess=c6413c47 idx=164 min=0.60 max=0.60 n= 1 tok= 141053 | you can run 8 spark agents. make sure to use them so that this finishes ASAP
+sess=aae70305 idx=  1 min=0.60 max=0.60 n= 1 tok=  32636 | [bf7a0cd0] Zen hold re-sends the buffered body after a 429; a reasoning blob refused with 
+sess=aae70305 idx=  9 min=0.62 max=0.62 n= 1 tok=  32632 | [bf7a0cd0] zen_hold_recovered logged status 400 after 263 seconds: the hold counted any no
+sess=c6413c47 idx=  1 min=0.71 max=0.84 n=14 tok=  16783 | The user sent a new message while you were working: you have 8 spark slots to use, so make

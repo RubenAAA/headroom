@@ -1,11 +1,11 @@
-//! Jev context refresh, observe mode.
+//! Jev context refresh: observe mode scores and logs, apply mode rewrites.
 //!
 //! Spark sessions grow to the model's window and then fail with a generic 400.
 //! The idea (`docs/notes/ideas/jev-context-refresh.md`) is to ask Jev which
-//! earlier exchanges the current task still needs and stub the rest. Nothing
-//! here changes a request: past `--ctx-refresh-observe-tokens` a background
-//! task scores the history and logs what a refresh would have stubbed, so the
-//! choices can be read before anything is applied.
+//! earlier exchanges the current task still needs and stub the rest. Observe
+//! mode only scores and logs, so the choices can be read before anything is
+//! applied; apply mode builds the shorter base in the background and later
+//! turns forward that base plus the new tail.
 //!
 //! The unit is an exchange: one typed user message and everything up to the
 //! next. On the 1M-token session of 2026-10-01, tool results were 20% of the
@@ -18,9 +18,11 @@
 
 use crate::proxy::AppState;
 use futures::StreamExt;
+use headroom_core::ccr::{CcrStore, compute_key};
+use headroom_core::transforms::live_zone::CTX_OFFLOAD_MARKER_PREFIX;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const JEV_MODEL: &str = "jev-1.13-free";
@@ -41,6 +43,12 @@ const EXCHANGE_CHARS: usize = 5000;
 const PART_CHARS: usize = 400;
 /// Scores under each of these would be stubbed; the log reports all three.
 const THRESHOLDS: [f64; 3] = [0.3, 0.4, 0.5];
+/// Apply mode stubs the lowest-scoring `1 / STUB_QUARTILE_DIVISOR` of scored
+/// exchanges, never a fixed cutoff: on the 1M-token session the large
+/// exchanges scored 0.48-0.72 while trivia scored under 0.3, so a threshold
+/// keeps what is big, and the mid-range moves with the task wording (same
+/// ranking, shifted scores). Percentiles transfer; thresholds do not.
+const STUB_QUARTILE_DIVISOR: usize = 4;
 /// User text that is not a request from the person typing.
 const NOT_TYPED: [&str; 5] = [
     "<task-notification>",
@@ -433,6 +441,315 @@ pub(crate) fn observe(state: &AppState, parsed: &Value, session_key: &str, reque
     });
 }
 
+/// A shorter history built once and replayed verbatim, `ctx/inject.rs` style:
+/// rewriting the prefix identically every turn keeps the provider's cached
+/// prefix stable. The live tail (`base_len..`) always goes through as-is.
+#[derive(Debug, Clone)]
+struct RefreshBase {
+    /// Rewritten prefix messages.
+    base: Vec<Value>,
+    /// How many of the turn's original messages `base` covers.
+    base_len: usize,
+    /// `compute_key` of the first message when built. A shorter history means
+    /// the client cleared; a same-length history with a different first
+    /// message means it compacted, and this base no longer covers it.
+    first_hash: String,
+}
+
+/// Persisted bases by routed session key. Process-local: a restart rebuilds
+/// the base on the next trigger turn (the stubbed originals stay in the CCR
+/// store under their hashes either way).
+fn bases() -> &'static Mutex<HashMap<String, RefreshBase>> {
+    static BASES: OnceLock<Mutex<HashMap<String, RefreshBase>>> = OnceLock::new();
+    BASES.get_or_init(Default::default)
+}
+
+/// Sessions with a base build running or recently finished.
+fn build_seen() -> &'static Mutex<HashMap<String, Instant>> {
+    static BUILD_SEEN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    BUILD_SEEN.get_or_init(Default::default)
+}
+
+/// True when this session may start a base build now, and marks it started.
+/// Separate from [`claim`]: observe and apply run on their own triggers, and a
+/// rebuild every [`COOLDOWN`] is how the base follows a growing session.
+fn claim_build(session_key: &str) -> bool {
+    let Ok(mut map) = build_seen().lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    map.retain(|_, t| now.duration_since(*t) < COOLDOWN);
+    if map.contains_key(session_key) {
+        return false;
+    }
+    map.insert(session_key.to_string(), now);
+    true
+}
+
+/// The lowest-scoring quarter of `scored`, as exchange indices, ascending.
+/// Pure so the rule is testable without Jev.
+fn select_stubs(scored: &[Scored]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..scored.len()).collect();
+    order.sort_by(|&a, &b| {
+        scored[a]
+            .score
+            .total_cmp(&scored[b].score)
+            .then_with(|| scored[a].index.cmp(&scored[b].index))
+    });
+    let mut stubs: Vec<usize> = order
+        .into_iter()
+        .take(scored.len() / STUB_QUARTILE_DIVISOR)
+        .map(|i| scored[i].index)
+        .collect();
+    stubs.sort_unstable();
+    stubs
+}
+
+/// The replacement for one stubbed exchange: a pointer, not prose. Jev cannot
+/// summarise, so the stub says what was dropped and where the original lives;
+/// `headroom_retrieve` fetches `<<ctx:HASH>>` from the CCR store.
+fn stub_text(score: f64, head: &str, messages: usize, tokens: usize, hash: &str) -> String {
+    format!(
+        "[Context refresh: an earlier exchange ({messages} messages, about {tokens} tokens, relevance {score:.2}) was stubbed; only its opening request is shown below. The full exchange is kept and can be fetched back.]\nOpening request: {head}\n{CTX_OFFLOAD_MARKER_PREFIX}{hash}>> (stubbed exchange; use headroom_retrieve to fetch the original)"
+    )
+}
+
+/// Rewrite `messages[..base_len]` with each stubbed exchange replaced by its
+/// first message carrying the stub. Whole exchanges only, so no
+/// `tool_use`/`tool_result` pair is split, and the kept message keeps its
+/// (user) role. Returns the rewritten prefix plus stubbed counts. An exchange
+/// whose original the store refuses stays verbatim: a stub without an
+/// original is dropped history, not refresh.
+fn rewrite_prefix(
+    messages: &[Value],
+    ex: &[Exchange],
+    scored: &[Scored],
+    base_len: usize,
+    ccr: &dyn CcrStore,
+) -> (Vec<Value>, usize, usize) {
+    let stubs = select_stubs(scored);
+    let score_of = |index: usize| {
+        scored
+            .iter()
+            .find(|s| s.index == index)
+            .map_or(0.0, |s| s.score)
+    };
+    let mut out = Vec::with_capacity(base_len);
+    let mut stubbed = 0;
+    let mut stubbed_tokens = 0;
+    for (index, e) in ex.iter().enumerate() {
+        if e.first >= base_len {
+            break;
+        }
+        let end = e.end.min(base_len).min(messages.len());
+        if end <= e.first {
+            continue;
+        }
+        let slice = &messages[e.first..end];
+        if !stubs.contains(&index) {
+            out.extend_from_slice(slice);
+            continue;
+        }
+        let original = Value::Array(slice.to_vec()).to_string();
+        let hash = compute_key(original.as_bytes());
+        if !ccr.put(&hash, &original) {
+            out.extend_from_slice(slice);
+            continue;
+        }
+        let mut kept = messages[e.first].clone();
+        if kept.is_object() {
+            let tokens = original.len() / BYTES_PER_TOKEN;
+            kept["content"] = Value::String(stub_text(
+                score_of(index),
+                &truncate_chars(&e.typed, 100),
+                slice.len(),
+                tokens,
+                &hash,
+            ));
+            stubbed += 1;
+            stubbed_tokens += tokens;
+        }
+        out.push(kept);
+    }
+    (out, stubbed, stubbed_tokens)
+}
+
+/// Score one snapshot and persist the rewritten base. Runs off the request
+/// path; the next turn replays what it stores. The newest [`PROTECT_TAIL`]
+/// exchanges stay out of the base: they are the live tail, always verbatim.
+#[allow(clippy::too_many_arguments)]
+async fn build_base(
+    state: &AppState,
+    url: &str,
+    snapshot: &Value,
+    session_key: &str,
+    request_id: &str,
+    total_tokens: usize,
+    redact: bool,
+    ccr: Arc<dyn CcrStore>,
+) {
+    let live = snapshot.as_array().cloned().unwrap_or_default();
+    let mut body = json!({ "messages": snapshot.clone() });
+    if redact {
+        crate::redact::redact_body(&state.redact_store, session_key, &mut body);
+    }
+    let judged = body["messages"].as_array().cloned().unwrap_or_default();
+    if judged.len() != live.len() {
+        // Redaction must not reshape the transcript; if it ever does, the
+        // judged positions would stub the wrong messages. Abort, keep history.
+        return;
+    }
+    let ex = exchanges(&judged);
+    if ex.len() <= PROTECT_HEAD + PROTECT_TAIL {
+        return;
+    }
+    let obs = observe_exchanges(state, url, &ex).await;
+    if obs.scored.is_empty() || select_stubs(&obs.scored).is_empty() {
+        return;
+    }
+    let base_len = ex[ex.len() - PROTECT_TAIL].first;
+    let (base, stubbed, stubbed_tokens) =
+        rewrite_prefix(&live, &ex, &obs.scored, base_len, ccr.as_ref());
+    if stubbed == 0 {
+        return;
+    }
+    let first_hash = compute_key(
+        live.first()
+            .map(Value::to_string)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    let base_messages = base.len();
+    if let Ok(mut map) = bases().lock() {
+        map.insert(
+            session_key.to_string(),
+            RefreshBase {
+                base,
+                base_len,
+                first_hash,
+            },
+        );
+    }
+    let session = crate::cache_stabilization::drift_detector::session_key_log_prefix(session_key);
+    tracing::info!(
+        event = "ctx_refresh_base_built",
+        session_key_hash = %session,
+        request_id = %request_id,
+        total_tokens = total_tokens,
+        exchanges = ex.len(),
+        scored = obs.scored.len(),
+        stubbed_exchanges = stubbed,
+        stubbed_tokens = stubbed_tokens,
+        base_len = base_len,
+        base_messages = base_messages,
+        tail_messages = live.len() - base_len,
+        errors = obs.errors,
+        "Jev refresh base built and persisted; replayed from the next turn"
+    );
+}
+
+/// Apply-mode entry point from the routed request path. Replays the stored
+/// base plus the live tail when one covers this history, and past the trigger
+/// starts a background build of a new base. Returns true when `parsed` was
+/// rewritten. Replay is synchronous; scoring never blocks the turn: a fresh
+/// base lands on the first turn after the background run finishes.
+pub(crate) fn apply(
+    state: &AppState,
+    parsed: &mut Value,
+    session_key: &str,
+    request_id: &str,
+) -> bool {
+    let trigger = state.config.ctx_refresh_apply_tokens;
+    if trigger == 0 {
+        return false;
+    }
+    // Spark only, like the observer.
+    let spark = parsed
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.to_lowercase().contains("spark"));
+    let Some(messages) = parsed.get("messages").filter(|_| spark) else {
+        return false;
+    };
+    let total_tokens = messages.to_string().len() / BYTES_PER_TOKEN;
+    // A build needs the CCR store: stubs without retrievable originals are
+    // dropped history, not refresh.
+    if total_tokens >= trigger {
+        if let Some(ccr) = state.ctx_offload.as_ref().map(|r| r.store.ccr()) {
+            if claim_build(session_key) {
+                let snapshot = messages.clone();
+                let url = state.config.ctx_refresh_jev_url.clone();
+                let redact = state.config.redact_sensitive;
+                let state = state.clone();
+                let (session_key, request_id) = (session_key.to_string(), request_id.to_string());
+                tokio::spawn(async move {
+                    build_base(
+                        &state,
+                        &url,
+                        &snapshot,
+                        &session_key,
+                        &request_id,
+                        total_tokens,
+                        redact,
+                        ccr,
+                    )
+                    .await;
+                });
+            }
+        }
+    }
+    // Replay AFTER the build clones its snapshot: the build scores the full
+    // history, this turn forwards the stored base plus the live tail.
+    let base = bases()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(session_key).cloned());
+    let Some(base) = base else {
+        return false;
+    };
+    let stale = match parsed.get("messages").and_then(Value::as_array) {
+        Some(msgs) if msgs.len() >= base.base_len => {
+            let hash = compute_key(
+                msgs.first()
+                    .map(Value::to_string)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            hash != base.first_hash
+        }
+        _ => true,
+    };
+    if stale {
+        // The client cleared or compacted under us; drop the base and let the
+        // next trigger turn rebuild it.
+        if let Ok(mut m) = bases().lock() {
+            m.remove(session_key);
+        }
+        return false;
+    }
+    let mut next = base.base.clone();
+    let mut tail_messages = 0;
+    if let Some(msgs) = parsed.get("messages").and_then(Value::as_array) {
+        tail_messages = msgs.len() - base.base_len;
+        next.extend(msgs[base.base_len..].iter().cloned());
+    }
+    parsed["messages"] = Value::Array(next);
+    let tokens_after = parsed["messages"].to_string().len() / BYTES_PER_TOKEN;
+    let session = crate::cache_stabilization::drift_detector::session_key_log_prefix(session_key);
+    tracing::info!(
+        event = "ctx_refresh_applied",
+        session_key_hash = %session,
+        request_id = %request_id,
+        base_len = base.base_len,
+        base_messages = base.base.len(),
+        tail_messages = tail_messages,
+        tokens_before = total_tokens,
+        tokens_after = tokens_after,
+        "Jev refresh base replayed with the live tail"
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,5 +1025,186 @@ mod tests {
         observe(&state_with(1), &body, "gate-fires", "r");
         assert_eq!(body, before);
         assert!(!claim("gate-fires"), "a run was started for this session");
+    }
+
+    fn scored(index: usize, score: f64) -> Scored {
+        Scored {
+            index,
+            messages: 3,
+            tokens: 100,
+            score,
+            head: format!("request {index}"),
+        }
+    }
+
+    /// The percentile rule, not a fixed cutoff: whether every score is high
+    /// or every score is low, the lowest quarter is stubbed.
+    #[test]
+    fn stub_selection_is_the_lowest_quarter_whatever_the_scale() {
+        let high: Vec<Scored> = [0.9, 0.6, 0.75, 0.8, 0.7, 0.85, 0.65, 0.95]
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| scored(i, s))
+            .collect();
+        assert_eq!(select_stubs(&high), vec![1, 6]);
+        let low: Vec<Scored> = [0.2, 0.1, 0.15, 0.29, 0.05, 0.25, 0.12, 0.3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| scored(i, s))
+            .collect();
+        assert_eq!(select_stubs(&low), vec![1, 4]);
+        let few: Vec<Scored> = [0.1, 0.2, 0.3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| scored(i, s))
+            .collect();
+        assert!(select_stubs(&few).is_empty());
+    }
+
+    /// A stubbed exchange becomes one user message carrying a pointer; the
+    /// original lands in the store under the hash the pointer names; pairs
+    /// stay whole because only whole exchanges move.
+    #[test]
+    fn stub_rewrite_stashes_whole_exchanges_and_keeps_pairs() {
+        use headroom_core::ccr::InMemoryCcrStore;
+        let msgs = transcript();
+        let ex = exchanges(&msgs);
+        assert_eq!(ex.len(), 10);
+        // The lowest quarter of four scored is the single lowest: exchange 2.
+        let judged: Vec<Scored> = [(1, 0.8), (2, 0.5), (3, 0.7), (4, 0.6)]
+            .into_iter()
+            .map(|(i, s)| scored(i, s))
+            .collect();
+        let base_len = ex[ex.len() - PROTECT_TAIL].first;
+        let store = InMemoryCcrStore::new();
+        let (base, stubbed, _) = rewrite_prefix(&msgs, &ex, &judged, base_len, &store);
+        assert_eq!(stubbed, 1);
+        // Exchange 2 (messages 6..9) became one message; the rest verbatim.
+        assert_eq!(base.len(), base_len - 2);
+        let stub = base[6].get("content").and_then(Value::as_str).unwrap();
+        assert!(stub.contains("<<ctx:"), "stub carries a pointer: {stub}");
+        assert!(stub.contains("please do the thing number 2 in the parser"));
+        assert_eq!(base[6].get("role").and_then(Value::as_str), Some("user"));
+        let hash = stub
+            .split("<<ctx:")
+            .nth(1)
+            .and_then(|s| s.split(">>").next())
+            .unwrap();
+        let original = store.get(hash).expect("original is retrievable");
+        assert!(original.contains("please do the thing number 2 in the parser"));
+        // Every tool_result still answers a tool_use in the same base.
+        let mut uses = Vec::new();
+        let mut results = Vec::new();
+        for m in &base {
+            if let Some(blocks) = m.get("content").and_then(Value::as_array) {
+                for b in blocks {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("tool_use") => uses.push(b.get("id").and_then(Value::as_str).unwrap()),
+                        Some("tool_result") => {
+                            results.push(b.get("tool_use_id").and_then(Value::as_str).unwrap());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        uses.sort_unstable();
+        results.sort_unstable();
+        assert_eq!(uses, results);
+        assert!(!uses.contains(&"t2"));
+    }
+
+    fn apply_state() -> AppState {
+        // A trigger the tiny test body never reaches: replay works without a
+        // build, and no background task starts.
+        crate::test_support::test_state(move |c| c.ctx_refresh_apply_tokens = 10_000_000)
+    }
+
+    /// A stored base plus the live tail is what goes forward, byte for byte.
+    #[tokio::test]
+    async fn apply_replays_base_plus_live_tail() {
+        let msgs = transcript();
+        let base_len = 24;
+        let base: Vec<Value> = msgs[..base_len].to_vec();
+        let first_hash = compute_key(msgs[0].to_string().as_bytes());
+        bases().lock().unwrap().insert(
+            "refresh-apply-replay".to_string(),
+            RefreshBase {
+                base: base.clone(),
+                base_len,
+                first_hash,
+            },
+        );
+        let mut parsed = json!({"model": "claude-muse-spark-1.3", "messages": msgs});
+        assert!(apply(
+            &apply_state(),
+            &mut parsed,
+            "refresh-apply-replay",
+            "r"
+        ));
+        let out = parsed["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 30);
+        assert_eq!(&out[..base_len], &base[..]);
+        assert_eq!(&out[base_len..], &transcript()[base_len..]);
+    }
+
+    /// A history shorter than the base (the client cleared) or with a new
+    /// first message (it compacted) drops the base and forwards untouched.
+    #[tokio::test]
+    async fn apply_drops_a_base_the_history_outgrew() {
+        let msgs = transcript();
+        let first_hash = compute_key(msgs[0].to_string().as_bytes());
+        bases().lock().unwrap().insert(
+            "refresh-apply-stale".to_string(),
+            RefreshBase {
+                base: msgs[..24].to_vec(),
+                base_len: 24,
+                first_hash,
+            },
+        );
+        let mut cleared = json!({"model": "claude-muse-spark-1.3", "messages": msgs[..6].to_vec()});
+        assert!(!apply(
+            &apply_state(),
+            &mut cleared,
+            "refresh-apply-stale",
+            "r"
+        ));
+        assert_eq!(cleared["messages"].as_array().unwrap().len(), 6);
+        assert!(bases().lock().unwrap().get("refresh-apply-stale").is_none());
+
+        bases().lock().unwrap().insert(
+            "refresh-apply-compacted".to_string(),
+            RefreshBase {
+                base: msgs[..24].to_vec(),
+                base_len: 24,
+                first_hash: "deadbeef".to_string(),
+            },
+        );
+        let mut compacted = json!({"model": "claude-muse-spark-1.3", "messages": msgs});
+        assert!(!apply(
+            &apply_state(),
+            &mut compacted,
+            "refresh-apply-compacted",
+            "r"
+        ));
+        assert_eq!(compacted["messages"].as_array().unwrap().len(), 30);
+    }
+
+    /// Off by default: with no flag, even a stored base is never replayed.
+    #[tokio::test]
+    async fn apply_is_off_unless_the_flag_is_set() {
+        let msgs = transcript();
+        bases().lock().unwrap().insert(
+            "refresh-apply-off".to_string(),
+            RefreshBase {
+                base: Vec::new(),
+                base_len: 0,
+                first_hash: compute_key(msgs[0].to_string().as_bytes()),
+            },
+        );
+        let mut parsed = json!({"model": "claude-muse-spark-1.3", "messages": msgs});
+        let state = crate::test_support::test_state(|_| {});
+        assert!(!apply(&state, &mut parsed, "refresh-apply-off", "r"));
+        assert_eq!(parsed["messages"].as_array().unwrap().len(), 30);
     }
 }

@@ -1,0 +1,32 @@
+jev-context-refresh observe-mode measurement, run 2026-10-08 (read-only; no repo edits, no proxy contact)
+Data: ~/headroom-proxy.log.3/.4 (events), .log/.1/.2 (gap analysis). Logs are 150-880MB: filter with grep first, aggregate with python3 -I scripts. Scripts take file paths as argv; run from /tmp (never from inside a data dir).
+
+1. Per-file event counts:
+   for f in headroom-proxy.log headroom-proxy.log.1 headroom-proxy.log.2 headroom-proxy.log.3 headroom-proxy.log.4; do
+     printf "%s observed=%s exchange=%s\n" "$f" \
+       "$(grep -c ctx_refresh_observed $f)" "$(grep -c ctx_refresh_exchange $f)"; done
+   # .3: 15/1400, .4: 1/10, all others 0/0
+
+2. Extract slices (675KB + 8KB):
+   grep -h ctx_refresh_observed headroom-proxy.log.3 headroom-proxy.log.4 > /tmp/jev-refresh/observed.jsonl
+   grep -h ctx_refresh_exchange headroom-proxy.log.3 headroom-proxy.log.4 > /tmp/jev-refresh/exchange.jsonl
+
+3. Aggregates (scripts in this dir, outputs as .txt next to them):
+   python3 -I schema.py  observed.jsonl exchange.jsonl   # field schemas (sanity)
+   python3 -I analyze.py observed.jsonl exchange.jsonl   # per-observation table, score quantiles, bands, top-token check
+   python3 -I heads.py   exchange.jsonl                  # distinct exchanges ever <0.3 / in 0.3-0.4 with score ranges
+   python3 -I types.py   exchange.jsonl                  # head-type x band census, per-exchange swing, small session detail
+   python3 -I other.py   exchange.jsonl                  # distinct non-teammate-msg exchanges
+
+4. Gap analysis (why zero events since Oct 2):
+   grep -n "refresh-observe" ~/.headroom-flags.sh          # flag still 400000
+   head/tail timestamps of .log/.1/.2                     # spans: Oct3-4 / Oct4-6 / Oct6-8
+   grep -c -i spark ; grep -c -i jev  (per recent file)    # traffic continues
+   grep -h -i jev <recent logs> > jev-recent.txt; python3 -I jevagg.py jev-recent.txt
+   grep -h -o '"event":"[a-zA-Z0-9_]*"' headroom-proxy.log | sort | uniq -c | sort -rn  # full event census
+   grep -a -h -e '"event":"outbound_body_bytes"' -e '"event":"count_tokens_local"' <recent logs> > sizes.jsonl
+   python3 -I sizes.py sizes.jsonl                        # max bytes_in 1077109 (~269k est tok) < 1.6MB trigger; 0 over
+   NOTE: use /bin/grep (a `grep` wrapper shadows it in this shell); use -a on .log.1 (has binary chunks).
+
+Result files: observed.jsonl exchange.jsonl numbers.txt heads.txt types.txt other.txt jev-recent.txt jevagg.txt
+event-census-current.txt sizes.jsonl sizes.txt + this file + the six .py scripts.

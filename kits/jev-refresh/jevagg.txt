@@ -1,0 +1,19 @@
+lines=160 unparsable=0 span=2026-10-06T11:29:33.353475Z..2026-10-05T22:51:01.031896Z
+levels: {'INFO': 160}
+
+   63  prefix_replay_not_replayed
+       {'message': "prefix replay declined: forwarding this turn's own bytes"}
+   31  routed_forward_continuity
+       {'message': 'routed forward continuity'}
+   30  orphan_turn_judged
+       {'message': 'ccr: asked Jev whether a text-only stop left announced work undone'}
+   15  (no event)
+       {'message': 'forwarded'}
+    7  routed_response_completed
+       {'message': 'routed turn completed'}
+    7  orphan_turn_continuation
+       {'message': 'ccr: text-only turn announced an action and stopped; sending it back with a nudge'}
+    6  orphan_turn_rescued
+       {'message': 'ccr: orphan nudge round returned a tool call; streaming it to the client'}
+    1  responses_stream_event_shape
+       {'message': 'first event of this kind since the proxy started'}

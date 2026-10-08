@@ -1,0 +1,37 @@
+=== head-type by score band (lines, tokens) ===
+--- <0.3 ---
+  teammate-msg   lines= 129 tokens=  199399
+  other          lines=   6 tokens=   10044
+  typed-task?    lines=   1 tokens=   32631
+--- 0.3-0.4 ---
+  teammate-msg   lines= 203 tokens=  440674
+  slash-command  lines=   8 tokens=  104232
+  other          lines=   8 tokens=   13392
+  typed-task?    lines=   1 tokens=   32625
+--- 0.4-0.5 ---
+  teammate-msg   lines= 351 tokens=  654720
+  other          lines=  12 tokens=   46177
+  typed-task?    lines=   3 tokens=   97884
+--- >=0.5 ---
+  teammate-msg   lines= 534 tokens= 1391994
+  other          lines= 143 tokens=  988909
+  slash-command  lines=   6 tokens=   78174
+  typed-task?    lines=   5 tokens=  163172
+
+=== per-exchange score swing (same exchange, different tasks) ===
+exchanges scored more than once: 101
+swing max-min: min=0.10 p10=0.27 p25=0.34 med=0.42 p75=0.46 p90=0.49 max=0.70
+exchanges crossing the 0.3 line across tasks: 38 of 101
+exchanges crossing the 0.4 line across tasks: 82 of 101
+
+=== small session aae70305: all 10 exchanges (type + score + tokens) ===
+idx= 1 score=0.60 tok= 32636 msg=3 type=typed-task?
+idx= 2 score=0.29 tok= 32631 msg=3 type=typed-task?
+idx= 3 score=0.54 tok= 32629 msg=3 type=typed-task?
+idx= 4 score=0.48 tok= 32630 msg=3 type=typed-task?
+idx= 5 score=0.53 tok= 32641 msg=3 type=typed-task?
+idx= 6 score=0.44 tok= 32629 msg=3 type=typed-task?
+idx= 7 score=0.50 tok= 32634 msg=3 type=typed-task?
+idx= 8 score=0.38 tok= 32625 msg=3 type=typed-task?
+idx= 9 score=0.62 tok= 32632 msg=3 type=typed-task?
+idx=10 score=0.43 tok= 32625 msg=3 type=typed-task?
