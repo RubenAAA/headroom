@@ -1,0 +1,89 @@
+{
+ "mode": {
+  "incomplete_message_lines": 0,
+  "incomplete_body_cause_lines": 0,
+  "mid_response_error_rids": 0,
+  "non_sse_buffer_failed_rids": 0,
+  "incomplete_sample": null,
+  "proxy_errors": 9,
+  "proxy_error_status": {
+   "503": 9
+  },
+  "proxy_error_rids": 0,
+  "proxy_error_rids_seen_at_stub": 0,
+  "upstream_transport_retrying": 18,
+  "outbound_body_bytes": 18,
+  "log_lines": 259
+ },
+ "integrity": {
+  "sent_markers": 12,
+  "captures": 36,
+  "matched": 36,
+  "missing_markers": 0,
+  "missing_list": [],
+  "extra_captures": 0,
+  "body_mismatches": 0,
+  "clen_mismatches": 0,
+  "non_json": 0
+ },
+ "retry": {
+  "same_rid_double_landings": 9,
+  "same_rid_details": {
+   "e17ca422": [
+    "001-v1_messages-7dff209f.json",
+    "002-v1_messages-7dff209f.json",
+    "003-v1_messages-7dff209f.json"
+   ],
+   "ab79683a": [
+    "005-v1_chat_completions-51c21ad9.json",
+    "006-v1_chat_completions-51c21ad9.json",
+    "007-v1_chat_completions-51c21ad9.json"
+   ],
+   "87015879": [
+    "009-v1_responses-9c152532.json",
+    "010-v1_responses-9c152532.json",
+    "011-v1_responses-9c152532.json"
+   ],
+   "e1ebdfc1": [
+    "013-v1_messages-50d8cf9b.json",
+    "014-v1_messages-50d8cf9b.json",
+    "015-v1_messages-50d8cf9b.json"
+   ],
+   "3c3d63be": [
+    "017-v1_chat_completions-84dc1ff2.json",
+    "018-v1_chat_completions-84dc1ff2.json",
+    "019-v1_chat_completions-84dc1ff2.json"
+   ],
+   "63bb9a1f": [
+    "021-v1_responses-da191997.json",
+    "022-v1_responses-da191997.json",
+    "023-v1_responses-da191997.json"
+   ],
+   "7dd61140": [
+    "025-v1_messages-7dff209f.json",
+    "026-v1_messages-7dff209f.json",
+    "027-v1_messages-7dff209f.json"
+   ],
+   "1a3841bd": [
+    "029-v1_responses-9c152532.json",
+    "030-v1_responses-9c152532.json",
+    "031-v1_responses-9c152532.json"
+   ],
+   "677ad71d": [
+    "033-v1_chat_completions-84dc1ff2.json",
+    "034-v1_chat_completions-84dc1ff2.json",
+    "035-v1_chat_completions-84dc1ff2.json"
+   ]
+  },
+  "landing_histogram": {
+   "1": 9,
+   "3": 9
+  },
+  "client_resent_markers": 6,
+  "captures_without_rid": 0
+ },
+ "adjacency": {
+  "captures_after_truncated": 27,
+  "bad_after_truncated": 0
+ }
+}

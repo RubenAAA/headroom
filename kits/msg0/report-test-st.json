@@ -1,0 +1,306 @@
+[
+ {
+  "label": "A1-sub-unsorted-nomarkers",
+  "path": "/v1/messages",
+  "status": 200,
+  "resp_body": "{\"id\": \"msg_stub_001\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"claude-sonnet-4-5\", \"stop_reason\": \"end_turn\", \"stop_sequence\": null, \"content\": [{\"type\": \"text\", \"text\": \"stub-ok\"}], \"usage\": {\"input_tokens\": 10, \"output_tokens\": 5, \"cache_creation_input_tokens\": 0, \"cache_read_input_tokens\": 0}}",
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/messages",
+    "tool_count": 3
+   },
+   {
+    "event": "e2_applied",
+    "path": "/v1/messages",
+    "tool_count": 3
+   },
+   {
+    "event": "e3_applied",
+    "path": "/v1/messages",
+    "placed_count": 1,
+    "locations": "[\"tools[2]\"]"
+   }
+  ]
+ },
+ {
+  "label": "A2-sub-sorted-nomarkers",
+  "path": "/v1/messages",
+  "status": 200,
+  "resp_body": "{\"id\": \"msg_stub_001\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"claude-sonnet-4-5\", \"stop_reason\": \"end_turn\", \"stop_sequence\": null, \"content\": [{\"type\": \"text\", \"text\": \"stub-ok\"}], \"usage\": {\"input_tokens\": 10, \"output_tokens\": 5, \"cache_creation_input_tokens\": 0, \"cache_read_input_tokens\": 0}}",
+  "events": [
+   {
+    "event": "e3_applied",
+    "path": "/v1/messages",
+    "placed_count": 1,
+    "locations": "[\"tools[2]\"]"
+   }
+  ]
+ },
+ {
+  "label": "A3-sub-unsorted-markerpresent",
+  "path": "/v1/messages",
+  "status": 200,
+  "resp_body": "{\"id\": \"msg_stub_001\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"claude-sonnet-4-5\", \"stop_reason\": \"end_turn\", \"stop_sequence\": null, \"content\": [{\"type\": \"text\", \"text\": \"stub-ok\"}], \"usage\": {\"input_tokens\": 10, \"output_tokens\": 5, \"cache_creation_input_tokens\": 0, \"cache_read_input_tokens\": 0}}",
+  "events": [
+   {
+    "event": "e1_skipped",
+    "path": "/v1/messages",
+    "reason": "marker_present",
+    "tool_count": 3
+   },
+   {
+    "event": "e2_applied",
+    "path": "/v1/messages",
+    "tool_count": 3
+   },
+   {
+    "event": "e3_skipped",
+    "path": "/v1/messages",
+    "reason": "marker_present"
+   }
+  ]
+ },
+ {
+  "label": "A4-sub-notools",
+  "path": "/v1/messages",
+  "status": 200,
+  "resp_body": "{\"id\": \"msg_stub_001\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"claude-sonnet-4-5\", \"stop_reason\": \"end_turn\", \"stop_sequence\": null, \"content\": [{\"type\": \"text\", \"text\": \"stub-ok\"}], \"usage\": {\"input_tokens\": 10, \"output_tokens\": 5, \"cache_creation_input_tokens\": 0, \"cache_read_input_tokens\": 0}}",
+  "events": [
+   {
+    "event": "e3_no_target",
+    "path": "/v1/messages"
+   }
+  ]
+ },
+ {
+  "label": "A5-payg-unsorted-nomarkers",
+  "path": "/v1/messages",
+  "status": 200,
+  "resp_body": "{\"id\": \"msg_stub_001\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"claude-sonnet-4-5\", \"stop_reason\": \"end_turn\", \"stop_sequence\": null, \"content\": [{\"type\": \"text\", \"text\": \"stub-ok\"}], \"usage\": {\"input_tokens\": 10, \"output_tokens\": 5, \"cache_creation_input_tokens\": 0, \"cache_read_input_tokens\": 0}}",
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/messages",
+    "tool_count": 3
+   },
+   {
+    "event": "e2_applied",
+    "path": "/v1/messages",
+    "tool_count": 3
+   },
+   {
+    "event": "e3_applied",
+    "path": "/v1/messages",
+    "placed_count": 1,
+    "locations": "[\"tools[2]\"]"
+   }
+  ]
+ },
+ {
+  "label": "C1-payg-chat-unsorted",
+  "path": "/v1/chat/completions",
+  "status": 200,
+  "resp_body": "{\"id\": \"chatcmpl-stub-001\", \"object\": \"chat.completion\", \"created\": 1790000000, \"model\": \"gpt-5-mini\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"stub-ok\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 10, \"completion_tokens\": 5, \"total_tokens\": 15}}",
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 2
+   },
+   {
+    "event": "e2_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 2
+   },
+   {
+    "event": "e4_applied",
+    "path": "/v1/chat/completions",
+    "key_prefix": "e9e723fc"
+   }
+  ]
+ },
+ {
+  "label": "C2-payg-chat-stability-turn2",
+  "path": "/v1/chat/completions",
+  "status": 200,
+  "resp_body": "{\"id\": \"chatcmpl-stub-001\", \"object\": \"chat.completion\", \"created\": 1790000000, \"model\": \"gpt-5-mini\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"stub-ok\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 10, \"completion_tokens\": 5, \"total_tokens\": 15}}",
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 2
+   },
+   {
+    "event": "e2_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 2
+   },
+   {
+    "event": "e4_applied",
+    "path": "/v1/chat/completions",
+    "key_prefix": "e9e723fc"
+   }
+  ]
+ },
+ {
+  "label": "C3-payg-chat-othertools",
+  "path": "/v1/chat/completions",
+  "status": 200,
+  "resp_body": "{\"id\": \"chatcmpl-stub-001\", \"object\": \"chat.completion\", \"created\": 1790000000, \"model\": \"gpt-5-mini\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"stub-ok\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 10, \"completion_tokens\": 5, \"total_tokens\": 15}}",
+  "events": [
+   {
+    "event": "e2_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 1
+   },
+   {
+    "event": "e4_applied",
+    "path": "/v1/chat/completions",
+    "key_prefix": "27a9201f"
+   }
+  ]
+ },
+ {
+  "label": "C4-payg-chat-keypresent",
+  "path": "/v1/chat/completions",
+  "status": 200,
+  "resp_body": "{\"id\": \"chatcmpl-stub-001\", \"object\": \"chat.completion\", \"created\": 1790000000, \"model\": \"gpt-5-mini\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"stub-ok\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 10, \"completion_tokens\": 5, \"total_tokens\": 15}}",
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 2
+   },
+   {
+    "event": "e2_applied",
+    "path": "/v1/chat/completions",
+    "tool_count": 2
+   },
+   {
+    "event": "e4_skipped",
+    "path": "/v1/chat/completions",
+    "reason": "key_present"
+   }
+  ]
+ },
+ {
+  "label": "C5-sub-chat-unsorted",
+  "path": "/v1/chat/completions",
+  "status": 200,
+  "resp_body": "{\"id\": \"chatcmpl-stub-001\", \"object\": \"chat.completion\", \"created\": 1790000000, \"model\": \"gpt-5-mini\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"stub-ok\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 10, \"completion_tokens\": 5, \"total_tokens\": 15}}",
+  "events": [
+   {
+    "event": "e1_skipped",
+    "path": "/v1/chat/completions",
+    "reason": "auth_mode",
+    "auth_mode": "subscription"
+   },
+   {
+    "event": "e2_skipped",
+    "path": "/v1/chat/completions",
+    "reason": "auth_mode",
+    "auth_mode": "subscription"
+   },
+   {
+    "event": "e4_skipped",
+    "path": "/v1/chat/completions",
+    "reason": "auth_mode",
+    "auth_mode": "subscription"
+   }
+  ]
+ },
+ {
+  "label": "R1-payg-resp-unsorted",
+  "path": "/v1/responses",
+  "status": 200,
+  "resp_body": "{\"id\": \"resp_stub_001\", \"object\": \"response\", \"created_at\": 1790000000, \"status\": \"completed\", \"model\": \"gpt-5-mini\", \"output\": [{\"type\": \"message\", \"id\": \"msg_stub_1\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"stub-ok\", \"annotations\": []}]}], \"usage\": {\"input_tokens\": 10, \"output_tokens\": 5, \"total_tokens\": 15}}",
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/responses",
+    "tool_count": 2
+   },
+   {
+    "event": "e4_applied",
+    "path": "/v1/responses",
+    "key_prefix": "ea84276c"
+   }
+  ]
+ },
+ {
+  "label": "R2-payg-resp-stability-turn2",
+  "path": "/v1/responses",
+  "status": 200,
+  "resp_body": "{\"id\": \"resp_stub_001\", \"object\": \"response\", \"created_at\": 1790000000, \"status\": \"completed\", \"model\": \"gpt-5-mini\", \"output\": [{\"type\": \"message\", \"id\": \"msg_stub_1\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"stub-ok\", \"annotations\": []}]}], \"usage\": {\"input_tokens\": 10, \"output_tokens\": 5, \"total_tokens\": 15}}",
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/responses",
+    "tool_count": 2
+   },
+   {
+    "event": "e4_applied",
+    "path": "/v1/responses",
+    "key_prefix": "ea84276c"
+   }
+  ]
+ },
+ {
+  "label": "R3-payg-resp-othertools",
+  "path": "/v1/responses",
+  "status": 200,
+  "resp_body": "{\"id\": \"resp_stub_001\", \"object\": \"response\", \"created_at\": 1790000000, \"status\": \"completed\", \"model\": \"gpt-5-mini\", \"output\": [{\"type\": \"message\", \"id\": \"msg_stub_1\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"stub-ok\", \"annotations\": []}]}], \"usage\": {\"input_tokens\": 10, \"output_tokens\": 5, \"total_tokens\": 15}}",
+  "events": [
+   {
+    "event": "e4_applied",
+    "path": "/v1/responses",
+    "key_prefix": "e3c7dd99"
+   }
+  ]
+ },
+ {
+  "label": "R4-payg-resp-keypresent",
+  "path": "/v1/responses",
+  "status": 200,
+  "resp_body": "{\"id\": \"resp_stub_001\", \"object\": \"response\", \"created_at\": 1790000000, \"status\": \"completed\", \"model\": \"gpt-5-mini\", \"output\": [{\"type\": \"message\", \"id\": \"msg_stub_1\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"stub-ok\", \"annotations\": []}]}], \"usage\": {\"input_tokens\": 10, \"output_tokens\": 5, \"total_tokens\": 15}}",
+  "events": [
+   {
+    "event": "e1_applied",
+    "path": "/v1/responses",
+    "tool_count": 2
+   },
+   {
+    "event": "e4_skipped",
+    "path": "/v1/responses",
+    "reason": "key_present"
+   }
+  ]
+ },
+ {
+  "label": "R5-sub-resp-unsorted",
+  "path": "/v1/responses",
+  "status": 200,
+  "resp_body": "{\"id\": \"resp_stub_001\", \"object\": \"response\", \"created_at\": 1790000000, \"status\": \"completed\", \"model\": \"gpt-5-mini\", \"output\": [{\"type\": \"message\", \"id\": \"msg_stub_1\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"stub-ok\", \"annotations\": []}]}], \"usage\": {\"input_tokens\": 10, \"output_tokens\": 5, \"total_tokens\": 15}}",
+  "events": [
+   {
+    "event": "e1_skipped",
+    "path": "/v1/responses",
+    "reason": "auth_mode",
+    "auth_mode": "subscription"
+   },
+   {
+    "event": "e2_skipped",
+    "path": "/v1/responses",
+    "reason": "auth_mode",
+    "auth_mode": "subscription"
+   },
+   {
+    "event": "e4_skipped",
+    "path": "/v1/responses",
+    "reason": "auth_mode",
+    "auth_mode": "subscription"
+   }
+  ]
+ }
+]

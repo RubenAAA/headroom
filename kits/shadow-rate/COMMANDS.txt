@@ -1,0 +1,8 @@
+# shadow-rate repeatability log (2026-10-08). Read-only against ~/headroom-proxy.log* (counts grow).
+# 01: levels + event histogram + shadow-candidate counts (exact fields.event match)
+python3 -I /tmp/shadow-rate/01_shadow.py | tee /tmp/shadow-rate/01_shadow.out
+# 02: tool/call/name-ish event names + key-only schemas for candidates carrying names
+python3 -I /tmp/shadow-rate/02_toolish.py | tee /tmp/shadow-rate/02_toolish.out
+# 03: denominator split model_route_translate x stream flag (Spark buffered check)
+python3 -I /tmp/shadow-rate/03_denominator.py | tee /tmp/shadow-rate/03_denominator.out
+# Rules followed: counts/buckets/sha256-hashes only; no raw log values printed.

@@ -1,0 +1,77 @@
+total_shape_lines=255 parse_ok=212 parse_fail=43
+== by stream_event ==
+40	response.output_item.added
+40	response.output_item.done
+14	response.created
+14	response.in_progress
+14	response.function_call_arguments.delta
+14	response.function_call_arguments.done
+14	response.completed
+13	response.content_part.added
+13	response.output_text.delta
+13	response.output_text.done
+13	response.content_part.done
+13	response.reasoning_summary_part.added
+13	response.reasoning_summary_text.delta
+13	response.reasoning_summary_text.done
+13	response.reasoning_summary_part.done
+1	response.failed
+== by item_type ==
+175	''
+28	'function_call'
+26	'reasoning'
+26	'message'
+== distinct structures per event (count, sig truncated to 400ch) ==
+--- response.completed: 1 distinct structs over 14 lines
+  14	<non-json len=700>
+--- response.content_part.added: 1 distinct structs over 13 lines
+  13	{content_index:int,item_id:str,output_index:int,part:{annotations:[],logprobs:[],text:str,type:str},sequence_number:int,type:str}
+--- response.content_part.done: 1 distinct structs over 13 lines
+  13	{content_index:int,item_id:str,output_index:int,part:{annotations:[],logprobs:[],text:str,type:str},sequence_number:int,type:str}
+--- response.created: 1 distinct structs over 14 lines
+  14	<non-json len=700>
+--- response.failed: 1 distinct structs over 1 lines
+  1	<non-json len=700>
+--- response.function_call_arguments.delta: 1 distinct structs over 14 lines
+  14	{delta:str,item_id:str,output_index:int,sequence_number:int,type:str}
+--- response.function_call_arguments.done: 1 distinct structs over 14 lines
+  14	{arguments:str,item_id:str,name:str,output_index:int,sequence_number:int,type:str}
+--- response.in_progress: 1 distinct structs over 14 lines
+  14	<non-json len=700>
+--- response.output_item.added: 4 distinct structs over 40 lines
+  14	{item:{arguments:str,call_id:str,id:str,name:str,status:str,type:str},output_index:int,sequence_number:int,type:str}
+  13	{item:{id:str,status:str,summary:[],type:str},output_index:int,sequence_number:int,type:str}
+  8	{item:{content:[],id:str,role:str,status:str,type:str},output_index:int,sequence_number:int,type:str}
+  5	{item:{content:[],id:str,phase:str,role:str,status:str,type:str},output_index:int,sequence_number:int,type:str}
+--- response.output_item.done: 5 distinct structs over 40 lines
+  14	{item:{arguments:str,call_id:str,id:str,name:str,status:str,type:str},output_index:int,sequence_number:int,type:str}
+  8	{item:{encrypted_content:str,id:str,status:str,summary:[],type:str},output_index:int,sequence_number:int,type:str}
+  8	{item:{content:[{annotations:[],logprobs:[],text:str,type:str}],id:str,role:str,status:str,type:str},output_index:int,sequence_number:int,type:str}
+  5	{item:{content:[{annotations:[],logprobs:[],text:str,type:str}],id:str,phase:str,role:str,status:str,type:str},output_index:int,sequence_number:int,type:str}
+  5	{item:{encrypted_content:str,id:str,status:str,summary:[{text:str,type:str}],type:str},output_index:int,sequence_number:int,type:str}
+--- response.output_text.delta: 1 distinct structs over 13 lines
+  13	{content_index:int,delta:str,item_id:str,logprobs:[],output_index:int,sequence_number:int,type:str}
+--- response.output_text.done: 1 distinct structs over 13 lines
+  13	{content_index:int,item_id:str,logprobs:[],output_index:int,sequence_number:int,text:str,type:str}
+--- response.reasoning_summary_part.added: 1 distinct structs over 13 lines
+  13	{item_id:str,output_index:int,part:{text:str,type:str},sequence_number:int,summary_index:int,type:str}
+--- response.reasoning_summary_part.done: 1 distinct structs over 13 lines
+  13	{item_id:str,output_index:int,part:{text:str,type:str},sequence_number:int,summary_index:int,type:str}
+--- response.reasoning_summary_text.delta: 1 distinct structs over 13 lines
+  13	{delta:str,item_id:str,output_index:int,sequence_number:int,summary_index:int,type:str}
+--- response.reasoning_summary_text.done: 1 distinct structs over 13 lines
+  13	{item_id:str,output_index:int,sequence_number:int,summary_index:int,text:str,type:str}
+== top-level keys per event ==
+response.content_part.added: type(13),sequence_number(13),output_index(13),content_index(13),item_id(13),part(13)
+response.content_part.done: type(13),sequence_number(13),output_index(13),content_index(13),item_id(13),part(13)
+response.function_call_arguments.delta: type(14),sequence_number(14),output_index(14),item_id(14),delta(14)
+response.function_call_arguments.done: type(14),sequence_number(14),output_index(14),item_id(14),arguments(14),name(14)
+response.output_item.added: type(40),sequence_number(40),output_index(40),item(40)
+response.output_item.done: type(40),sequence_number(40),output_index(40),item(40)
+response.output_text.delta: type(13),sequence_number(13),output_index(13),content_index(13),item_id(13),delta(13),logprobs(13)
+response.output_text.done: type(13),sequence_number(13),output_index(13),content_index(13),item_id(13),text(13),logprobs(13)
+response.reasoning_summary_part.added: type(13),sequence_number(13),output_index(13),summary_index(13),item_id(13),part(13)
+response.reasoning_summary_part.done: type(13),sequence_number(13),output_index(13),summary_index(13),item_id(13),part(13)
+response.reasoning_summary_text.delta: type(13),sequence_number(13),output_index(13),summary_index(13),item_id(13),delta(13)
+response.reasoning_summary_text.done: type(13),sequence_number(13),output_index(13),summary_index(13),item_id(13),text(13)
+== response.completed usage keys ==

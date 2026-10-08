@@ -2,6 +2,32 @@
 
 - **Status:** open. Audit of 2026-09-30, partly unverified. Only one fix came
   out of it: mid-conversation `system` messages (`4eab6be1`, `ce3b82db`).
+- **Status:** messages[0]-drop follow-up 2026-10-08: NOT reproduced on any
+  check. Side proxies on the installed binary (~800 marked + ~250 unmarked
+  requests, forced connect-level retries, per-request content-length audit,
+  500-request hash run): zero drops, zero hash/length deviations, zero
+  double-landings. Remaining suspects: misattribution in the original
+  sent-vs-got pairing, or a stub-side artifact under distress. Artifacts:
+  `kits/msg0/` (11M). Next check queued: response-side failure mode (stub
+  accepts the full request then closes mid-response).
+- **Status:** response-side check 2026-10-08: CLEAN, anomaly closed as
+  non-proxy. Stub truncated responses 5 ways (Content-Length/chunked x
+  stream/non-stream + invalid framing): 171/171 captures matched (count +
+  sha256), 106 captures right after a truncated response all clean, 12
+  same-RID retry multi-landings all byte-identical. Matrix pinned:
+  non-stream trunc -> 502 no retry; Anthropic-stream -> retry x2;
+  OpenAI-stream -> silent short 200, a plausible mis-pairing mechanism for
+  the original. Rerun: `/tmp/msg0/run-trunc.sh`. The messages[0] drop is
+  now attributable only to the original sent-vs-got pairing or a stub
+  artifact.
+- **Side finding 2026-10-08, RESOLVED same day (code trace, no bug):** the
+  `x-request-id` skip is deliberate. Single call site (`proxy.rs:239` →
+  `presend.rs:806` → `headers.rs:267`): the builder injects RID only for
+  non-Subscription traffic, and `presend.rs:795` forces PAYG when
+  `auth_mode_policy_enforcement` is off. Test arm (enforcement off) → RID
+  always; control (on) → subscription-auth requests skip it by design
+  (fingerprint risk, see comment). The discriminator is classified auth
+  mode, not transformed-vs-pristine. RID joins must scope by arm/auth mode.
 - **Source:** `openai/request.rs`, `routed/prepare.rs`, `openai/stream.rs`,
   `routed/translation.rs`. Data: 400 recent replay-prefix captures and the
   2026-09-29 log.
@@ -138,3 +164,10 @@
 - **Next:** read the info-level unhandled-event lines after a day of traffic.
   Done: the reasoning-replay lane test (see the correction above and
   `learnings/zen-reasoning-blob-vs-exit-rotation.md`) and the OpenCode body diff.
+- **Status 2026-10-08:** shape cap raised 700 → 2000 (`SHAPE_LINE` in
+  `openai/stream.rs`) so `response.completed` fits whole; `output_tokens_details`
+  no longer cut mid-object (was 43/255 shapes unparseable).
+- **Status 2026-10-08:** shadow-call counter added (`StreamTranslator.shadow_tool_uses`,
+  via `ToolAlias.is_shadow_call` in `routed/tool_alias.rs`, emitted on
+  `routed_response_completed`). Rate reads out as turns with `shadow_tool_uses > 0`
+  over `routed_response_completed` turns.

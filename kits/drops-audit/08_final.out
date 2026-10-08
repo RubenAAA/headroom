@@ -1,0 +1,41 @@
+unhandled_true=180 range=2026-10-06T09:11:33.130114Z..2026-10-08T11:22:57.044304Z
+  UH 20 lines maxcount=2500 response.content_part.added
+  UH 20 lines maxcount=2500 response.content_part.done
+  UH 44 lines maxcount=8500 response.created
+  UH 44 lines maxcount=8500 response.in_progress
+  UH 26 lines maxcount=4500 response.reasoning_summary_part.done
+  UH 26 lines maxcount=4500 response.reasoning_summary_text.done
+shapes_true=255 range=2026-10-06T09:11:33.119465Z..2026-10-07T16:22:09.856278Z
+  SH 14 response.completed
+  SH 13 response.content_part.added
+  SH 13 response.content_part.done
+  SH 14 response.created
+  SH 1 response.failed
+  SH 14 response.function_call_arguments.delta
+  SH 14 response.function_call_arguments.done
+  SH 14 response.in_progress
+  SH 40 response.output_item.added
+  SH 40 response.output_item.done
+  SH 13 response.output_text.delta
+  SH 13 response.output_text.done
+  SH 13 response.reasoning_summary_part.added
+  SH 13 response.reasoning_summary_part.done
+  SH 13 response.reasoning_summary_text.delta
+  SH 13 response.reasoning_summary_text.done
+truncated(seclen)=count:
+  ('response.completed', 700)=14
+  ('response.created', 700)=14
+  ('response.failed', 700)=1
+  ('response.in_progress', 700)=14
+completed_trunc=14 usage_key_lines={'cached_tokens': 6, 'encrypted_content': 8, 'input_tokens': 14, 'input_tokens_details': 6, 'output': 14, 'output_tokens': 14, 'total_tokens': 12, 'usage': 14}
+annotations_nonempty/total=0/39 logprobs_nonempty/total=0/65
+item_types:
+  ('response.output_item.added', 'function_call')=14
+  ('response.output_item.added', 'message')=13
+  ('response.output_item.added', 'reasoning')=13
+  ('response.output_item.done', 'function_call')=14
+  ('response.output_item.done', 'message')=13
+  ('response.output_item.done', 'reasoning')=13
+reasoning_enc:
+  ('response.output_item.added', 'no_enc')=13
+  ('response.output_item.done', 'with_enc')=13

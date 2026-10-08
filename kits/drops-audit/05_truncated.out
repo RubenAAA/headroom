@@ -1,0 +1,19 @@
+== truncated-shape line counts ==
+14	response.created
+14	response.in_progress
+14	response.completed
+1	response.failed
+1	?
+== key names per truncated event (key: in-how-many-lines) ==
+response.completed: type(31),id(28),status(28),sequence_number(14),response(14),object(14),created_at(14),completed_at(14),parallel_tool_calls(14),temperature(14),top_p(14),background(14),truncation(14),top_logprobs(14),model(14),error(14),incomplete_details(14),output(14),usage(14),input_tokens(14),output_tokens(14),total_tokens(12),encrypted_content(8),summary(8),input_tokens_details(6),cached_tokens(6),name(5),call_id(5),arguments(5),text(3),role(1),content(1),annotations(1),logprobs(1)
+response.created: type(42),description(42),sequence_number(14),response(14),id(14),object(14),created_at(14),status(14),parallel_tool_calls(14),temperature(14),top_p(14),background(14),truncation(14),top_logprobs(14),model(14),error(14),incomplete_details(14),output(14),instructions(14),tool_choice(14),tools(14),name(14),strict(14),parameters(14),additionalProperties(14),properties(14),isolation(13),effort(1)
+response.failed: description(3),type(2),sequence_number(1),response(1),id(1),object(1),created_at(1),status(1),parallel_tool_calls(1),temperature(1),top_p(1),background(1),truncation(1),top_logprobs(1),model(1),error(1),code(1),message(1),incomplete_details(1),output(1),instructions(1),tool_choice(1),tools(1),name(1),strict(1),parameters(1),additionalProperties(1),properties(1)
+response.in_progress: type(42),description(42),sequence_number(14),response(14),id(14),object(14),created_at(14),status(14),parallel_tool_calls(14),temperature(14),top_p(14),background(14),truncation(14),top_logprobs(14),model(14),error(14),incomplete_details(14),output(14),instructions(14),tool_choice(14),tools(14),name(14),strict(14),parameters(14),additionalProperties(14),properties(14),isolation(13),effort(1)
+== masked prefixes (distinct) ==
+? x1: 
+response.completed x8: {"X":"X.X","X":X,"X":{"X":"X","X":"X","X":X,"X":X
+response.completed x4: {"X":"X.X","X":8,"X":{"X":"X","X":"X","X":X,"X":X
+response.completed x1: {"X":"X.X","X":7,"X":{"X":"X","X":"X","X":X,"X":X
+response.created x14: {"X":"X.X","X":0,"X":{"X":"X","X":"X","X":X,"X":"X
+response.failed x1: {"X":"X.X","X":7,"X":{"X":"X","X":"X","X":X,"X":"X","X
+response.in_progress x14: {"X":"X.X","X":1,"X":{"X":"X","X":"X","X":X,"X":"X

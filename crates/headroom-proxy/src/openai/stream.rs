@@ -34,8 +34,10 @@ fn count_unhandled_event(name: &str) -> u64 {
 
 /// Characters of a string value kept in a logged event shape.
 const SHAPE_STRING: usize = 40;
-/// Longest shape line logged.
-const SHAPE_LINE: usize = 700;
+/// Longest shape line logged. Sized so the largest interesting shape
+/// (`response.completed` with its `usage` block) fits whole: a mid-object
+/// cut hides `output_tokens_details` and breaks JSON parsing.
+const SHAPE_LINE: usize = 2000;
 
 /// `value` with long strings cut and every array reduced to its first element:
 /// what fields an event carries, without its text.
@@ -341,6 +343,10 @@ pub(crate) struct StreamTranslator {
     /// lowercase rename. `None` on every path that never renamed outbound,
     /// so only Zen-bound routed turns pay attention to it.
     tool_aliases: Option<crate::routed::tool_alias::ToolAlias>,
+    /// Tool calls this turn whose upstream name was a gate shadow name the
+    /// rename layer could not restore (`ToolAlias::is_shadow_call`). For the
+    /// drops-audit rate on the completion log.
+    shadow_tool_uses: u32,
     /// `--report-true-usage`: put the provider's own counts in the terminal
     /// `message_delta` instead of the legacy output-only shape.
     report_true_usage: bool,
@@ -489,6 +495,7 @@ impl StreamTranslator {
             ttfb_ms: 0.0,
             last_usage: None,
             tool_aliases: None,
+            shadow_tool_uses: 0,
             report_true_usage: false,
         }
     }
@@ -583,7 +590,9 @@ impl StreamTranslator {
         if self
             .tool_aliases
             .as_ref()
+            .is_some_and(|a| a.is_shadow_call(upstream_name))
         {
+            self.shadow_tool_uses += 1;
         }
         self.current_tool_name = self
             .tool_aliases
@@ -1584,6 +1593,7 @@ impl StreamTranslator {
             output_tokens = self.total_output_tokens,
             saw_text = self.saw_text_ever,
             saw_tool_use = self.saw_tool_use,
+            shadow_tool_uses = self.shadow_tool_uses,
             last_phase = self.last_message_phase.as_deref().unwrap_or("none"),
             stop_reason,
             "routed turn completed"

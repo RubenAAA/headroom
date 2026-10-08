@@ -267,6 +267,16 @@ impl ToolAlias {
             .unwrap_or(name)
     }
 
+    /// True when an upstream tool name is a gate shadow call that the rename
+    /// layer cannot restore: it looks like a shadow name, the strict forward
+    /// map has no entry for it, and even the case-insensitive fallback passes
+    /// it through unchanged. For the completion-log shadow counter.
+    pub(crate) fn is_shadow_call(&self, upstream_name: &str) -> bool {
+        is_gate_shadow_name(upstream_name)
+            && !self.forward.contains_key(upstream_name)
+            && self.reverse_name(upstream_name) == upstream_name
+    }
+
     /// Rename an OpenAI Responses request body in place: `tools[]`
     /// definitions, `input[]` function-call history, a forced tool choice,
     /// and `output[]` function-call items (the shape CCR rebuilt turns

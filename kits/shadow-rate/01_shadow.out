@@ -1,0 +1,93 @@
+files=5 lines_total=5494174 json_with_event=4866892
+levels: {'INFO': 4793538, 'WARN': 73354}
+distinct_events=191
+top_events:
+  550895 ccr_marker_offered
+  489828 volatile_content_suspected
+  473976 ccr_context_tracker_eviction
+  215036 model_routing_decision
+  164656 ccr_expansion_evaluation
+  164656 memory_inject_skipped
+  164656 working_directory_hold_skipped
+  164611 prefix_replay_applied
+  164568 e1_skipped
+  164568 e2_skipped
+  164568 e3_skipped
+  160549 savings_pricing_counterfactual
+  144747 role_sentence_hold_skipped
+  126310 routed_upstream_response_headers
+  124015 messages_rewritten
+  114019 routed_compression_accounting
+  114019 e4_skipped
+  114019 model_route_translate
+  113534 routed_redact_outbound
+  112861 routed_redact_stream
+  66421 ctx_offload_spark
+  51802 upstream_response_ready
+  51802 stage_timings
+  50637 outbound_body_bytes
+  50637 prefix_composition
+  50637 turn_cache_fingerprint
+  50336 memory_tools_injected
+  50175 turn_cost_ledger
+  49806 vs_stock_turn
+  39951 tool_search_deferral
+  38999 savings_placement
+  35014 prefix_replay_not_replayed
+  31609 routed_forward_continuity
+  27535 prefix_replay_no_stream_leads_turn
+  25306 sidecar_detected
+  23772 sidecar_routed_attempt
+  19713 codex_rate_limits_missing
+  19043 routed_response_completed
+  13526 zen_egress_failover
+  12531 ctx_offload_accounting
+  12310 zen_egress_rate_limited
+  9133 slow_upstream_path_probe
+  8954 resource_heartbeat
+  6639 zen_turn_failed_over
+  6005 zen_hold_waiting
+  5729 sidecar_answered_locally
+  4916 zen_hold_retry_after_ignored
+  3902 routed_upstream_send_failed
+  3665 sidecar_routed_fallback
+  3216 cache_drift_first_request
+  2571 beta_header_merge
+  2566 routed_upstream_retry
+  2040 ccr_round_usage
+  1786 unified_utilization_sample
+  1414 ctx_refresh_exchange
+  1176 cache_drift_first_request_outbound
+  1153 prefix_replay_matched_alternate
+  1150 image_prefix_census
+  1132 ccr_retrieval_call
+  1130 count_tokens_local
+shadow_or_alias_events: {}
+zen_tool_alias_applied n=0 renamed_hist={} shadowed_hist={} range=None
+zen_shadow_call_answered n=0 calls_hist={} range=None
+routed_response_completed n=19043 range=['2026-10-06T10:48:03.793868Z', '2026-10-08T12:27:46.809358Z']
+  model_bucket={'spark': 19043}
+  provider_bucket={'other:2d0e69232416': 19043}
+  saw_tool_use={'False': 1097, 'True': 17946} stop_reason={'end_turn': 1097, 'tool_use': 17946}
+  output_items_with_function_call=15075
+  output_items_top:
+    5646 reasoning,function_call
+    4298 function_call
+    3073 
+    2398 reasoning,message,function_call
+    1254 reasoning,function_call,function_call
+    498 reasoning,message
+    437 message,function_call
+    395 message
+    366 reasoning,message,function_call,function_call
+    213 function_call,function_call
+    118 reasoning,function_call,function_call,function_call
+    105 reasoning,message,function_call,function_call,function_call,function_call
+    62 reasoning,message,function_call,function_call,function_call
+    44 reasoning,function_call,function_call,function_call,function_call
+    41 reasoning,message,function_call,function_call,function_call,function_call,function_call
+ccr_tool_call_dropped n=0 shadow_names={} other=0 other_distinct_hashes=0 null=0 range=None
+ccr_tool_call_dropped_stop_reason_downgraded n=3 shadow_names={} other=3 other_distinct_hashes=1 null=0 range=['2026-10-02T12:10:19.069922Z', '2026-10-07T15:37:15.224697Z']
+ccr_continuation_answer_lost n=1 shadow_names={} other=1 other_distinct_hashes=1 null=0 range=['2026-10-05T08:20:06.507978Z', '2026-10-05T08:20:06.507978Z']
+routed_completed_call_not_streamed n=0 range=None
+routed_response_text_head(debug_probe) n=0

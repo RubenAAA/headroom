@@ -1,0 +1,89 @@
+tool/call/name-ish events:
+  1132 ccr_retrieval_call
+  3 ccr_tool_call_dropped_stop_reason_downgraded
+  48 ccr_tool_invalid_hash_length
+  340 ccr_tool_missing_hash
+  20 memory_calls_stranded
+  445 memory_tool_call
+  50336 memory_tools_injected
+  30 memory_tools_not_injected
+  1 orphan_tool_repair
+  811 responses_stream_event_shape
+  75 routed_duplicate_call_id_renamed
+  113 routed_function_call_without_added
+  5740 sidecar_answered_locally
+  30 tool_call_defect
+  4 tool_roster_changed
+  40 tool_roster_pinned
+  39951 tool_search_deferral
+  24 tool_search_history_repair
+  1 unanswered_tool_use_forwarded
+== schema ccr_retrieval_call (n=1132) ==
+  1132 event:str
+  756 hash:str
+  1132 message:str
+  376 query:str
+  1132 request_id:str
+  1132 round:int
+== schema ccr_tool_call_dropped_stop_reason_downgraded (n=3) ==
+  3 event:str
+  3 message:str
+  3 request_id:str
+  3 unresolved_proxy_tool:int
+  3 unresolved_tool_name:str
+== schema memory_tools_injected (n=2000) ==
+  2000 bytes_added:int
+  2000 event:str
+  2000 request_id:str
+  2000 tools_added:int
+  2000 tools_total:int
+== schema model_route_translate (n=2000) ==
+  2000 event:str
+  2000 message:str
+  2000 model:str
+  2000 request_id:str
+  2000 stream:bool
+  2000 upstream:str
+== schema responses_stream_event_shape (n=811) ==
+  811 event:str
+  811 item_type:str
+  811 message:str
+  811 shape:str
+  811 stream_event:str
+== schema routed_done_with_open_block (n=0) ==
+== schema routed_duplicate_call_id_renamed (n=75) ==
+  75 event:str
+  75 message:str
+  75 raw_call_id:str
+  75 renamed_to:str
+== schema routed_function_call_without_added (n=113) ==
+  113 egress_slot:int
+  113 event:str
+  113 message:str
+  113 request_id:str
+  113 routed_provider:str
+  113 session_id:str
+  113 stream_age_s:float
+  113 upstream_model:str
+== schema routed_response_completed (n=2000) ==
+  2000 egress_slot:int
+  2000 event:str
+  2000 message:str
+  2000 output_tokens:int
+  2000 request_id:str
+  2000 routed_provider:str
+  2000 saw_text:bool
+  2000 saw_tool_use:bool
+  683 session_id:str
+  2000 stop_reason:str
+  2000 stream_age_s:float
+  683 text_head:str
+  2000 upstream_model:str
+== schema tool_search_deferral (n=2000) ==
+  2000 core_deferred_tokens:int
+  2000 deferred_tokens:int
+  2000 deferred_tools:int
+  2000 event:str
+  2000 loaded_tools:int
+  2000 message:str
+  2000 request_id:str

@@ -1,0 +1,18 @@
+matched_lines=433
+== top_keys ==
+433	timestamp
+433	level
+433	fields
+433	target
+== nested keys (one level) ==
+433	fields.message:str
+433	fields.event:str
+433	fields.stream_event:str
+255	fields.item_type:str
+255	fields.shape:str
+178	fields.count:int
+== field types ==
+433	timestamp:str
+433	level:str
+433	fields:dict
+433	target:str

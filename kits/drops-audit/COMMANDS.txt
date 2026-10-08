@@ -1,0 +1,16 @@
+# drops-audit repeatability log (2026-10-08). Read-only against ~/headroom-proxy.log (live file; counts grow).
+# 01: schema discovery (key names + types only)
+python3 -I /tmp/drops-audit/01_schema.py | tee /tmp/drops-audit/01_schema.out
+# 02: unhandled-event aggregation (substring match; superseded by 08 for exact counts)
+python3 -I /tmp/drops-audit/02_unhandled.py | tee /tmp/drops-audit/02_unhandled.out
+# 04: shape structure signatures (one JSON-shape parse; includes 1 collision line in totals, structs unaffected)
+python3 -I /tmp/drops-audit/04_shapes_struct.py | tee /tmp/drops-audit/04_shapes_struct.out
+# 05: truncated-shape key names (values never printed; '?' row = 1 collision line)
+python3 -I /tmp/drops-audit/05_truncated.py | tee /tmp/drops-audit/05_truncated.out
+# 06: full per-event shape counts (deleted intermediate; see 08)
+# 07: collision check - which fields contain the substrings (field names + lengths only)
+# 08 (AUTHORITATIVE): exact fields.event match, compact counts
+python3 -I /tmp/drops-audit/08_final.py | tee /tmp/drops-audit/08_final.out
+# 09: distinct function-call tool names as sha256 hashes (values never printed/stored)
+# (inline python -c; output in 09_toolnames.out)
+# purity rechecks: grep -c for both substrings + exact-event counters (see transcript)

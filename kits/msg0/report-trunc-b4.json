@@ -1,0 +1,47 @@
+{
+ "mode": {
+  "incomplete_message_lines": 0,
+  "incomplete_body_cause_lines": 0,
+  "mid_response_error_rids": 7,
+  "non_sse_buffer_failed_rids": 6,
+  "incomplete_sample": null,
+  "proxy_errors": 0,
+  "proxy_error_status": {},
+  "proxy_error_rids": 0,
+  "proxy_error_rids_seen_at_stub": 0,
+  "upstream_transport_retrying": 0,
+  "outbound_body_bytes": 9,
+  "log_lines": 143
+ },
+ "integrity": {
+  "sent_markers": 6,
+  "captures": 11,
+  "matched": 11,
+  "missing_markers": 0,
+  "missing_list": [],
+  "extra_captures": 0,
+  "body_mismatches": 0,
+  "clen_mismatches": 0,
+  "non_json": 0
+ },
+ "retry": {
+  "same_rid_double_landings": 1,
+  "same_rid_details": {
+   "bf07b031": [
+    "002-v1_messages-b0e0d1ca.json",
+    "003-v1_messages-b0e0d1ca.json",
+    "004-v1_messages-b0e0d1ca.json"
+   ]
+  },
+  "landing_histogram": {
+   "1": 8,
+   "3": 1
+  },
+  "client_resent_markers": 3,
+  "captures_without_rid": 0
+ },
+ "adjacency": {
+  "captures_after_truncated": 10,
+  "bad_after_truncated": 0
+ }
+}

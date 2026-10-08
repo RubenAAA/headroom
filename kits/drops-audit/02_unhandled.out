@@ -1,0 +1,16 @@
+total_unhandled_lines=178
+ts_min=2026-10-06T09:11:33.130114Z
+ts_max=2026-10-08T10:43:08.216949Z
+== levels ==
+178	INFO
+== targets ==
+178	headroom_proxy::openai::stream
+== messages ==
+178	'no translation for this Responses event; nothing emitted'
+== by stream_event (lines, min_count, max_count, all_counts_if_few) ==
+43	min=1	max=8500	response.created first5=[1, 1, 1, 1, 1] last5=[6500, 7000, 7500, 8000, 8500]
+43	min=1	max=8500	response.in_progress first5=[1, 1, 1, 1, 1] last5=[6500, 7000, 7500, 8000, 8500]
+26	min=1	max=4500	response.reasoning_summary_text.done first5=[1, 1, 1, 1, 1] last5=[2500, 3000, 3500, 4000, 4500]
+26	min=1	max=4500	response.reasoning_summary_part.done first5=[1, 1, 1, 1, 1] last5=[2500, 3000, 3500, 4000, 4500]
+20	min=1	max=2500	response.content_part.added vals=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 500, 500, 1000, 1000, 1500, 2000, 2500]
+20	min=1	max=2500	response.content_part.done vals=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 500, 500, 1000, 1000, 1500, 2000, 2500]

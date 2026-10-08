@@ -1,0 +1,40 @@
+{
+ "mode": {
+  "incomplete_message_lines": 0,
+  "incomplete_body_cause_lines": 45,
+  "mid_response_error_rids": 45,
+  "non_sse_buffer_failed_rids": 45,
+  "incomplete_sample": null,
+  "proxy_errors": 0,
+  "proxy_error_status": {},
+  "proxy_error_rids": 0,
+  "proxy_error_rids_seen_at_stub": 0,
+  "upstream_transport_retrying": 0,
+  "outbound_body_bytes": 90,
+  "log_lines": 1360
+ },
+ "integrity": {
+  "sent_markers": 60,
+  "captures": 90,
+  "matched": 90,
+  "missing_markers": 0,
+  "missing_list": [],
+  "extra_captures": 0,
+  "body_mismatches": 0,
+  "clen_mismatches": 0,
+  "non_json": 0
+ },
+ "retry": {
+  "same_rid_double_landings": 0,
+  "same_rid_details": {},
+  "landing_histogram": {
+   "1": 90
+  },
+  "client_resent_markers": 30,
+  "captures_without_rid": 0
+ },
+ "adjacency": {
+  "captures_after_truncated": 45,
+  "bad_after_truncated": 0
+ }
+}
