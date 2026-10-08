@@ -480,6 +480,7 @@ pub(crate) async fn handle_streaming_response(
     early_retry: Option<crate::routed::early_stream_retry::EarlyRetryCtx>,
     drop_close: crate::sse::stream_finisher::DropClose,
     request_id: &str,
+    report_true_usage: bool,
 ) -> Response {
     let original_model = original
         .get("model")
@@ -534,6 +535,7 @@ pub(crate) async fn handle_streaming_response(
         deferred.clone(),
         Some(tool_aliases),
         Some(request_id.clone()),
+        report_true_usage,
     );
 
     // The translator has already put the turn into the Anthropic event

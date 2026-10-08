@@ -341,6 +341,9 @@ pub(crate) struct StreamTranslator {
     /// lowercase rename. `None` on every path that never renamed outbound,
     /// so only Zen-bound routed turns pay attention to it.
     tool_aliases: Option<crate::routed::tool_alias::ToolAlias>,
+    /// `--report-true-usage`: put the provider's own counts in the terminal
+    /// `message_delta` instead of the legacy output-only shape.
+    report_true_usage: bool,
 }
 
 impl StreamTranslator {
@@ -486,6 +489,7 @@ impl StreamTranslator {
             ttfb_ms: 0.0,
             last_usage: None,
             tool_aliases: None,
+            report_true_usage: false,
         }
     }
 
@@ -566,11 +570,21 @@ impl StreamTranslator {
         self
     }
 
+    fn with_report_true_usage(mut self, on: bool) -> Self {
+        self.report_true_usage = on;
+        self
+    }
+
     /// Record the tool name for the call now streaming, mapping it back
     /// to the client's name when the outbound turn was renamed for the
     /// Zen gate (see `with_tool_aliases`). One site covers both wire
     /// shapes: Responses `output_item.added` and Chat `delta.tool_calls`.
     fn capture_tool_name(&mut self, upstream_name: &str) {
+        if self
+            .tool_aliases
+            .as_ref()
+        {
+        }
         self.current_tool_name = self
             .tool_aliases
             .as_ref()
@@ -859,7 +873,8 @@ impl StreamTranslator {
                     events.extend(self.abort_terminal());
                 } else {
                     self.close_block_final(&mut events);
-                    events.push(self.emit_message_delta("end_turn"));
+                    let usage = self.last_usage.clone();
+                    events.push(self.emit_message_delta_with_usage("end_turn", usage.as_ref()));
                     events.push(self.emit_message_stop());
                 }
             }
@@ -962,7 +977,11 @@ impl StreamTranslator {
                 "length" => "max_tokens",
                 _ => "end_turn",
             };
-            events.push(self.emit_message_delta(stop_reason));
+            // Truth is whatever a `usage` chunk stored before this one; when
+            // the upstream sends usage after `finish_reason` there is none
+            // yet and the delta keeps the legacy shape.
+            let usage = self.last_usage.clone();
+            events.push(self.emit_message_delta_with_usage(stop_reason, usage.as_ref()));
             events.push(self.emit_message_stop());
         }
 
@@ -1461,7 +1480,7 @@ impl StreamTranslator {
                 .ended_on_commentary
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        events.push(self.emit_message_delta(stop_reason));
+        events.push(self.emit_message_delta_with_usage(stop_reason, usage.as_ref()));
         events.push(self.emit_message_stop());
     }
 
@@ -1704,11 +1723,12 @@ impl StreamTranslator {
             stop_reason,
             "routed turn stopped short upstream"
         );
-        events.push(self.emit_message_delta(stop_reason));
-        events.push(self.emit_message_stop());
         // Outside the reason: a response that stopped short still
-        // spent tokens, whether or not it said why.
+        // spent tokens, whether or not it said why. Extracted before the
+        // terminal events so the delta can carry the true counts.
         let usage = chunk.get("response").and_then(|v| v.get("usage")).cloned();
+        events.push(self.emit_message_delta_with_usage(stop_reason, usage.as_ref()));
+        events.push(self.emit_message_stop());
         self.emit_outcome(usage.as_ref(), 200);
     }
 
@@ -1790,6 +1810,59 @@ impl StreamTranslator {
             stop_reason,
             json!({"output_tokens": self.total_output_tokens}),
         )
+    }
+
+    /// Usage block for a terminal `message_delta`.
+    ///
+    /// The legacy shape is output-only: translated routes always told the
+    /// client `input_tokens: 0` at `message_start` and only
+    /// `output_tokens` here. With `--report-true-usage` the provider's own
+    /// counts go out instead, in Anthropic's key vocabulary, so the client
+    /// compacts against real context sizes. `None`, or a block without
+    /// both counts, falls back to the legacy shape: a missing number must
+    /// not become a zero the client trusts.
+    fn delta_usage(&self, truth: Option<&Value>) -> Value {
+        let legacy = || json!({"output_tokens": self.total_output_tokens});
+        if !self.report_true_usage {
+            return legacy();
+        }
+        let Some(u) = truth else {
+            return legacy();
+        };
+        let input = u
+            .get("input_tokens")
+            .or_else(|| u.get("prompt_tokens"))
+            .cloned();
+        let output = u
+            .get("output_tokens")
+            .or_else(|| u.get("completion_tokens"))
+            .cloned();
+        let (Some(input), Some(output)) = (input, output) else {
+            return legacy();
+        };
+        let cached = u
+            .get("cache_read_input_tokens")
+            .cloned()
+            .or_else(|| {
+                u.get("input_tokens_details")
+                    .or_else(|| u.get("prompt_tokens_details"))
+                    .and_then(|d| d.get("cached_tokens"))
+                    .cloned()
+            })
+            .unwrap_or(json!(0));
+        json!({
+            "input_tokens": input,
+            "output_tokens": output,
+            "cache_read_input_tokens": cached,
+        })
+    }
+
+    /// `emit_message_delta` with a terminal usage block: provider truth
+    /// when `--report-true-usage` can supply it, else the legacy shape.
+    /// `abort_terminal` stays on `emit_message_delta`: a turn that died
+    /// mid-stream reports nothing either way.
+    fn emit_message_delta_with_usage(&self, stop_reason: &str, truth: Option<&Value>) -> String {
+        crate::sse::outbound::message_delta(stop_reason, self.delta_usage(truth))
     }
 
     fn emit_message_stop(&self) -> String {
@@ -1933,12 +2006,14 @@ pub(crate) fn translate_openai_stream_to_anthropic(
     deferred_ccr: Option<DeferredCcrBooking>,
     tool_aliases: Option<crate::routed::tool_alias::ToolAlias>,
     request_id: Option<String>,
+    report_true_usage: bool,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     let mut translator = StreamTranslator::new(model)
         .with_codex_limits(codex_limits)
         .with_initial_rate_limits_seen(quota_seen_in_headers)
         .with_outcome(outcome)
         .with_tool_aliases(tool_aliases)
+        .with_report_true_usage(report_true_usage)
         .with_request_id(request_id.filter(|id| !id.is_empty()));
     if let Some(deferred) = deferred_ccr {
         translator = translator.with_deferred_ccr(deferred);

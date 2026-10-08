@@ -856,6 +856,7 @@ async fn dispatch_upstream_answer(
         }
         handle_routed_error_response(upstream_resp, upstream_status, outcome_ctx).await
     } else if downstream_is_stream {
+        let report_true_usage = state.config.report_true_usage;
         handle_streaming_response(
             upstream_resp,
             &parsed,
@@ -866,6 +867,7 @@ async fn dispatch_upstream_answer(
             early_retry,
             crate::sse::stream_finisher::DropClose::from_headers(&headers),
             request_id,
+            report_true_usage,
         )
         .await
     } else {

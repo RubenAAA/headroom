@@ -994,7 +994,10 @@ pub(crate) fn stop_reason_overclaims_tool_call(
 ///
 /// Usage comes from the final round, matching what the buffered path returns
 /// to the client. The rounds this replaced are accounted separately through
-/// [`crate::proxy::CcrRoundUsage`] so nothing is counted twice.
+/// [`crate::proxy::CcrRoundUsage`] so nothing is counted twice. Under
+/// `--report-true-usage` the caller replaces `usage` with
+/// [`full_turn_usage`] before calling, so the turn reports first round plus
+/// every continuation round (routed shapes only; see the call site).
 ///
 /// A continuation's `message_delta` fields this proxy does not read ride along
 /// in `extras`; the fields it writes win over them.
@@ -1021,6 +1024,76 @@ pub(crate) fn synthesize_terminal(
             &serde_json::to_vec(&json!({"type": "message_stop"})).unwrap_or_default(),
         ),
     ]
+}
+
+/// Read the first round's true usage out of the withheld terminal frames.
+///
+/// Only the first round's translator terminal frames sit in `withheld`;
+/// nothing was withheld after them. The `message_delta` frame's `usage`
+/// block is the first round's whole truth because the translated terminal
+/// delta is cumulative over that round (not a fragment the way native
+/// message_deltas across continuation rounds are).
+fn withheld_first_round_usage(withheld: &[Bytes]) -> Option<Value> {
+    let mut framer = SseFramer::new();
+    for frame in withheld {
+        framer.push(frame);
+    }
+    while let Some(event) = framer.next_event() {
+        let event = event.ok()?;
+        if event.event_name.as_deref() != Some("message_delta") {
+            continue;
+        }
+        let parsed: Value = serde_json::from_slice(&event.data).ok()?;
+        let usage = parsed.get("usage")?;
+        if usage.is_object() {
+            return Some(usage.clone());
+        }
+    }
+    None
+}
+
+/// Full-turn truth for a routed CCR turn: first round plus every
+/// continuation round.
+///
+/// `round_usage` already carries every round's sums (including the settled
+/// terminal's) in its plain Anthropic-keyed counters, but nothing from the
+/// first round, which resolved out of band. That round's truth sits in the
+/// withheld terminal `message_delta`; without it the sum starts at zero and
+/// the reported whole is short by one round. Keys are the Anthropic set the
+/// terminal frame speaks: `input_tokens`, `output_tokens`,
+/// `cache_read_input_tokens`.
+///
+/// Counters are clamped at zero on the way out: [`add_response`](crate::proxy::CcrRoundUsage::add_response)
+/// skips responses with no `usage` block outright, and a negative count in a
+/// present block is provider noise the client must never see.
+fn full_turn_usage(
+    withheld: &[Bytes],
+    round_usage: &Arc<Mutex<crate::proxy::CcrRoundUsage>>,
+) -> Value {
+    let first = withheld_first_round_usage(withheld);
+    let num = |usage: Option<&Value>, key: &str| -> i64 {
+        usage
+            .and_then(|u| u.get(key))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0)
+    };
+    let first_input = num(first.as_ref(), "input_tokens");
+    let first_output = num(first.as_ref(), "output_tokens");
+    let first_cached = num(first.as_ref(), "cache_read_input_tokens");
+    let guard = round_usage.lock();
+    let (input, output, cached) = guard.map_or((0, 0, 0), |g| {
+        (
+            g.input_tokens.max(0),
+            g.output_tokens.max(0),
+            g.cache_read_tokens.max(0),
+        )
+    });
+    json!({
+        "input_tokens": first_input + input,
+        "output_tokens": first_output + output,
+        "cache_read_input_tokens": first_cached + cached,
+    })
 }
 
 /// Per-stream bookkeeping for the rewrite.
@@ -1242,7 +1315,7 @@ where
             return;
         }
 
-        let (resolved, extras) = match orphan_trigger {
+        let (mut resolved, extras) = match orphan_trigger {
             // `resolve_orphan_turn` logs `orphan_turn_continuation` itself.
             Some(trigger) => (
                 resolve_orphan_turn(&ctx, &round_usage, &rebuild_message(&rw.state), trigger).await,
@@ -1257,6 +1330,20 @@ where
                     .await
             }
         };
+        if ctx.config.report_true_usage && !matches!(ctx.shape, CcrShape::Anthropic) {
+            // The settled turn carries only its own final round's usage
+            // block; the client is told the whole turn instead — the first
+            // round plus every continuation round. Native Anthropic turns
+            // keep today's shape: the client already counted the first
+            // round at `message_start`, so summing here would count it
+            // twice.
+            if let Some(obj) = resolved.as_object_mut() {
+                obj.insert(
+                    "usage".to_string(),
+                    full_turn_usage(&rw.withheld, &round_usage),
+                );
+            }
+        }
         // Only the final continuation's extras describe the turn going out.
         // One from a round the resolvers then discarded names another message.
         let extras = extras.filter(|e| {

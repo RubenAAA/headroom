@@ -377,6 +377,9 @@ async fn routed_sidecar_stream_body(
         // A sidecar carries no tools, so there is nothing to rename.
         None,
         Some(request_id.to_string()),
+        // Sidecar usage never reaches a client: the folded text feeds the
+        // spinner, so the legacy output-only delta is all it needs.
+        false,
     );
     // Restore before the client: Zen echoed placeholders back for the
     // paths and secrets it saw, and the 4 words go to the spinner.

@@ -1372,6 +1372,7 @@ async fn trailing_frame_without_terminator_is_flushed() {
         None,
         None,
         Some("test".to_string()),
+        false,
     );
     let out: Vec<String> = translated
         .map(|r| String::from_utf8(r.unwrap().to_vec()).unwrap())
@@ -1428,6 +1429,7 @@ async fn a_failed_upstream_is_never_polled_again() {
         None,
         None,
         Some("test".to_string()),
+        false,
     );
     let items: Vec<Result<bytes::Bytes, std::io::Error>> = translated.collect().await;
     // The upstream error follows the abort events, so the finisher can
@@ -1746,4 +1748,155 @@ fn an_event_shape_keeps_fields_and_drops_text() {
     );
     assert!(first_sighting("response.test_shape/once"));
     assert!(!first_sighting("response.test_shape/once"));
+}
+
+fn terminal_delta_usage(output: &str) -> serde_json::Value {
+    let (_, data) = output
+        .split("event: message_delta")
+        .nth(1)
+        .and_then(|rest| rest.split_once("data: "))
+        .expect("no message_delta in output");
+    let payload: serde_json::Value =
+        serde_json::from_str(data.lines().next().unwrap_or("")).expect("delta data parses");
+    payload.get("usage").cloned().expect("delta has usage")
+}
+
+/// Without the flag a completed turn reports only what the translator
+/// counted itself: output tokens, no input.
+#[test]
+fn terminal_delta_keeps_legacy_shape_by_default() {
+    let mut t = StreamTranslator::new("muse-spark-1.3".to_string());
+    let mut out = Vec::new();
+    out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+    out.extend(t.process_frame(
+        Some("response.completed"),
+        &json!({"response": {"usage": {"input_tokens": 500, "output_tokens": 42, "input_tokens_details": {"cached_tokens": 300}}}})
+            .to_string(),
+    ));
+
+    assert_eq!(
+        terminal_delta_usage(&out.join("")),
+        json!({"output_tokens": 42})
+    );
+}
+
+/// With the flag the provider's own counts go out in Anthropic's key
+/// vocabulary, including cached tokens.
+#[test]
+fn terminal_delta_reports_provider_truth_when_flagged() {
+    let mut t = StreamTranslator::new("muse-spark-1.3".to_string()).with_report_true_usage(true);
+    let mut out = Vec::new();
+    out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+    out.extend(t.process_frame(
+        Some("response.completed"),
+        &json!({"response": {"usage": {"input_tokens": 500, "output_tokens": 42, "input_tokens_details": {"cached_tokens": 300}}}})
+            .to_string(),
+    ));
+
+    assert_eq!(
+        terminal_delta_usage(&out.join("")),
+        json!({"input_tokens": 500, "output_tokens": 42, "cache_read_input_tokens": 300})
+    );
+}
+
+/// An incomplete turn reports truth too: usage was already extracted
+/// before the delta went out.
+#[test]
+fn incomplete_delta_reports_provider_truth_when_flagged() {
+    let mut t = StreamTranslator::new("muse-spark-1.3".to_string()).with_report_true_usage(true);
+    let mut out = Vec::new();
+    out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+    out.extend(t.process_frame(
+        Some("response.incomplete"),
+        &json!({"response": {"incomplete_details": {"reason": "max_output_tokens"}, "usage": {"input_tokens": 500, "output_tokens": 42}}})
+            .to_string(),
+    ));
+
+    assert_eq!(
+        terminal_delta_usage(&out.join("")),
+        json!({"input_tokens": 500, "output_tokens": 42, "cache_read_input_tokens": 0})
+    );
+}
+
+/// Chat Completions truth arrives under its own key names and is stored
+/// on `last_usage`; the `finish_reason` delta maps them to Anthropic's.
+#[test]
+fn chat_finish_reason_delta_maps_truth_when_flagged() {
+    let mut t = StreamTranslator::new("codex-model".to_string()).with_report_true_usage(true);
+    let mut out = Vec::new();
+    out.extend(t.process_frame(
+        None,
+        &json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": null}]}).to_string(),
+    ));
+    out.extend(t.process_frame(
+        None,
+        &json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 700, "completion_tokens": 12, "prompt_tokens_details": {"cached_tokens": 650}}})
+            .to_string(),
+    ));
+
+    assert_eq!(
+        terminal_delta_usage(&out.join("")),
+        json!({"input_tokens": 700, "output_tokens": 12, "cache_read_input_tokens": 650})
+    );
+}
+
+/// A Chat turn whose usage arrives only with `[DONE]` keeps the legacy
+/// shape: `finish_reason` already closed the turn without truth.
+#[test]
+fn chat_done_after_finish_reason_keeps_legacy_shape() {
+    let mut t = StreamTranslator::new("codex-model".to_string()).with_report_true_usage(true);
+    let mut out = Vec::new();
+    out.extend(t.process_frame(
+        None,
+        &json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}).to_string(),
+    ));
+    // Usage arrives with no turn left to carry it: the `[DONE]` is a
+    // no-op and `last_usage` stays empty.
+    out.extend(t.process_frame(
+        None,
+        &json!({"usage": {"prompt_tokens": 700, "completion_tokens": 12}}).to_string(),
+    ));
+    out.extend(t.process_frame(None, "[DONE]"));
+
+    assert_eq!(
+        terminal_delta_usage(&out.join("")),
+        json!({"output_tokens": 0})
+    );
+}
+
+/// A Chat turn that ends at `[DONE]` with an open block reports the
+/// stored truth, since no `finish_reason` closed it first.
+#[test]
+fn chat_done_with_open_block_reports_truth_when_flagged() {
+    let mut t = StreamTranslator::new("codex-model".to_string()).with_report_true_usage(true);
+    let mut out = Vec::new();
+    out.extend(t.process_frame(
+        None,
+        &json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": null}], "usage": {"prompt_tokens": 700, "completion_tokens": 12}})
+            .to_string(),
+    ));
+    out.extend(t.process_frame(None, "[DONE]"));
+
+    assert_eq!(
+        terminal_delta_usage(&out.join("")),
+        json!({"input_tokens": 700, "output_tokens": 12, "cache_read_input_tokens": 0})
+    );
+}
+
+/// A truth block missing a count falls back to the legacy shape rather
+/// than telling the client a zero it would trust.
+#[test]
+fn partial_truth_falls_back_to_legacy_shape() {
+    let mut t = StreamTranslator::new("muse-spark-1.3".to_string()).with_report_true_usage(true);
+    let mut out = Vec::new();
+    out.extend(t.process_frame(Some("response.created"), &json!({}).to_string()));
+    out.extend(t.process_frame(
+        Some("response.completed"),
+        &json!({"response": {"usage": {"output_tokens": 42}}}).to_string(),
+    ));
+
+    assert_eq!(
+        terminal_delta_usage(&out.join("")),
+        json!({"output_tokens": 42})
+    );
 }

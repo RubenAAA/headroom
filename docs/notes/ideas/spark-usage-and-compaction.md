@@ -1,6 +1,11 @@
 # Idea: tell the client Spark's real token usage, and settle how /compact works there
 
 - **Status:** open, undecided. Nothing changed. Needs a one-session test first.
+- **Status:** step 2 implemented 2026-10-08 behind `--report-true-usage`
+  (default ON): terminal `message_delta` on streamed translated routes now
+  carries the provider's own input/output/cached counts; routed CCR turns
+  report first round plus every continuation round. Still wants a one-session
+  test.
 - **Source:** 2026-09-30 audit of the Spark path. `openai/stream.rs`
   `emit_message_start` (`input_tokens: 0`) and `emit_message_delta`
   (`output_tokens` only).

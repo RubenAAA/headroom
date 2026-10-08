@@ -987,6 +987,25 @@ pub struct CliArgs {
     )]
     pub redact_paths: bool,
 
+    /// Report the provider's real token counts to the client on streamed
+    /// translated routes (Spark, Codex). Off, the terminal `message_delta`
+    /// carries only `output_tokens` and `message_start` says `input_tokens:
+    /// 0`, so the client never sees the turn's true context size. On, the
+    /// delta carries `input_tokens`, `output_tokens` and
+    /// `cache_read_input_tokens` from the upstream usage block, and CCR
+    /// turns report the whole turn (first round plus continuation rounds).
+    /// Default `true`: the client compacts on its own local count since
+    /// 2.1.288 anyway, so masked zeros buy nothing; true numbers make the
+    /// context display and the ledger agree. Set `false` to restore the
+    /// legacy output-only shape.
+    #[arg(
+        long = "report-true-usage",
+        env = "HEADROOM_PROXY_REPORT_TRUE_USAGE",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub report_true_usage: bool,
+
     /// B1: rewrite every `cache_control` marker to `ttl: "1h"` so the cached
     /// prefix survives idle gaps past the 5-minute default. Anthropic only,
     /// and skipped on PAYG — a 1h write is priced at 2× base input against
@@ -2863,6 +2882,9 @@ pub struct Config {
     pub redact_sensitive: bool,
     /// Mask filesystem paths when redaction runs. Default `false`.
     pub redact_paths: bool,
+    /// Report provider-true usage on streamed translated routes. Default
+    /// `false`; see the flag docs on the CLI side.
+    pub report_true_usage: bool,
     /// B1: pin `cache_control.ttl` to `1h`. Non-PAYG only. Default `false`.
     pub force_1h_cache_ttl: bool,
     /// 1h on the tools and system prefix, 5m on the message tail. Takes
@@ -3243,6 +3265,7 @@ impl Config {
             max_conversation_concurrency: args.max_conversation_concurrency,
             redact_sensitive: args.redact_sensitive,
             redact_paths: args.redact_paths,
+            report_true_usage: args.report_true_usage,
             force_1h_cache_ttl: args.force_1h_cache_ttl,
             split_cache_ttl: args.split_cache_ttl,
             respect_client_5m_ttl: args.respect_client_5m_ttl,
@@ -3556,6 +3579,7 @@ impl Config {
             max_conversation_concurrency: 0,
             redact_sensitive: false,
             redact_paths: false,
+            report_true_usage: true,
             force_1h_cache_ttl: false,
             split_cache_ttl: false,
             respect_client_5m_ttl: false,
