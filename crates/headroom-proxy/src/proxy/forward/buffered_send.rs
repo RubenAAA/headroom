@@ -533,12 +533,18 @@ pub(crate) async fn prepare_buffered_send(
 /// Non-SSE error statuses only. Hands the same bytes on unchanged; on an
 /// unreadable body hands back empty. Extracted from `forward_http` without
 /// behavior change.
+///
+/// `learn_from` carries the context-guard learning key (request model,
+/// outbound beta, credential scope) on Anthropic paths: a `prompt is too long`
+/// refusal teaches the real window for that shape, so the next turn trips the
+/// client's graceful compaction instead of failing again.
 pub(crate) async fn collect_error_body<S>(
     resp_stream: S,
     status: StatusCode,
     outcome_ctx: &Option<OutcomeContext>,
     request_id: &str,
     path_for_log: &str,
+    learn_from: Option<(&str, Option<&str>, &str)>,
 ) -> Body
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
@@ -547,6 +553,11 @@ where
     match http_body_util::BodyExt::collect(body_stream).await {
         Ok(collected) => {
             let body_bytes = collected.to_bytes();
+            if let Some((model, beta, scope)) = learn_from
+                && status == StatusCode::BAD_REQUEST
+            {
+                super::super::context_guard::note_prompt_too_long(model, beta, &body_bytes, scope);
+            }
             let (kind, detail) = describe_upstream_error(&body_bytes);
             tracing::warn!(
                 request_id = %request_id,

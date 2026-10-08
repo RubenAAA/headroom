@@ -35,3 +35,6 @@ mod integration_stream_drop_retry;
 
 #[path = "suites/sse/integration_nonstream_sse_answer.rs"]
 mod integration_nonstream_sse_answer;
+
+#[path = "suites/sse/integration_context_guard.rs"]
+mod integration_context_guard;

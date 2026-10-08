@@ -3,6 +3,7 @@
 mod app;
 mod ccr_expansion;
 mod ccr_response;
+mod context_guard;
 mod continuation;
 mod egress;
 mod forward;
@@ -1096,16 +1097,32 @@ pub(crate) async fn forward_http(
             },
         )
         .await;
+    // Context-limit guard (#3998): arm the SSE usage rewriter when the
+    // forwarded request is near the model's real window, so the client's own
+    // compaction gauge trips gracefully instead of looping on 400s. The model
+    // comes from the buffered request; on the unbuffered passthrough path it
+    // is unknown and the stream stays byte-faithful.
+    let context_guard = forward::ResponseStreamCtx::context_guard_for(
+        sse_kind,
+        &original_buffered,
+        forwarded_body.as_ref(),
+        &outgoing_headers,
+        headers_snapshot.as_ref(),
+        &request_id,
+    );
     let resp_stream = forward::tee_response_stream(
         upstream_body,
-        sse_kind,
-        &state,
-        outcome_ctx.clone(),
-        ccr_round_usage.clone(),
-        status,
-        &request_id,
-        pending_stats.take(),
-        &path_for_log,
+        forward::TeeCtx {
+            sse_kind,
+            state: &state,
+            outcome_ctx: outcome_ctx.clone(),
+            ccr_round_usage: ccr_round_usage.clone(),
+            status,
+            request_id: &request_id,
+            pending_stats: pending_stats.take(),
+            path_for_log: &path_for_log,
+            context_guard,
+        },
     );
     let (body, status, resp_headers) = forward::build_response_body(
         resp_stream,

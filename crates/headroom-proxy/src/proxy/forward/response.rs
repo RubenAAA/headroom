@@ -601,6 +601,52 @@ pub(crate) struct ResponseStreamCtx<'a> {
     pub(crate) headers_snapshot: &'a Option<HeaderMap>,
 }
 
+impl ResponseStreamCtx<'_> {
+    /// Arm the context-limit guard (#3998) for this response's client-bound
+    /// stream, or `None` when the stream must stay byte-faithful: non-Anthropic
+    /// SSE, the kill switch off, or no buffered request to read the model from.
+    pub(crate) fn context_guard_for(
+        sse_kind: SseStreamKind,
+        original_buffered: &bytes::Bytes,
+        forwarded_body: Option<&bytes::Bytes>,
+        outgoing_headers: &HeaderMap,
+        headers_snapshot: Option<&HeaderMap>,
+        request_id: &str,
+    ) -> Option<super::context_guard::StreamUsageGuard> {
+        use super::context_guard as guard;
+        if !matches!(sse_kind, SseStreamKind::Anthropic) || !guard::context_guard_enabled() {
+            return None;
+        }
+        let body = if forwarded_body.is_some_and(|b| !b.is_empty()) {
+            forwarded_body.unwrap_or(original_buffered)
+        } else {
+            original_buffered
+        };
+        let model = guard::request_model(body)?;
+        if model.is_empty() {
+            return None;
+        }
+        let outbound_beta = outgoing_headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok());
+        let client_beta = headers_snapshot
+            .and_then(|h| h.get("anthropic-beta"))
+            .and_then(|v| v.to_str().ok());
+        let scope = guard::credential_scope_from_headers(outgoing_headers);
+        let armed =
+            guard::stream_guard_for(Some(&model), outbound_beta, client_beta, &scope, request_id)?;
+        tracing::debug!(
+            request_id = %request_id,
+            event = "context_guard_armed",
+            model = %model,
+            believed_limit = armed.believed_limit(),
+            effective_limit = armed.effective_limit(),
+            "context guard armed for anthropic stream"
+        );
+        Some(armed)
+    }
+}
+
 #[allow(clippy::type_complexity)]
 /// The reply to a de-streamed Responses request was an event stream with no
 /// `response.completed` in it (`reframe_buffered_responses_sse` found none).
@@ -906,20 +952,38 @@ pub(crate) fn build_outcome_context(
 /// The pending ledger event rides into the parser tee and is finalized
 /// when the stream closes; non-SSE responses finalize from a JSON usage
 /// capture instead (see `spawn_sse_parser_tee`).
+/// Everything `tee_response_stream` needs besides the upstream body: the
+/// parser-tee inputs plus the context guard for the client-bound leg.
+pub(crate) struct TeeCtx<'a> {
+    pub(crate) sse_kind: SseStreamKind,
+    pub(crate) state: &'a AppState,
+    pub(crate) outcome_ctx: Option<OutcomeContext>,
+    pub(crate) ccr_round_usage: Option<Arc<Mutex<CcrRoundUsage>>>,
+    pub(crate) status: StatusCode,
+    pub(crate) request_id: &'a str,
+    pub(crate) pending_stats: Option<capture::PendingRecord>,
+    pub(crate) path_for_log: &'a str,
+    pub(crate) context_guard: Option<super::context_guard::StreamUsageGuard>,
+}
+
 pub(crate) fn tee_response_stream<S>(
     upstream_body: S,
-    sse_kind: SseStreamKind,
-    state: &AppState,
-    outcome_ctx: Option<OutcomeContext>,
-    ccr_round_usage: Option<Arc<Mutex<CcrRoundUsage>>>,
-    status: StatusCode,
-    request_id: &str,
-    pending_stats: Option<capture::PendingRecord>,
-    path_for_log: &str,
+    ctx: TeeCtx<'_>,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + use<S>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send,
 {
+    let TeeCtx {
+        sse_kind,
+        state,
+        outcome_ctx,
+        ccr_round_usage,
+        status,
+        request_id,
+        pending_stats,
+        path_for_log,
+        context_guard,
+    } = ctx;
     let rid = request_id.to_owned();
     let parser_telemetry = std::sync::Arc::new(ParserTelemetry::default());
     let parser_tx = spawn_sse_parser_tee(
@@ -933,7 +997,12 @@ where
         pending_stats,
         path_for_log,
     );
-    tee_stream_to_parser(upstream_body, parser_tx, parser_telemetry, rid)
+    // The context guard wraps the client-bound leg *below* the parser tee, so
+    // savings metrics and telemetry keep parsing the original upstream bytes.
+    super::context_guard::GuardedStream::new(
+        tee_stream_to_parser(upstream_body, parser_tx, parser_telemetry, rid),
+        context_guard,
+    )
 }
 
 /// Wraps the final streaming body: SSE finish or plain passthrough.
@@ -1193,8 +1262,27 @@ where
     // and hand the same bytes on unchanged.
     let should_buffer_error = !is_sse && (status.is_client_error() || status.is_server_error());
     let body = if should_buffer_error {
-        forward::collect_error_body(resp_stream, status, outcome_ctx, request_id, path_for_log)
-            .await
+        // Context-guard learning key (#3998): computed even on paths that end
+        // up not learning — `note_prompt_too_long` only fires on a 400 whose
+        // body carries the prompt-too-long shape.
+        let learn_model = super::context_guard::request_model(original_buffered);
+        let learn_beta = outgoing_headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok());
+        let learn_scope = super::context_guard::credential_scope_from_headers(outgoing_headers);
+        let learn_from = learn_model
+            .as_deref()
+            .filter(|m| !m.is_empty())
+            .map(|m| (m, learn_beta, learn_scope.as_str()));
+        forward::collect_error_body(
+            resp_stream,
+            status,
+            outcome_ctx,
+            request_id,
+            path_for_log,
+            learn_from,
+        )
+        .await
     } else if should_buffer_for_cache {
         // Wrap the mapped stream into a hyper Body so BodyExt::collect can
         // buffer it. This is only for non-SSE success responses where we
@@ -1301,6 +1389,39 @@ where
                     status,
                     request_id,
                 );
+
+                // Buffered context-guard nudge (#3998): the non-streaming
+                // equivalent of the SSE usage rewrite. Scoped to the messages
+                // endpoint like Python's `handle_anthropic_messages`, after
+                // `emit_buffered_outcome` so telemetry parses the original bytes.
+                // (Only the path gates here: buffered replies carry
+                // `SseStreamKind::None`, which says nothing about the provider.)
+                if path_for_log.contains("/v1/messages") {
+                    use super::context_guard as guard;
+                    if let Some(model) = guard::request_model(original_buffered)
+                        && !model.is_empty()
+                    {
+                        let outbound_beta = outgoing_headers
+                            .get("anthropic-beta")
+                            .and_then(|v| v.to_str().ok());
+                        let client_beta = headers_snapshot
+                            .as_ref()
+                            .and_then(|h| h.get("anthropic-beta"))
+                            .and_then(|v| v.to_str().ok());
+                        let scope = guard::credential_scope_from_headers(outgoing_headers);
+                        if let Some((believed, effective)) =
+                            guard::guard_limits_for(&model, outbound_beta, client_beta, &scope)
+                            && let Some(nudged) = guard::nudge_response_usage(
+                                &body_bytes,
+                                believed,
+                                effective,
+                                request_id,
+                            )
+                        {
+                            body_bytes = nudged;
+                        }
+                    }
+                }
 
                 forward::wrap_buffered_success_body(
                     body_bytes,
