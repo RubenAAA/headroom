@@ -73,6 +73,8 @@ export HEADROOM_MEMORY_MODE=tool
 #                     system prompt counts even on a one-line question.
 #   min_input_tokens  the same bound from below, for a route that only pays
 #                     off on big turns.
+#   max_output_tokens skip turns whose own `max_tokens` exceeds this; a turn
+#                     that declares no budget never matches.
 #   from_models       restrict the rule to these client model ids.
 #   name              the label the decision log prints.
 export HEADROOM_MODEL_ROUTER_ENABLED=1

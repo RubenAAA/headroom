@@ -38,6 +38,14 @@ pub struct CostRule {
     pub max_input_tokens: Option<u64>,
     /// Match only when estimated input tokens are >= this.
     pub min_input_tokens: Option<u64>,
+    /// Match only when the request's own `max_tokens` is <= this.
+    ///
+    /// The caller's declared output budget is the best "this turn is trivial"
+    /// signal at routing time: a tiny prompt asking for 4000 output tokens may
+    /// want a long answer from the strong model. A request that declares no
+    /// `max_tokens` does NOT match (an unbounded response is not a trivial
+    /// turn), so the rule can never widen to unbounded requests.
+    pub max_output_tokens: Option<u64>,
     /// Match only when the request declares no tools (a proxy for low-risk work).
     pub require_no_tools: bool,
     /// Match only when the request declares tools (a proxy for agentic work).
@@ -56,7 +64,13 @@ pub struct CostRule {
 
 impl CostRule {
     /// True when every set condition is satisfied for this request.
-    pub fn matches(&self, model: &str, input_tokens: u64, has_tools: bool) -> bool {
+    pub fn matches(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        has_tools: bool,
+        max_tokens: Option<u64>,
+    ) -> bool {
         if !self.from_models.is_empty() && !self.from_models.iter().any(|m| m == model) {
             return false;
         }
@@ -73,6 +87,11 @@ impl CostRule {
         }
         if let Some(min) = self.min_input_tokens
             && input_tokens < min
+        {
+            return false;
+        }
+        if let Some(max_out) = self.max_output_tokens
+            && max_tokens.is_none_or(|m| m > max_out)
         {
             return false;
         }
@@ -293,8 +312,14 @@ impl ModelRouter {
     ///
     /// Never fails: on a disabled router or no matching rule, returns a
     /// non-matching decision that leaves the original model in place.
-    pub fn select(&self, model: &str, input_tokens: u64, has_tools: bool) -> ModelDecision {
-        self.select_skipping(model, input_tokens, has_tools, &mut |_| false)
+    pub fn select(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        has_tools: bool,
+        max_tokens: Option<u64>,
+    ) -> ModelDecision {
+        self.select_skipping(model, input_tokens, has_tools, max_tokens, &mut |_| false)
     }
 
     /// As [`Self::select`], but `skip` can veto a rule by its target model.
@@ -309,6 +334,7 @@ impl ModelRouter {
         model: &str,
         input_tokens: u64,
         has_tools: bool,
+        max_tokens: Option<u64>,
         skip: &mut dyn FnMut(&str) -> bool,
     ) -> ModelDecision {
         if !self.enabled() {
@@ -319,7 +345,7 @@ impl ModelRouter {
         }
 
         for route in &self.config.routes {
-            if route.matches(model, input_tokens, has_tools) {
+            if route.matches(model, input_tokens, has_tools, max_tokens) {
                 // A rule routing a model to itself changes nothing, so there is
                 // nothing to skip: the request goes where it was already going.
                 if route.to_model != model && skip(&route.to_model) {
@@ -333,13 +359,15 @@ impl ModelRouter {
                 } else {
                     &route.name
                 };
+                let max_tokens_repr = max_tokens.map_or("None".to_owned(), |m| m.to_string());
                 let reason = format!(
-                    "matched rule {}: {} -> {} (input_tokens={}, has_tools={})",
+                    "matched rule {}: {} -> {} (input_tokens={}, has_tools={}, max_tokens={})",
                     py_repr_str(label),
                     model,
                     route.to_model,
                     input_tokens,
                     py_bool(has_tools),
+                    max_tokens_repr,
                 );
                 return ModelDecision {
                     original_model: model.to_string(),
@@ -401,6 +429,20 @@ pub fn estimate_input_tokens(
     chars / 4
 }
 
+/// Read the request's declared output budget: the top-level `max_tokens` when
+/// it is an integer. Booleans and non-integers are treated as absent.
+///
+/// Divergence: Python's `int` accepts negatives, and a negative `max_tokens`
+/// then satisfies any `max_output_tokens` bound (`-5 > bound` is false). Here
+/// a negative reads as absent, so the rule does not match. Upstream rejects a
+/// negative budget with a 400 either way, so the routing decision is moot.
+pub fn request_max_tokens(body: &serde_json::Map<String, Value>) -> Option<u64> {
+    match body.get("max_tokens") {
+        Some(Value::Number(n)) => n.as_u64(),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config parsing
 // ---------------------------------------------------------------------------
@@ -414,10 +456,11 @@ fn truthy(value: Option<&str>) -> bool {
 
 /// Route object keys the parser understands. Anything else is a typo, and a
 /// typo would silently widen the rule — so it is rejected.
-const ALLOWED_ROUTE_KEYS: [&str; 7] = [
+const ALLOWED_ROUTE_KEYS: [&str; 8] = [
     "to_model",
     "max_input_tokens",
     "min_input_tokens",
+    "max_output_tokens",
     "require_no_tools",
     "require_tools",
     "from_models",
@@ -475,6 +518,8 @@ fn route_from_entry(entry: &Value, index: usize) -> Option<CostRule> {
 
     let max_tokens = strict_opt_int(map.get("max_input_tokens"), "max_input_tokens", index).ok()?;
     let min_tokens = strict_opt_int(map.get("min_input_tokens"), "min_input_tokens", index).ok()?;
+    let max_output =
+        strict_opt_int(map.get("max_output_tokens"), "max_output_tokens", index).ok()?;
 
     // Only an absent key defaults to `false`. Python reads
     // `entry.get("require_no_tools", False)` and then rejects anything that
@@ -499,6 +544,7 @@ fn route_from_entry(entry: &Value, index: usize) -> Option<CostRule> {
         to_model,
         max_input_tokens: max_tokens,
         min_input_tokens: min_tokens,
+        max_output_tokens: max_output,
         require_no_tools,
         require_tools,
         from_models,
@@ -817,7 +863,7 @@ mod tests {
     fn disabled_by_default() {
         let router = ModelRouter::new(None);
         assert!(!router.enabled());
-        let d = router.select("gpt-5.4", 10, false);
+        let d = router.select("gpt-5.4", 10, false, None);
         assert!(!d.matched);
         assert!(!d.changed());
         assert_eq!(d.reason, "router disabled");
@@ -839,14 +885,14 @@ mod tests {
                 route("never"),
             ],
         };
-        let d = ModelRouter::new(Some(cfg)).select("gpt-5.4", 50, false);
+        let d = ModelRouter::new(Some(cfg)).select("gpt-5.4", 50, false, None);
         assert!(d.matched);
         assert!(d.changed());
         assert_eq!(d.routed_model, "mini");
         assert_eq!(d.rule_name, "small");
         assert_eq!(
             d.reason,
-            "matched rule 'small': gpt-5.4 -> mini (input_tokens=50, has_tools=False)"
+            "matched rule 'small': gpt-5.4 -> mini (input_tokens=50, has_tools=False, max_tokens=None)"
         );
     }
 
@@ -857,10 +903,10 @@ mod tests {
             cooldown: None,
             routes: vec![route("mini")],
         };
-        let d = ModelRouter::new(Some(cfg)).select("gpt-5.4", 7, true);
+        let d = ModelRouter::new(Some(cfg)).select("gpt-5.4", 7, true, None);
         assert_eq!(
             d.reason,
-            "matched rule 'mini': gpt-5.4 -> mini (input_tokens=7, has_tools=True)"
+            "matched rule 'mini': gpt-5.4 -> mini (input_tokens=7, has_tools=True, max_tokens=None)"
         );
     }
 
@@ -875,7 +921,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let d = ModelRouter::new(Some(cfg)).select("gpt-5.4", 500, false);
+        let d = ModelRouter::new(Some(cfg)).select("gpt-5.4", 500, false, None);
         assert!(!d.matched);
         assert_eq!(d.reason, "no rule matched");
     }
@@ -887,7 +933,7 @@ mod tests {
             cooldown: None,
             routes: vec![route("mini")],
         };
-        let d = ModelRouter::new(Some(cfg)).select("", 1, false);
+        let d = ModelRouter::new(Some(cfg)).select("", 1, false, None);
         assert!(!d.matched);
         assert_eq!(d.reason, "no source model");
     }
@@ -899,7 +945,7 @@ mod tests {
             cooldown: None,
             routes: vec![route("gpt-5.4"), route("mini")],
         };
-        let d = ModelRouter::new(Some(cfg)).select("gpt-5.4", 1, false);
+        let d = ModelRouter::new(Some(cfg)).select("gpt-5.4", 1, false, None);
         assert!(d.matched);
         assert!(!d.changed());
         assert_eq!(d.routed_model, "gpt-5.4");
@@ -911,18 +957,113 @@ mod tests {
             to_model: "mini".into(),
             max_input_tokens: Some(100),
             min_input_tokens: Some(10),
+            max_output_tokens: None,
             require_no_tools: true,
             require_tools: false,
             from_models: vec!["a".into(), "b".into()],
             name: String::new(),
         };
-        assert!(r.matches("a", 50, false));
-        assert!(!r.matches("c", 50, false)); // from_models
-        assert!(!r.matches("a", 50, true)); // require_no_tools
-        assert!(!r.matches("a", 101, false)); // max
-        assert!(!r.matches("a", 9, false)); // min
-        assert!(r.matches("a", 10, false)); // inclusive bounds
-        assert!(r.matches("a", 100, false));
+        assert!(r.matches("a", 50, false, None));
+        assert!(!r.matches("c", 50, false, None)); // from_models
+        assert!(!r.matches("a", 50, true, None)); // require_no_tools
+        assert!(!r.matches("a", 101, false, None)); // max
+        assert!(!r.matches("a", 9, false, None)); // min
+        assert!(r.matches("a", 10, false, None)); // inclusive bounds
+        assert!(r.matches("a", 100, false, None));
+    }
+
+    #[test]
+    fn max_output_tokens_bounds_declared_budget() {
+        // Issue #2765: a tiny prompt asking for a long answer must not
+        // downshift.
+        let r = CostRule {
+            to_model: "cheap".into(),
+            max_input_tokens: Some(4096),
+            max_output_tokens: Some(512),
+            ..Default::default()
+        };
+        assert!(r.matches("strong", 10, false, Some(512)));
+        assert!(r.matches("strong", 10, false, Some(1)));
+        assert!(!r.matches("strong", 10, false, Some(4000)));
+    }
+
+    #[test]
+    fn max_output_tokens_absent_budget_does_not_match() {
+        // An unbounded response is not a trivial turn: absent max_tokens never
+        // satisfies the bound, so the rule cannot widen to unbounded requests.
+        let r = CostRule {
+            to_model: "cheap".into(),
+            max_output_tokens: Some(512),
+            ..Default::default()
+        };
+        assert!(!r.matches("strong", 10, false, None));
+    }
+
+    #[test]
+    fn rule_without_max_output_tokens_ignores_budget() {
+        let r = CostRule {
+            to_model: "cheap".into(),
+            max_input_tokens: Some(4096),
+            ..Default::default()
+        };
+        assert!(r.matches("strong", 10, false, Some(4000)));
+        assert!(r.matches("strong", 10, false, None));
+    }
+
+    #[test]
+    fn request_max_tokens_reads_declared_budget() {
+        use serde_json::Map;
+        let body = |v: Value| {
+            let mut m = Map::new();
+            m.insert("max_tokens".to_owned(), v);
+            m
+        };
+        assert_eq!(request_max_tokens(&body(json!(4000))), Some(4000));
+        assert_eq!(request_max_tokens(&Map::new()), None);
+        assert_eq!(request_max_tokens(&body(json!(true))), None);
+        assert_eq!(request_max_tokens(&body(json!("4000"))), None);
+        assert_eq!(request_max_tokens(&body(json!(1.5))), None);
+        // Negative: Python's int accepts it (then satisfies any bound); here
+        // it reads as absent, so the rule does not match. Upstream 400s a
+        // negative budget either way.
+        assert_eq!(request_max_tokens(&body(json!(-5))), None);
+    }
+
+    #[test]
+    fn output_bound_rule_routes_only_bounded_requests() {
+        // Body-level: the declared budget travels from the request body into
+        // the match, and the matched reason names it.
+        let router = ModelRouter::new(Some(ModelRouterConfig::from_env(
+            Some("1"),
+            Some(r#"[{"to_model": "mini", "max_output_tokens": 512}]"#),
+        )));
+        let routed = apply_to_anthropic_body(
+            Bytes::from(
+                r#"{"model":"big","messages":[{"role":"user","content":"hi"}],"max_tokens":64}"#,
+            ),
+            &router,
+            "t",
+        );
+        let v: Value = serde_json::from_slice(&routed).unwrap();
+        assert_eq!(v["model"], "mini");
+
+        let unrouted = apply_to_anthropic_body(
+            Bytes::from(
+                r#"{"model":"big","messages":[{"role":"user","content":"hi"}],"max_tokens":4000}"#,
+            ),
+            &router,
+            "t",
+        );
+        let v: Value = serde_json::from_slice(&unrouted).unwrap();
+        assert_eq!(v["model"], "big");
+
+        let unbounded = apply_to_anthropic_body(
+            Bytes::from(r#"{"model":"big","messages":[{"role":"user","content":"hi"}]}"#),
+            &router,
+            "t",
+        );
+        let v: Value = serde_json::from_slice(&unbounded).unwrap();
+        assert_eq!(v["model"], "big");
     }
 
     #[test]
@@ -934,8 +1075,8 @@ mod tests {
             require_tools: true,
             ..Default::default()
         };
-        assert!(r.matches("cheap", 1, true));
-        assert!(!r.matches("cheap", 1, false));
+        assert!(r.matches("cheap", 1, true, None));
+        assert!(!r.matches("cheap", 1, false, None));
     }
 
     #[test]
@@ -948,8 +1089,8 @@ mod tests {
             require_no_tools: true,
             ..Default::default()
         };
-        assert!(!r.matches("m", 1, true));
-        assert!(!r.matches("m", 1, false));
+        assert!(!r.matches("m", 1, true, None));
+        assert!(!r.matches("m", 1, false, None));
     }
 
     // -- from_env ----------------------------------------------------------
@@ -984,7 +1125,8 @@ mod tests {
             Some("1"),
             Some(
                 r#"[{"name": "small->mini", "max_input_tokens": 4000,
-                     "min_input_tokens": "10", "require_no_tools": true,
+                     "min_input_tokens": "10", "max_output_tokens": 512,
+                     "require_no_tools": true,
                      "from_models": ["gpt-5.4"], "to_model": "gpt-5.4-mini"}]"#,
             ),
         );
@@ -995,6 +1137,7 @@ mod tests {
                 to_model: "gpt-5.4-mini".into(),
                 max_input_tokens: Some(4000),
                 min_input_tokens: Some(10),
+                max_output_tokens: Some(512),
                 require_no_tools: true,
                 require_tools: false,
                 from_models: vec!["gpt-5.4".into()],
@@ -1216,7 +1359,8 @@ pub fn apply_to_anthropic_body_with_cooldowns(
     // turn. Routed, that check is answered by the target and passes for any
     // name, typos included; the session then fails on its first real turn.
     // One output token has nothing to save, so leave it to the named model.
-    if obj.get("max_tokens").and_then(Value::as_u64) == Some(1) {
+    let max_tokens = request_max_tokens(obj);
+    if max_tokens == Some(1) {
         return body;
     }
 
@@ -1231,24 +1375,30 @@ pub fn apply_to_anthropic_body_with_cooldowns(
         })
         .unwrap_or(false);
 
-    let decision = router.select_skipping(model, input_tokens, has_tools, &mut |to_model| {
-        let Some(cooldowns) = cooldowns else {
-            return false;
-        };
-        let Some(notice) = cooldowns.note_skip(to_model) else {
-            return false;
-        };
-        if notice.log {
-            tracing::info!(
-                event = "model_route_cooldown_skip",
-                request_id = %request_id,
-                to_model = %to_model,
-                remaining_secs = notice.remaining.as_secs(),
-                "skipping a route whose target is in cooldown after a fallback"
-            );
-        }
-        true
-    });
+    let decision = router.select_skipping(
+        model,
+        input_tokens,
+        has_tools,
+        max_tokens,
+        &mut |to_model| {
+            let Some(cooldowns) = cooldowns else {
+                return false;
+            };
+            let Some(notice) = cooldowns.note_skip(to_model) else {
+                return false;
+            };
+            if notice.log {
+                tracing::info!(
+                    event = "model_route_cooldown_skip",
+                    request_id = %request_id,
+                    to_model = %to_model,
+                    remaining_secs = notice.remaining.as_secs(),
+                    "skipping a route whose target is in cooldown after a fallback"
+                );
+            }
+            true
+        },
+    );
     tracing::info!(
         event = "model_routing_decision",
         request_id = %request_id,
@@ -1428,7 +1578,7 @@ mod cooldown_tests {
     #[test]
     fn a_vetoed_rule_is_passed_over_for_the_next_one() {
         let r = router(r#"[{"to_model":"down"},{"to_model":"up"}]"#);
-        let d = r.select_skipping("claude-opus-5", 10, false, &mut |to| to == "down");
+        let d = r.select_skipping("claude-opus-5", 10, false, None, &mut |to| to == "down");
         assert_eq!(d.routed_model, "up");
         assert!(d.changed());
     }
@@ -1438,7 +1588,7 @@ mod cooldown_tests {
     #[test]
     fn vetoing_every_rule_leaves_the_original_model() {
         let r = router(r#"[{"to_model":"down"}]"#);
-        let d = r.select_skipping("claude-opus-5", 10, false, &mut |_| true);
+        let d = r.select_skipping("claude-opus-5", 10, false, None, &mut |_| true);
         assert!(!d.matched);
         assert_eq!(d.routed_model, "claude-opus-5");
     }
@@ -1449,7 +1599,7 @@ mod cooldown_tests {
     fn a_self_route_is_never_vetoed() {
         let r = router(r#"[{"to_model":"claude-opus-5"}]"#);
         let mut asked = Vec::new();
-        let d = r.select_skipping("claude-opus-5", 10, false, &mut |to| {
+        let d = r.select_skipping("claude-opus-5", 10, false, None, &mut |to| {
             asked.push(to.to_string());
             true
         });
