@@ -116,6 +116,10 @@ const CLIENT_UA_MAP: &[(&str, &str)] = &[
     ("anthropic-cli/", "anthropic-cli"),
     ("codex-cli/", "codex"),
     ("cursor/", "cursor"),
+    // Upstream b1fb162b: current Grok Build sends `grok-shell/<version>`,
+    // older builds `grok/`.
+    ("grok-shell/", "grok_build"),
+    ("grok/", "grok_build"),
     ("zed/", "zed"),
     ("aider/", "aider"),
     ("droid/", "droid"),
@@ -2531,6 +2535,8 @@ mod tests {
         assert_eq!(classify_client(&h).as_deref(), Some("codex"));
         let h = hm(&[("user-agent", "Mozilla/5.0")]);
         assert_eq!(classify_client(&h), None);
+        let h = hm(&[("user-agent", "grok-shell/0.2.112")]);
+        assert_eq!(classify_client(&h).as_deref(), Some("grok_build"));
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub const OPENAI_COMPATIBLE_HOSTS: &[(&str, &str)] = &[
     ("api.deepseek.com", "DeepSeek"),
     ("api.mistral.ai", "Mistral"),
     ("api.perplexity.ai", "Perplexity"),
+    ("api.x.ai", "xAI"),
     ("openai.azure.com", "Azure OpenAI"),
     ("api.openai.com", "OpenAI"),
 ];
@@ -34,7 +35,12 @@ pub const OPENAI_COMPATIBLE_HOSTS: &[(&str, &str)] = &[
 /// `--provider-name` or the raw `openai` label.
 pub fn classify_openai_upstream(url: Option<&str>) -> Option<&'static str> {
     let url = url.filter(|u| !u.is_empty())?;
-    let host = url::Url::parse(url).ok()?.host_str()?.to_lowercase();
+    // A fully qualified name (trailing dot) is the same host.
+    let host = url::Url::parse(url)
+        .ok()?
+        .host_str()?
+        .trim_end_matches('.')
+        .to_lowercase();
     if host.is_empty() {
         return None;
     }
@@ -107,6 +113,19 @@ mod tests {
         assert_eq!(
             classify_openai_upstream(Some("https://openai.azure.com/openai")),
             Some("Azure OpenAI")
+        );
+    }
+
+    #[test]
+    fn classifies_xai_including_a_fully_qualified_host() {
+        // Upstream b1fb162b.
+        assert_eq!(
+            classify_openai_upstream(Some("https://api.x.ai/v1")),
+            Some("xAI")
+        );
+        assert_eq!(
+            classify_openai_upstream(Some("https://api.x.ai./v1")),
+            Some("xAI")
         );
     }
 
