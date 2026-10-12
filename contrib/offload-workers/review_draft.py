@@ -149,8 +149,13 @@ FINDINGS:
 
 
 def _call(prompt, timeout):
-    """Run the configured worker backend once; returns (stdout, diagnostic)."""
-    return model.call(prompt, timeout, "OFFLOADED_REVIEW_WORKER")
+    """Run the configured worker backend once; returns (stdout, diagnostic).
+
+    No tools: the evidence is in the prompt. With them, children ran go test,
+    sourced the GitLab token from the repo, spawned agents and messaged
+    other sessions instead of answering.
+    """
+    return model.call(prompt, timeout, "OFFLOADED_REVIEW_WORKER", tools="")
 
 
 def ask(prompt):

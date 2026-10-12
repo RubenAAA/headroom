@@ -389,6 +389,17 @@ GOT=$(grep -v '^proof: ' <<<"$GOT")
 grep -q -- "--project=MC" "$T/yt.search" || fail "the lookup did not search the session's project"
 ok "the model drafts without tools, the worker files, and a retry does not file again"
 
+# The review model answers from the evidence in its prompt. With tools, its
+# children ran go test, sourced the GitLab token and messaged other sessions.
+GOT=$(cd "$REPO_DIR/contrib/offload-workers" && PYTHONDONTWRITEBYTECODE=1 python3 -c '
+import sys, types
+sys.modules["thread_dossier"] = types.ModuleType("thread_dossier")  # asks GitLab on import
+import review_draft as r
+r.model.call = lambda prompt, timeout, marker, tools=None: (repr(tools), None)
+print(r._call("p", 1)[0])')
+[[ $GOT == "''" ]] || fail "the review model was given tools: $GOT"
+ok "the review model runs without tools"
+
 # ── gitlab_api.py ───────────────────────────────────────────────────────────
 # The token reaches curl in a private header file, not in argv, and no payload
 # or header file outlives the call.
