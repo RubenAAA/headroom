@@ -336,6 +336,11 @@ async fn serve(
     state: AppState,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The ctx store only grows without this; see `ctx::retention`.
+    if let Some(base) = headroom_proxy::AppState::resolve_ctx_base(config) {
+        headroom_proxy::ctx::retention::spawn(base);
+    }
+
     // A socket bind never opens a TCP port: the filesystem owns access
     // control, so --listen is ignored entirely (upstream arbitrates the
     // same way: the socket wins, --host/--port are not bound).

@@ -450,7 +450,7 @@ impl AppState {
     /// given project. Nothing is opened here — the project is a property of
     /// a request, not of the process, so handles are opened on first sight.
     /// Extracted from `AppState::new` without behavior change.
-    pub(super) fn resolve_ctx_base(config: &Config) -> Option<std::path::PathBuf> {
+    pub fn resolve_ctx_base(config: &Config) -> Option<std::path::PathBuf> {
         if !(config.ctx_capture || config.ctx_offload || config.ctx_inject) {
             return None;
         }

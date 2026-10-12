@@ -17,6 +17,7 @@
 //! only the storage + search primitives.
 
 mod memory_records;
+pub mod retention;
 mod sessions;
 mod snapshot;
 mod store;
