@@ -41,6 +41,17 @@
 //! dollars on a cost dashboard are worse than an obvious zero, and
 //! the WARN tells an operator exactly which id to add by refreshing
 //! the vendored table (`scripts/refresh_model_limits.sh`).
+//!
+//! # Long-context tiers
+//!
+//! Some models bill every token of a request at a higher rate once
+//! the prompt crosses a threshold (LiteLLM spells it
+//! `input_cost_per_token_above_200k_tokens`, `…_above_272k_tokens`).
+//! [`lookup`] takes the request's prompt size and returns the rates
+//! of the highest tier it crosses, strictly greater than the
+//! threshold. A tier that omits a field keeps the rate below it.
+//! `_priority`/`_batches`/`_flex` variants are ignored: the ledger
+//! cannot tell which service tier a request used.
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
@@ -121,7 +132,25 @@ impl ModelPrice {
     }
 }
 
-static BOOK: OnceLock<HashMap<String, ModelPrice>> = OnceLock::new();
+/// One table row: base rates plus long-context tiers, ascending by
+/// threshold. Each tier already carries the rates below it for any
+/// field the table leaves out.
+struct Entry {
+    base: ModelPrice,
+    tiers: Vec<(u64, ModelPrice)>,
+}
+
+impl Entry {
+    fn at(&self, prompt_tokens: u64) -> ModelPrice {
+        self.tiers
+            .iter()
+            .rev()
+            .find(|(threshold, _)| prompt_tokens > *threshold)
+            .map_or(self.base, |(_, p)| *p)
+    }
+}
+
+static BOOK: OnceLock<HashMap<String, Entry>> = OnceLock::new();
 
 /// Bounded once-per-model warn set so an unknown model logs one WARN,
 /// not one per request. Capped so attacker-controlled model ids can't
@@ -140,11 +169,11 @@ pub fn warm() {
     let _ = book();
 }
 
-fn book() -> &'static HashMap<String, ModelPrice> {
+fn book() -> &'static HashMap<String, Entry> {
     BOOK.get_or_init(parse_vendored)
 }
 
-fn parse_vendored() -> HashMap<String, ModelPrice> {
+fn parse_vendored() -> HashMap<String, Entry> {
     let raw: serde_json::Value = serde_json::from_str(VENDORED_JSON)
         .expect("vendored LiteLLM JSON must parse — same invariant as model_limits");
     let mut out = HashMap::new();
@@ -176,17 +205,64 @@ fn parse_vendored() -> HashMap<String, ModelPrice> {
             .and_then(|v| v.as_f64())
             .filter(|c| c.is_finite() && *c >= 0.0)
             .unwrap_or(input);
+        let base = ModelPrice {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        };
         out.insert(
             model_id.to_ascii_lowercase(),
-            ModelPrice {
-                input,
-                output,
-                cache_read,
-                cache_write,
+            Entry {
+                base,
+                tiers: parse_tiers(spec, base),
             },
         );
     }
     out
+}
+
+/// Field prefixes of a LiteLLM long-context tier key,
+/// `<prefix><N>k_tokens`.
+const TIER_FIELDS: [&str; 4] = [
+    "input_cost_per_token_above_",
+    "output_cost_per_token_above_",
+    "cache_read_input_token_cost_above_",
+    "cache_creation_input_token_cost_above_",
+];
+
+fn parse_tiers(
+    spec: &serde_json::Map<String, serde_json::Value>,
+    base: ModelPrice,
+) -> Vec<(u64, ModelPrice)> {
+    let mut rates: std::collections::BTreeMap<u64, [Option<f64>; 4]> = Default::default();
+    for (key, value) in spec {
+        for (field, prefix) in TIER_FIELDS.iter().enumerate() {
+            let Some(thousands) = key
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix("k_tokens"))
+                .and_then(|n| n.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if let Some(rate) = value.as_f64().filter(|r| r.is_finite() && *r >= 0.0) {
+                rates.entry(thousands * 1000).or_default()[field] = Some(rate);
+            }
+        }
+    }
+    let mut prev = base;
+    rates
+        .into_iter()
+        .map(|(threshold, [input, output, cache_read, cache_write])| {
+            prev = ModelPrice {
+                input: input.unwrap_or(prev.input),
+                output: output.unwrap_or(prev.output),
+                cache_read: cache_read.unwrap_or(prev.cache_read),
+                cache_write: cache_write.unwrap_or(prev.cache_write),
+            };
+            (threshold, prev)
+        })
+        .collect()
 }
 
 /// Candidate keys tried, in order, for a request model id. Exact
@@ -237,14 +313,15 @@ fn push_revision_trimmed(push: &mut impl FnMut(String), id: &str) {
     }
 }
 
-/// Look up per-token pricing for a model id. `None` means "not in
-/// the vendored table" — the caller records $0 for USD fields and
-/// this module logs one WARN per distinct model id.
-pub fn lookup(model: &str) -> Option<ModelPrice> {
+/// Look up per-token pricing for a model id, at the long-context
+/// tier a prompt of `prompt_tokens` falls in (pass 0 for base rates).
+/// `None` means "not in the vendored table" — the caller records $0
+/// for USD fields and this module logs one WARN per distinct model id.
+pub fn lookup(model: &str, prompt_tokens: u64) -> Option<ModelPrice> {
     let table = book();
     for key in candidates(model) {
-        if let Some(p) = table.get(&key) {
-            return Some(*p);
+        if let Some(entry) = table.get(&key) {
+            return Some(entry.at(prompt_tokens));
         }
     }
     warn_once(model);
@@ -283,7 +360,7 @@ mod tests {
 
     #[test]
     fn known_anthropic_direct_id_prices() {
-        let p = lookup("claude-sonnet-4-5-20250929").expect("priced");
+        let p = lookup("claude-sonnet-4-5-20250929", 0).expect("priced");
         assert!(p.input > 0.0 && p.output > p.input);
         assert!(p.cache_read < p.input, "cache reads are discounted");
         assert!(p.cache_write > p.input, "cache writes carry a premium");
@@ -296,8 +373,8 @@ mod tests {
     /// longer exercises the regional-wins path.
     #[test]
     fn exact_regional_bedrock_entry_wins_over_base() {
-        let base = lookup("anthropic.claude-opus-4-6-v1").expect("base priced");
-        let eu = lookup("eu.anthropic.claude-opus-4-6-v1").expect("eu priced");
+        let base = lookup("anthropic.claude-opus-4-6-v1", 0).expect("base priced");
+        let eu = lookup("eu.anthropic.claude-opus-4-6-v1", 0).expect("eu priced");
         assert!(
             (base.input - 5e-6).abs() < 1e-12,
             "base id prices at list rate, got {}",
@@ -324,14 +401,14 @@ mod tests {
     #[test]
     fn every_geo_prefix_falls_back_to_base_price() {
         const BASE: &str = "anthropic.claude-3-5-haiku-20241022-v1:0";
-        let base = lookup(BASE).expect("base priced");
+        let base = lookup(BASE, 0).expect("base priced");
         for geo in crate::bedrock::vendor::GEO_PREFIXES {
             let id = format!("{geo}{BASE}");
             if book().get(&id).is_some() {
                 continue; // table lists this region explicitly — priced on its own terms
             }
             assert_eq!(
-                lookup(&id).unwrap_or_else(|| panic!("{id} must fall back")),
+                lookup(&id, 0).unwrap_or_else(|| panic!("{id} must fall back")),
                 base,
                 "{geo} must strip to the base entry when unlisted"
             );
@@ -340,23 +417,23 @@ mod tests {
 
     #[test]
     fn provider_path_segment_falls_back_to_bare_tail() {
-        let bare = lookup("gpt-4o").expect("bare id priced");
-        let routed = lookup("openai/gpt-4o").expect("routed id priced");
+        let bare = lookup("gpt-4o", 0).expect("bare id priced");
+        let routed = lookup("openai/gpt-4o", 0).expect("routed id priced");
         assert_eq!(bare, routed);
     }
 
     #[test]
     fn unknown_model_misses_instead_of_mispricing() {
-        assert!(lookup("claude").is_none(), "generic id must not match");
-        assert!(lookup("totally-unknown-model-xyz").is_none());
-        assert!(lookup("").is_none());
+        assert!(lookup("claude", 0).is_none(), "generic id must not match");
+        assert!(lookup("totally-unknown-model-xyz", 0).is_none());
+        assert!(lookup("", 0).is_none());
     }
 
     #[test]
     fn case_insensitive_lookup() {
         assert_eq!(
-            lookup("GPT-4o").expect("priced"),
-            lookup("gpt-4o").expect("priced")
+            lookup("GPT-4o", 0).expect("priced"),
+            lookup("gpt-4o", 0).expect("priced")
         );
     }
 
@@ -365,8 +442,8 @@ mod tests {
     /// `:rev` suffix trimmed.
     #[test]
     fn provider_path_and_revision_compose() {
-        let bare = lookup("gpt-4o").expect("bare id priced");
-        let combined = lookup("openai/gpt-4o:2").expect("combined form priced");
+        let bare = lookup("gpt-4o", 0).expect("bare id priced");
+        let combined = lookup("openai/gpt-4o:2", 0).expect("combined form priced");
         assert_eq!(bare, combined, "provider path + numeric revision compose");
     }
 
@@ -376,13 +453,13 @@ mod tests {
     /// $0.45/M, so borrowing across that boundary invents dollars.
     #[test]
     fn variant_suffix_never_borrows_the_bare_models_price() {
-        let bare = lookup("openrouter/z-ai/glm-4.6").expect("bare variant priced");
-        let exacto = lookup("openrouter/z-ai/glm-4.6:exacto").expect("listed variant priced");
+        let bare = lookup("openrouter/z-ai/glm-4.6", 0).expect("bare variant priced");
+        let exacto = lookup("openrouter/z-ai/glm-4.6:exacto", 0).expect("listed variant priced");
         assert_ne!(bare.input, exacto.input, "fixture guard: these must differ");
         // An UNLISTED variant must miss loudly, not silently take the
         // bare price.
         assert!(
-            lookup("openrouter/z-ai/glm-4.6:priority").is_none(),
+            lookup("openrouter/z-ai/glm-4.6:priority", 0).is_none(),
             "an uncatalogued variant must record $0 + WARN, never a guessed rate"
         );
     }
@@ -414,5 +491,41 @@ mod tests {
             cache_write: 1e-6,
         };
         assert_eq!(inverted.cache_savings_usd(1000, 0), 0.0);
+    }
+
+    /// Above 200k prompt tokens Sonnet 4.5 bills every token at the
+    /// long-context rates; at exactly 200k it still bills base.
+    #[test]
+    fn long_prompt_prices_at_the_above_200k_tier() {
+        let base = lookup("claude-sonnet-4-5-20250929", 200_000).expect("priced");
+        let long = lookup("claude-sonnet-4-5-20250929", 200_001).expect("priced");
+        assert_eq!(base, lookup("claude-sonnet-4-5-20250929", 0).unwrap());
+        assert!((long.input - 6e-6).abs() < 1e-12, "got {}", long.input);
+        assert!((long.output - 2.25e-5).abs() < 1e-12, "got {}", long.output);
+        assert!((long.cache_read - 6e-7).abs() < 1e-12);
+        assert!((long.cache_write - 7.5e-6).abs() < 1e-12);
+    }
+
+    /// The tier threshold comes from the key, not a fixed 200k:
+    /// gpt-5.4 steps up above 272k. Its `_batches`/`_flex` variants
+    /// must not leak into the standard tier.
+    #[test]
+    fn tier_threshold_is_read_from_the_key() {
+        let at_250k = lookup("gpt-5.4", 250_000).expect("priced");
+        let above = lookup("gpt-5.4", 272_001).expect("priced");
+        assert_eq!(at_250k, lookup("gpt-5.4", 0).unwrap());
+        assert!((above.input - 5e-6).abs() < 1e-12, "got {}", above.input);
+        assert!(
+            (above.output - 2.25e-5).abs() < 1e-12,
+            "got {}",
+            above.output
+        );
+        assert!((above.cache_read - 5e-7).abs() < 1e-12);
+    }
+
+    /// A model with no published tier bills base at any size.
+    #[test]
+    fn untiered_model_keeps_base_rates_on_long_prompts() {
+        assert_eq!(lookup("gpt-4o", 900_000), lookup("gpt-4o", 0));
     }
 }

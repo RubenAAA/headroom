@@ -660,7 +660,15 @@ impl Ledger {
         let usd = if ev.failed {
             EventUsd::default()
         } else {
-            match pricing::lookup(&ev.model) {
+            // Long-context tiers key off the whole prompt, cached
+            // segments included; without a usage block, the
+            // post-compression estimate stands in.
+            let prompt_tokens = if ev.usage.total_input() > 0 {
+                ev.usage.total_input()
+            } else {
+                ev.tokens_after
+            };
+            match pricing::lookup(&ev.model, prompt_tokens) {
                 Some(p) => EventUsd {
                     compression: p.compression_savings_usd(ev.tokens_saved()),
                     cache: p
@@ -1274,6 +1282,29 @@ mod tests {
         // sonnet-4-5: $15/M out vs $3/M in — 50 out vs 600 in.
         assert!((total - (input + output)).abs() < f64::EPSILON);
         assert!(total > input, "total spend must exceed input-only spend");
+    }
+
+    /// The tier keys off the whole prompt, cached reads included: a
+    /// turn of 1k fresh input on a 250k cached prefix bills every
+    /// token at Sonnet 4.5's above-200k rates.
+    #[test]
+    fn cached_long_prompt_bills_at_the_long_context_tier() {
+        let ledger = Ledger::in_memory();
+        let mut ev = event(PRICED_MODEL);
+        ev.usage = Usage {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+            cache_read_tokens: 250_000,
+            cache_write_tokens: 0,
+        };
+        ledger.record(ev);
+        let v = ledger.stats_payload(true);
+        // 1k × $6/M + 250k × $0.60/M, not 1k × $3/M + 250k × $0.30/M.
+        let input = v["session"]["input_cost_usd"].as_f64().unwrap();
+        assert!((input - 0.156).abs() < 1e-9, "input={input}");
+        // 1k × $22.50/M.
+        let output = v["session"]["output_cost_usd"].as_f64().unwrap();
+        assert!((output - 0.0225).abs() < 1e-9, "output={output}");
     }
 
     #[test]

@@ -26,8 +26,12 @@ Totals: **9 PORT (all landed, some in part), 9 ALREADY-THERE, the rest N/A**.
 | `1fb4cbae` | `ab4acb6f` | Claude Code's truncation banner changes the astgrep outline header | opt-in disk verification: needs `headroom wrap`'s workspace registry |
 
 Side gap found on the way, not an upstream commit: the observability ledger
-reads only base LiteLLM rates and ignores `*_above_200k_tokens`
-(`observability/pricing.rs:161-187`).
+read only base LiteLLM rates and ignored `*_above_<N>k_tokens`. Fixed
+after the ports: `observability::pricing::lookup` takes the prompt size
+(input + cache read + cache write) and returns the highest tier it
+crosses. Unlike upstream's 8c1beb20 fallback, a model whose entry lacks
+tier keys bills base: the vendored snapshot still carries them for
+Sonnet 4.5, so no hand-kept premium table is needed today.
 
 ## ALREADY-THERE
 
