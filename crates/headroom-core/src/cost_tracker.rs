@@ -879,9 +879,26 @@ pub fn build_prefix_cache_stats(input: &PrefixCacheStatsInput) -> PrefixCacheSta
         {
             let uncached = p.input_cost_per_token;
             if uncached > 0.0 {
-                read_mult = p.cache_read_cost_per_token.unwrap_or(uncached) / uncached;
-                write_mult = p.cache_write_cost_per_token.unwrap_or(uncached) / uncached;
-                pricing_source = "vendored";
+                // Upstream 463c1a43: a rate the table lacks keeps the
+                // provider default instead of becoming 1.0 (no discount, no
+                // premium), and the source says which half came from where.
+                // Writes don't matter when nothing was written.
+                if let Some(read) = p.cache_read_cost_per_token {
+                    read_mult = read / uncached;
+                }
+                if let Some(write) = p.cache_write_cost_per_token {
+                    write_mult = write / uncached;
+                }
+                let read_vendored = p.cache_read_cost_per_token.is_some();
+                let write_vendored = p.cache_write_cost_per_token.is_some();
+                pricing_source = if read_vendored && (write_vendored || pc.cache_write_tokens == 0)
+                {
+                    "vendored"
+                } else if read_vendored || write_vendored {
+                    "mixed"
+                } else {
+                    "provider_default"
+                };
             }
         }
 
@@ -2098,6 +2115,41 @@ mod tests {
         assert_eq!(g.cache_pricing_source, "vendored");
         // 10000 * 0.3e-6 * (1 - 0.25) = 0.00225 (table would give 0.0027).
         assert!((g.savings_usd - 0.00225).abs() < 0.0001);
+    }
+
+    #[test]
+    fn prefix_cache_stats_labels_a_half_vendored_rate_mixed() {
+        // Upstream 463c1a43: gemini-2.5-flash publishes a read rate but no
+        // write rate. With writes on the books the write side comes from the
+        // provider table, so the source is "mixed", not "vendored".
+        let mut providers = HashMap::new();
+        providers.insert(
+            "gemini".into(),
+            ProviderCacheInput {
+                cache_read_tokens: 10000,
+                cache_write_tokens: 5000,
+                uncached_input_tokens: 2000,
+                requests: 10,
+                hit_requests: 8,
+                ..Default::default()
+            },
+        );
+        let mut model_prices = HashMap::new();
+        model_prices.insert("gemini-2.5-flash".into(), 0.30 / 1_000_000.0);
+
+        let input = PrefixCacheStatsInput {
+            providers: &providers,
+            model_prices: &model_prices,
+            miss_attribution: &HashMap::new(),
+            prefix_freeze: &PrefixFreezeInput::default(),
+            compression_vs_cache: &CompressionVsCacheInput::default(),
+            tokens_saved_by_compression: 0,
+        };
+        let stats = build_prefix_cache_stats(&input);
+        let g = &stats.by_provider["gemini"];
+        assert_eq!(g.cache_pricing_source, "mixed");
+        assert!((g.savings_usd - 0.00225).abs() < 0.0001);
+        assert_eq!(g.write_premium_usd, 0.0);
     }
 
     #[test]
