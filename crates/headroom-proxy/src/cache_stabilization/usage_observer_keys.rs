@@ -70,8 +70,9 @@ pub(super) const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
 /// statusline (`/cache-health`).
 pub(super) const RECENT_SAMPLE_CAPACITY: usize = 100;
 /// Message-0 hashes of recent first turns, keyed for the fan-out check in
-/// [`first_turn_reason`]. Parallel subagents launch within seconds of each
-/// other, so a small window and a small table are enough.
+/// [`first_turn_reason`](super::first_turn::first_turn_reason). Parallel
+/// subagents launch within seconds of each other, so a small window and a
+/// small table are enough.
 pub(super) const FIRST_TURN_OPENER_CAPACITY: usize = 256;
 /// Translated-route (Spark, Codex) conversation keys already past their first
 /// turn. Native turns learn "first under key" from the tracked-stream table,
