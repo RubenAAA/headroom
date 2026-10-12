@@ -777,12 +777,11 @@ mod tests {
         assert!(!retired.is_current());
         assert_eq!(retired.superseded_by.as_deref(), Some(updated.id.as_str()));
 
-        // The retired text stops matching; the new text matches.
-        assert!(
-            store
-                .search_memories("old text", "alice", None, false, 10, None)
-                .is_empty()
-        );
+        // The retired row stops matching; the new text matches. "old
+        // text" still hits the new row through the shared word "text",
+        // so check ids, not emptiness.
+        let hits = store.search_memories("old text", "alice", None, false, 10, None);
+        assert!(hits.iter().all(|r| r.memory.id != original.id), "{hits:?}");
         assert_eq!(
             store
                 .search_memories("new text", "alice", None, false, 10, None)

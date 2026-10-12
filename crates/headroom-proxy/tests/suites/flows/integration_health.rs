@@ -306,7 +306,9 @@ async fn debug_inflight_counts_zen_requests_per_egress_until_the_stream_ends() {
     assert_eq!(held.status(), 200);
     assert_eq!(egress_in_flight(&url).await[&busy], 1);
 
-    // Rotating the busy egress turns its lane away; the other egress serves.
+    // Rotating the busy egress moves a new turn on its lane to the other
+    // egress (it has sent nothing, so it loses nothing by moving); the
+    // stalled stream keeps counting against the egress it started on.
     let maintenance = common::shared_client()
         .post(format!("{url}/debug/zen-egresses/{busy}/maintenance"))
         .json(&serde_json::json!({"rotating": true}))
@@ -314,8 +316,14 @@ async fn debug_inflight_counts_zen_requests_per_egress_until_the_stream_ends() {
         .await
         .unwrap();
     assert_eq!(maintenance.status(), 200);
-    let rejected = turn("agent one", "HOLD please").await.unwrap();
-    assert_eq!(rejected.status(), 503, "same lane, rotating egress");
+    let moved = turn("agent one", "no stall").await.unwrap();
+    assert_eq!(
+        moved.status(),
+        200,
+        "same lane fails over off the rotating egress"
+    );
+    moved.text().await.unwrap();
+    wait_for_egress_count(&url, &idle, 0).await;
     let served = turn("agent two", "no stall").await.unwrap();
     assert_eq!(served.status(), 200, "other lane, other egress");
     served.text().await.unwrap();

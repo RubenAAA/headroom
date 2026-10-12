@@ -144,7 +144,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        reqwest::Client::builder()
+        crate::ssl_context::client_builder()
             .no_proxy()
             .build()
             .unwrap()
@@ -210,7 +210,7 @@ mod tests {
                 });
             }
         });
-        reqwest::Client::builder()
+        crate::ssl_context::client_builder()
             .no_proxy()
             .timeout(std::time::Duration::from_millis(100))
             .build()

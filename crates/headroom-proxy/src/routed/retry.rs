@@ -1937,7 +1937,7 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        reqwest::Client::builder()
+        crate::ssl_context::client_builder()
             .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).unwrap())
             .build()
             .unwrap()

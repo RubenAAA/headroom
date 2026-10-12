@@ -475,7 +475,7 @@ mod resolver_alternation_tests {
             .mount(&open)
             .await;
         let via = |proxy: &MockServer| {
-            reqwest::Client::builder()
+            crate::ssl_context::client_builder()
                 .proxy(reqwest::Proxy::all(proxy.uri()).unwrap())
                 .build()
                 .unwrap()
@@ -959,7 +959,7 @@ mod continuation_client_tests {
         let mut state = crate::test_support::test_state(|_| {});
         state.zen_egresses = Some(Arc::new(crate::proxy::ProviderEgressPool::new(
             vec![
-                reqwest::Client::builder()
+                crate::ssl_context::client_builder()
                     .proxy(reqwest::Proxy::all(lane_proxy.uri()).unwrap())
                     .build()
                     .unwrap(),

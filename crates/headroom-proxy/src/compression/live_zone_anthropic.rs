@@ -186,6 +186,7 @@ pub fn compress_anthropic_request(
 /// policy. `effective_auth_mode` is the enforcement-folded mode: the
 /// F1-classified mode when `--auth-mode-policy-enforcement` is on,
 /// `Payg` otherwise. Only the forward path calls this.
+#[allow(clippy::too_many_arguments)]
 pub fn compress_anthropic_request_with_policy(
     body: &Bytes,
     mode: CompressionMode,

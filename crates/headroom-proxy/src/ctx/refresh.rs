@@ -674,29 +674,28 @@ pub(crate) fn apply(
     let total_tokens = messages.to_string().len() / BYTES_PER_TOKEN;
     // A build needs the CCR store: stubs without retrievable originals are
     // dropped history, not refresh.
-    if total_tokens >= trigger {
-        if let Some(ccr) = state.ctx_offload.as_ref().map(|r| r.store.ccr()) {
-            if claim_build(session_key) {
-                let snapshot = messages.clone();
-                let url = state.config.ctx_refresh_jev_url.clone();
-                let redact = state.config.redact_sensitive;
-                let state = state.clone();
-                let (session_key, request_id) = (session_key.to_string(), request_id.to_string());
-                tokio::spawn(async move {
-                    build_base(
-                        &state,
-                        &url,
-                        &snapshot,
-                        &session_key,
-                        &request_id,
-                        total_tokens,
-                        redact,
-                        ccr,
-                    )
-                    .await;
-                });
-            }
-        }
+    if total_tokens >= trigger
+        && let Some(ccr) = state.ctx_offload.as_ref().map(|r| r.store.ccr())
+        && claim_build(session_key)
+    {
+        let snapshot = messages.clone();
+        let url = state.config.ctx_refresh_jev_url.clone();
+        let redact = state.config.redact_sensitive;
+        let state = state.clone();
+        let (session_key, request_id) = (session_key.to_string(), request_id.to_string());
+        tokio::spawn(async move {
+            build_base(
+                &state,
+                &url,
+                &snapshot,
+                &session_key,
+                &request_id,
+                total_tokens,
+                redact,
+                ccr,
+            )
+            .await;
+        });
     }
     // Replay AFTER the build clones its snapshot: the build scores the full
     // history, this turn forwards the stored base plus the live tail.
@@ -910,7 +909,7 @@ mod tests {
         // Each lane is an HTTP proxy to its own mock, so the same URL reaches
         // a different server per lane.
         let lane = |mock: &MockServer| {
-            reqwest::Client::builder()
+            crate::ssl_context::client_builder()
                 .proxy(reqwest::Proxy::all(mock.uri()).unwrap())
                 .build()
                 .unwrap()
@@ -939,7 +938,7 @@ mod tests {
     #[tokio::test]
     async fn every_lane_limited_is_an_error_per_exchange_not_a_hang() {
         let limited = jev(vec![ResponseTemplate::new(429)]).await;
-        let lane = reqwest::Client::builder()
+        let lane = crate::ssl_context::client_builder()
             .proxy(reqwest::Proxy::all(limited.uri()).unwrap())
             .build()
             .unwrap();
