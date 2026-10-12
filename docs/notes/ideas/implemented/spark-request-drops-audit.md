@@ -1,7 +1,15 @@
 # Idea: audit what the Spark path drops and what it fails to pass
 
-- **Status:** open. Audit of 2026-09-30, partly unverified. Only one fix came
-  out of it: mid-conversation `system` messages (`4eab6be1`, `ce3b82db`).
+- **Status:** closed 2026-10-12. Shipped: mid-conversation `system` messages
+  (`4eab6be1`, `ce3b82db`), the 2000-byte shape cap and the shadow-call
+  counter (`fa23cba9c`). The messages[0] drop never reproduced (below). Last
+  open step, the unhandled-event read, came back clean: proxy logs
+  2026-10-03 to 10-12 hold only six unhandled Responses names, all carrying
+  no content to translate (`response.created`, `response.in_progress`,
+  `response.reasoning_summary_text.done`, `response.reasoning_summary_part.done`,
+  `response.content_part.added`, `response.content_part.done`), and no
+  `sse_unknown_event` at all.
+- **Status (history):** audit of 2026-09-30, partly unverified.
 - **Status:** messages[0]-drop follow-up 2026-10-08: NOT reproduced on any
   check. Side proxies on the installed binary (~800 marked + ~250 unmarked
   requests, forced connect-level retries, per-request content-length audit,
@@ -76,7 +84,7 @@
   `tool_search_tool_result` blocks it loses are Claude-side bookkeeping.
 - **Unknown:** how much live-zone compression on Spark helps or hurts. It
   rewrote 25 of 1,169 messages in one sample, saves 2.6% of tokens, and costs
-  time (see `spark-proxy-overhead-on-free-path.md`). Rewrites can also move
+  time (see `../rejected/spark-proxy-overhead-on-free-path.md`). Rewrites can also move
   cached bytes.
 - **Added, not dropped:** `routed/tool_alias.rs` lowercases tool names and, on
   tool-poor turns, adds marked shadow copies of `bash`/`edit`/`glob`/`grep`/

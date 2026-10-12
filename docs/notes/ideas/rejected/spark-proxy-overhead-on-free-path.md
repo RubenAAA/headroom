@@ -1,6 +1,9 @@
 # Idea: cut the proxy's own time on Spark turns
 
-- **Status:** open. Measured, not changed.
+- **Status:** rejected 2026-10-12 on the 2026-09-30 re-measure (4,242 Spark
+  turns): the proxy's own time is 1% of TTFB under 50k tokens, 4% at
+  50-200k, 11% above 200k; median 4%. Not worth an A/B. Reopen if the
+  over-200k share of Spark turns passes about 20%.
 - **Source:** `PERF` lines, `opt_ms` field, 2026-09-29 21:22-22:10Z (after the
   cache fix), 1,193 Spark turns.
 - **Claim:** `opt_ms` p50 1,124, p90 4,219, max 8,636. On the 419 turns above

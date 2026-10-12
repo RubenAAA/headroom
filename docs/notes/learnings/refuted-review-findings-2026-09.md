@@ -14,7 +14,7 @@ the effort is now always `max` whatever the client asks
 `max`-to-`xhigh` rewrite was never needed. `summary: auto` and
 `stream_options.sequential_cutoff` are still forced. The "documented Zen
 requirement" wording for the latter is unproven: OpenCode's own request omits
-it and is served (see `ideas/spark-request-drops-audit.md`).
+it and is served (see `ideas/implemented/spark-request-drops-audit.md`).
 
 ## 2. Zen sends no `max_output_tokens`, defaults to `xhigh` — NOT a bug
 
