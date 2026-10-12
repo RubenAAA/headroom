@@ -39,6 +39,7 @@ use serde_json::Value;
 use crate::cache_stabilization::tool_def_normalize::{
     any_tool_has_cache_control, sort_schema_keys_recursive, sort_tools_deterministically,
 };
+use crate::compression::live_zone_anthropic::log_disabled_passes;
 use crate::compression::{Outcome, PassthroughReason};
 use crate::config::CompressionMode;
 
@@ -393,24 +394,13 @@ fn normalize_tool_definitions_openai_chat(
     // dashboards see operator intent rather than `auth_mode`.
     let e1_allowed = phase_e_passes.allows_chat(crate::config::PhaseEPass::E1);
     let e2_allowed = phase_e_passes.allows_chat(crate::config::PhaseEPass::E2);
-    if !e1_allowed {
-        tracing::info!(
-            event = "e1_skipped",
-            request_id = %request_id,
-            path = "/v1/chat/completions",
-            reason = "pass_disabled",
-            "E1 not listed in --phase-e-chat-passes; tool-array sort skipped"
-        );
-    }
-    if !e2_allowed {
-        tracing::info!(
-            event = "e2_skipped",
-            request_id = %request_id,
-            path = "/v1/chat/completions",
-            reason = "pass_disabled",
-            "E2 not listed in --phase-e-chat-passes; schema-key sort skipped"
-        );
-    }
+    log_disabled_passes(
+        e1_allowed,
+        e2_allowed,
+        request_id,
+        "/v1/chat/completions",
+        "--phase-e-chat-passes",
+    );
     if !e1_allowed && !e2_allowed {
         return (body.clone(), NormalizationApplied::default());
     }

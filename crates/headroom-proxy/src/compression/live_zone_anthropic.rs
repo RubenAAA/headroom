@@ -765,24 +765,13 @@ pub(super) fn normalize_tool_definitions(
     // dashboards see operator intent rather than `auth_mode`.
     let e1_allowed = phase_e_passes.allows_anthropic(crate::config::PhaseEPass::E1);
     let e2_allowed = phase_e_passes.allows_anthropic(crate::config::PhaseEPass::E2);
-    if !e1_allowed {
-        tracing::info!(
-            event = "e1_skipped",
-            request_id = %request_id,
-            path = "/v1/messages",
-            reason = "pass_disabled",
-            "E1 not listed in --phase-e-anthropic-passes; tool-array sort skipped"
-        );
-    }
-    if !e2_allowed {
-        tracing::info!(
-            event = "e2_skipped",
-            request_id = %request_id,
-            path = "/v1/messages",
-            reason = "pass_disabled",
-            "E2 not listed in --phase-e-anthropic-passes; schema-key sort skipped"
-        );
-    }
+    log_disabled_passes(
+        e1_allowed,
+        e2_allowed,
+        request_id,
+        "/v1/messages",
+        "--phase-e-anthropic-passes",
+    );
     if !e1_allowed && !e2_allowed {
         return NormalizationApplied::default();
     }
@@ -833,6 +822,37 @@ pub(super) fn normalize_tool_definitions(
     }
 
     applied
+}
+
+/// Emit a `pass_disabled` skip event for each Phase E pass the operator's
+/// `flag` (e.g. `--phase-e-anthropic-passes`) leaves out. Shared by the
+/// Anthropic, Chat Completions and Responses walkers; `path` names the
+/// endpoint in the event.
+pub(super) fn log_disabled_passes(
+    e1_allowed: bool,
+    e2_allowed: bool,
+    request_id: &str,
+    path: &'static str,
+    flag: &'static str,
+) {
+    if !e1_allowed {
+        tracing::info!(
+            event = "e1_skipped",
+            request_id = %request_id,
+            path = path,
+            reason = "pass_disabled",
+            "E1 not listed in {flag}; tool-array sort skipped"
+        );
+    }
+    if !e2_allowed {
+        tracing::info!(
+            event = "e2_skipped",
+            request_id = %request_id,
+            path = path,
+            reason = "pass_disabled",
+            "E2 not listed in {flag}; schema-key sort skipped"
+        );
+    }
 }
 
 /// Auth-mode gate for Phase E normalization: both PR-E1 and PR-E2 mutate
