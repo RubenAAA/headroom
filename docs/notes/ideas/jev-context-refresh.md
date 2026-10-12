@@ -28,6 +28,32 @@
   as units (keeping each `tool_use`/`tool_result` pair whole), and rerun
   observe to see whether the one-exchange sessions gain anything. No
   offline Jev run on captures: it would send client code to opencode.ai.
+- **Status 2026-10-12, tool rounds built** (branch `ctx-refresh-tool-rounds`):
+  exchanges before the current task stay whole; from the task's exchange
+  on, each assistant turn and the results that answer it is a unit. Rounds
+  everywhere were tried first and dropped: on the largest multi-exchange
+  history (778k tokens) the 100-unit scoring cap then covered small rounds,
+  and the estimate fell from 18% to 5%. Offline check, no Jev: 102
+  pre-compaction Spark histories over 100k tokens, rebuilt from
+  `~/.claude-work` transcripts (09-20..10-12), split by the real code. A
+  quarter of the candidates, at their mean size, comes to a median 0% of
+  the history with whole exchanges and 14% with the split (mean 2.3% to
+  12.5%, n=40); no history got less. Scores are not in that estimate: it
+  takes Jev's pick as blind to size.
+  **Bigger gap found:** 62 of the 102 hold no typed message. They start
+  from the client's compaction summary ("This session is being
+  continued…", in `NOT_TYPED`), and the agent runs on with only tool
+  results and task notifications, so there is no task and nothing is
+  scored. The 608k-token history is one.
+- **Status 2026-10-12, summary as task built:** a compaction summary now
+  opens an exchange, its task the "Primary Request and Intent" section
+  (present in 88 of 89 summaries; the whole summary otherwise). A request
+  typed later still wins. Same 102 histories: all have a task now, against
+  40; the 62 without one reach a median 19% (none at 0), all 102 a median
+  19%. The 608k history gets 6.5%: 748 units, and only the largest 100 are
+  scored. **Next:** rerun observe live and read real scores; if the cap
+  binds on the big runs, weigh more Jev calls per run against the free
+  limit.
 - **Idea:** when a session passes a token trigger, Jev judges which parts of
   the history the current task still needs. The proxy keeps those verbatim,
   swaps the rest for stubs the model can fetch back (`headroom_retrieve`), and

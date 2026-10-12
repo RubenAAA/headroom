@@ -605,9 +605,9 @@ Options:
           [default: 0]
 
       --ctx-refresh-observe-tokens <CTX_REFRESH_OBSERVE_TOKENS>
-          Jev context refresh, observe mode: past this many estimated tokens, a Spark turn starts a background run that asks Jev which earlier exchanges the current task no longer needs, and logs `ctx_refresh_observed` and one `ctx_refresh_exchange` per scored exchange. The request is never changed. `0` (the default) is off. See `docs/notes/ideas/jev-context-refresh.md`.
+          Jev context refresh, observe mode: past this many estimated tokens, a Spark turn starts a background run that asks Jev which earlier exchanges, and tool rounds of the current task, the task no longer needs, and logs `ctx_refresh_observed` and one `ctx_refresh_exchange` per scored unit. The request is never changed. `0` (the default) is off. See `docs/notes/ideas/jev-context-refresh.md`.
           
-          The free Jev endpoint rate-limits, so a session is observed at most once per 30 minutes and at most 100 exchanges are scored.
+          The free Jev endpoint rate-limits, so a session is observed at most once per 30 minutes and at most 100 units are scored.
           
           [env: HEADROOM_PROXY_CTX_REFRESH_OBSERVE_TOKENS=]
           [default: 0]
@@ -619,7 +619,7 @@ Options:
           [default: https://opencode.ai/zen/v1/systemone]
 
       --ctx-refresh-apply-tokens <CTX_REFRESH_APPLY_TOKENS>
-          Jev context refresh, apply mode: past this many estimated tokens, a Spark turn builds a shorter base history in the background (Jev scores each exchange, the lowest quarter is stubbed) and later turns forward that base plus the new tail. `0` (the default) is off. See `docs/notes/ideas/jev-context-refresh.md`. Needs `ctx_offload`: the stubbed originals live in the CCR store for `headroom_retrieve`
+          Jev context refresh, apply mode: past this many estimated tokens, a Spark turn builds a shorter base history in the background (Jev scores each unit, the lowest quarter is stubbed) and later turns forward that base plus the new tail. `0` (the default) is off. See `docs/notes/ideas/jev-context-refresh.md`. Needs `ctx_offload`: the stubbed originals live in the CCR store for `headroom_retrieve`
           
           [env: HEADROOM_PROXY_CTX_REFRESH_APPLY_TOKENS=]
           [default: 0]

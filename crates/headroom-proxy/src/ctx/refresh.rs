@@ -7,13 +7,21 @@
 //! applied; apply mode builds the shorter base in the background and later
 //! turns forward that base plus the new tail.
 //!
-//! The unit is an exchange: one typed user message and everything up to the
-//! next. On the 1M-token session of 2026-10-01, tool results were 20% of the
-//! bytes and user-role text 43%, so scoring tool results alone would not have
-//! shrunk it. Whole exchanges also never split a `tool_use`/`tool_result` pair.
+//! The unit is an exchange (one typed user message and everything up to the
+//! next) before the current task, and a tool round from the task's exchange
+//! on: one assistant turn and the user messages that answer it, the first
+//! round carrying the typed message. On the 1M-token session of 2026-10-01,
+//! tool results were 20% of the bytes and user-role text 43%, so scoring tool
+//! results alone would not have shrunk it. Whole exchanges alone left a long
+//! autonomous run, one exchange that is never stubbed, nothing to cut (0-1% in
+//! three of five sessions, 2026-10-12 observe data). Rounds everywhere cut the
+//! largest multi-exchange history's estimate from 18% to 5%, since
+//! [`MAX_SCORED`] then covers small rounds, not large exchanges. A round
+//! boundary only falls on an assistant message, so a `tool_result` stays in
+//! the unit of the `tool_use` it answers.
 //!
 //! The free Jev endpoint rate-limits (429 after about 140 calls in a few
-//! minutes), so a run scores at most [`MAX_SCORED`] exchanges, three at a time,
+//! minutes), so a run scores at most [`MAX_SCORED`] units, three at a time,
 //! and a session is observed at most once per [`COOLDOWN`].
 
 use crate::proxy::AppState;
@@ -30,10 +38,12 @@ const QUESTION: &str =
     "Does the current task need the details of this earlier exchange to be done correctly?";
 /// The 1M-token session of 2026-10-01 was 4.5 MB on the wire.
 const BYTES_PER_TOKEN: usize = 4;
-/// Exchanges never scored: the opening one, and the newest few.
+/// Units never scored: the opening one, and the newest few.
 const PROTECT_HEAD: usize = 1;
 const PROTECT_TAIL: usize = 5;
 const MAX_SCORED: usize = 100;
+/// A typed request shorter than this ("continue", "ok") is not a task.
+const TASK_MIN_CHARS: usize = 20;
 const CONCURRENCY: usize = 3;
 const COOLDOWN: Duration = Duration::from_secs(30 * 60);
 /// A base unreplayed this long is dropped: the provider's cached prefix is
@@ -65,12 +75,19 @@ const NOT_TYPED: [&str; 5] = [
     "This session is being continued",
 ];
 
-/// One typed user message and the messages that answer it.
+/// An exchange or a tool round: `messages[first..end]`.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Exchange {
+pub(crate) struct Unit {
     pub first: usize,
     pub end: usize,
+    /// The typed request of the exchange this unit belongs to.
     pub typed: String,
+    /// True for a whole exchange or an exchange's first round, which hold
+    /// the typed message.
+    pub opens: bool,
+    /// What the stub and the log show: the request for an opening round, the
+    /// tools called and the assistant's text for a later one.
+    pub head: String,
     pub bytes: usize,
     pub text: String,
 }
@@ -114,6 +131,42 @@ fn typed_text(msg: &Value) -> Option<String> {
         return None;
     }
     Some(typed.to_string())
+}
+
+/// The task a compaction summary carries: its "Primary Request and Intent"
+/// section, or the whole summary when that heading is missing. After the
+/// client compacts, an agent often runs on with no typed message at all: in
+/// 62 of 102 Spark histories over 100k tokens (2026-09-20..10-12), the
+/// summary was the only request there was.
+fn summary_task(msg: &Value) -> Option<String> {
+    const SUMMARY: &str = "This session is being continued";
+    const SECTION: &str = "Primary Request and Intent:";
+    if msg.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let raw = match msg.get("content")? {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    let (text, _) = crate::cache_stabilization::ephemeral_spans::split_ephemeral_spans(&raw);
+    let text = text.trim();
+    if !text.starts_with(SUMMARY) {
+        return None;
+    }
+    let task = match text.find(SECTION) {
+        Some(at) => {
+            let section = &text[at + SECTION.len()..];
+            section.find("\n2.").map_or(section, |end| &section[..end])
+        }
+        None => text,
+    };
+    Some(task.trim().to_string()).filter(|t| !t.is_empty())
 }
 
 /// What Jev reads for one message: text, tool calls and results, each cut short.
@@ -171,46 +224,113 @@ fn cap_exchange(text: &str) -> String {
     format!("{head}\n…\n{tail}")
 }
 
-/// Split a transcript into exchanges. Messages before the first typed one
-/// belong to the first exchange.
-pub(crate) fn exchanges(messages: &[Value]) -> Vec<Exchange> {
+fn role(msg: &Value) -> Option<&str> {
+    msg.get("role").and_then(Value::as_str)
+}
+
+/// Head of a later round: the tools it called and the assistant's first text.
+fn round_head(slice: &[Value]) -> String {
+    let mut tools: Vec<&str> = Vec::new();
+    let mut said = "";
+    for m in slice.iter().filter(|m| role(m) == Some("assistant")) {
+        match m.get("content") {
+            Some(Value::String(s)) if said.is_empty() => said = s,
+            Some(Value::Array(blocks)) => {
+                for b in blocks {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("tool_use") => {
+                            let name = b.get("name").and_then(Value::as_str).unwrap_or("?");
+                            if !tools.contains(&name) {
+                                tools.push(name);
+                            }
+                        }
+                        Some("text") if said.is_empty() => {
+                            said = b.get("text").and_then(Value::as_str).unwrap_or("");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let said = said.trim().replace('\n', " ");
+    if tools.is_empty() {
+        said
+    } else {
+        format!("tools {}: {said}", tools.join(", "))
+    }
+}
+
+/// Split a transcript into exchanges, and those from the current task's on
+/// into rounds. A new round starts at an assistant message that follows a
+/// user message no one typed (a tool result or a harness notice). A
+/// compaction summary opens an exchange as a typed message would, its task
+/// taken from [`summary_task`]. Messages before the first request belong to
+/// the first unit.
+pub(crate) fn units(messages: &[Value]) -> Vec<Unit> {
     let mut starts: Vec<(usize, String)> = Vec::new();
     for (i, m) in messages.iter().enumerate() {
-        if let Some(t) = typed_text(m) {
+        if let Some(t) = typed_text(m).or_else(|| summary_task(m)) {
             starts.push((i, t));
         }
     }
-    if starts.is_empty() {
-        return Vec::new();
-    }
-    starts[0].0 = 0;
-    let mut out = Vec::with_capacity(starts.len());
-    for (k, (first, typed)) in starts.iter().enumerate() {
+    let split_from = starts
+        .iter()
+        .rposition(|(_, t)| t.chars().count() >= TASK_MIN_CHARS)
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for (k, (typed_at, typed)) in starts.iter().enumerate() {
+        let first = if k == 0 { 0 } else { *typed_at };
         let end = starts.get(k + 1).map_or(messages.len(), |(next, _)| *next);
-        let slice = &messages[*first..end];
-        let mut text = String::new();
-        for m in slice {
-            render_message(m, &mut text);
+        let mut bounds = vec![first];
+        let rounds_from = if k < split_from { end } else { typed_at + 1 };
+        bounds.extend((rounds_from..end).filter(|&i| {
+            i - 1 != *typed_at
+                && role(&messages[i]) == Some("assistant")
+                && role(&messages[i - 1]) == Some("user")
+        }));
+        for (r, &from) in bounds.iter().enumerate() {
+            let to = bounds.get(r + 1).copied().unwrap_or(end);
+            let slice = &messages[from..to];
+            let opens = r == 0;
+            let mut text = String::new();
+            if !opens {
+                text.push_str(&format!("request: {}\n", truncate_chars(typed, PART_CHARS)));
+            }
+            for m in slice {
+                render_message(m, &mut text);
+            }
+            out.push(Unit {
+                first: from,
+                end: to,
+                typed: typed.clone(),
+                opens,
+                head: if opens {
+                    typed.clone()
+                } else {
+                    round_head(slice)
+                },
+                bytes: slice.iter().map(|m| m.to_string().len()).sum(),
+                text: cap_exchange(&text),
+            });
         }
-        out.push(Exchange {
-            first: *first,
-            end,
-            typed: typed.clone(),
-            bytes: slice.iter().map(|m| m.to_string().len()).sum(),
-            text: cap_exchange(&text),
-        });
     }
     out
 }
 
-/// The last request that says something: not a stray "continue" or "ok".
-fn current_task(ex: &[Exchange]) -> Option<usize> {
-    ex.iter().rposition(|e| e.typed.chars().count() >= 20)
+/// The unit that opens the last request that says something: not a stray
+/// "continue" or "ok".
+fn current_task(units: &[Unit]) -> Option<usize> {
+    units
+        .iter()
+        .rposition(|u| u.opens && u.typed.chars().count() >= TASK_MIN_CHARS)
 }
 
-/// What gets scored: everything but the opening, the newest few and the task's
-/// own exchange; the largest first, since they hold the savings.
-fn candidates(ex: &[Exchange], task: usize) -> Vec<usize> {
+/// What gets scored: everything but the opening, the newest few and the
+/// round holding the task's request; the largest first, since they hold the
+/// savings.
+fn candidates(ex: &[Unit], task: usize) -> Vec<usize> {
     let tail_start = ex.len().saturating_sub(PROTECT_TAIL);
     let mut idx: Vec<usize> = (PROTECT_HEAD..tail_start).filter(|i| *i != task).collect();
     idx.sort_by_key(|i| std::cmp::Reverse(ex[*i].bytes));
@@ -226,11 +346,14 @@ pub(crate) struct Scored {
     pub tokens: usize,
     pub score: f64,
     pub head: String,
+    /// A later round, not the one that opens its exchange.
+    pub round: bool,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Observation {
     pub exchanges: usize,
+    pub units: usize,
     pub scored: Vec<Scored>,
     pub errors: usize,
 }
@@ -323,9 +446,10 @@ fn retry_pause(attempt: u32) -> Duration {
 }
 
 /// Score the candidates against the current task.
-pub(crate) async fn observe_exchanges(state: &AppState, url: &str, ex: &[Exchange]) -> Observation {
+pub(crate) async fn observe_units(state: &AppState, url: &str, ex: &[Unit]) -> Observation {
     let mut obs = Observation {
-        exchanges: ex.len(),
+        exchanges: ex.iter().filter(|u| u.opens).count(),
+        units: ex.len(),
         ..Default::default()
     };
     let Some(task_idx) = current_task(ex) else {
@@ -350,7 +474,8 @@ pub(crate) async fn observe_exchanges(state: &AppState, url: &str, ex: &[Exchang
                 messages: ex[i].end - ex[i].first,
                 tokens: ex[i].bytes / BYTES_PER_TOKEN,
                 score,
-                head: truncate_chars(&ex[i].typed.replace('\n', " "), 100),
+                head: truncate_chars(&ex[i].head.replace('\n', " "), 100),
+                round: !ex[i].opens,
             }),
             Err(_) => obs.errors += 1,
         }
@@ -391,7 +516,8 @@ fn log_observation(session_key: &str, request_id: &str, total_tokens: usize, obs
             tokens = s.tokens,
             score = s.score,
             head = %s.head,
-            "Jev scored an earlier exchange against the current task"
+            round = s.round,
+            "Jev scored an earlier round against the current task"
         );
     }
     let under = |t: f64| {
@@ -409,13 +535,14 @@ fn log_observation(session_key: &str, request_id: &str, total_tokens: usize, obs
         request_id = %request_id,
         total_tokens,
         exchanges = obs.exchanges,
+        units = obs.units,
         scored = obs.scored.len(),
         errors = obs.errors,
-        stub_lt_0_3_exchanges = n3,
+        stub_lt_0_3_units = n3,
         stub_lt_0_3_tokens = t3,
-        stub_lt_0_4_exchanges = n4,
+        stub_lt_0_4_units = n4,
         stub_lt_0_4_tokens = t4,
-        stub_lt_0_5_exchanges = n5,
+        stub_lt_0_5_units = n5,
         stub_lt_0_5_tokens = t5,
         "Jev refresh observed; the request was not changed"
     );
@@ -452,8 +579,8 @@ pub(crate) fn observe(state: &AppState, parsed: &Value, session_key: &str, reque
     let (session_key, request_id) = (session_key.to_string(), request_id.to_string());
     tokio::spawn(async move {
         let msgs = body["messages"].as_array().cloned().unwrap_or_default();
-        let ex = exchanges(&msgs);
-        let obs = observe_exchanges(&state, &url, &ex).await;
+        let ex = units(&msgs);
+        let obs = observe_units(&state, &url, &ex).await;
         log_observation(&session_key, &request_id, total_tokens, &obs);
     });
 }
@@ -558,24 +685,35 @@ fn select_stubs(scored: &[Scored]) -> Vec<usize> {
     stubs
 }
 
-/// The replacement for one stubbed exchange: a pointer, not prose. Jev cannot
+/// The replacement for one stubbed round: a pointer, not prose. Jev cannot
 /// summarise, so the stub says what was dropped and where the original lives;
 /// `headroom_retrieve` fetches `<<ctx:HASH>>` from the CCR store.
-fn stub_text(score: f64, head: &str, messages: usize, tokens: usize, hash: &str) -> String {
+fn stub_text(
+    opens: bool,
+    score: f64,
+    head: &str,
+    messages: usize,
+    tokens: usize,
+    hash: &str,
+) -> String {
+    let (what, shown, label) = if opens {
+        ("exchange", "its opening request", "Opening request")
+    } else {
+        ("tool round", "the tools it called", "Tool round")
+    };
     format!(
-        "[Context refresh: an earlier exchange ({messages} messages, about {tokens} tokens, relevance {score:.2}) was stubbed; only its opening request is shown below. The full exchange is kept and can be fetched back.]\nOpening request: {head}\n{CTX_OFFLOAD_MARKER_PREFIX}{hash}>> (stubbed exchange; use headroom_retrieve to fetch the original)"
+        "[Context refresh: an earlier {what} ({messages} messages, about {tokens} tokens, relevance {score:.2}) was stubbed; only {shown} is shown below. The full {what} is kept and can be fetched back.]\n{label}: {head}\n{CTX_OFFLOAD_MARKER_PREFIX}{hash}>> (stubbed {what}; use headroom_retrieve to fetch the original)"
     )
 }
 
-/// Rewrite `messages[..base_len]` with each stubbed exchange replaced by its
-/// first message carrying the stub. Whole exchanges only, so no
-/// `tool_use`/`tool_result` pair is split, and the kept message keeps its
-/// (user) role. Returns the rewritten prefix plus stubbed counts. An exchange
-/// whose original the store refuses stays verbatim: a stub without an
-/// original is dropped history, not refresh.
+/// Rewrite `messages[..base_len]` with each stubbed round replaced by one
+/// user message carrying the stub. A round holds every `tool_result` that
+/// answers its `tool_use`, so no pair is split. Returns the rewritten prefix
+/// plus stubbed counts. A round whose original the store refuses stays
+/// verbatim: a stub without an original is dropped history, not refresh.
 fn rewrite_prefix(
     messages: &[Value],
-    ex: &[Exchange],
+    ex: &[Unit],
     scored: &[Scored],
     base_len: usize,
     ccr: &dyn CcrStore,
@@ -609,27 +747,24 @@ fn rewrite_prefix(
             out.extend_from_slice(slice);
             continue;
         }
-        let mut kept = messages[e.first].clone();
-        if kept.is_object() {
-            let tokens = original.len() / BYTES_PER_TOKEN;
-            kept["content"] = Value::String(stub_text(
-                score_of(index),
-                &truncate_chars(&e.typed, 100),
-                slice.len(),
-                tokens,
-                &hash,
-            ));
-            stubbed += 1;
-            stubbed_tokens += tokens;
-        }
-        out.push(kept);
+        let tokens = original.len() / BYTES_PER_TOKEN;
+        out.push(json!({"role": "user", "content": stub_text(
+            e.opens,
+            score_of(index),
+            &truncate_chars(&e.head.replace('\n', " "), 100),
+            slice.len(),
+            tokens,
+            &hash,
+        )}));
+        stubbed += 1;
+        stubbed_tokens += tokens;
     }
     (out, stubbed, stubbed_tokens)
 }
 
 /// Score one snapshot and persist the rewritten base. Runs off the request
 /// path; the next turn replays what it stores. The newest [`PROTECT_TAIL`]
-/// exchanges stay out of the base: they are the live tail, always verbatim.
+/// rounds stay out of the base: they are the live tail, always verbatim.
 #[allow(clippy::too_many_arguments)]
 async fn build_base(
     state: &AppState,
@@ -652,11 +787,11 @@ async fn build_base(
         // judged positions would stub the wrong messages. Abort, keep history.
         return;
     }
-    let ex = exchanges(&judged);
+    let ex = units(&judged);
     if ex.len() <= PROTECT_HEAD + PROTECT_TAIL {
         return;
     }
-    let obs = observe_exchanges(state, url, &ex).await;
+    let obs = observe_units(state, url, &ex).await;
     if obs.scored.is_empty() || select_stubs(&obs.scored).is_empty() {
         return;
     }
@@ -690,9 +825,10 @@ async fn build_base(
         session_key_hash = %session,
         request_id = %request_id,
         total_tokens = total_tokens,
-        exchanges = ex.len(),
+        exchanges = obs.exchanges,
+        units = obs.units,
         scored = obs.scored.len(),
-        stubbed_exchanges = stubbed,
+        stubbed_units = stubbed,
         stubbed_tokens = stubbed_tokens,
         base_len = base_len,
         base_messages = base_messages,
@@ -834,7 +970,7 @@ mod tests {
 
     #[test]
     fn a_tool_result_does_not_start_an_exchange() {
-        let ex = exchanges(&transcript());
+        let ex = units(&transcript());
         assert_eq!(ex.len(), 10);
         assert!(ex.iter().all(|e| e.end - e.first == 3));
         assert_eq!((ex[0].first, ex[9].end), (0, 30));
@@ -853,7 +989,7 @@ mod tests {
         m.push(user("Stop hook feedback: doc drift"));
         m.push(user("[Request interrupted by user]"));
         m.push(user("a second real request"));
-        let ex = exchanges(&m);
+        let ex = units(&m);
         assert_eq!(ex.len(), 2);
         assert_eq!(ex[0].typed, "first real request", "reminder span is lifted");
         assert_eq!(
@@ -871,7 +1007,7 @@ mod tests {
         m[5] = json!({"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
             {"type": "text", "text": "also please handle the edge case here"}]});
-        let ex = exchanges(&m);
+        let ex = units(&m);
         assert_eq!(ex.len(), 10);
         assert_eq!((ex[1].first, ex[1].end), (3, 6));
     }
@@ -880,20 +1016,20 @@ mod tests {
     fn messages_before_the_first_typed_one_join_the_first_exchange() {
         let mut m = vec![assistant_tool("a"), tool_result("a", "ok")];
         m.push(user("then a typed request that is long enough"));
-        let ex = exchanges(&m);
+        let ex = units(&m);
         assert_eq!(ex.len(), 1);
         assert_eq!((ex[0].first, ex[0].end), (0, 3));
     }
 
     #[test]
     fn no_typed_message_means_no_exchanges() {
-        assert!(exchanges(&[assistant_tool("a"), tool_result("a", "ok")]).is_empty());
-        assert!(exchanges(&[]).is_empty());
+        assert!(units(&[assistant_tool("a"), tool_result("a", "ok")]).is_empty());
+        assert!(units(&[]).is_empty());
     }
 
     #[test]
     fn the_opening_the_tail_and_the_task_are_never_scored() {
-        let ex = exchanges(&transcript());
+        let ex = units(&transcript());
         let task = current_task(&ex).unwrap();
         assert_eq!(task, 9);
         let c = candidates(&ex, task);
@@ -904,7 +1040,7 @@ mod tests {
     fn a_short_last_message_is_not_the_task() {
         let mut m = transcript();
         m.push(user("continue"));
-        let ex = exchanges(&m);
+        let ex = units(&m);
         assert_eq!(current_task(&ex), Some(9), "'continue' says nothing");
     }
 
@@ -936,8 +1072,8 @@ mod tests {
     #[tokio::test]
     async fn exchanges_are_scored_against_the_current_task() {
         let server = jev(vec![answer(0.2)]).await;
-        let ex = exchanges(&transcript());
-        let obs = observe_exchanges(&state_with(1), &server.uri(), &ex).await;
+        let ex = units(&transcript());
+        let obs = observe_units(&state_with(1), &server.uri(), &ex).await;
         assert_eq!((obs.scored.len(), obs.errors), (4, 0));
         let sent = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
@@ -952,8 +1088,8 @@ mod tests {
     async fn a_rate_limit_is_retried_then_counted_not_fatal() {
         let limited = ResponseTemplate::new(429).set_body_string("slow down");
         let server = jev(vec![limited.clone(), limited, answer(0.7)]).await;
-        let ex = exchanges(&transcript());
-        let obs = observe_exchanges(&state_with(1), &server.uri(), &ex).await;
+        let ex = units(&transcript());
+        let obs = observe_units(&state_with(1), &server.uri(), &ex).await;
         assert_eq!(
             (obs.scored.len(), obs.errors),
             (4, 0),
@@ -961,7 +1097,7 @@ mod tests {
         );
 
         let always = jev(vec![ResponseTemplate::new(429)]).await;
-        let obs = observe_exchanges(&state_with(1), &always.uri(), &ex).await;
+        let obs = observe_units(&state_with(1), &always.uri(), &ex).await;
         assert_eq!((obs.scored.len(), obs.errors), (0, 4));
     }
 
@@ -985,8 +1121,8 @@ mod tests {
         ));
         let mut state = state_with(1);
         state.zen_egresses = Some(pool);
-        let ex = exchanges(&transcript());
-        let obs = observe_exchanges(&state, "http://jev.invalid/systemone", &ex).await;
+        let ex = units(&transcript());
+        let obs = observe_units(&state, "http://jev.invalid/systemone", &ex).await;
         assert_eq!((obs.scored.len(), obs.errors), (4, 0));
         assert_eq!(open.received_requests().await.unwrap().len(), 4);
         assert!(
@@ -1013,8 +1149,8 @@ mod tests {
         ));
         let mut state = state_with(1);
         state.zen_egresses = Some(pool);
-        let ex = exchanges(&transcript());
-        let obs = observe_exchanges(&state, "http://jev.invalid/systemone", &ex).await;
+        let ex = units(&transcript());
+        let obs = observe_units(&state, "http://jev.invalid/systemone", &ex).await;
         assert_eq!((obs.scored.len(), obs.errors), (0, 4));
     }
 
@@ -1027,8 +1163,8 @@ mod tests {
             answer(0.9),
         ])
         .await;
-        let ex = exchanges(&transcript());
-        let obs = observe_exchanges(&state_with(1), &server.uri(), &ex).await;
+        let ex = units(&transcript());
+        let obs = observe_units(&state_with(1), &server.uri(), &ex).await;
         assert_eq!((obs.scored.len(), obs.errors), (1, 3));
         assert!((obs.scored[0].score - 0.9).abs() < 1e-9);
     }
@@ -1036,7 +1172,7 @@ mod tests {
     #[tokio::test]
     async fn nothing_is_asked_without_a_task() {
         let server = jev(vec![answer(0.5)]).await;
-        let obs = observe_exchanges(&state_with(1), &server.uri(), &[]).await;
+        let obs = observe_units(&state_with(1), &server.uri(), &[]).await;
         assert_eq!((obs.scored.len(), obs.errors), (0, 0));
         assert!(server.received_requests().await.unwrap().is_empty());
     }
@@ -1098,6 +1234,7 @@ mod tests {
             tokens: 100,
             score,
             head: format!("request {index}"),
+            round: false,
         }
     }
 
@@ -1132,7 +1269,7 @@ mod tests {
     fn stub_rewrite_stashes_whole_exchanges_and_keeps_pairs() {
         use headroom_core::ccr::InMemoryCcrStore;
         let msgs = transcript();
-        let ex = exchanges(&msgs);
+        let ex = units(&msgs);
         assert_eq!(ex.len(), 10);
         // The lowest quarter of four scored is the single lowest: exchange 2.
         let judged: Vec<Scored> = [(1, 0.8), (2, 0.5), (3, 0.7), (4, 0.6)]
@@ -1157,9 +1294,16 @@ mod tests {
         let original = store.get(hash).expect("original is retrievable");
         assert!(original.contains("please do the thing number 2 in the parser"));
         // Every tool_result still answers a tool_use in the same base.
+        let (uses, results) = tool_ids(&base);
+        assert_eq!(uses, results);
+        assert!(!uses.contains(&"t2"));
+    }
+
+    /// Sorted `tool_use` ids and `tool_result` ids across `msgs`.
+    fn tool_ids(msgs: &[Value]) -> (Vec<&str>, Vec<&str>) {
         let mut uses = Vec::new();
         let mut results = Vec::new();
-        for m in &base {
+        for m in msgs {
             if let Some(blocks) = m.get("content").and_then(Value::as_array) {
                 for b in blocks {
                     match b.get("type").and_then(Value::as_str) {
@@ -1174,8 +1318,194 @@ mod tests {
         }
         uses.sort_unstable();
         results.sort_unstable();
+        (uses, results)
+    }
+
+    /// One typed request, then `rounds` tool round trips, then a final reply:
+    /// the long autonomous run that reaches the window.
+    fn autonomous_run(rounds: usize) -> Vec<Value> {
+        let mut m = vec![user("fix the lexer bug and run the parser tests")];
+        for i in 0..rounds {
+            m.push(assistant_tool(&format!("t{i}")));
+            m.push(tool_result(&format!("t{i}"), "ok"));
+        }
+        m.push(json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}));
+        m
+    }
+
+    /// A one-exchange run splits into its rounds: the first carries the typed
+    /// request, each later one starts at an assistant turn and ends with the
+    /// results that answer it, and the final reply is a round of its own.
+    #[test]
+    fn a_long_run_splits_into_tool_rounds() {
+        let msgs = autonomous_run(12);
+        let ex = units(&msgs);
+        assert_eq!(ex.len(), 13, "first round, 11 later rounds, the reply");
+        assert_eq!((ex[0].first, ex[0].end, ex[0].opens), (0, 3, true));
+        assert_eq!((ex[1].first, ex[1].end, ex[1].opens), (3, 5, false));
+        assert_eq!((ex[12].first, ex[12].end), (25, 26));
+        assert!(ex.iter().all(|u| u.typed.starts_with("fix the lexer bug")));
+        assert_eq!(ex[1].head, "tools Read: reading");
+        assert!(ex[1].text.starts_with("request: fix the lexer bug"));
+        for u in &ex {
+            let (uses, results) = tool_ids(&msgs[u.first..u.end]);
+            assert_eq!(
+                uses, results,
+                "round {}..{} keeps its pairs",
+                u.first, u.end
+            );
+        }
+        let task = current_task(&ex).unwrap();
+        assert_eq!(task, 0, "the task is the opening round");
+        assert_eq!(candidates(&ex, task), (1..8).collect::<Vec<_>>());
+    }
+
+    /// An exchange before the task stays whole; the task's own splits. A
+    /// short "continue" after the task splits too: it carries on the same
+    /// work.
+    #[test]
+    fn exchanges_before_the_task_stay_whole() {
+        let mut m = autonomous_run(3);
+        m.extend(autonomous_run(3).into_iter().map(|mut x| {
+            if x["content"] == "fix the lexer bug and run the parser tests" {
+                x["content"] = json!("now port the same fix to the formatter");
+            }
+            x
+        }));
+        m.extend(autonomous_run(2).into_iter().map(|mut x| {
+            if x["role"] == "user" && x["content"].is_string() {
+                x["content"] = json!("continue");
+            }
+            x
+        }));
+        let ex = units(&m);
+        assert_eq!((ex[0].first, ex[0].end, ex[0].opens), (0, 8, true));
+        assert!(ex[1..].iter().all(|u| u.first >= 8));
+        assert_eq!(ex.iter().filter(|u| u.opens).count(), 3);
+        assert_eq!(
+            ex.len(),
+            1 + 4 + 3,
+            "whole, then rounds of the task, then of 'continue'"
+        );
+        assert_eq!(current_task(&ex), Some(1));
+    }
+
+    fn compaction_summary() -> Value {
+        user(
+            "This session is being continued from a previous conversation that ran out of context.\n\nSummary:\n1. Primary Request and Intent:\n   - port the lexer fix to the formatter and run its tests\n\n2. Key Technical Concepts:\n   - the parser",
+        )
+    }
+
+    /// After compaction the agent runs on with no typed message: the
+    /// summary's request section is the task, and the run splits into
+    /// rounds behind it.
+    #[test]
+    fn a_compaction_summary_is_the_task_when_nothing_is_typed_after_it() {
+        let mut m = autonomous_run(12);
+        m[0] = compaction_summary();
+        m.insert(5, user("<task-notification>x</task-notification>"));
+        let ex = units(&m);
+        assert_eq!(ex.len(), 13);
+        assert_eq!(
+            ex[0].typed,
+            "- port the lexer fix to the formatter and run its tests"
+        );
+        assert_eq!(current_task(&ex), Some(0));
+        assert_eq!(candidates(&ex, 0).len(), 7);
+    }
+
+    /// A request typed after the summary is the task, as before.
+    #[test]
+    fn a_request_typed_after_the_summary_is_the_task() {
+        let mut m = vec![
+            compaction_summary(),
+            assistant_tool("s"),
+            tool_result("s", "ok"),
+        ];
+        m.extend(autonomous_run(3));
+        let ex = units(&m);
+        let task = current_task(&ex).unwrap();
+        assert_eq!(ex[task].first, 3);
+        assert!(ex[task].typed.starts_with("fix the lexer bug"));
+        assert_eq!(
+            (ex[0].first, ex[0].end),
+            (0, 3),
+            "the summary's exchange stays whole"
+        );
+    }
+
+    #[test]
+    fn a_summary_without_the_request_heading_is_the_task_whole() {
+        let msg = user(
+            "This session is being continued from a previous conversation. Summary: did things",
+        );
+        assert!(summary_task(&msg).unwrap().starts_with("This session"));
+        assert_eq!(summary_task(&user("please continue the work")), None);
+        assert_eq!(
+            summary_task(&tool_result("a", "This session is being continued")),
+            None
+        );
+    }
+
+    /// A harness notice after a tool result stays in that round; the next
+    /// assistant turn starts a new one.
+    #[test]
+    fn a_notice_between_rounds_stays_in_the_earlier_round() {
+        let mut m = autonomous_run(2);
+        m.insert(3, user("<task-notification>x</task-notification>"));
+        let ex = units(&m);
+        assert_eq!((ex[0].first, ex[0].end), (0, 4));
+        assert_eq!((ex[1].first, ex[1].end), (4, 6));
+    }
+
+    /// A stubbed round becomes one user message naming its tools and the
+    /// pointer; its pair goes with it, every other pair stays.
+    #[test]
+    fn stub_rewrite_replaces_a_round_and_keeps_pairs() {
+        use headroom_core::ccr::InMemoryCcrStore;
+        let msgs = autonomous_run(12);
+        let ex = units(&msgs);
+        let judged: Vec<Scored> = (1..8)
+            .map(|i| scored(i, if i == 4 { 0.1 } else { 0.8 }))
+            .collect();
+        let base_len = ex[ex.len() - PROTECT_TAIL].first;
+        let store = InMemoryCcrStore::new();
+        let (base, stubbed, _) = rewrite_prefix(&msgs, &ex, &judged, base_len, &store);
+        assert_eq!(stubbed, 1);
+        assert_eq!(base.len(), base_len - 1, "a two-message round became one");
+        let stub = &base[ex[4].first];
+        assert_eq!(stub["role"], "user");
+        let text = stub["content"].as_str().unwrap();
+        assert!(text.contains("an earlier tool round"), "{text}");
+        assert!(text.contains("Tool round: tools Read: reading"), "{text}");
+        let hash = text
+            .split("<<ctx:")
+            .nth(1)
+            .and_then(|s| s.split(">>").next())
+            .unwrap();
+        let original: Vec<Value> = serde_json::from_str(&store.get(hash).unwrap()).unwrap();
+        assert_eq!(original, msgs[ex[4].first..ex[4].end]);
+        let (uses, results) = tool_ids(&base);
         assert_eq!(uses, results);
-        assert!(!uses.contains(&"t2"));
+        assert!(!uses.contains(&"t4"));
+    }
+
+    /// Jev reads a later round with the request it serves.
+    #[tokio::test]
+    async fn a_round_is_scored_with_its_request() {
+        let server = jev(vec![answer(0.5)]).await;
+        let ex = units(&autonomous_run(12));
+        let obs = observe_units(&state_with(1), &server.uri(), &ex).await;
+        assert_eq!((obs.exchanges, obs.units, obs.scored.len()), (1, 13, 7));
+        assert!(obs.scored.iter().all(|s| s.round));
+        for req in server.received_requests().await.unwrap() {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let state = body["state"].as_str().unwrap();
+            assert!(
+                state.contains("Earlier exchange:\nrequest: fix the lexer bug"),
+                "{state}"
+            );
+        }
     }
 
     fn apply_state() -> AppState {

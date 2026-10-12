@@ -619,11 +619,12 @@ HEADROOM_FLAGS=(
 
   # Jev context refresh, observe mode (see docs/notes/ideas/jev-context-refresh.md).
   # Past this many estimated tokens a Spark turn starts a background run that
-  # asks Jev which earlier exchanges the current task no longer needs, and logs
-  # `ctx_refresh_exchange` per exchange and `ctx_refresh_observed` per run. It
-  # changes no request. Once per session per 30 minutes, at most 100 exchanges,
-  # because the free Jev endpoint rate-limits. Added 2026-10-01; read the log
-  # before building the apply half. 0 turns it off.
+  # asks Jev which earlier exchanges, and tool rounds of the current task, the
+  # task no longer needs, and logs `ctx_refresh_exchange` per unit and
+  # `ctx_refresh_observed` per run. It changes no request. Once per session per
+  # 30 minutes, at most 100 units, because the free Jev endpoint rate-limits.
+  # Added 2026-10-01; read the log before building the apply half. 0 turns it
+  # off.
   --ctx-refresh-observe-tokens 400000
 
   # ─── Defaults, written out ──────────────────────────────────────────
