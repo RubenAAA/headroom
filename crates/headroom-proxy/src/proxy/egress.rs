@@ -23,11 +23,14 @@ pub(crate) struct CallerClientKey {
     pub(super) addresses: Vec<SocketAddr>,
 }
 
-/// Provider-only transports assigned once per stream lane. First-seen lanes
-/// cycle across the configured egresses, which gives a fan-out of N streams
-/// N distinct egresses when at least N are configured; later turns stay on
-/// their assigned egress. The bounded map retains affinity for active work
-/// without growing forever on a long-lived proxy.
+/// Provider-only transports assigned once per stream lane; later turns stay
+/// on their assigned egress. A first-seen lane takes an egress that is warm
+/// but quiet, else wakes the lowest cold one, so N parallel streams still get
+/// N distinct egresses while a lone session keeps to one. Each egress in use
+/// is a VPN login on an account whose ten devices the user's own machines
+/// share; one the relay sees idle for 15 minutes releases its device. The
+/// bounded map retains affinity for active work without growing forever on a
+/// long-lived proxy.
 pub(crate) struct ProviderEgressPool {
     pub(super) clients: Vec<reqwest::Client>,
     pub(super) egress_ids: Vec<String>,
@@ -43,6 +46,9 @@ pub(crate) struct ProviderEgressPool {
     pub(super) unhealthy_until_ms: Vec<std::sync::atomic::AtomicU64>,
     /// Per slot, 429s in a row since the lane last answered a request.
     pub(super) limited_streak: Vec<std::sync::atomic::AtomicU32>,
+    /// Per slot, when (ms since `born`) it was last assigned or acquired; `0`
+    /// means never.
+    pub(super) last_used_ms: Vec<std::sync::atomic::AtomicU64>,
     /// Counts failovers, so successive ones start at different lanes.
     pub(super) failover_cursor: std::sync::atomic::AtomicUsize,
     pub(super) born: std::time::Instant,
@@ -65,6 +71,14 @@ pub(super) const LANE_LIMITED_MS: u64 = 15_000;
 /// 19:06 local on 2026-09-30, lanes 1, 3 and 5 answered 40 429s and no 200 in
 /// 17 minutes, so a flat 15 s kept probing lanes that stayed limited.
 pub(super) const LANE_LIMITED_MAX_MS: u64 = 120_000;
+
+/// An egress used this recently still holds its VPN login (the relay calls a
+/// lane idle after 15 minutes); a new stream lane prefers one of these.
+pub(super) const LANE_WARM_MS: u64 = 10 * 60_000;
+
+/// An egress with nothing in flight and no new turn for this long is free for
+/// a new stream lane. Shorter than this, its session is likely between turns.
+pub(super) const LANE_QUIET_MS: u64 = 60_000;
 
 pub(super) struct ProviderEgressAssignments {
     pub(super) lanes: lru::LruCache<String, usize>,
@@ -91,6 +105,9 @@ impl ProviderEgressPool {
             limited_streak: (0..egress_ids.len())
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            last_used_ms: (0..egress_ids.len())
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             failover_cursor: std::sync::atomic::AtomicUsize::new(0),
             born: std::time::Instant::now(),
             egress_ids,
@@ -106,10 +123,44 @@ impl ProviderEgressPool {
         if let Some(&slot) = assignments.lanes.get(&lane_fingerprint) {
             return slot;
         }
-        let slot = assignments.next_slot % self.clients.len();
-        assignments.next_slot = assignments.next_slot.wrapping_add(1);
+        let slot = self.pick_new_slot().unwrap_or_else(|| {
+            let slot = assignments.next_slot % self.clients.len();
+            assignments.next_slot = assignments.next_slot.wrapping_add(1);
+            slot
+        });
+        self.touch(slot);
         assignments.lanes.put(lane_fingerprint, slot);
         slot
+    }
+
+    /// For a first-seen lane: the lowest healthy egress that is warm and
+    /// quiet, else the lowest healthy cold one. `None` when every healthy
+    /// egress is warm and busy; the caller then cycles as before.
+    fn pick_new_slot(&self) -> Option<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = self.now_ms();
+        let open: Vec<usize> = (0..self.clients.len())
+            .filter(|&s| !self.is_unhealthy(s) && !self.is_in_maintenance(&self.egress_ids[s]))
+            .collect();
+        let since = |s: usize| {
+            let at = self.last_used_ms[s].load(Relaxed);
+            (at != 0).then(|| now.saturating_sub(at))
+        };
+        let warm_and_quiet = open.iter().copied().find(|&s| {
+            self.in_flight[s].load(Relaxed) == 0
+                && since(s).is_some_and(|ago| (LANE_QUIET_MS..LANE_WARM_MS).contains(&ago))
+        });
+        warm_and_quiet.or_else(|| {
+            open.iter()
+                .copied()
+                .find(|&s| since(s).is_none_or(|ago| ago >= LANE_WARM_MS))
+        })
+    }
+
+    fn touch(&self, slot: usize) {
+        // `max(1)`: 0 means never used, and a pool born this millisecond
+        // would otherwise record its first use as never.
+        self.last_used_ms[slot].store(self.now_ms().max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn set_maintenance(&self, egress_id: &str, rotating: bool) -> bool {
@@ -145,6 +196,7 @@ impl ProviderEgressPool {
         }
         self.in_flight[slot].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(maintenance);
+        self.touch(slot);
         Ok(EgressInflightGuard {
             pool: Arc::clone(self),
             slot,
@@ -550,6 +602,42 @@ mod tests {
         pool.mark_limited(0);
         assert!(pass_over_ms(&pool, 0) <= 15_000, "an answer resets the run");
         assert_eq!(pass_over_ms(&pool, 1), 0, "the other lane is untouched");
+    }
+
+    /// New stream lanes reuse an egress that is warm and quiet, so a lone
+    /// session keeps one VPN login; parallel ones still fan out, and an
+    /// egress idle past the relay's window counts as cold again.
+    #[test]
+    fn new_lanes_reuse_a_quiet_warm_egress_and_fan_out_when_busy() {
+        let mut pool = ProviderEgressPool::new(
+            vec![reqwest::Client::new(); 3],
+            vec!["a".into(), "b".into(), "c".into()],
+        );
+        pool.born = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .expect("uptime past an hour");
+        assert_eq!(pool.slot_for_lane("one"), 0);
+        assert_eq!(pool.slot_for_lane("two"), 1, "0 just started a turn");
+        let ago = |ms: u64| pool.now_ms() - ms;
+        pool.last_used_ms[0].store(ago(LANE_QUIET_MS + 1_000), Relaxed);
+        pool.last_used_ms[1].store(ago(LANE_QUIET_MS + 1_000), Relaxed);
+        pool.in_flight[0].store(1, Relaxed);
+        assert_eq!(
+            pool.slot_for_lane("three"),
+            1,
+            "warm, quiet, nothing in flight"
+        );
+        pool.in_flight[0].store(0, Relaxed);
+        pool.last_used_ms[0].store(ago(LANE_WARM_MS + 1_000), Relaxed);
+        pool.last_used_ms[1].store(ago(LANE_WARM_MS + 1_000), Relaxed);
+        pool.last_used_ms[2].store(ago(LANE_QUIET_MS + 1_000), Relaxed);
+        assert_eq!(pool.slot_for_lane("four"), 2, "warm beats cold");
+        assert_eq!(pool.slot_for_lane("five"), 0, "then the lowest cold one");
+        assert_eq!(
+            pool.slot_for_lane("one"),
+            0,
+            "a known lane keeps its egress"
+        );
     }
 
     /// Turns in flight when a limit lands all report 429 within moments of
