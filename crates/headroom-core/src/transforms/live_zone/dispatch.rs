@@ -411,7 +411,8 @@ pub(super) fn dispatch_compressor_uncached(
                         crate::transforms::observability::observe_kompress_size_gate("deadline");
                         if config.ml_budget.as_ref().is_some_and(|b| b.take_warn()) {
                             tracing::warn!(
-                                "kompress_ml_stage_budget_exceeded; passing remaining blocks through"
+                                event = "kompress_ml_stage_budget_exceeded",
+                                "ML stage budget spent; passing remaining blocks through"
                             );
                         }
                         return DispatchResult::NoOp {

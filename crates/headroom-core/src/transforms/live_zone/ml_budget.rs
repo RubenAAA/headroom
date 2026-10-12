@@ -60,6 +60,7 @@ pub fn ml_stage_deadline_seconds_from(raw: Option<&str>) -> f64 {
             Ok(v) => v,
             Err(_) => {
                 tracing::warn!(
+                    event = "ml_stage_deadline_env_invalid",
                     "{} must be a number, got {:?}; using default {}",
                     ML_STAGE_DEADLINE_ENV,
                     s,
