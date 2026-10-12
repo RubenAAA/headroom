@@ -9,21 +9,21 @@ About 50 commits only delete or deprecate Python code (mirrors of Rust
 selectors, memory adapters, dead helpers). Nothing in `crates/` depends on
 them: N/A.
 
-Totals: **9 PORT (all open), 9 ALREADY-THERE, the rest N/A**.
+Totals: **9 PORT (all landed, some in part), 9 ALREADY-THERE, the rest N/A**.
 
-## PORT
+## Landed ports
 
-| sha | what | where in Rust |
-|---|---|---|
-| `42d4f58b` | a 200 stream that ends in an `error` event or without `message_stop` counts as a failed request, not an unbooked turn | `proxy/sse_anthropic.rs:445-475`; check `proxy/sse_openai.rs` for `response.failed` |
-| `f8212a39` | strip `defer_loading` before measuring a turn hook's tool delta | `proxy/hooks.rs:155-177` |
-| `fd067033` | dense-line elider must not elide lines holding nested JSON after a label (`result: {...}`) | `headroom-core/src/transforms/dense_line_elider.rs:46-51` |
-| `2a12e035` | holdout estimate needs 30 clusters, 0.5 coverage, 10pp band before it beats the baseline | `headroom-core/src/output_savings.rs:450-588` |
-| `463c1a43` | a missing cache rate must not force the multiplier to 1.0 and label it `vendored` | `headroom-core/src/cost_tracker.rs:877-885` |
-| `b1fb162b` | grok-shell/grok UA → `grok_build`, `api.x.ai` → xAI, xAI cache rates (read 0.16, write 1.0) | `websocket_codex.rs:112-126`, `cost_tracker.rs:39-62`, `display_provider.rs:17-27` |
-| `489de468` | per-agent savings attribution (`by_agent` next to `by_provider`/`by_model`) | `headroom-core/src/savings_tracker.rs:646,1682,2626` |
-| `a88e2d51` | error bodies echo raw error text; return fixed messages per error kind | `handlers/gemini.rs:320,479`, `batch.rs` (10 sites), `batch_anthropic.rs:157` |
-| `1fb4cbae` | astgrep outline should read Claude Code's `[Truncated: PARTIAL view …]` banner (optional disk check skipped) | `interceptors/astgrep.rs:157,257` |
+| sha | commit | what landed | left out, and why |
+|---|---|---|---|
+| `42d4f58b` | `304d0e0a` | an in-band error on a 2xx stream (Anthropic `error`, Chat error frame, Responses `response.failed`) books as failed work, status 502 | a stream that just stops early stays unbooked: Rust cannot tell it from a client disconnect |
+| `f8212a39` | `f5fa469d` | `defer_loading` stripped before measuring a hook's tool delta; deferral credit capped at the booked tools still deferred | — |
+| `fd067033` | `db6d19f3` | the elider keeps a line whole when parseable JSON spans (nested included) make up half of it, or the scan runs out of budget | upstream declines on any span, which matches every `[]`/`{}` in minified JS. The router half has no Rust counterpart (no Kompress JSON-record guard) |
+| `2a12e035` | `255e5be4` | measured beats baseline only at 30 conversations per arm, 50% coverage, ≤10pp band | — |
+| `463c1a43` | `ec98b570` | a cache rate the table lacks keeps the provider default; source `mixed` when half-vendored | LiteLLM `cost_per_token` resolver: Python only |
+| `b1fb162b` | `8564daaa` | `grok-shell/`, `grok/` → `grok_build`; `api.x.ai` (trailing dot too) → xAI | xAI cache row: Rust never labels a provider `xai` |
+| `489de468` | `8e54ba7c` | history checkpoints carry `agent`; rollups get `by_agent` | — |
+| `a88e2d51` | `38abb859` | fixed invalid-body and upstream-failure texts in the batch, Anthropic batch and Gemini handlers; the error goes to the log | workflow, eval and npm script changes |
+| `1fb4cbae` | `ab4acb6f` | Claude Code's truncation banner changes the astgrep outline header | opt-in disk verification: needs `headroom wrap`'s workspace registry |
 
 Side gap found on the way, not an upstream commit: the observability ledger
 reads only base LiteLLM rates and ignores `*_above_200k_tokens`
@@ -36,12 +36,14 @@ reads only base LiteLLM rates and ignores `*_above_200k_tokens`
 `ccr_response.rs:625-644`), `d091fbd9` (`sse/anthropic.rs:733-760`),
 `33ade5b0` (`headers.rs:319-332`), `159daa25` (`bedrock/invoke.rs:604-611`),
 `1a4e4194` (clap, `config.rs:1702`), `a6545580` (orchestrator logs the
-transform; upstream now hides the message text, Rust still logs it),
+transform; upstream now hides the message text, Rust still logs it, but
+there the text is the proxy's own format strings, not payload),
 and the four `crates/headroom-core` commits, which merged cleanly.
 
 ## N/A
 
-CLI wrap/init (`976aa714`, `a6523b19`, `07b45115`, `71663b44`),
+CLI wrap/init/learn (`976aa714`, `a6523b19`, `07b45115`, `71663b44`; Rust
+has no `headroom learn`),
 mcp_registry (`f2153fec`), traffic learner (`e6eaa411`), OTEL window
 (`7d9dd55e`), gateway compress API (`5cac7ab6`), route specs (`69a16cb5`),
 Python system relocation (`d9e29bb2`), `/api/hello` routing (`931e5b96`,
