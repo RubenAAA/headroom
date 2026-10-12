@@ -20,7 +20,7 @@ Totals: **9 PORT (all landed, some in part), 9 ALREADY-THERE, the rest N/A**.
 | `fd067033` | `db6d19f3` | the elider keeps a line whole when parseable JSON spans (nested included) make up half of it, or the scan runs out of budget | upstream declines on any span, which matches every `[]`/`{}` in minified JS. The router half has no Rust counterpart (no Kompress JSON-record guard) |
 | `2a12e035` | `255e5be4` | measured beats baseline only at 30 conversations per arm, 50% coverage, ≤10pp band | — |
 | `463c1a43` | `ec98b570` | a cache rate the table lacks keeps the provider default; source `mixed` when half-vendored | LiteLLM `cost_per_token` resolver: Python only |
-| `b1fb162b` | `8564daaa` | `grok-shell/`, `grok/` → `grok_build`; `api.x.ai` (trailing dot too) → xAI | xAI cache row: Rust never labels a provider `xai` |
+| `b1fb162b` | `8564daaa` | `grok-shell/`, `grok/` → `grok_build`; `api.x.ai` (trailing dot too) → xAI | xAI provider label and cache row: Rust labels outcomes by endpoint (`openai_chat`), with no per-host buckets (`zai`, `meta`, `zen` are absent too), so nothing could carry `xai` |
 | `489de468` | `8e54ba7c` | history checkpoints carry `agent`; rollups get `by_agent` | — |
 | `a88e2d51` | `38abb859` | fixed invalid-body and upstream-failure texts in the batch, Anthropic batch and Gemini handlers; the error goes to the log | workflow, eval and npm script changes |
 | `1fb4cbae` | `ab4acb6f` | Claude Code's truncation banner changes the astgrep outline header | opt-in disk verification: needs `headroom wrap`'s workspace registry |
@@ -32,6 +32,18 @@ after the ports: `observability::pricing::lookup` takes the prompt size
 crosses. Unlike upstream's 8c1beb20 fallback, a model whose entry lacks
 tier keys bills base: the vendored snapshot still carries them for
 Sonnet 4.5, so no hand-kept premium table is needed today.
+
+Review of the ports, 2026-10-12. Fixed: a Responses `error` frame now
+books as failed like `response.failed` (`8d716668b`, 42d4f58b); the
+deferral reconcile measures only the tools the credit covered and lowers
+`tool_search_deferred_tools` as upstream does (`530ace978`, f8212a39);
+a bad Gemini body is a 400 as upstream, and logged upstream errors drop
+URL queries (`e1d51c739`, a88e2d51); a reload test for history without
+`agent` (`b35010ce7`, 489de468); an unlisted tier cache rate follows the
+tier's input (`0a0f36e24`, ledger side gap). Kept on purpose: the
+dense-line elider's half-the-line JSON rule (fd067033), and Chat or
+Responses streams with no terminal event still book (a client disconnect
+looks the same).
 
 ## ALREADY-THERE
 

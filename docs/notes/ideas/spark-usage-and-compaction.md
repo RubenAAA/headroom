@@ -2,9 +2,14 @@
 
 - **Status:** step 2 implemented 2026-10-08 behind `--report-true-usage`
   (default ON): terminal `message_delta` on streamed translated routes now
-  carries the provider's own input/output/cached counts; routed CCR turns
-  report first round plus every continuation round. Still wants a one-session
-  test.
+  carries the provider's own input/output/cached counts. Still wants a
+  one-session test.
+- **Status 2026-10-12:** two review fixes before that test. OpenAI input
+  includes its cached tokens, so the delta now sends input minus cached
+  (`99be9a916`; it had counted cached tokens twice). Routed CCR turns
+  summed input and cache reads over every round, telling the client it held
+  N times its context; they now report output summed and context from the
+  final round (`20c98d250`).
 - **Status:** `[1m]` probe 2026-10-08, INCONCLUSIVE on the window: client
   2.1.294 strips `claude-muse-spark-1.3[1m]` to the plain id before sending
   (`[claude-code:unrecognized_model]`, `query_source: sdk`; zero `[1m]`

@@ -10,6 +10,12 @@
   `docs/jev-model.md` for what Jev can do and its limits;
   `spark-usage-and-compaction.md` for the context sizes.
 - **Status 2026-10-08:** apply half built, untested (tree conflicts block builds): `--ctx-refresh-apply-tokens` (off by default), base persist/replay in `ctx/refresh.rs`, wired in `routed/transforms.rs`. Stubs the lowest-scoring quarter per run (percentile, not a fixed cutoff); originals in the CCR store under `<<ctx:HASH>>`. Still open: live single-session trial, `docs/flags.md` regen.
+- **Status 2026-10-12:** review fixes to apply mode, still unrun live. A user
+  message holding a `tool_result` no longer starts an exchange, so a stub
+  cannot orphan the previous `tool_use` (`17cf0de1f`); a rewind to the same
+  length drops the base instead of replaying a stale last message
+  (`e4177b637`). Still open from the review: `bases()` never evicts, and a
+  rebuild every 30 min re-scores without checking the history grew.
 - **Idea:** when a session passes a token trigger, Jev judges which parts of
   the history the current task still needs. The proxy keeps those verbatim,
   swaps the rest for stubs the model can fetch back (`headroom_retrieve`), and
