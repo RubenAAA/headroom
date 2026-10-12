@@ -340,6 +340,23 @@ async fn serve(
     if let Some(base) = headroom_proxy::AppState::resolve_ctx_base(config) {
         headroom_proxy::ctx::retention::spawn(base);
     }
+    // The first turn on a Codex route builds its BPE tokenizer inline,
+    // 350-550 ms in a release build (2026-10-12). Build it now instead.
+    // Spark's models count by estimate and need none, so a proxy without a
+    // tiktoken route skips this and its ~45 MB.
+    if let Some(model) = config
+        .model_routes
+        .iter()
+        .filter_map(|route| route.target_model.clone())
+        .find(|model| {
+            headroom_core::tokenizer::detect_backend(model)
+                == headroom_core::tokenizer::Backend::Tiktoken
+        })
+    {
+        let _ = std::thread::Builder::new()
+            .name("tokenizer-warm".into())
+            .spawn(move || drop(headroom_core::tokenizer::get_tokenizer(&model)));
+    }
 
     // A socket bind never opens a TCP port: the filesystem owns access
     // control, so --listen is ignored entirely (upstream arbitrates the
