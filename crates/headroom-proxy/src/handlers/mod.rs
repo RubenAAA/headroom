@@ -38,11 +38,19 @@ pub(crate) fn invalid_request_body_message(e: &serde_json::Error) -> &'static st
 }
 
 /// `what` for the caller; `what` plus the error for the log. Forward errors
-/// can carry the upstream URL, query string included (Gemini's `?key=`).
+/// can carry the upstream URL, query string included (Gemini's `?key=`), so
+/// the log copy drops every URL query.
 pub(crate) fn upstream_failure_message(what: &str, e: &dyn std::fmt::Display) -> String {
-    tracing::warn!(event = "handler_upstream_failure", error = %e, "{what}");
+    let error = URL_QUERY
+        .replace_all(&e.to_string(), "$1?[redacted]")
+        .into_owned();
+    tracing::warn!(event = "handler_upstream_failure", error = %error, "{what}");
     what.to_string()
 }
+
+static URL_QUERY: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+    regex_lite::Regex::new(r#"(https?://[^\s?"')]*)\?[^\s"')]*"#).expect("static regex")
+});
 
 #[cfg(test)]
 mod tests {
@@ -60,5 +68,15 @@ mod tests {
         let msg =
             upstream_failure_message("Failed to forward batch request", &"https://h/?key=SECRET");
         assert_eq!(msg, "Failed to forward batch request");
+    }
+
+    #[test]
+    fn logged_upstream_errors_drop_url_queries() {
+        let text = "error sending request for url (https://h/v1/x?key=SECRET&alt=sse)";
+        let out = URL_QUERY.replace_all(text, "$1?[redacted]");
+        assert_eq!(
+            out,
+            "error sending request for url (https://h/v1/x?[redacted])"
+        );
     }
 }

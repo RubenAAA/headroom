@@ -316,7 +316,7 @@ struct GeminiRequest {
 fn parse_gemini_request(body: &Bytes, headers: &HeaderMap) -> Result<GeminiRequest, Response> {
     let body_json: Value = serde_json::from_slice(body).map_err(|e| {
         error_response(
-            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_REQUEST,
             super::invalid_request_body_message(&e),
             400,
         )
@@ -1161,6 +1161,16 @@ async fn forward_streaming(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A body that is not JSON is the client's fault: 400, as upstream.
+    #[test]
+    fn unparseable_body_is_a_400() {
+        let Err(resp) = parse_gemini_request(&Bytes::from_static(b"{nope"), &HeaderMap::new())
+        else {
+            panic!("bad body must be rejected");
+        };
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn has_non_text_parts_file_data_and_function_response() {
