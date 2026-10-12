@@ -45,6 +45,16 @@ async fn anthropic_upstream_with_status(
     complete: bool,
     status: u16,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    anthropic_upstream_inner(complete, status, status >= 500).await
+}
+
+/// As [`anthropic_upstream_with_status`], with the lone `error` event sent
+/// whenever `error_event` is set, whatever the status.
+async fn anthropic_upstream_inner(
+    complete: bool,
+    status: u16,
+    error_event: bool,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral");
@@ -64,7 +74,7 @@ async fn anthropic_upstream_with_status(
                                 Result<Frame<Bytes>, std::io::Error>,
                             >(8);
                             tokio::spawn(async move {
-                                let mut frames: Vec<Vec<u8>> = if status >= 500 {
+                                let mut frames: Vec<Vec<u8>> = if error_event {
                                     vec![
                                         b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n".to_vec(),
                                     ]
@@ -74,7 +84,7 @@ async fn anthropic_upstream_with_status(
                                     b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":300,\"output_tokens\":64,\"cache_read_input_tokens\":0}}\n\n".to_vec(),
                                 ]
                                 };
-                                if complete && status < 500 {
+                                if complete && !error_event {
                                     frames.push(
                                         b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
                                             .to_vec(),
@@ -195,9 +205,21 @@ async fn complete_stream_is_booked() {
 /// alone only reached the unbooked counter.
 #[tokio::test]
 async fn errored_stream_on_5xx_is_booked_failed() {
+    let (addr, _upstream) = anthropic_upstream_with_status(false, 529).await;
+    assert_booked_failed(addr, 529, "529").await;
+}
+
+/// Upstream 42d4f58b: an `error` event after a 200 is failed work too. The
+/// client keeps its 200; the books record 502.
+#[tokio::test]
+async fn error_event_on_200_is_booked_failed() {
+    let (addr, _upstream) = anthropic_upstream_inner(false, 200, true).await;
+    assert_booked_failed(addr, 200, "502").await;
+}
+
+async fn assert_booked_failed(addr: SocketAddr, client_status: u16, booked_status: &str) {
     let dir = tempfile::tempdir().expect("temp dir");
     let savings_path = dir.path().join("savings.json");
-    let (addr, _upstream) = anthropic_upstream_with_status(false, 529).await;
     let tracker = Arc::new(headroom_core::savings_tracker::SavingsTracker::new(
         Some(savings_path),
         false,
@@ -234,7 +256,7 @@ async fn errored_stream_on_5xx_is_booked_failed() {
         .send()
         .await
         .expect("proxy responds");
-    assert_eq!(resp.status(), 529);
+    assert_eq!(resp.status(), client_status);
     let _ = resp.bytes().await;
     // Poll until the failure is booked instead of a fixed settle: the
     // failed_work counter is the completion signal.
@@ -264,7 +286,7 @@ async fn errored_stream_on_5xx_is_booked_failed() {
         "an exhausted 529 must land in failed work"
     );
     assert_eq!(
-        snap["failed_work"]["by_status"]["529"]
+        snap["failed_work"]["by_status"][booked_status]
             .as_i64()
             .unwrap_or(-1),
         1,

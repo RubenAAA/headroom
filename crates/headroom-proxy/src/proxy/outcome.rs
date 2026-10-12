@@ -745,6 +745,19 @@ impl OutcomeContext {
     }
 }
 
+/// Status to book for a stream that arrived with `upstream_status`.
+///
+/// Upstream 42d4f58b: once a 200 has gone out, the provider can only report
+/// failure in-band (`error`, `response.failed`). Such a turn is failed work,
+/// so it books as 502 and takes the failure funnel; the client still saw 200.
+pub(super) fn stream_outcome_status(upstream_status: StatusCode, failed_in_band: bool) -> i64 {
+    if failed_in_band && !upstream_status.is_server_error() {
+        502
+    } else {
+        i64::from(upstream_status.as_u16())
+    }
+}
+
 /// Book a completed OpenAI-shaped stream.
 ///
 /// Chat Completions and the Responses API report the same three numbers under

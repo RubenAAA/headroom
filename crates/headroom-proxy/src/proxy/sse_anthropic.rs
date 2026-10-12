@@ -442,13 +442,21 @@ pub(super) fn book_anthropic_incomplete(close: &AnthropicClose<'_>) {
         // errored stream is failed work, not a missing turn — an
         // exhausted 529 served as SSE must land in `record_failed`,
         // never in the success stats nor the unbooked counter.
-        if close.upstream_status.is_server_error() {
+        //
+        // Upstream 42d4f58b: an `error` event after a 200 is failed work
+        // too. A stream that merely stops early stays unbooked: here that
+        // cannot be told apart from a client disconnect.
+        let failed_in_band = close.state.status == crate::sse::anthropic::StreamStatus::Errored;
+        if close.upstream_status.is_server_error() || failed_in_band {
             if let Some(ctx) = close.outcome_ctx {
                 let outcome = headroom_core::request_outcome::RequestOutcome {
                     request_id: close.request_id.to_string(),
                     provider: ctx.provider.clone(),
                     model: ctx.model.clone(),
-                    status_code: close.upstream_status.as_u16() as i64,
+                    status_code: super::outcome::stream_outcome_status(
+                        close.upstream_status,
+                        failed_in_band,
+                    ),
                     output_tokens: close.state.usage.output_tokens as i64,
                     uncached_input_tokens: close.state.usage.input_tokens as i64,
                     total_latency_ms: ctx.started_at.elapsed().as_secs_f64() * 1000.0,

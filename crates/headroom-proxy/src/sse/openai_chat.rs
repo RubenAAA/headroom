@@ -88,7 +88,10 @@ impl ChunkState {
     /// callers feed every framed event in here.
     pub fn apply(&mut self, event: SseEvent) -> Result<(), StateError> {
         if event.is_done_sentinel() {
-            self.status = StreamStatus::Done;
+            // A `[DONE]` after an error frame does not undo the error.
+            if self.status != StreamStatus::Errored {
+                self.status = StreamStatus::Done;
+            }
             return Ok(());
         }
         // We do warn on `event:` being set because Chat Completions
@@ -104,8 +107,17 @@ impl ChunkState {
                 "openai chat event has an event: line; spec says it shouldn't"
             );
         }
+        // Upstream 42d4f58b: an in-band error after a 200 is a failed
+        // request. OpenAI-compatible servers send it either as an
+        // `event: error` frame or as a `{"error": ...}` chunk.
+        if event.event_name.as_deref() == Some("error") {
+            self.status = StreamStatus::Errored;
+        }
 
         let v: Value = parse_json(&event.data)?;
+        if v.get("error").is_some_and(|e| !e.is_null()) {
+            self.status = StreamStatus::Errored;
+        }
 
         // Top-level fields: id, model, system_fingerprint, choices, usage.
         if let Some(id) = v.get("id").and_then(|x| x.as_str()) {

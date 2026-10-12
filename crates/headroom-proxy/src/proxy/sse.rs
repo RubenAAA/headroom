@@ -579,6 +579,9 @@ pub(super) async fn run_sse_state_machine(
                 if let Some(model) = state.model.as_deref() {
                     p.set_model_if_unknown(model);
                 }
+                if state.status == crate::sse::openai_chat::StreamStatus::Errored {
+                    p.mark_failed();
+                }
                 let usage = state
                     .usage
                     .as_ref()

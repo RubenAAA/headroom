@@ -236,6 +236,7 @@ pub(super) fn close_openai_chat_stream(
     );
     if let Some(ctx) = outcome_ctx {
         let (input_tok, cached_tok, output_tok) = extract_chat_usage(state);
+        let failed_in_band = state.status == crate::sse::openai_chat::StreamStatus::Errored;
         emit_openai_stream_outcome(
             ctx,
             request_id,
@@ -243,7 +244,7 @@ pub(super) fn close_openai_chat_stream(
             input_tok,
             cached_tok,
             output_tok,
-            upstream_status.as_u16() as i64,
+            super::outcome::stream_outcome_status(upstream_status, failed_in_band),
         );
     }
 }
@@ -426,6 +427,9 @@ pub(super) fn close_openai_responses_stream(
     );
     if let Some(ctx) = outcome_ctx {
         let (input_tok, cached_tok, output_tok) = extract_responses_usage(state);
+        // `response.incomplete` is a normal end (e.g. the output cap);
+        // only `response.failed` is a failed request.
+        let failed_in_band = state.status == crate::sse::openai_responses::StreamStatus::Failed;
         emit_openai_stream_outcome(
             ctx,
             request_id,
@@ -433,7 +437,7 @@ pub(super) fn close_openai_responses_stream(
             input_tok,
             cached_tok,
             output_tok,
-            upstream_status.as_u16() as i64,
+            super::outcome::stream_outcome_status(upstream_status, failed_in_band),
         );
     }
 }

@@ -142,3 +142,21 @@ fn multiple_choices_keyed_by_index() {
     assert_eq!(s.choices.get(&0).unwrap().content, "AA2");
     assert_eq!(s.choices.get(&1).unwrap().content, "BB2");
 }
+
+#[test]
+fn error_chunk_marks_stream_errored_and_done_does_not_clear_it() {
+    // Upstream 42d4f58b: an in-band error after a 200 is a failed request.
+    // A trailing `[DONE]` must not turn it back into a clean finish.
+    let mut s = ChunkState::new();
+    let raw = concat!(
+        "data: {\"id\":\"chatcmpl-6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}]}\n\n",
+        "data: {\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    run(&mut s, raw.as_bytes());
+    assert_eq!(s.status, StreamStatus::Errored);
+
+    let mut s = ChunkState::new();
+    run(&mut s, b"event: error\ndata: {\"message\":\"boom\"}\n\n");
+    assert_eq!(s.status, StreamStatus::Errored);
+}
