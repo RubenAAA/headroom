@@ -662,7 +662,10 @@ impl Ledger {
         } else {
             // Long-context tiers key off the whole prompt, cached
             // segments included; without a usage block, the
-            // post-compression estimate stands in.
+            // post-compression estimate stands in. Saved tokens price
+            // at the compressed prompt's tier, so a compression that
+            // drops a request below a threshold books less than it
+            // saved, never more.
             let prompt_tokens = if ev.usage.total_input() > 0 {
                 ev.usage.total_input()
             } else {

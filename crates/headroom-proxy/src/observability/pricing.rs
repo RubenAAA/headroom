@@ -195,16 +195,16 @@ fn parse_vendored() -> HashMap<String, Entry> {
         if !input.is_finite() || !output.is_finite() || input < 0.0 || output < 0.0 {
             continue;
         }
-        let cache_read = spec
+        let listed_cache_read = spec
             .get("cache_read_input_token_cost")
             .and_then(|v| v.as_f64())
-            .filter(|c| c.is_finite() && *c >= 0.0)
-            .unwrap_or(input);
-        let cache_write = spec
+            .filter(|c| c.is_finite() && *c >= 0.0);
+        let listed_cache_write = spec
             .get("cache_creation_input_token_cost")
             .and_then(|v| v.as_f64())
-            .filter(|c| c.is_finite() && *c >= 0.0)
-            .unwrap_or(input);
+            .filter(|c| c.is_finite() && *c >= 0.0);
+        let cache_read = listed_cache_read.unwrap_or(input);
+        let cache_write = listed_cache_write.unwrap_or(input);
         let base = ModelPrice {
             input,
             output,
@@ -215,7 +215,12 @@ fn parse_vendored() -> HashMap<String, Entry> {
             model_id.to_ascii_lowercase(),
             Entry {
                 base,
-                tiers: parse_tiers(spec, base),
+                tiers: parse_tiers(
+                    spec,
+                    base,
+                    listed_cache_read.is_some(),
+                    listed_cache_write.is_some(),
+                ),
             },
         );
     }
@@ -231,9 +236,14 @@ const TIER_FIELDS: [&str; 4] = [
     "cache_creation_input_token_cost_above_",
 ];
 
+/// `cache_read_listed`/`cache_write_listed` say whether the base row
+/// had its own cache rate. One it lacked means "bills as input", so an
+/// unlisted tier cache rate follows the tier's input, not the rate below.
 fn parse_tiers(
     spec: &serde_json::Map<String, serde_json::Value>,
     base: ModelPrice,
+    cache_read_listed: bool,
+    cache_write_listed: bool,
 ) -> Vec<(u64, ModelPrice)> {
     let mut rates: std::collections::BTreeMap<u64, [Option<f64>; 4]> = Default::default();
     for (key, value) in spec {
@@ -254,11 +264,20 @@ fn parse_tiers(
     rates
         .into_iter()
         .map(|(threshold, [input, output, cache_read, cache_write])| {
+            let input = input.unwrap_or(prev.input);
             prev = ModelPrice {
-                input: input.unwrap_or(prev.input),
+                input,
                 output: output.unwrap_or(prev.output),
-                cache_read: cache_read.unwrap_or(prev.cache_read),
-                cache_write: cache_write.unwrap_or(prev.cache_write),
+                cache_read: cache_read.unwrap_or(if cache_read_listed {
+                    prev.cache_read
+                } else {
+                    input
+                }),
+                cache_write: cache_write.unwrap_or(if cache_write_listed {
+                    prev.cache_write
+                } else {
+                    input
+                }),
             };
             (threshold, prev)
         })
@@ -521,6 +540,16 @@ mod tests {
             above.output
         );
         assert!((above.cache_read - 5e-7).abs() < 1e-12);
+    }
+
+    /// gpt-5.4 lists no cache-write rate, so writes bill as input. Above
+    /// 272k they must follow the tier's input, not keep the base rate.
+    #[test]
+    fn unlisted_cache_rate_follows_the_tier_input() {
+        let base = lookup("gpt-5.4", 0).expect("priced");
+        let above = lookup("gpt-5.4", 272_001).expect("priced");
+        assert_eq!(base.cache_write, base.input, "fixture guard");
+        assert_eq!(above.cache_write, above.input);
     }
 
     /// A model with no published tier bills base at any size.
