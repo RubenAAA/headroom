@@ -482,16 +482,9 @@ impl MemoryBackend for RecallStore {
         memory.importance = existing.importance;
         memory.entity_refs.clone_from(&existing.entity_refs);
         memory.metadata.clone_from(&existing.metadata);
-        existing.valid_until = Some(chrono::Utc::now());
-        existing.superseded_by = Some(memory.id.clone());
-        // The old row keeps its index entry: validity is a read-time
-        // filter, and re-indexing unchanged text would churn the FTS
-        // tables for no new matchable content.
-        if !self.store(&existing) {
-            return Err(UpdateError::Backend(format!(
-                "superseding {memory_id} failed to persist"
-            )));
-        }
+        // New record first, old one marked last: a failure part-way leaves
+        // the old row current, where the reverse order left it pointing at
+        // a successor that never landed and the content out of every read.
         if !self.store(&memory) {
             return Err(UpdateError::Backend(format!(
                 "updated copy of {memory_id} failed to persist"
@@ -500,6 +493,16 @@ impl MemoryBackend for RecallStore {
         if !self.index(&memory) {
             return Err(UpdateError::Backend(format!(
                 "updated copy of {memory_id} failed to index"
+            )));
+        }
+        existing.valid_until = Some(chrono::Utc::now());
+        existing.superseded_by = Some(memory.id.clone());
+        // The old row keeps its index entry: validity is a read-time
+        // filter, and re-indexing unchanged text would churn the FTS
+        // tables for no new matchable content.
+        if !self.store(&existing) {
+            return Err(UpdateError::Backend(format!(
+                "superseding {memory_id} failed to persist"
             )));
         }
         Ok(memory)
@@ -720,6 +723,12 @@ mod tests {
                 .iter()
                 .all(|r| (r.similarity - 1.0).abs() < f64::EPSILON)
         );
+        assert_eq!(
+            results[0].memory.content, "alice note two",
+            "newest first, even within one second"
+        );
+        let newest = store.search_memories("", "alice", None, false, 1, None);
+        assert_eq!(newest[0].memory.content, "alice note two");
     }
 
     #[test]

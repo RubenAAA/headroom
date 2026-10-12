@@ -244,11 +244,16 @@ impl MemoryRecordStore {
         rows.collect()
     }
 
-    /// Every record id belonging to `user_id`. Returned before a bulk delete
-    /// so the caller can clear the matching index entries too.
+    /// Every record id belonging to `user_id`, newest first. Returned before
+    /// a bulk delete so the caller can clear the matching index entries too,
+    /// and read by the empty-query list. `created_at` has one-second
+    /// resolution, so `rowid` breaks ties in insert order.
     pub fn ids_for_user(&self, user_id: &str) -> rusqlite::Result<Vec<String>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT id FROM memories WHERE user_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM memories WHERE user_id = ?1
+             ORDER BY created_at DESC, rowid DESC",
+        )?;
         let rows = stmt.query_map(params![user_id], |r| r.get::<_, String>(0))?;
         rows.collect()
     }
