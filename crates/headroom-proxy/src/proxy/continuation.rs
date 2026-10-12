@@ -140,12 +140,17 @@ pub(crate) struct CcrRoundUsage {
     pub client_input_tokens: u64,
     pub client_cache_read_tokens: u64,
     pub client_cache_write_tokens: u64,
+    /// `(input excluding cache reads, cache reads)` of the latest response
+    /// folded in: the context the client holds once the turn settles.
+    /// `None` when that response carried no `usage` block.
+    pub last_round_context: Option<(i64, i64)>,
 }
 
 impl CcrRoundUsage {
     /// Fold in one response's `usage` block.
     pub(crate) fn add_response(&mut self, response: &serde_json::Value) {
         let Some(usage) = response.get("usage") else {
+            self.last_round_context = None;
             return;
         };
         let get = |key: &str| {
@@ -167,6 +172,14 @@ impl CcrRoundUsage {
             self.client_cache_read_tokens = cached.max(0) as u64;
             self.client_cache_write_tokens = get("cache_creation_input_tokens").max(0) as u64;
         }
+        // OpenAI input counts include cached tokens; the Anthropic key
+        // marks a block whose input already excludes them.
+        let exclusive = if usage.get("cache_read_input_tokens").is_some() {
+            input
+        } else {
+            input - cached
+        };
+        self.last_round_context = Some((exclusive.max(0), cached.max(0)));
         self.rounds += 1;
         self.input_tokens += input;
         self.output_tokens += output;
@@ -217,6 +230,9 @@ impl CcrRoundUsage {
             self.client_input_tokens = other.client_input_tokens;
             self.client_cache_read_tokens = other.client_cache_read_tokens;
             self.client_cache_write_tokens = other.client_cache_write_tokens;
+        }
+        if other.rounds > 0 {
+            self.last_round_context = other.last_round_context;
         }
         self.rounds += other.rounds;
         self.input_tokens += other.input_tokens;
