@@ -18,6 +18,13 @@
 # parallel codegen units instead of the default 16. Release profile is
 # untouched (workspace Cargo.toml keeps codegen-units=1 + fat LTO for size).
 codegen-units = 256
+# Full debug info made each checkout's target/ 40-80 GB, and agents keep
+# several checkouts. Line tables still give file:line in backtraces;
+# dependencies get none, since nobody steps through them.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.test]
 inherits = "dev"
