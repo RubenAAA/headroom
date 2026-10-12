@@ -94,7 +94,6 @@ use self::events::RecentHitRateSample;
 use self::fingerprint::PrefixFingerprint;
 use self::fingerprint::hex16;
 use self::first_turn::FirstTurnContext;
-use self::first_turn::first_turn_reason;
 use self::keys::CACHE_READ_MULTIPLIER;
 use self::keys::CACHE_WRITE_1H_MULTIPLIER;
 use self::keys::CACHE_WRITE_5M_MULTIPLIER;
@@ -758,42 +757,6 @@ impl UsageObserver {
     /// without scoring it or counting it abandoned.
     pub fn end_unscored(&self, request_id: &str) {
         self.lock().pending.pop(request_id);
-    }
-
-    /// A translated-route turn (Spark, Codex) completed its stream. Same
-    /// unscored exit as [`end_unscored`](Self::end_unscored) — no hit-rate,
-    /// no ledger, no recache classification — plus the first-turn marker, so
-    /// routed sessions delimit the way native ones do. "Creation" here is
-    /// the provider's uncached input; the fleet first-turn counters include
-    /// it, split by conversation key offline (translated keys carry their
-    /// lane).
-    pub fn complete_translated_first_turn(
-        &self,
-        request_id: &str,
-        cache_read_input_tokens: u64,
-        uncached_input_tokens: u64,
-    ) {
-        let now_instant = Instant::now();
-        let mut inner = self.lock();
-        let Some(pending) = Self::pop_pending(&mut inner, request_id) else {
-            return;
-        };
-        if inner
-            .translated_first_turns_seen
-            .put(pending.conversation_key.clone(), ())
-            .is_some()
-        {
-            return;
-        }
-        Self::record_first_turn_write(
-            &mut inner,
-            &pending,
-            request_id,
-            cache_read_input_tokens,
-            uncached_input_tokens,
-            0,
-            now_instant,
-        );
     }
 
     /// Record the wire sizes and the arm this turn ran under.
@@ -2498,135 +2461,6 @@ impl UsageObserver {
                 "cache write re-covered footprint the conversation already held"
             );
         }
-    }
-
-    /// Attribute the first completed turn under a conversation key. The
-    /// recache classifier has nothing to score it against, so without this
-    /// its cache write — 41% of all write tokens, live — went unattributed.
-    /// Extracted from `complete_with_cache_capability` without behavior change.
-    fn record_first_turn_write(
-        inner: &mut Inner,
-        pending: &PendingRequest,
-        request_id: &str,
-        cache_read_input_tokens: u64,
-        cache_creation_input_tokens: u64,
-        streams_tracked: usize,
-        now_instant: Instant,
-    ) {
-        if streams_tracked != 0 {
-            return;
-        }
-        let ctx = pending.first_turn.clone().unwrap_or_default();
-        let opener_seen_elsewhere = match ctx.message_zero_hash.as_deref() {
-            Some(hash) => {
-                let seen = inner.first_turn_openers.get(hash).is_some_and(|(at, key)| {
-                    *key != pending.conversation_key
-                        && now_instant.duration_since(*at) < IDENTICAL_PROMPT_FANOUT_WINDOW
-                });
-                inner.first_turn_openers.put(
-                    hash.to_string(),
-                    (now_instant, pending.conversation_key.clone()),
-                );
-                seen
-            }
-            None => false,
-        };
-        if cache_creation_input_tokens > RECACHE_SLACK_TOKENS {
-            let reason = first_turn_reason(&ctx, pending.adoption.as_ref(), opener_seen_elsewhere);
-            // A cold start writing cache is normal and stays uncharged.
-            // Two shapes are not cold starts and were filed as if they
-            // were: a `fresh_session` that read cache is not fresh, and an
-            // `arrived_with_history` that read none is a live conversation
-            // whose key moved under it with no compaction to explain the
-            // move. On 2026-09-07 those two accounted for 549K of the
-            // 2.73M written here, and nothing counted either.
-            let contradicts_itself = (reason == "fresh_session" && cache_read_input_tokens > 0)
-                || (reason == "arrived_with_history" && cache_read_input_tokens == 0);
-            inner.first_turn_writes_total += 1;
-            inner.first_turn_write_tokens_total += cache_creation_input_tokens;
-            if contradicts_itself {
-                inner.first_turn_contradictions_total += 1;
-            }
-            tracing::info!(
-                event = "first_turn_write_observed",
-                contradicts_itself,
-                request_id = %request_id,
-                conversation_key = %pending.conversation_key,
-                session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-                msgs = ctx.msgs,
-                cache_creation_input_tokens,
-                cache_read_input_tokens,
-                model = ctx.model.as_deref().unwrap_or(""),
-                attribution_reason = reason,
-                adopted = pending
-                    .adoption
-                    .as_ref()
-                    .map(|_| pending.replay_applied.is_some()),
-                donor_session_key_hash = pending
-                    .adoption
-                    .as_ref()
-                    .map(|a| a.donor_session_key_hash.as_str())
-                    .unwrap_or(""),
-                "first turn under its conversation key wrote cache"
-            );
-            crate::observability::observe_first_turn_write(reason, cache_creation_input_tokens);
-        }
-    }
-
-    /// D0 diagnostic for first-turn-write-sharing.md: one line per turn
-    /// classified FirstTurn, with none of the write branch's gates, so
-    /// tracked first turns and tiny turns are measured too. Pure observation:
-    /// no counter moves here.
-    /// Extracted from `complete_with_cache_capability` without behavior change.
-    fn emit_first_turn_diagnostic(
-        pending: &PendingRequest,
-        request_id: &str,
-        usage: &TurnUsage<'_>,
-        class: &TurnClass,
-    ) {
-        if !matches!(class, TurnClass::FirstTurn) {
-            return;
-        }
-        let dctx = pending.first_turn.clone().unwrap_or_default();
-        let (rounds_in, rounds_read, rounds_write) =
-            pending.billed_totals.map_or((0, 0, 0), |(bi, bcr, bcw)| {
-                (
-                    bi.saturating_sub(usage.input_tokens),
-                    bcr.saturating_sub(usage.cache_read_input_tokens),
-                    bcw.saturating_sub(usage.cache_creation_input_tokens),
-                )
-            });
-        let (write_5m, write_1h) = usage
-            .cache_write_ttl_split
-            .map_or((-1_i64, -1_i64), |(m5, h1)| (m5 as i64, h1 as i64));
-        tracing::info!(
-            event = "first_turn_prefix_diagnostic",
-            request_id = %request_id,
-            conversation_key = %pending.conversation_key,
-            session_key_hash = pending.session_key_hash.as_deref().unwrap_or(""),
-            model = dctx.model.as_deref().unwrap_or(""),
-            msgs = dctx.msgs,
-            message_zero_hash = dctx.message_zero_hash.as_deref().unwrap_or(""),
-            compaction_restart = dctx.compaction_restart,
-            adopted = pending.adoption.is_some(),
-            replay_applied = pending.replay_applied.is_some(),
-            tool_choice = dctx.tool_choice.as_deref().unwrap_or("absent"),
-            thinking = dctx.thinking.as_deref().unwrap_or("absent"),
-            effort = dctx.effort.as_deref().unwrap_or("absent"),
-            images_in_m0 = dctx.images_in_m0,
-            opens_with_scaffolding = dctx.opens_with_scaffolding,
-            m0_scaffold_bytes = dctx.m0_scaffold_bytes,
-            m0_rest_bytes = dctx.m0_rest_bytes,
-            outer_input_tokens = usage.input_tokens,
-            outer_cache_read = usage.cache_read_input_tokens,
-            outer_cache_write = usage.cache_creation_input_tokens,
-            outer_write_5m = write_5m,
-            outer_write_1h = write_1h,
-            rounds_input_tokens = rounds_in,
-            rounds_cache_read = rounds_read,
-            rounds_cache_write = rounds_write,
-            "first turn under its conversation key completed; cache-key controls and outer-vs-rounds split"
-        );
     }
 
     /// Fleet-wide rolling hit rate (statusline ambient signal).
