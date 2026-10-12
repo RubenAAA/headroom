@@ -306,7 +306,20 @@ pub(crate) fn run_presend_seam(
     if crate::turn_hooks::registered_turn_hooks().is_empty() {
         body_to_send
     } else {
-        let (bytes, tools_saved) = apply_request_hooks(body_to_send, endpoint, request_id);
+        let booked_deferred = outcome_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.tags.get("tool_search_deferred_tokens"))
+            .and_then(|v| v.parse::<i64>().ok());
+        let (bytes, tools_saved, deferred_tokens) =
+            apply_request_hooks(body_to_send, endpoint, request_id, booked_deferred);
+        if let Some(lowered) = deferred_tokens
+            && let Some(ctx) = outcome_ctx.as_mut()
+        {
+            ctx.tags.insert(
+                "tool_search_deferred_tokens".to_string(),
+                lowered.to_string(),
+            );
+        }
         if tools_saved > 0
             && let Some(ctx) = outcome_ctx.as_mut()
         {

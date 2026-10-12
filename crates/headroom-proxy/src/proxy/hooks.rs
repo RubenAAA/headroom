@@ -129,14 +129,20 @@ impl TurnHookUsage {
 /// in-place shrinks count; growth clamps to zero). Callers MUST gate on a
 /// non-empty registry so the empty-registry path is a byte-identical no-op
 /// (this fn re-serializes and would perturb bytes).
+///
+/// `booked_deferred_tokens` is the `tool_search_deferred_tokens` credit
+/// already booked for this request. When a hook un-defers some of those
+/// tools, the third value is the lowered credit to book instead (upstream
+/// f8212a39); `None` leaves the tag alone.
 pub(crate) fn apply_request_hooks(
     body: bytes::Bytes,
     endpoint: compression::CompressibleEndpoint,
     request_id: &str,
-) -> (bytes::Bytes, i64) {
+    booked_deferred_tokens: Option<i64>,
+) -> (bytes::Bytes, i64, Option<i64>) {
     let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return (body, 0),
+        Err(_) => return (body, 0, None),
     };
     let model = parsed
         .get("model")
@@ -156,13 +162,18 @@ pub(crate) fn apply_request_hooks(
     // saw), hence a tag rather than a fold — mirrors upstream
     // `handlers/anthropic.py` + the OpenAI chat path.
     let tok = headroom_core::tokenizer::get_tokenizer(&model);
+    let count_value = |v: &serde_json::Value| -> i64 {
+        serde_json::to_string(v)
+            .map(|s| tok.count_text(&s) as i64)
+            .unwrap_or(0)
+    };
+    // Upstream f8212a39: deferral has its own credit
+    // (`tool_search_deferred_tokens`), so the flag itself is not measured.
+    // Otherwise un-deferring a tool shortens the JSON by the flag text and
+    // books a saving although the bill goes up.
     let count_tools = |t: &Option<serde_json::Value>| -> i64 {
-        match t {
-            Some(v) => serde_json::to_string(v)
-                .map(|s| tok.count_text(&s) as i64)
-                .unwrap_or(0),
-            None => 0,
-        }
+        t.as_ref()
+            .map_or(0, |v| count_value(&without_deferral_flags(v)))
     };
 
     let mut ctx = crate::turn_hooks::TurnContext {
@@ -173,8 +184,15 @@ pub(crate) fn apply_request_hooks(
         config: None,
     };
     let tools_before = count_tools(&ctx.tools);
+    let deferred_before = booked_deferred_tokens.map(|_| deferred_by_name(ctx.tools.as_ref()));
     crate::turn_hooks::run_request_hooks(&mut ctx);
     let tools_saved = tools_before.saturating_sub(count_tools(&ctx.tools));
+    let deferred_tokens =
+        booked_deferred_tokens
+            .zip(deferred_before)
+            .and_then(|(booked, before)| {
+                reconcile_deferred_tokens(booked, &before, ctx.tools.as_ref(), &count_value)
+            });
 
     // Write mutated messages/tools back onto the body.
     if let Some(obj) = parsed.as_object_mut() {
@@ -192,12 +210,80 @@ pub(crate) fn apply_request_hooks(
         }
     }
     match serde_json::to_vec(&parsed) {
-        Ok(v) => (bytes::Bytes::from(v), tools_saved),
+        Ok(v) => (bytes::Bytes::from(v), tools_saved, deferred_tokens),
         Err(e) => {
             tracing::warn!(event = "turn_hooks_reserialize_failed", request_id = %request_id, error = %e, "turn hooks: re-serialize failed; forwarding original body");
-            (body, 0)
+            (body, 0, None)
         }
     }
+}
+
+/// The tool array with every `defer_loading` key dropped, as it is measured
+/// for a hook's tool delta.
+fn without_deferral_flags(tools: &serde_json::Value) -> serde_json::Value {
+    let Some(arr) = tools.as_array() else {
+        return tools.clone();
+    };
+    serde_json::Value::Array(
+        arr.iter()
+            .map(|t| {
+                let mut t = t.clone();
+                if let Some(obj) = t.as_object_mut() {
+                    obj.remove("defer_loading");
+                }
+                t
+            })
+            .collect(),
+    )
+}
+
+/// Deferred tools (`defer_loading: true`) keyed by name.
+fn deferred_by_name(
+    tools: Option<&serde_json::Value>,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    tools
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|t| t.get("defer_loading").and_then(|d| d.as_bool()) == Some(true))
+        .filter_map(|t| Some((t.get("name")?.as_str()?.to_string(), t.clone())))
+        .collect()
+}
+
+/// Cap the deferral credit at the booked tools still deferred after the
+/// hooks. A tool a hook un-deferred is billed, so its share goes. Each tool
+/// still deferred counts at the smaller of its booked and final schema, so
+/// growing one schema cannot keep another's credit alive, and a schema a
+/// hook shortened (already booked as the hook's own saving) is not credited
+/// twice. Only ever lowers: `None` when nothing is released.
+fn reconcile_deferred_tokens(
+    booked: i64,
+    before: &std::collections::BTreeMap<String, serde_json::Value>,
+    tools_after: Option<&serde_json::Value>,
+    count: &dyn Fn(&serde_json::Value) -> i64,
+) -> Option<i64> {
+    let after = deferred_by_name(tools_after);
+    let one = |t: &serde_json::Value| count(&serde_json::Value::Array(vec![t.clone()]));
+    let kept: Vec<serde_json::Value> = before
+        .iter()
+        .filter_map(|(name, booked_schema)| {
+            let now = after.get(name)?;
+            Some(
+                if one(now) < one(booked_schema) {
+                    now
+                } else {
+                    booked_schema
+                }
+                .clone(),
+            )
+        })
+        .collect();
+    let measured = if kept.is_empty() {
+        0
+    } else {
+        count(&serde_json::Value::Array(kept))
+    };
+    (measured < booked).then_some(measured)
 }
 
 /// `call_model` implementation for turn hooks: re-drives the upstream model via

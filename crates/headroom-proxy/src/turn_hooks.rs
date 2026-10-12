@@ -262,14 +262,69 @@ mod tests {
             }))
             .unwrap(),
         );
-        let (out, saved) = crate::proxy::apply_request_hooks(
+        let (out, saved, _) = crate::proxy::apply_request_hooks(
             body,
             CompressibleEndpoint::AnthropicMessages,
             "req-test",
+            None,
         );
         assert!(saved > 0, "removed schema must count, got {saved}");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["tools"].as_array().unwrap().len(), 1);
+        clear_turn_hooks();
+    }
+
+    /// Upstream f8212a39: un-deferring a tool only drops the flag text, which
+    /// must not book as a saving; and the deferral credit for that tool goes,
+    /// because it is billed now.
+    #[test]
+    fn undeferring_a_tool_books_no_saving_and_lowers_the_deferral_credit() {
+        use crate::compression::CompressibleEndpoint;
+        let _g = REGISTRY_LOCK.blocking_lock();
+        clear_turn_hooks();
+
+        struct Undefer;
+        impl TurnHook for Undefer {
+            fn name(&self) -> &str {
+                "undefer"
+            }
+            fn on_request(&self, ctx: &mut TurnContext) {
+                if let Some(Value::Array(tools)) = &mut ctx.tools {
+                    for t in tools.iter_mut() {
+                        if t["name"] == "hot"
+                            && let Some(obj) = t.as_object_mut()
+                        {
+                            obj.remove("defer_loading");
+                        }
+                    }
+                }
+            }
+        }
+
+        register_turn_hook(Arc::new(Undefer));
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-x",
+                "messages": [],
+                "tools": [
+                    {"name": "hot", "description": "a tool the hook brings back into context", "defer_loading": true},
+                    {"name": "cold", "description": "a tool that stays deferred for the turn", "defer_loading": true},
+                ],
+            }))
+            .unwrap(),
+        );
+        let (_, saved, lowered) = crate::proxy::apply_request_hooks(
+            body,
+            CompressibleEndpoint::AnthropicMessages,
+            "req-test",
+            Some(10_000),
+        );
+        assert_eq!(saved, 0, "dropping the flag is not a saving");
+        let lowered = lowered.expect("the un-deferred tool's credit must go");
+        assert!(
+            lowered > 0 && lowered < 10_000,
+            "only the still-deferred tool stays credited, got {lowered}"
+        );
         clear_turn_hooks();
     }
 
@@ -286,10 +341,11 @@ mod tests {
             }))
             .unwrap(),
         );
-        let (_, saved) = crate::proxy::apply_request_hooks(
+        let (_, saved, _) = crate::proxy::apply_request_hooks(
             body,
             CompressibleEndpoint::AnthropicMessages,
             "req-test",
+            None,
         );
         assert_eq!(saved, 0);
     }
