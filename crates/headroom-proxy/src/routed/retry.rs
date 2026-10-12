@@ -958,7 +958,56 @@ async fn backoff_retryable_status(
         );
         return StatusRetry::Break(r);
     }
-    // Same reason: a Zen Retry-After past the cap is not a
+    let (delay_source, backoff) = routed_retry_backoff(
+        state,
+        attempt,
+        max_delay_ms,
+        retry_after_uncapped,
+        zen_hold_owns_this,
+    );
+    tracing::warn!(
+        event = "routed_upstream_retry",
+        status = status.as_u16(),
+        attempt,
+        backoff_ms = backoff.as_millis() as u64,
+        retry_after_header = r.headers().contains_key(http::header::RETRY_AFTER),
+        delay_source,
+        retry_after_clamped = false,
+        request_id = %request_id,
+        session_key_hash = %session_key.map(crate::cache_stabilization::drift_detector::session_key_log_prefix).unwrap_or_default(),
+        "retrying transient upstream error"
+    );
+    crate::observability::record_upstream_retry(
+        "routed",
+        crate::observability::retry_reason::from_status(status.as_u16()),
+    );
+    park_egress(upstream_url, egress_gate_key, backoff);
+    tokio::time::sleep(backoff).await;
+    StatusRetry::Waited
+}
+
+/// Share the pain only within this egress: parallel turns behind the
+/// same limited IP wait together, while other egresses remain independent.
+fn park_egress(upstream_url: &str, egress_gate_key: &str, backoff: std::time::Duration) {
+    if crate::routed::upstream_gate::upstream_host(upstream_url).is_some() {
+        crate::routed::upstream_gate::gate_hold(
+            egress_gate_key,
+            backoff.as_millis().min(u64::MAX as u128) as u64,
+        );
+    }
+}
+
+/// Where this attempt's delay came from (`header` or `backoff`) and the
+/// clamped sleep before the next attempt.
+fn routed_retry_backoff(
+    state: &AppState,
+    attempt: u32,
+    max_delay_ms: u64,
+    retry_after_uncapped: Option<f64>,
+    zen_hold_owns_this: bool,
+) -> (&'static str, std::time::Duration) {
+    // Same reason as `zen_hold_owns_this` in the caller: a Zen
+    // Retry-After past the cap is not a
     // wait, so it must not stretch the fast loop's ~1s slices
     // into cap-length sleeps before the hold takes over.
     let retry_after = match retry_after_uncapped {
@@ -972,32 +1021,12 @@ async fn backoff_retryable_status(
         crate::proxy::backoff_ms(state, attempt - 1),
     ))
     .min(std::time::Duration::from_millis(max_delay_ms));
-    tracing::warn!(
-        event = "routed_upstream_retry",
-        status = status.as_u16(),
-        attempt,
-        backoff_ms = backoff.as_millis() as u64,
-        retry_after_header = r.headers().contains_key(http::header::RETRY_AFTER),
-        delay_source = if retry_after.is_some() { "header" } else { "backoff" },
-        retry_after_clamped = false,
-        request_id = %request_id,
-        session_key_hash = %session_key.map(crate::cache_stabilization::drift_detector::session_key_log_prefix).unwrap_or_default(),
-        "retrying transient upstream error"
-    );
-    crate::observability::record_upstream_retry(
-        "routed",
-        crate::observability::retry_reason::from_status(status.as_u16()),
-    );
-    // Share the pain only within this egress: parallel turns behind the
-    // same limited IP wait together, while other egresses remain independent.
-    if crate::routed::upstream_gate::upstream_host(upstream_url).is_some() {
-        crate::routed::upstream_gate::gate_hold(
-            egress_gate_key,
-            backoff.as_millis().min(u64::MAX as u128) as u64,
-        );
-    }
-    tokio::time::sleep(backoff).await;
-    StatusRetry::Waited
+    let delay_source = if retry_after.is_some() {
+        "header"
+    } else {
+        "backoff"
+    };
+    (delay_source, backoff)
 }
 
 /// 413 replay-strip: the replay prefix pins the outbound body at the session

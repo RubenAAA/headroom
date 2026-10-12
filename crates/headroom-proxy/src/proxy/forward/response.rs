@@ -1216,6 +1216,20 @@ pub(crate) struct ResponseBodyCtx<'a> {
     pub(crate) sse_kind: SseStreamKind,
 }
 
+/// The memory-tool provider for a request path, or `None` when the path is
+/// not an LLM endpoint the memory tools speak.
+fn memory_provider_for_path(path_for_log: &str) -> Option<&'static str> {
+    if path_for_log.contains("/v1/messages") {
+        Some("anthropic")
+    } else if path_for_log.contains("/v1/chat/completions") {
+        Some("openai")
+    } else if path_for_log.contains("/v1/responses") {
+        Some("openai_responses")
+    } else {
+        None
+    }
+}
+
 /// Picks the response body shape: buffered error, buffered success, reframed
 /// SSE, or a straight stream.
 ///
@@ -1303,15 +1317,7 @@ where
                 // the client has never heard of them. Resolved up here because
                 // it depends only on the request, and the pair below runs more
                 // than once.
-                let memory_provider = if path_for_log.contains("/v1/messages") {
-                    Some("anthropic")
-                } else if path_for_log.contains("/v1/chat/completions") {
-                    Some("openai")
-                } else if path_for_log.contains("/v1/responses") {
-                    Some("openai_responses")
-                } else {
-                    None
-                };
+                let memory_provider = memory_provider_for_path(path_for_log);
                 let memory_ctx = memory_tool_context(
                     state,
                     headers_snapshot,

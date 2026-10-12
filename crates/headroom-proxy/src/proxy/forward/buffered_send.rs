@@ -271,21 +271,7 @@ pub(super) async fn maybe_retry_status(
                 "upstream Retry-After exceeds the internal wait cap; returning the response without an early retry"
             );
         } else {
-            let retry_after =
-                retry_after_uncapped.map(|delay| delay.ceil().min(u64::MAX as f64) as u64);
-            let delay_source = if retry_after.is_some() {
-                "header"
-            } else {
-                "backoff"
-            };
-            // Shared selection (C5): header wins, else the
-            // backoff below. No outer clamp here — unlike
-            // the routed loop, this path sleeps the raw
-            // value, so it stays as written.
-            let delay_ms = headroom_core::retry::next_delay_ms(
-                retry_after_uncapped,
-                backoff_ms(state, attempt),
-            );
+            let (delay_ms, delay_source) = status_retry_delay(state, attempt, retry_after_uncapped);
             tracing::warn!(
                 event = "upstream_retryable_status",
                 request_id = %request_id,
@@ -308,6 +294,28 @@ pub(super) async fn maybe_retry_status(
         }
     }
     false
+}
+
+/// Delay before the next retryable-status attempt, and whether it came from
+/// the `Retry-After` header or the backoff schedule.
+fn status_retry_delay(
+    state: &AppState,
+    attempt: u32,
+    retry_after_uncapped: Option<f64>,
+) -> (u64, &'static str) {
+    let retry_after = retry_after_uncapped.map(|delay| delay.ceil().min(u64::MAX as f64) as u64);
+    let delay_source = if retry_after.is_some() {
+        "header"
+    } else {
+        "backoff"
+    };
+    // Shared selection (C5): header wins, else the
+    // backoff below. No outer clamp here — unlike
+    // the routed loop, this path sleeps the raw
+    // value, so it stays as written.
+    let delay_ms =
+        headroom_core::retry::next_delay_ms(retry_after_uncapped, backoff_ms(state, attempt));
+    (delay_ms, delay_source)
 }
 
 /// Leading in-band SSE-error arm of the send loop: sleep and report `true`

@@ -170,6 +170,40 @@ fn prefix_head_bytes(value: &serde_json::Value) -> i64 {
 #[derive(Clone)]
 pub(crate) struct SkipModelRouting(pub(crate) String);
 
+/// Every POST to a compressible path tees the response into the SSE
+/// state machine (usage observer, hit-rate metrics, re-cache watchdog),
+/// and the CCR stream rewriter re-frames the body on the passthrough
+/// branch too. Those parsers read the raw byte stream, so a gzip/br-encoded
+/// upstream response is opaque to them — Claude Code sends
+/// `accept-encoding: gzip, deflate, br, zstd` and Anthropic gzips SSE.
+/// With `--compression` off that used to blind telemetry and, worse, the
+/// rewriter forwarded an empty body under a `content-encoding: gzip`
+/// header (client-side ZlibError, "stream ended before any data"). Force
+/// identity upstream whenever a parser may attach, not only when
+/// intercepting; the client receives uncompressed bytes (we never
+/// re-encode), which HTTP permits regardless of what it advertised.
+fn force_identity_encoding_for_parsers(
+    method: &axum::http::Method,
+    uri: &Uri,
+    outgoing_headers: &mut HeaderMap,
+) {
+    if *method == axum::http::Method::POST && compression::is_compressible_path(uri.path()) {
+        outgoing_headers.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("identity"),
+        );
+    }
+}
+
+/// The savings-ledger provider name for a compressible endpoint.
+fn ledger_provider(endpoint: compression::CompressibleEndpoint) -> &'static str {
+    match endpoint {
+        compression::CompressibleEndpoint::AnthropicMessages => ledger::provider::ANTHROPIC,
+        compression::CompressibleEndpoint::OpenAiChatCompletions => ledger::provider::OPENAI_CHAT,
+        compression::CompressibleEndpoint::OpenAiResponses => ledger::provider::OPENAI_RESPONSES,
+    }
+}
+
 pub(crate) async fn forward_http(
     state: AppState,
     client_addr: SocketAddr,
@@ -307,24 +341,7 @@ pub(crate) async fn forward_http(
         && is_application_json(req.headers());
     let should_intercept = gate_decision.should_compress && is_llm_json_post;
 
-    // Every POST to a compressible path tees the response into the SSE
-    // state machine (usage observer, hit-rate metrics, re-cache watchdog),
-    // and the CCR stream rewriter re-frames the body on the passthrough
-    // branch too. Those parsers read the raw byte stream, so a gzip/br-encoded
-    // upstream response is opaque to them — Claude Code sends
-    // `accept-encoding: gzip, deflate, br, zstd` and Anthropic gzips SSE.
-    // With `--compression` off that used to blind telemetry and, worse, the
-    // rewriter forwarded an empty body under a `content-encoding: gzip`
-    // header (client-side ZlibError, "stream ended before any data"). Force
-    // identity upstream whenever a parser may attach, not only when
-    // intercepting; the client receives uncompressed bytes (we never
-    // re-encode), which HTTP permits regardless of what it advertised.
-    if method == axum::http::Method::POST && compression::is_compressible_path(uri.path()) {
-        outgoing_headers.insert(
-            http::header::ACCEPT_ENCODING,
-            http::HeaderValue::from_static("identity"),
-        );
-    }
+    force_identity_encoding_for_parsers(&method, &uri, &mut outgoing_headers);
 
     // PR-E6: capture a header snapshot BEFORE the body is consumed so
     // the drift detector can derive a per-session key from
@@ -353,18 +370,9 @@ pub(crate) async fn forward_http(
         .then(|| compression::classify_compressible_path(uri.path()))
         .flatten()
         .map(|endpoint| {
-            let provider = match endpoint {
-                compression::CompressibleEndpoint::AnthropicMessages => ledger::provider::ANTHROPIC,
-                compression::CompressibleEndpoint::OpenAiChatCompletions => {
-                    ledger::provider::OPENAI_CHAT
-                }
-                compression::CompressibleEndpoint::OpenAiResponses => {
-                    ledger::provider::OPENAI_RESPONSES
-                }
-            };
             capture::PendingRecord::new(
                 state.stats.clone(),
-                ledger::RequestEvent::new(provider, "", &request_id),
+                ledger::RequestEvent::new(ledger_provider(endpoint), "", &request_id),
                 start,
             )
         });
