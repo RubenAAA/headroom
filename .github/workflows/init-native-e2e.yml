@@ -32,6 +32,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   init-native:
     # Fork guard: this job builds or exercises the Python package, which

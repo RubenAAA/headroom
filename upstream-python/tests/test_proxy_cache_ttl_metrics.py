@@ -313,7 +313,7 @@ def test_streaming_parser_extracts_anthropic_ttl_bucket_usage() -> None:
         b'"cache_read_input_tokens":3,"cache_creation_input_tokens":9,'
         b'"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":5}}}}\n\n'
     )
-    usage = proxy._parse_sse_usage(chunk, "anthropic")
+    usage = proxy._parse_sse_usage_from_buffer({"sse_buffer": bytearray(chunk)}, "anthropic")
 
     assert usage is not None
     assert usage["cache_creation_ephemeral_5m_input_tokens"] == 4
@@ -498,3 +498,23 @@ def test_reset_runtime_clears_miss_attribution() -> None:
     asyncio.run(metrics.record_cache_miss_attribution("anthropic", "ttl_expiry"))
     asyncio.run(metrics.reset_runtime())
     assert dict(metrics.cache_miss_attribution_by_provider) == {}
+
+
+def test_prefix_cache_stats_prices_xai_cache_reads_with_grok_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Grok traffic books under ``xai``; its cache reads must be priced with a
+    Grok model, not dropped to $0 because no model matched the provider."""
+    metrics = PrometheusMetrics()
+    metrics.cache_by_provider["xai"].update(
+        {"requests": 1, "hit_requests": 1, "cache_read_tokens": 1_000_000}
+    )
+    tracker = CostTracker()
+    tracker._tokens_sent_by_model.update({"grok-4": 1})
+    monkeypatch.setattr(CostTracker, "_get_list_price", lambda _self, _model: 3.0)
+    monkeypatch.setattr(CostTracker, "_get_cache_prices", lambda _self, _model: None)
+
+    stats = build_prefix_cache_stats(metrics, tracker)
+
+    # No catalog cache rates: xAI's own fallback ratio, not Anthropic's 0.1.
+    assert stats["by_provider"]["xai"]["savings_usd"] == round(1_000_000 * 3e-6 * (1 - 0.16), 4)

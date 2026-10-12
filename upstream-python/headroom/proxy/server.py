@@ -75,7 +75,6 @@ from headroom.ccr import (
     CCR_TOOL_NAME,
     # Batch processing
     CCRResponseHandler,
-    CCRToolInjector,
     ContextTracker,
     ContextTrackerConfig,
     ResponseHandlerConfig,
@@ -128,26 +127,19 @@ from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECO
 # Extracted modules (re-exported for backward compatibility)
 # =============================================================================
 from headroom.proxy.cost import (
-    _CACHE_ECONOMICS,  # noqa: F401
-    CostTracker,  # noqa: F401
-    _summarize_transforms,  # noqa: F401
-    build_prefix_cache_stats,  # noqa: F401
-    build_session_summary,  # noqa: F401
-    merge_cost_stats,  # noqa: F401
+    CostTracker,
+    build_prefix_cache_stats,
+    build_session_summary,
+    merge_cost_stats,
 )
 from headroom.proxy.helpers import (
     COMPRESSION_CACHE_MAX_ENTRIES,
     COMPRESSION_CACHE_TTL_SECONDS,
-    COMPRESSION_TIMEOUT_SECONDS,  # noqa: F401
+    COMPRESSION_TIMEOUT_SECONDS,
     EAGER_PRELOAD_TIMEOUT_SECONDS,
-    MAX_COMPRESSION_CACHE_SESSIONS,  # noqa: F401
-    MAX_MESSAGE_ARRAY_LENGTH,  # noqa: F401
-    MAX_REQUEST_BODY_SIZE,  # noqa: F401
-    MAX_SSE_BUFFER_SIZE,  # noqa: F401
+    MAX_COMPRESSION_CACHE_SESSIONS,
     RETRYABLE_OVERLOAD_STATUSES,
-    _get_image_compressor,  # noqa: F401
-    _read_request_json,  # noqa: F401
-    _setup_file_logging,  # noqa: F401
+    _setup_file_logging,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
     overload_retry_is_futile,
@@ -161,11 +153,8 @@ from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
 from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
-from headroom.proxy.models import (  # noqa: F401
-    CacheEntry,
+from headroom.proxy.models import (
     ProxyConfig,
-    RateLimitState,
-    RequestLog,
     default_periodic_malloc_trim,
 )
 from headroom.proxy.modes import (
@@ -183,14 +172,15 @@ from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
     set_current_project,
+    set_registered_cwd,
     strip_project_path_prefix,
 )
-from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
-from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
+from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.proxy.rate_limiter import TokenBucketRateLimiter
 from headroom.proxy.request_body_limit import RequestBodyLimitMiddleware
-from headroom.proxy.request_logger import RequestLogger  # noqa: F401
+from headroom.proxy.request_logger import RequestLogger
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
-from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
+from headroom.proxy.semantic_cache import SemanticCache
 from headroom.proxy.ssl_context import (
     build_httpx_verify,
     describe_trust_policy,
@@ -200,6 +190,7 @@ from headroom.proxy.tcp_keepalive import install_tcp_keepalive
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
+from headroom.proxy.workspace_registry import resolve_registered_cwd
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
 from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
@@ -213,8 +204,6 @@ from headroom.telemetry.beacon import is_beacon_enabled, is_telemetry_enabled
 from headroom.telemetry.toin import get_toin
 from headroom.transforms import (
     CacheAligner,
-    CodeAwareCompressor,
-    CodeCompressorConfig,
     CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
@@ -233,11 +222,6 @@ try:
     HAS_FCNTL = True
 except ImportError:
     HAS_FCNTL = False
-
-_build_prefix_cache_stats = build_prefix_cache_stats
-_build_session_summary = build_session_summary
-_merge_cost_stats = merge_cost_stats
-
 
 _AGENT_LABELS: dict[str, str] = {
     "claude": "Claude",
@@ -1027,15 +1011,6 @@ class HeadroomProxy(
         # the default request path is unchanged.
         self.model_router = ModelRouter(config.model_router)
 
-        # Initialize transforms based on routing mode.
-        #
-        # Phase B PR-B1 retired the IntelligentContextManager / RollingWindow
-        # message-dropping branch. Live-zone-only compression (PR-B2..B7) does
-        # not drop messages — it operates on content blocks within messages —
-        # so the proxy no longer needs a "context manager" transform stage.
-        # Reported via metrics as `_context_manager_status = "passthrough"`.
-        self._context_manager_status = "passthrough"
-
         # ContentRouter is the single proxy routing surface. Provider handlers
         # normalize their request shapes into messages or CompressionUnits, and
         # the router chooses SmartCrusher, log/search/diff/code, or Kompress.
@@ -1417,18 +1392,6 @@ class HeadroomProxy(
         self._active_requests = 0
         self._activity_generation = 0
 
-        # CCR tool injectors (one per provider)
-        self.anthropic_tool_injector = CCRToolInjector(
-            provider="anthropic",
-            inject_tool=config.ccr_inject_tool,
-            inject_system_instructions=config.ccr_inject_system_instructions,
-        )
-        self.openai_tool_injector = CCRToolInjector(
-            provider="openai",
-            inject_tool=config.ccr_inject_tool,
-            inject_system_instructions=config.ccr_inject_system_instructions,
-        )
-
         # CCR Response Handler (handles CCR tool calls automatically)
         self.ccr_response_handler = (
             CCRResponseHandler(
@@ -1791,7 +1754,12 @@ class HeadroomProxy(
                         remaining,
                     )
 
-        future = loop.run_in_executor(self._compression_executor, _wrapped)
+        # run_in_executor doesn't copy contextvars into the worker thread
+        # (unlike asyncio.to_thread) -- without this, get_registered_cwd()
+        # etc. would silently see the ContextVar default, not what the
+        # request middleware bound.
+        ctx = contextvars.copy_context()
+        future = loop.run_in_executor(self._compression_executor, ctx.run, _wrapped)
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
@@ -1816,7 +1784,9 @@ class HeadroomProxy(
         Runs on the dedicated single-thread background executor.
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._background_compression_executor, fn)
+        # Same context-propagation fix as _run_compression_in_executor above.
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(self._background_compression_executor, ctx.run, fn)
 
     # How often the lazy TTL sweep in `_get_compression_cache` may run.
     _COMPRESSION_CACHE_CLEANUP_INTERVAL_SECONDS = 60.0
@@ -1936,39 +1906,6 @@ class HeadroomProxy(
                 self._compression_caches.move_to_end(session_id)
             self._compression_cache_last_seen[session_id] = now
             return cache
-
-    def _setup_code_aware(self, config: ProxyConfig, transforms: list) -> str:
-        """Set up code-aware compression if enabled.
-
-        Args:
-            config: Proxy configuration
-            transforms: Transform list to append to
-
-        Returns:
-            Status string for logging: 'enabled', 'disabled', 'available', 'unavailable'
-        """
-        if config.code_aware_enabled:
-            if is_tree_sitter_available():
-                code_config = CodeCompressorConfig(
-                    preserve_imports=True,
-                    preserve_signatures=True,
-                    preserve_type_annotations=True,
-                )
-                # CodeAware runs after the content/structure transforms.
-                # Phase B PR-B1 retired the trailing context_manager so we
-                # append rather than insert(-1).
-                transforms.append(CodeAwareCompressor(code_config))
-                return "enabled"
-            else:
-                logger.warning(
-                    "Code-aware compression requested but tree-sitter not installed. "
-                    "Install with: pip install headroom-ai[code]"
-                )
-                return "unavailable"
-        else:
-            if is_tree_sitter_available():
-                return "available"  # Available but not enabled
-            return "disabled"
 
     def _eager_preload_transforms(self) -> tuple[dict[str, str], list[dict[str, str]]]:
         """Eagerly load every compressor/parser/detector once (dedup by ``id()``).
@@ -3180,11 +3117,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Installed here (not at module import) so importing headroom.proxy.server
     # in tests or library contexts does not silently attach a RotatingFileHandler
     # to the user's live proxy log. Multi-worker processes add their PID so
-    # same-port workers never share a RotatingFileHandler target.
-    _setup_file_logging(
-        config.port,
-        process_id=os.getpid() if config.worker_processes > 1 else None,
-    )
+    # same-port workers never share a RotatingFileHandler target. Stateless
+    # mode must not create a log directory or file.
+    if not config.stateless:
+        _setup_file_logging(
+            config.port,
+            process_id=os.getpid() if config.worker_processes > 1 else None,
+        )
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint
@@ -3983,6 +3922,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         query = request.url.query
         headers = dict(request.headers.items())
         set_current_project(classify_project(headers) or prefix_project)
+        # Non-None only if a live wrap session registered this exact token
+        # (workspace_registry.py) -- the caller-supplied x-headroom-cwd
+        # header is never itself sufficient authority.
+        set_registered_cwd(
+            resolve_registered_cwd(config.port, headers.get("x-headroom-session-token"))
+        )
         # Path-based Codex identification: stamp X-Client: codex on the
         # Responses endpoint for callers that don't otherwise classify (e.g.
         # Codex Desktop, whose User-Agent isn't a known codex UA). Without it
@@ -4881,7 +4826,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         feedback_stats = feedback.get_stats()
 
         # Build prefix cache stats once (used in both prefix_cache and cost)
-        prefix_cache_stats = _build_prefix_cache_stats(m, proxy.cost_tracker)
+        prefix_cache_stats = build_prefix_cache_stats(m, proxy.cost_tracker)
 
         # Calculate total tokens before Headroom-side reduction.
         proxy_compression_tokens = m.tokens_saved_total
@@ -4923,7 +4868,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         new_input_saved_tokens = int(_pc_totals.get("new_input_saved_tokens", 0) or 0)
 
         # Build human-readable summary
-        summary = _build_session_summary(proxy, m, prefix_cache_stats, total_tokens_before)
+        summary = build_session_summary(proxy, m, prefix_cache_stats, total_tokens_before)
         # DEBUG: log the summary payload for external upsert consumers
         try:
             logger.debug("/stats summary data: %r", summary)
@@ -5133,6 +5078,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "tokens": {
                 "input": m.tokens_input_total,
+                # Provenance of "input": the provider's own billed count versus
+                # Headroom's tokenizer estimate. Only the first reconciles with
+                # the provider console (input + cache read + cache write).
+                "input_provider_reported": m.tokens_input_provider_reported_total,
+                "input_estimated": m.tokens_input_estimated_total,
+                "input_provider_reported_percent": round(
+                    (m.tokens_input_provider_reported_total / m.tokens_input_total * 100)
+                    if m.tokens_input_total > 0
+                    else 0,
+                    2,
+                ),
+                "requests_input_provider_reported": m.requests_input_provider_reported,
+                "requests_input_estimated": m.requests_input_estimated,
                 "output": m.tokens_output_total,
                 "output_saved": output_reduction.get("tokens_saved", 0),
                 "output_reduction_percent": output_reduction.get("reduction_percent", 0),
@@ -5330,7 +5288,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "litellm_available": LITELLM_AVAILABLE,
             "persistent_savings": persistent_savings,
             "prefix_cache": prefix_cache_stats,
-            "cost": _merge_cost_stats(
+            "cost": merge_cost_stats(
                 proxy.cost_tracker.stats() if proxy.cost_tracker else None,
                 prefix_cache_stats,
             ),

@@ -51,6 +51,7 @@ from typing import Any
 
 from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
 from headroom.proxy.turn_hooks import (
     TurnContext,
     merge_provider_headers,
@@ -893,7 +894,7 @@ class RequestTransformer:
         )
         if hooks:
             msg_before = _safe_count(count_messages, messages)
-            tools_before = _safe_count(count_tools, tools)
+            tools_before = _safe_count(count_tools, without_deferral_flags(tools))
             deferred_before = self.tags.get("tool_search_deferred_tools")
             run_request_hooks(ctx, stream_safe_only=not self.caps.redrive_allowed)
             messages = ctx.messages
@@ -911,7 +912,7 @@ class RequestTransformer:
             if msg_before is not None and msg_after is not None and msg_after < msg_before:
                 transforms.append("turn_hook")
                 messages_rewritten = True
-            tools_after = _safe_count(count_tools, tools)
+            tools_after = _safe_count(count_tools, without_deferral_flags(tools))
             if tools_before is not None and tools_after is not None:
                 saved = max(0, tools_before - tools_after)
                 if saved > 0:
@@ -1177,7 +1178,6 @@ def shape_gateway_body(
     and the block is re-appended deterministically. Never raises.
     """
     try:
-        from headroom.proxy import runtime_env
         from headroom.proxy.output_savings import (
             assign_arm,
             conversation_key_from_body,
@@ -1187,6 +1187,7 @@ def shape_gateway_body(
         from headroom.proxy.output_shaper import (
             OutputShaperSettings,
             classify_turn,
+            output_holdout_fraction,
             resolve_verbosity_level,
             shape_openai_chat_request,
             shape_request,
@@ -1200,11 +1201,7 @@ def shape_gateway_body(
         )
         if not settings.enabled:
             return False
-        try:
-            holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
-        except ValueError:
-            holdout = 0.0
-        arm = assign_arm(conversation_key_from_body(provider_body), holdout)
+        arm = assign_arm(conversation_key_from_body(provider_body), output_holdout_fraction())
         messages = provider_body.get("messages")
         turn_kind = classify_turn(messages if isinstance(messages, list) else []).value
         stratum = stratum_key(
@@ -1497,14 +1494,12 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
     """``POST /v1/compress/response`` — finish or re-drive a pending turn."""
     from fastapi.responses import JSONResponse
 
-    from headroom.proxy.helpers import _read_request_json
+    from headroom.proxy.helpers import _read_request_json, invalid_request_body_message
 
     try:
         body = await _read_request_json(request)
-    except Exception:
-        return _error(400, "invalid_request", "Invalid JSON in request body.")
-    if not isinstance(body, dict):
-        return _error(400, "invalid_request", "Request body must be a JSON object.")
+    except Exception as exc:
+        return _error(400, "invalid_request", invalid_request_body_message(exc))
 
     turn_id = body.get("turn_id")
     if not isinstance(turn_id, str) or not turn_id.strip() or len(turn_id) > 128:
