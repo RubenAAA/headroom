@@ -110,6 +110,16 @@ ticket_hook "curl -sS -X POST \"\$D/api/issues/\$k/comments\" --data @c.json"
 [[ $RC -eq 0 && -z $OUT ]] || fail "a comment on an issue id in a variable was diverted (rc=$RC out=$OUT)"
 ok "tr -d, cut -d and issue ids in variables are not filings"
 
+# A read of a filed ticket was diverted twice: the token's `$(tr -d ...)`
+# sat inside curl's own arguments, and the base URL held the /api part.
+ticket_hook "curl -s -H \"Authorization: Bearer \$(tr -d '\n' < ~/.config/youtrack/token)\" \"\$D/api/issues?fields=id\""
+[[ $RC -eq 0 && -z $OUT ]] || fail "a tr -d inside curl's arguments read as -d (rc=$RC out=$OUT)"
+ticket_hook "curl -s \"\${D%/}/issues/ANL-1963?fields=summary\" -o /tmp/x.json"
+[[ $RC -eq 0 && -z $OUT ]] || fail "a read of an existing issue under a variable base was diverted (rc=$RC out=$OUT)"
+ticket_hook "curl -s -H \"Authorization: Bearer \$(tr -d '\n' <tok)\" https://yt.example/api/issues -d \"\$(cat body.json)\""
+diverts || fail "a create with its body in \$(...) was not treated as a write (rc=$RC out=$OUT)"
+ok "a \$(tr -d ...) in curl's arguments and an /issues/<id> read are not filings"
+
 ticket_hook "$(printf 'curl -sS -X POST "https://yt.example/api/issues?fields=id" \\\n  -H "Content-Type: application/json" \\\n  --data @body.json')"
 diverts || fail "a create split over continuation lines was not treated as a write (rc=$RC out=$OUT)"
 ticket_hook "T=\$(tr -d '\n' <tok); curl https://yt.example/api/issues -d @body.json"

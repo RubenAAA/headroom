@@ -382,7 +382,9 @@ if [ "$TOOL" = "Bash" ]; then
   # no issue suffix and still fall through to the divert check. Any path
   # segment counts as the suffix, a shell variable included: `$k` in
   # /api/issues/$k/comments is an existing issue as much as PROJ-12 is.
-  if echo "$LOW" | grep -qE 'api/issues/[^?"'"'"'[:space:]]|/issue/[a-z]+-[0-9]+'; then
+  # A readable id counts under any base: `${D%/}/issues/ANL-1963` is a read
+  # whose base URL already ends in /api.
+  if echo "$LOW" | grep -qE 'api/issues/[^?"'"'"'[:space:]]|/issues?/[a-z][a-z0-9]*-[0-9]+'; then
     exit 0
   fi
   # Subject AND shape, never shape alone. `curl -X POST` to something else is
@@ -409,6 +411,8 @@ if [ "$TOOL" = "Bash" ]; then
   # its original case.
   CURL_LINE=$(printf '%s\n' "$CMD" | sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta')
   while IFS= read -r SEG; do
+    # A `$(tr -d '\n' <token)` inside curl's arguments is not curl's -d.
+    SEG=$(printf '%s' "$SEG" | sed -e ':a' -e 's/\$([^()]*)//g; ta')
     SEG_LOW=$(printf '%s' "$SEG" | tr '[:upper:]' '[:lower:]')
     echo "$SEG_LOW" | grep -qE '[[:space:]](-x (post|put|patch)|--data|-d[[:space:]@"'"'"'])' || continue
     if echo "$SEG" | grep -qE '[[:space:]](-G|--get|-X GET)([[:space:]]|$)' &&
