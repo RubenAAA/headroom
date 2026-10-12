@@ -246,7 +246,10 @@ async fn routed_turn_sheds_with_429_past_the_cap() {
         let body = routed_turn("same opener");
         async move { drain(post(&client, &url, &body).await).await }
     });
-    wait_for_upstream_requests(&mock, 1, Duration::from_secs(2)).await;
+    // The first routed turn builds the o200k tokenizer on its way out
+    // (about a second in a debug build, more under a loaded test run), so
+    // A's arrival gets a generous bound. B's tokenizer is warm by then.
+    wait_for_upstream_requests(&mock, 1, Duration::from_secs(10)).await;
     let b = tokio::spawn({
         let client = client.clone();
         let url = url.clone();
