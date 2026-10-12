@@ -454,6 +454,11 @@ struct HistoryEntry {
     timestamp: String,
     provider: String,
     model: String,
+    /// Calling agent (`claude-code`, `codex`, `opencode`, …), so clients that
+    /// share an upstream get their own rollup row (upstream `489de468`).
+    /// Points written before it load as `unknown`.
+    #[serde(default)]
+    agent: String,
     total_tokens_saved: i64,
     compression_savings_usd: f64,
     /// Lifetime cumulative cache reads/savings at this point. `#[serde(default)]`
@@ -810,6 +815,7 @@ impl SavingsTracker {
             timestamp: to_utc_iso(ts),
             provider: normalize_provider(provider),
             model: normalize_model(Some(model)),
+            agent: normalize_provider(None),
             total_tokens_saved: st.lifetime.tokens_saved,
             compression_savings_usd: st.lifetime.compression_savings_usd,
             cache_read_tokens: st.lifetime.cache_read_tokens,
@@ -1002,6 +1008,7 @@ impl SavingsTracker {
                 timestamp: to_utc_iso(ts),
                 provider: normalize_provider(rec.provider),
                 model: normalize_model(Some(rec.model)),
+                agent: normalize_provider(rec.stack),
                 total_tokens_saved: st.lifetime.tokens_saved,
                 compression_savings_usd: st.lifetime.compression_savings_usd,
                 cache_read_tokens: st.lifetime.cache_read_tokens,
@@ -1695,6 +1702,15 @@ impl SavingsTracker {
                 m.total_input_tokens_delta += delta_input_tokens;
                 m.total_input_cost_usd_delta =
                     round_n(m.total_input_cost_usd_delta + delta_input_cost, 6);
+
+                let agent = normalize_provider(Some(&point.agent));
+                let a = entry.by_agent.entry(agent).or_default();
+                a.tokens_saved += delta_tokens;
+                a.compression_savings_usd_delta =
+                    round_n(a.compression_savings_usd_delta + delta_usd, 6);
+                a.total_input_tokens_delta += delta_input_tokens;
+                a.total_input_cost_usd_delta =
+                    round_n(a.total_input_cost_usd_delta + delta_input_cost, 6);
             }
         }
 
@@ -2272,6 +2288,7 @@ fn history_entry_value(e: &HistoryEntry) -> Value {
         "timestamp": e.timestamp,
         "provider": e.provider,
         "model": e.model,
+        "agent": e.agent,
         "total_tokens_saved": e.total_tokens_saved,
         "compression_savings_usd": e.compression_savings_usd,
         "cache_read_tokens": e.cache_read_tokens,
@@ -2386,6 +2403,7 @@ fn normalize_history_entry(entry: &Value) -> Option<HistoryEntry> {
         timestamp: to_utc_iso(timestamp),
         provider,
         model,
+        agent: normalize_provider(entry.get("agent").and_then(Value::as_str)),
         total_tokens_saved: tts,
         compression_savings_usd: round_n(csu, 6),
         cache_read_tokens: crt,
@@ -2625,6 +2643,7 @@ struct RollupEntry {
     total_output_cost_usd: f64,
     by_provider: BTreeMap<String, RollupDelta>,
     by_model: BTreeMap<String, RollupDelta>,
+    by_agent: BTreeMap<String, RollupDelta>,
 }
 
 impl RollupEntry {
@@ -2651,6 +2670,7 @@ impl RollupEntry {
             total_output_cost_usd: 0.0,
             by_provider: BTreeMap::new(),
             by_model: BTreeMap::new(),
+            by_agent: BTreeMap::new(),
         }
     }
 
@@ -2686,6 +2706,7 @@ impl RollupEntry {
             "total_output_cost_usd": self.total_output_cost_usd,
             "by_provider": map_deltas(&self.by_provider),
             "by_model": map_deltas(&self.by_model),
+            "by_agent": map_deltas(&self.by_agent),
         })
     }
 }

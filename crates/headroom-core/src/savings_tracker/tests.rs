@@ -1272,3 +1272,46 @@ fn lifetime_loads_from_a_state_file_written_before_output_shaping() {
     let snap = t.snapshot();
     assert_eq!(snap["lifetime"]["output_tokens_saved"], json!(25));
 }
+
+#[test]
+fn rollup_buckets_split_savings_by_agent() {
+    // Upstream 489de468: Claude Code and OpenCode share the anthropic
+    // upstream, so only the agent dimension tells them apart. History
+    // written before the field existed rolls up under "unknown".
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.json");
+    let t = tracker(&path);
+    for (stack, saved) in [
+        (Some("claude-code"), 1000),
+        (Some("opencode"), 400),
+        (None, 50),
+    ] {
+        assert!(t.record_request(&RequestRecord {
+            model: "claude-sonnet-4",
+            provider: Some("anthropic"),
+            input_tokens: 500,
+            tokens_saved: saved,
+            stack,
+            ..Default::default()
+        }));
+    }
+    let resp = t.history_response("compact");
+    let bucket = &resp["series"]["hourly"].as_array().unwrap()[0];
+    assert_eq!(
+        bucket["by_agent"]["claude-code"]["tokens_saved"],
+        json!(1000)
+    );
+    assert_eq!(bucket["by_agent"]["opencode"]["tokens_saved"], json!(400));
+    assert_eq!(bucket["by_agent"]["unknown"]["tokens_saved"], json!(50));
+    assert_eq!(
+        bucket["by_provider"]["anthropic"]["tokens_saved"],
+        json!(1450)
+    );
+
+    // The agent survives a reload.
+    drop(t);
+    let t = tracker(&path);
+    let resp = t.history_response("compact");
+    let bucket = &resp["series"]["hourly"].as_array().unwrap()[0];
+    assert_eq!(bucket["by_agent"]["opencode"]["tokens_saved"], json!(400));
+}
