@@ -211,6 +211,30 @@ Options:
           
           [env: HEADROOM_PROXY_PRUNE_DROP_TOOLS=]
 
+      --phase-e-anthropic-passes <PHASE_E_ANTHROPIC_PASSES>
+          Phase E passes to run on Anthropic `/v1/messages` (comma-separated `e1,e2,e3`). E1 sorts `tools[]`, E2 sorts schema keys, E3 auto-places `cache_control`. Default runs all three; empty disables every Anthropic pass. A pass listed for a path it never runs on (e.g. `e4` here) is inert.
+          
+          Source priority: CLI flag → `HEADROOM_PROXY_PHASE_E_ANTHROPIC_PASSES` env var → default.
+          
+          [env: HEADROOM_PROXY_PHASE_E_ANTHROPIC_PASSES=]
+          [default: e1,e2,e3]
+
+      --phase-e-chat-passes <PHASE_E_CHAT_PASSES>
+          Phase E passes to run on OpenAI chat completions (comma-separated `e1,e2,e4`). E1 sorts `tools[]`, E2 sorts schema keys, E4 injects `prompt_cache_key`. Default runs all three; empty disables every chat pass.
+          
+          Source priority: CLI flag → `HEADROOM_PROXY_PHASE_E_CHAT_PASSES` env var → default.
+          
+          [env: HEADROOM_PROXY_PHASE_E_CHAT_PASSES=]
+          [default: e1,e2,e4]
+
+      --phase-e-responses-passes <PHASE_E_RESPONSES_PASSES>
+          Phase E passes to run on OpenAI responses (comma-separated `e1,e2,e4`). Same passes as chat; default runs all three; empty disables every responses pass.
+          
+          Source priority: CLI flag → `HEADROOM_PROXY_PHASE_E_RESPONSES_PASSES` env var → default.
+          
+          [env: HEADROOM_PROXY_PHASE_E_RESPONSES_PASSES=]
+          [default: e1,e2,e4]
+
       --prune-keep-tools <PRUNE_KEEP_TOOLS>
           Tool pruning (A4): keep ONLY these tool names (comma-separated allowlist). When set, every tool not listed is dropped (most aggressive); takes precedence over --prune-drop-mcp. Off by default
           
@@ -435,6 +459,13 @@ Options:
           [default: false]
           [possible values: true, false]
 
+      --report-true-usage <REPORT_TRUE_USAGE>
+          Report the provider's real token counts to the client on streamed translated routes (Spark, Codex). Off, the terminal `message_delta` carries only `output_tokens` and `message_start` says `input_tokens: 0`, so the client never sees the turn's true context size. On, the delta carries `input_tokens`, `output_tokens` and `cache_read_input_tokens` from the upstream usage block, and CCR turns report the whole turn (first round plus continuation rounds). Default `true`: the client compacts on its own local count since 2.1.288 anyway, so masked zeros buy nothing; true numbers make the context display and the ledger agree. Set `false` to restore the legacy output-only shape
+          
+          [env: HEADROOM_PROXY_REPORT_TRUE_USAGE=]
+          [default: true]
+          [possible values: true, false]
+
       --force-1h-cache-ttl <FORCE_1H_CACHE_TTL>
           B1: rewrite every `cache_control` marker to `ttl: "1h"` so the cached prefix survives idle gaps past the 5-minute default. Anthropic only, and skipped on PAYG — a 1h write is priced at 2× base input against 1.25× for 5m, so it is free on a subscription (where writes are token-counted for the usage window) and 60% dearer in dollars on an API key.
           
@@ -586,6 +617,12 @@ Options:
           
           [env: HEADROOM_PROXY_CTX_REFRESH_JEV_URL=]
           [default: https://opencode.ai/zen/v1/systemone]
+
+      --ctx-refresh-apply-tokens <CTX_REFRESH_APPLY_TOKENS>
+          Jev context refresh, apply mode: past this many estimated tokens, a Spark turn builds a shorter base history in the background (Jev scores each exchange, the lowest quarter is stubbed) and later turns forward that base plus the new tail. `0` (the default) is off. See `docs/notes/ideas/jev-context-refresh.md`. Needs `ctx_offload`: the stubbed originals live in the CCR store for `headroom_retrieve`
+          
+          [env: HEADROOM_PROXY_CTX_REFRESH_APPLY_TOKENS=]
+          [default: 0]
 
       --ctx-offload-ttl-seconds <CTX_OFFLOAD_TTL_SECONDS>
           CTX-3: TTL (seconds) for offloaded originals in the CCR store. Long by design (retrieval outlives a session); default `604_800` (7 days)
@@ -1177,6 +1214,22 @@ Options:
           Source priority: CLI flag → `ANTHROPIC_FOUNDRY_RESOURCE` env var → none.
           
           [env: ANTHROPIC_FOUNDRY_RESOURCE=]
+
+      --stats <STATS>
+          Native savings stats: record per-request savings/cost telemetry and serve `/stats`, `/stats/timeseries`, `/stats/events`, and `/dashboard`. When disabled, nothing is recorded and those paths fall through to the catch-all forwarder (i.e. they reach the upstream, matching the pre-feature behaviour).
+          
+          Source priority: CLI flag → `HEADROOM_PROXY_STATS` env var → default (`false`).
+          
+          [env: HEADROOM_PROXY_STATS=]
+          [default: false]
+          [possible values: true, false]
+
+      --stats-path <STATS_PATH>
+          Where the savings ledger persists its state. When unset, the proxy uses `$HEADROOM_WORKSPACE_DIR/native_stats.json` when that env var is set (how the Python proxy resolves its workspace), else `~/.headroom/native_stats.json`; if no home directory can be resolved, stats stay in-memory (logged).
+          
+          Source priority: CLI flag → `HEADROOM_PROXY_STATS_PATH` env var → workspace-derived default.
+          
+          [env: HEADROOM_PROXY_STATS_PATH=]
 
   -h, --help
           Print help (see a summary with '-h')

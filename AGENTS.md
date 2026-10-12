@@ -133,7 +133,7 @@ file is `contrib/headroom-flags.sh` in the checkout, so edit either. A running
 proxy is reused as it is, and flags on a later command line are ignored, so a
 change with no restart means you are still measuring the old setting.
 
-All 154 options (156 with `-h`/`-V`): `headroom-proxy --help`, or [`docs/flags.md`](docs/flags.md),
+All 161 options (163 with `-h`/`-V`): `headroom-proxy --help`, or [`docs/flags.md`](docs/flags.md),
 generated from that output. Regenerate it when you add a flag.
 
 The flags file ships with `--redact-sensitive true`: on routed paths (Spark,
