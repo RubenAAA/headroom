@@ -146,6 +146,9 @@ async fn every_continuation_round_extends_the_last_and_marks_its_tail() {
             config.cache_tail_breakpoint = true;
             config.cache_tail_breakpoints = 2;
             config.ccr_max_retrieval_rounds = 4;
+            // Pins the move-every-round behaviour; the default `1` keeps
+            // the first round's marker on the client's boundary.
+            config.memory_keep_client_boundary_rounds = 0;
         },
         |state| state,
     )

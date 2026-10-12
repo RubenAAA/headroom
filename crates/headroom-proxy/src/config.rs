@@ -3584,8 +3584,8 @@ impl Config {
             split_cache_ttl: false,
             respect_client_5m_ttl: false,
             cache_tail_breakpoint: false,
-            ccr_keep_client_boundary_rounds: 0,
-            memory_keep_client_boundary_rounds: 0,
+            ccr_keep_client_boundary_rounds: 1,
+            memory_keep_client_boundary_rounds: 1,
             hold_working_directory: false,
             hold_role_sentence: false,
             cache_stampede_gate: false,
@@ -3874,6 +3874,20 @@ mod upstream_write_timeout_tests {
         assert_eq!(args.mode, "cache");
         let config = Config::from_cli(args);
         assert_eq!(config.mode, crate::modes::PROXY_MODE_CACHE);
+    }
+
+    #[test]
+    fn for_test_keeps_the_client_boundary_like_the_cli() {
+        let cli = Config::from_cli(parse(&[]));
+        let config = Config::for_test("http://127.0.0.1:9".parse().unwrap());
+        assert_eq!(
+            config.ccr_keep_client_boundary_rounds,
+            cli.ccr_keep_client_boundary_rounds
+        );
+        assert_eq!(
+            config.memory_keep_client_boundary_rounds,
+            cli.memory_keep_client_boundary_rounds
+        );
     }
 
     #[test]
