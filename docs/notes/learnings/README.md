@@ -7,6 +7,9 @@ retests), with status in the file.
 Measurement-led files (`recache-*`, `savings-*`, `proxy-*`) scope every
 number to its window; do not quote across windows.
 
+- [`subscription-meter-weights.md`](subscription-meter-weights.md): the
+  subscription meter, fitted per token class: output 39% of use, cache
+  reads 33%, 1h writes 27%, fresh input 1%; forced 1h TTL rechecked.
 - [`sqlite-copy-needs-backup-api.md`](sqlite-copy-needs-backup-api.md):
   a file copy of a live WAL-mode DB without its `-wal` reads as malformed;
   copy with the backup API.
