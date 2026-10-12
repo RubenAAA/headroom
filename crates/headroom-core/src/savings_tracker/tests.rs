@@ -1315,3 +1315,35 @@ fn rollup_buckets_split_savings_by_agent() {
     let bucket = &resp["series"]["hourly"].as_array().unwrap()[0];
     assert_eq!(bucket["by_agent"]["opencode"]["tokens_saved"], json!(400));
 }
+
+/// A history point saved before `agent` existed reloads under "unknown"
+/// (upstream 489de468 has the same reload test).
+#[test]
+fn history_saved_without_an_agent_reloads_as_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.json");
+    let t = tracker(&path);
+    assert!(t.record_request(&RequestRecord {
+        model: "claude-sonnet-4",
+        provider: Some("anthropic"),
+        input_tokens: 500,
+        tokens_saved: 70,
+        stack: Some("claude-code"),
+        ..Default::default()
+    }));
+    drop(t);
+
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let history = saved["history"].as_array_mut().unwrap();
+    assert!(!history.is_empty(), "fixture guard: a point was saved");
+    for point in history {
+        assert!(point.as_object_mut().unwrap().remove("agent").is_some());
+    }
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let resp = tracker(&path).history_response("compact");
+    let bucket = &resp["series"]["hourly"].as_array().unwrap()[0];
+    assert_eq!(bucket["by_agent"]["unknown"]["tokens_saved"], json!(70));
+    assert!(bucket["by_agent"].get("claude-code").is_none());
+}
