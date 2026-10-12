@@ -1781,7 +1781,8 @@ fn terminal_delta_keeps_legacy_shape_by_default() {
 }
 
 /// With the flag the provider's own counts go out in Anthropic's key
-/// vocabulary, including cached tokens.
+/// vocabulary, including cached tokens. OpenAI's input count includes the
+/// cached ones; Anthropic's excludes them, so 500 with 300 cached is 200.
 #[test]
 fn terminal_delta_reports_provider_truth_when_flagged() {
     let mut t = StreamTranslator::new("muse-spark-1.3".to_string()).with_report_true_usage(true);
@@ -1795,7 +1796,7 @@ fn terminal_delta_reports_provider_truth_when_flagged() {
 
     assert_eq!(
         terminal_delta_usage(&out.join("")),
-        json!({"input_tokens": 500, "output_tokens": 42, "cache_read_input_tokens": 300})
+        json!({"input_tokens": 200, "output_tokens": 42, "cache_read_input_tokens": 300})
     );
 }
 
@@ -1836,7 +1837,7 @@ fn chat_finish_reason_delta_maps_truth_when_flagged() {
 
     assert_eq!(
         terminal_delta_usage(&out.join("")),
-        json!({"input_tokens": 700, "output_tokens": 12, "cache_read_input_tokens": 650})
+        json!({"input_tokens": 50, "output_tokens": 12, "cache_read_input_tokens": 650})
     );
 }
 

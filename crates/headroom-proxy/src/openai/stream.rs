@@ -1850,16 +1850,24 @@ impl StreamTranslator {
         let (Some(input), Some(output)) = (input, output) else {
             return legacy();
         };
-        let cached = u
-            .get("cache_read_input_tokens")
-            .cloned()
-            .or_else(|| {
-                u.get("input_tokens_details")
-                    .or_else(|| u.get("prompt_tokens_details"))
-                    .and_then(|d| d.get("cached_tokens"))
-                    .cloned()
-            })
-            .unwrap_or(json!(0));
+        // OpenAI's input count includes its cached tokens; Anthropic's
+        // `input_tokens` excludes them and the client adds the two, so the
+        // OpenAI shape must subtract or cached tokens count twice. A block
+        // already in Anthropic keys is exclusive and passes as is.
+        let (input, cached) = if let Some(cached) = u.get("cache_read_input_tokens") {
+            (input, cached.clone())
+        } else {
+            let cached = u
+                .get("input_tokens_details")
+                .or_else(|| u.get("prompt_tokens_details"))
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            match input.as_u64() {
+                Some(n) => (json!(n.saturating_sub(cached)), json!(cached)),
+                None => return legacy(),
+            }
+        };
         json!({
             "input_tokens": input,
             "output_tokens": output,
