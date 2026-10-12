@@ -42,7 +42,9 @@ Sonnet 4.5, so no hand-kept premium table is needed today.
 `1a4e4194` (clap, `config.rs:1702`), `a6545580` (orchestrator logs the
 transform; upstream now hides the message text, Rust still logs it, but
 there the text is the proxy's own format strings, not payload),
-and the four `crates/headroom-core` commits, which merged cleanly.
+and the four `crates/headroom-core` commits (`47f87108`, `a20c76c2`,
+`eaa7308a`, `3db1a944`), which merged cleanly; each one's `crates/`
+diff reverse-applies on HEAD.
 
 ## N/A
 
@@ -52,5 +54,20 @@ mcp_registry (`f2153fec`), traffic learner (`e6eaa411`), OTEL window
 (`7d9dd55e`), gateway compress API (`5cac7ab6`), route specs (`69a16cb5`),
 Python system relocation (`d9e29bb2`), `/api/hello` routing (`931e5b96`,
 Rust sends everything to one upstream), openclaw plugin (`37f3f9ef`),
-any-llm backend (`03538f2f`), import laziness (`59bd482f`), docs, CI,
-tests, and the `headroom-snip` plugin (moved to `upstream-python/plugins/`).
+any-llm backend (`03538f2f`), import laziness (`59bd482f`).
+
+Python dead-code removal and deprecation, nothing Rust mirrors:
+`f14906e0`, `efd6e157`, `2c2357ad`, `0494edcc`, `7387b8cc`, `235043d3`,
+`4bf4ae87`, `ebc59356`, `9b1971dd`, `2e497cbe`, `e4a1ec19`, `fc8ff5a7`,
+`9b42fcc4`, `098df1c7`, `02ce467d`, `c191beef`, `73f59a32`, `31d378b0`,
+`132cd583`, `25cc2d58`, `abbf36f0`, `30d23fb7`, `6d23895d`, `e7ac6ca6`,
+`5c72d824`, `08fce183`, `310c108c`, `63cc9afa`, `de896926`, `688b3270`,
+`8e61cca2`, `e5cbec5f`, `58387c11`, `fc5ac70b`, `7e5d97fe`.
+
+Tests only: `1b7466d1`, `415fed07`, `9266b030`, `65a21987`, `85c35799`,
+`a63b23fe`. Python install, release and deps: `64a661d5`, `5682883b`,
+`79f2c278`, `c195a122`, `3f990663`, `51ec6e8f`. Python dashboard
+templates (`4e4f49d0`, `20ce054f`): the Rust `observability/dashboard.html`
+is its own page and has neither the savings-profile badge nor the
+settings selects. Docs and CI: `a31d89b4`, `c7a223da`. The
+`headroom-snip` plugin (`17abee27`) moved to `upstream-python/plugins/`.
