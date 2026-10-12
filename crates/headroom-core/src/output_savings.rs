@@ -687,26 +687,7 @@ impl SavingsLedger {
         match serde_json::from_str::<SavingsLedger>(&text) {
             Ok(mut ledger) => {
                 if !ledger.shaped_only {
-                    // Pre-rule arms cannot be told apart from shaped ones
-                    // entry by entry, so drop them and re-accumulate from
-                    // live traffic. The offline baseline is kept: it is
-                    // learned from pre-shaper history, costs real analysis to
-                    // rebuild, and never held the contaminated quantity
-                    // anyway (upstream `074f0ae9`).
-                    let arms = ledger.treatment.len() + ledger.control.len();
-                    if arms > 0 {
-                        tracing::warn!(
-                            event = "output_savings_ledger_predates_shaped_only",
-                            treatment_arms = ledger.treatment.len(),
-                            control_arms = ledger.control.len(),
-                            "output-savings ledger predates the shaped-only rule; \
-                             dropping arms and re-accumulating from live traffic \
-                             (baseline kept)",
-                        );
-                        ledger.treatment.clear();
-                        ledger.control.clear();
-                    }
-                    ledger.shaped_only = true;
+                    ledger.migrate_to_shaped_only();
                 }
                 ledger
             }
@@ -720,6 +701,30 @@ impl SavingsLedger {
                 SavingsLedger::default()
             }
         }
+    }
+
+    /// Bring a ledger written before the shaped-only rule up to it.
+    fn migrate_to_shaped_only(&mut self) {
+        // Pre-rule arms cannot be told apart from shaped ones
+        // entry by entry, so drop them and re-accumulate from
+        // live traffic. The offline baseline is kept: it is
+        // learned from pre-shaper history, costs real analysis to
+        // rebuild, and never held the contaminated quantity
+        // anyway (upstream `074f0ae9`).
+        let arms = self.treatment.len() + self.control.len();
+        if arms > 0 {
+            tracing::warn!(
+                event = "output_savings_ledger_predates_shaped_only",
+                treatment_arms = self.treatment.len(),
+                control_arms = self.control.len(),
+                "output-savings ledger predates the shaped-only rule; \
+                 dropping arms and re-accumulating from live traffic \
+                 (baseline kept)",
+            );
+            self.treatment.clear();
+            self.control.clear();
+        }
+        self.shaped_only = true;
     }
 }
 

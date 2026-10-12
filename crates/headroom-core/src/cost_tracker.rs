@@ -820,6 +820,49 @@ pub struct PrefixCacheStats {
     pub compression_vs_cache: CompressionVsCacheStats,
 }
 
+/// Cache read/write multipliers for `provider`, plus where they came from.
+///
+/// Per-model cache rates win over the hardcoded provider table, which
+/// cannot express a model's actual published cache rates. The table
+/// stays as the fallback for models with no vendored cache pricing.
+fn resolve_cache_multipliers(
+    provider: &str,
+    model_prices: &HashMap<String, f64>,
+    econ: &CacheEconomics,
+    cache_write_tokens: i64,
+) -> (f64, f64, &'static str) {
+    let mut read_mult = econ.read_multiplier;
+    let mut write_mult = econ.write_multiplier;
+    let mut pricing_source = "provider_default";
+    if let Some(matched) = find_provider_model(provider, model_prices)
+        && let Some(p) = crate::pricing::lookup(matched)
+    {
+        let uncached = p.input_cost_per_token;
+        if uncached > 0.0 {
+            // Upstream 463c1a43: a rate the table lacks keeps the
+            // provider default instead of becoming 1.0 (no discount, no
+            // premium), and the source says which half came from where.
+            // Writes don't matter when nothing was written.
+            if let Some(read) = p.cache_read_cost_per_token {
+                read_mult = read / uncached;
+            }
+            if let Some(write) = p.cache_write_cost_per_token {
+                write_mult = write / uncached;
+            }
+            let read_vendored = p.cache_read_cost_per_token.is_some();
+            let write_vendored = p.cache_write_cost_per_token.is_some();
+            pricing_source = if read_vendored && (write_vendored || cache_write_tokens == 0) {
+                "vendored"
+            } else if read_vendored || write_vendored {
+                "mixed"
+            } else {
+                "provider_default"
+            };
+        }
+    }
+    (read_mult, write_mult, pricing_source)
+}
+
 /// Build provider-aware prefix-cache statistics for the dashboard.
 ///
 /// Pure data — no dependency on `PrometheusMetrics` or `CostTracker`.
@@ -865,42 +908,11 @@ pub fn build_prefix_cache_stats(input: &PrefixCacheStatsInput) -> PrefixCacheSta
         }
 
         let econ = cache_economics(provider);
-        let mut read_mult = econ.read_multiplier;
-        let mut write_mult = econ.write_multiplier;
 
         let input_price = find_model_input_price(provider, input.model_prices);
 
-        // Per-model cache rates win over the hardcoded provider table, which
-        // cannot express a model's actual published cache rates. The table
-        // stays as the fallback for models with no vendored cache pricing.
-        let mut pricing_source = "provider_default";
-        if let Some(matched) = find_provider_model(provider, input.model_prices)
-            && let Some(p) = crate::pricing::lookup(matched)
-        {
-            let uncached = p.input_cost_per_token;
-            if uncached > 0.0 {
-                // Upstream 463c1a43: a rate the table lacks keeps the
-                // provider default instead of becoming 1.0 (no discount, no
-                // premium), and the source says which half came from where.
-                // Writes don't matter when nothing was written.
-                if let Some(read) = p.cache_read_cost_per_token {
-                    read_mult = read / uncached;
-                }
-                if let Some(write) = p.cache_write_cost_per_token {
-                    write_mult = write / uncached;
-                }
-                let read_vendored = p.cache_read_cost_per_token.is_some();
-                let write_vendored = p.cache_write_cost_per_token.is_some();
-                pricing_source = if read_vendored && (write_vendored || pc.cache_write_tokens == 0)
-                {
-                    "vendored"
-                } else if read_vendored || write_vendored {
-                    "mixed"
-                } else {
-                    "provider_default"
-                };
-            }
-        }
+        let (read_mult, write_mult, pricing_source) =
+            resolve_cache_multipliers(provider, input.model_prices, &econ, pc.cache_write_tokens);
 
         let mut savings_usd = 0.0;
         let mut write_premium_usd = 0.0;
