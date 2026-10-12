@@ -149,6 +149,21 @@ fn response_failed_status() {
     assert_eq!(s.status, StreamStatus::Failed);
 }
 
+/// An `error` frame mid-stream fails the response too (upstream 42d4f58b
+/// treats `error` and `response.failed` alike).
+#[test]
+fn error_event_fails_the_response() {
+    let mut s = ResponseState::new();
+    let raw = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_6\",\"model\":\"gpt-5\"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"boom\"}\n\n",
+    );
+    run(&mut s, raw.as_bytes());
+    assert_eq!(s.status, StreamStatus::Failed);
+}
+
 #[test]
 fn response_incomplete_status() {
     let mut s = ResponseState::new();

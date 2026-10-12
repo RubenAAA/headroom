@@ -236,6 +236,9 @@ pub(super) fn close_openai_chat_stream(
     );
     if let Some(ctx) = outcome_ctx {
         let (input_tok, cached_tok, output_tok) = extract_chat_usage(state);
+        // Upstream 42d4f58b also fails a 200 that ends with no `[DONE]`.
+        // Not here: this close runs on a client disconnect too, and the
+        // two cannot be told apart (same call as sse_anthropic.rs).
         let failed_in_band = state.status == crate::sse::openai_chat::StreamStatus::Errored;
         emit_openai_stream_outcome(
             ctx,
@@ -428,7 +431,9 @@ pub(super) fn close_openai_responses_stream(
     if let Some(ctx) = outcome_ctx {
         let (input_tok, cached_tok, output_tok) = extract_responses_usage(state);
         // `response.incomplete` is a normal end (e.g. the output cap);
-        // only `response.failed` is a failed request.
+        // only `response.failed` or `error` is a failed request. A
+        // stream with no terminal event is not failed, for the reason
+        // given on the Chat close above.
         let failed_in_band = state.status == crate::sse::openai_responses::StreamStatus::Failed;
         emit_openai_stream_outcome(
             ctx,

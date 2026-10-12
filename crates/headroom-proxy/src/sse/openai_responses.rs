@@ -200,6 +200,12 @@ impl ResponseState {
             | "response.reasoning_summary_part.done"
             | "reasoning_summary_part.done" => Ok(()),
             "response.completed" => self.on_response_completed(&v),
+            // A bare `error` frame carries no envelope; it still ends the
+            // response as failed.
+            "error" => {
+                self.status = StreamStatus::Failed;
+                Ok(())
+            }
             "response.failed" => {
                 self.status = StreamStatus::Failed;
                 // Phase G PR-G3: capture `service_tier` from the
