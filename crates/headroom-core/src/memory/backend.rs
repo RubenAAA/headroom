@@ -88,6 +88,8 @@ pub enum UpdateError {
     NotFound(String),
     /// User ID validation failed.
     Unauthorized { expected: String, got: String },
+    /// The memory was already replaced; update the current version instead.
+    Superseded { id: String, by: Option<String> },
     /// Backend-specific error.
     Backend(String),
 }
@@ -99,6 +101,10 @@ impl std::fmt::Display for UpdateError {
             Self::Unauthorized { expected, got } => {
                 write!(f, "unauthorized: expected {expected}, got {got}")
             }
+            Self::Superseded { id, by: Some(by) } => {
+                write!(f, "memory {id} was superseded by {by}")
+            }
+            Self::Superseded { id, by: None } => write!(f, "memory {id} was superseded"),
             Self::Backend(msg) => write!(f, "backend error: {msg}"),
         }
     }
@@ -182,6 +188,12 @@ impl MemoryBackend for MockBackend {
     ) -> Result<Memory, UpdateError> {
         let mut memories = self.memories.lock().unwrap();
         if let Some(existing) = memories.iter_mut().find(|m| m.id == memory_id) {
+            if !existing.is_current() {
+                return Err(UpdateError::Superseded {
+                    id: memory_id.into(),
+                    by: existing.superseded_by.clone(),
+                });
+            }
             let mut updated = existing.clone();
             updated.content = new_content.to_string();
             updated.supersedes = Some(existing.id.clone());

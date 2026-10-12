@@ -476,6 +476,13 @@ impl MemoryBackend for RecallStore {
                 got: existing.user_id.clone(),
             });
         }
+        // Branching off a retired row would leave two current versions.
+        if !existing.is_current() {
+            return Err(UpdateError::Superseded {
+                id: memory_id.to_string(),
+                by: existing.superseded_by.clone(),
+            });
+        }
         let mut memory = Memory::new(new_content, existing.user_id.clone());
         memory.supersedes = Some(existing.id.clone());
         memory.session_id = existing.session_id.clone();
@@ -785,6 +792,10 @@ mod tests {
         let retired = store.get_memory(&original.id).expect("old row kept");
         assert!(!retired.is_current());
         assert_eq!(retired.superseded_by.as_deref(), Some(updated.id.as_str()));
+        assert!(matches!(
+            store.update_memory(&original.id, "a fork", None, None),
+            Err(UpdateError::Superseded { by: Some(by), .. }) if by == updated.id
+        ));
 
         // The retired row stops matching; the new text matches. "old
         // text" still hits the new row through the shared word "text",
