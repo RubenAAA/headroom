@@ -1587,9 +1587,19 @@ impl StreamTranslator {
             .and_then(|r| r.pointer("/usage/output_tokens_details/reasoning_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // Input includes its cached part; the pair gives the turn's cache hit
+        // rate, which no other routed log line carries.
+        let usage = |pointer: &str| {
+            response
+                .and_then(|r| r.pointer(pointer))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
         tracing::info!(
             output_items = %output_items,
             reasoning_tokens,
+            input_tokens = usage("/usage/input_tokens"),
+            cached_tokens = usage("/usage/input_tokens_details/cached_tokens"),
             visible_chars = self.visible_chars,
             event = "routed_response_completed",
             request_id = %request_id,
