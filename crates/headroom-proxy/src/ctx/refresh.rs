@@ -464,6 +464,14 @@ struct RefreshBase {
     /// the client cleared; a same-length history with a different first
     /// message means it compacted, and this base no longer covers it.
     first_hash: String,
+    /// `compute_key` of the last message the base covers
+    /// (`base_len - 1`). A rewind can keep the length and the first message
+    /// yet change this one; without the check the base would overwrite it.
+    last_hash: String,
+}
+
+fn message_hash(msg: Option<&Value>) -> String {
+    compute_key(msg.map(Value::to_string).unwrap_or_default().as_bytes())
 }
 
 /// Persisted bases by routed session key. Process-local: a restart rebuilds
@@ -623,12 +631,8 @@ async fn build_base(
     if stubbed == 0 {
         return;
     }
-    let first_hash = compute_key(
-        live.first()
-            .map(Value::to_string)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    let first_hash = message_hash(live.first());
+    let last_hash = message_hash(base_len.checked_sub(1).and_then(|i| live.get(i)));
     let base_messages = base.len();
     if let Ok(mut map) = bases().lock() {
         map.insert(
@@ -637,6 +641,7 @@ async fn build_base(
                 base,
                 base_len,
                 first_hash,
+                last_hash,
             },
         );
     }
@@ -718,19 +723,14 @@ pub(crate) fn apply(
     };
     let stale = match parsed.get("messages").and_then(Value::as_array) {
         Some(msgs) if msgs.len() >= base.base_len => {
-            let hash = compute_key(
-                msgs.first()
-                    .map(Value::to_string)
-                    .unwrap_or_default()
-                    .as_bytes(),
-            );
-            hash != base.first_hash
+            let last = base.base_len.checked_sub(1).and_then(|i| msgs.get(i));
+            message_hash(msgs.first()) != base.first_hash || message_hash(last) != base.last_hash
         }
         _ => true,
     };
     if stale {
-        // The client cleared or compacted under us; drop the base and let the
-        // next trigger turn rebuild it.
+        // The client cleared, compacted or rewound under us; drop the base
+        // and let the next trigger turn rebuild it.
         if let Ok(mut m) = bases().lock() {
             m.remove(session_key);
         }
@@ -1156,6 +1156,7 @@ mod tests {
                 base: base.clone(),
                 base_len,
                 first_hash,
+                last_hash: message_hash(msgs.get(base_len - 1)),
             },
         );
         let mut parsed = json!({"model": "claude-muse-spark-1.3", "messages": msgs});
@@ -1183,6 +1184,7 @@ mod tests {
                 base: msgs[..24].to_vec(),
                 base_len: 24,
                 first_hash,
+                last_hash: message_hash(msgs.get(23)),
             },
         );
         let mut cleared = json!({"model": "claude-muse-spark-1.3", "messages": msgs[..6].to_vec()});
@@ -1201,6 +1203,7 @@ mod tests {
                 base: msgs[..24].to_vec(),
                 base_len: 24,
                 first_hash: "deadbeef".to_string(),
+                last_hash: message_hash(msgs.get(23)),
             },
         );
         let mut compacted = json!({"model": "claude-muse-spark-1.3", "messages": msgs});
@@ -1213,6 +1216,40 @@ mod tests {
         assert_eq!(compacted["messages"].as_array().unwrap().len(), 30);
     }
 
+    /// A rewind to exactly `base_len` messages keeps the length and the
+    /// first message but ends on a new request; the base must not replace
+    /// it.
+    #[tokio::test]
+    async fn apply_drops_a_base_after_a_same_length_rewind() {
+        let msgs = transcript();
+        bases().lock().unwrap().insert(
+            "refresh-apply-rewind".to_string(),
+            RefreshBase {
+                base: msgs[..24].to_vec(),
+                base_len: 24,
+                first_hash: compute_key(msgs[0].to_string().as_bytes()),
+                last_hash: message_hash(msgs.get(23)),
+            },
+        );
+        let mut rewound = msgs[..24].to_vec();
+        rewound[23] = user("a different request after the rewind");
+        let mut parsed = json!({"model": "claude-muse-spark-1.3", "messages": rewound.clone()});
+        assert!(!apply(
+            &apply_state(),
+            &mut parsed,
+            "refresh-apply-rewind",
+            "r"
+        ));
+        assert_eq!(parsed["messages"], Value::Array(rewound));
+        assert!(
+            bases()
+                .lock()
+                .unwrap()
+                .get("refresh-apply-rewind")
+                .is_none()
+        );
+    }
+
     /// Off by default: with no flag, even a stored base is never replayed.
     #[tokio::test]
     async fn apply_is_off_unless_the_flag_is_set() {
@@ -1223,6 +1260,7 @@ mod tests {
                 base: Vec::new(),
                 base_len: 0,
                 first_hash: compute_key(msgs[0].to_string().as_bytes()),
+                last_hash: message_hash(None),
             },
         );
         let mut parsed = json!({"model": "claude-muse-spark-1.3", "messages": msgs});
