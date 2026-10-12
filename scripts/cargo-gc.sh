@@ -18,6 +18,9 @@
 #   - oldest artifacts while target/ is over GC_MAXSIZE (`--maxsize`).
 #     Oldest-evicted-first and a no-op when under the cap, so this step is
 #     inherently "only when needed".
+#   - incremental caches untouched for GC_INCREMENTAL_DAYS. cargo-sweep
+#     skips target/*/incremental, which held 43 of 46 GB on 2026-10-12;
+#     a build touches the caches it reuses, so an idle one is stale.
 #   - maturin wheels in target/wheels/ beyond GC_KEEP_WHEELS (keep-last-N).
 #     cargo-sweep does not track these versioned outputs, so they are
 #     pruned explicitly. Each wheel is small; the bound is what matters.
@@ -30,6 +33,7 @@
 # Tuning without editing (environment):
 #   GC_MAXSIZE (default 15GiB), GC_MAXAGE_DAYS (default 90),
 #   GC_KEEP_WHEELS (default 3), GC_INTERVAL_HOURS (default 24),
+#   GC_INCREMENTAL_DAYS (default 1),
 #   CARGO_TARGET_DIR (respected for stamp/lock/wheel paths, as with cargo).
 
 set -euo pipefail
@@ -42,6 +46,7 @@ LOCKDIR="$TARGET_DIR/.gc-lock"
 GC_MAXSIZE="${GC_MAXSIZE:-15GiB}"
 GC_MAXAGE_DAYS="${GC_MAXAGE_DAYS:-90}"
 GC_KEEP_WHEELS="${GC_KEEP_WHEELS:-3}"
+GC_INCREMENTAL_DAYS="${GC_INCREMENTAL_DAYS:-1}"
 GC_INTERVAL_HOURS="${GC_INTERVAL_HOURS:-24}"
 
 log() {
@@ -168,6 +173,20 @@ sweep() {
     fi
 }
 
+prune_incremental() {
+    local dir
+    for dir in "$TARGET_DIR"/*/incremental; do
+        [ -d "$dir" ] || continue
+        if [ "$MODE" = "check" ]; then
+            find "$dir" -mindepth 1 -maxdepth 1 -type d -mtime +$((GC_INCREMENTAL_DAYS - 1)) \
+                -printf '[cargo-gc] would remove %p\n' >&2
+        else
+            find "$dir" -mindepth 1 -maxdepth 1 -type d -mtime +$((GC_INCREMENTAL_DAYS - 1)) \
+                -exec rm -rf {} + || log "warning: pruning $dir failed"
+        fi
+    done
+}
+
 prune_wheels() {
     local dir="$TARGET_DIR/wheels" f count=0
     [ -d "$dir" ] || return 0
@@ -195,6 +214,7 @@ sweep --maxsize "$GC_MAXSIZE"
 if [ "$MODE" != "auto" ]; then
     sweep --time "$GC_MAXAGE_DAYS"
 fi
+prune_incremental
 prune_wheels
 
 if [ "$MODE" = "check" ]; then
