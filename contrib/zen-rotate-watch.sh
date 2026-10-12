@@ -514,6 +514,18 @@ rotation_worked() { rm -f "$ZEN_EGRESS_STAMP_DIR/$1.backoff"; }
 
 # HTTP status Zen gives a request sent through the lane (000 when the lane
 # cannot reach Zen), or nothing when the rotator cannot name the lane's port.
+zen_lane_idle() {
+  "$ZEN_EGRESS_ROTATE_COMMAND" status 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    sys.exit(0 if any(lane.get("egress_id") == sys.argv[1] and lane.get("idle") is True
+                      for lane in data.get("lanes", [])) else 1)
+except (ValueError, TypeError, AttributeError):
+    sys.exit(1)
+' "$1"
+}
+
 zen_probe_status() {
   local id="$1" port
   port=$("$ZEN_EGRESS_ROTATE_COMMAND" status 2>/dev/null | python3 -c '
@@ -562,6 +574,14 @@ rotate_zen_egress() {
         exit 0
       fi
       rotation_allowed "$egress_id" || exit 0
+    fi
+
+    # An idle Nord lane holds no login, and the user's own machines share
+    # the account's ten devices. Rotating it and probing Zen through it
+    # would take one for a bucket that is not filling.
+    if [[ "$reason" == "proactive" ]] && zen_lane_idle "$egress_id"; then
+      log "egress=$egress_id idle; proactive rotation skipped"
+      exit 0
     fi
 
     # Drain only this egress's turns; other egresses keep streaming. Fail

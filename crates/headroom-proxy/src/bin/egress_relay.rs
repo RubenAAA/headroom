@@ -72,6 +72,12 @@ const MAINTAIN_TICK: Duration = Duration::from_secs(60);
 const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 /// Probe every lane's own server this often, traffic or not.
 const LANE_CHECK_EVERY: Duration = Duration::from_secs(300);
+/// A Nord lane with no open connection and none begun for this long is idle.
+/// Nord counts every login against the account's ten devices, the user's own
+/// machines included, so maintenance leaves an idle lane alone: no health
+/// probe, no proactive rotation. The first real connect wakes it; a dead
+/// server is then found by the failures that connect sees.
+const LANE_IDLE_AFTER: Duration = Duration::from_secs(15 * 60);
 /// Consecutive failed connects on a lane that make its server suspect.
 const SUSPECT_FAILURES: u32 = 3;
 /// A lane whose server keeps failing probes for this long is re-rotated.
@@ -135,6 +141,8 @@ struct LaneState {
     /// Connects that failed before reaching the tunnel, since the last one that did.
     failures: u32,
     last_ok: Option<Instant>,
+    /// When a client last opened a connection on this lane, ok or not.
+    last_used: Option<Instant>,
 }
 
 struct Lane {
@@ -633,6 +641,7 @@ impl Lane {
                 rotating: false,
                 failures: 0,
                 last_ok: None,
+                last_used: None,
             }),
             active: Mutex::new(HashMap::new()),
             next_connection: AtomicU64::new(1),
@@ -648,10 +657,11 @@ impl Lane {
     }
 
     fn begin_connection(&self, client: &TcpStream) -> io::Result<Option<(u64, LaneSnapshot)>> {
-        let state = lock_unpoisoned(&self.state);
+        let mut state = lock_unpoisoned(&self.state);
         if state.rotating {
             return Ok(None);
         }
+        state.last_used = Some(Instant::now());
         let id = self.next_connection.fetch_add(1, Ordering::Relaxed);
         let socket = Arc::new(client.try_clone()?);
         lock_unpoisoned(&self.active).insert(id, vec![socket]);
@@ -672,6 +682,20 @@ impl Lane {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Interrupted, "connection retired"))?
             .push(Arc::new(upstream.try_clone()?));
         Ok(())
+    }
+
+    /// No connection open and none begun within `window`.
+    fn unused_for(&self, window: Duration) -> bool {
+        lock_unpoisoned(&self.active).is_empty()
+            && lock_unpoisoned(&self.state)
+                .last_used
+                .is_none_or(|at| at.elapsed() >= window)
+    }
+
+    /// A Nord lane maintenance should not log in on. The Proton lane is never
+    /// idle in this sense: its tunnel stays up either way.
+    fn is_idle(&self) -> bool {
+        self.credentials.is_some() && self.unused_for(LANE_IDLE_AFTER)
     }
 
     fn unregister(&self, id: u64) {
@@ -997,6 +1021,7 @@ impl Manager {
             .lane_list()
             .into_iter()
             .map(|lane| {
+                let idle = lane.is_idle();
                 let state = lock_unpoisoned(&lane.state);
                 json!({
                     "slot": lane.slot,
@@ -1007,6 +1032,7 @@ impl Manager {
                     "exit_fingerprint": fingerprint(&state.exit_ip),
                     "socks_connects": state.connects,
                     "rotating": state.rotating,
+                    "idle": idle,
                 })
             })
             .collect();
@@ -1042,6 +1068,11 @@ impl Manager {
         else {
             return json!({"ok": false, "error": "unknown egress id"});
         };
+        // A proactive rotation moves the exit before its rate-limit bucket
+        // fills; an idle lane's is not filling, and rotating it logs in.
+        if reason == "proactive" && lane.is_idle() {
+            return json!({"ok": true, "skipped": "idle"});
+        }
         let old = {
             let state = lock_unpoisoned(&lane.state);
             LaneSnapshot {
@@ -1578,7 +1609,18 @@ impl Manager {
                 book.note_rtt(host, *rtt);
             }
         }
-        let targets = lock_unpoisoned(&self.servers).sweep_targets(&held, SWEEP_PROBES);
+        // Each probe is a login, and a login takes one of the account's
+        // devices. With no Nord lane used since the last sweep nothing needs a
+        // fresher book; the listing and round trips above take no login.
+        let in_use = self
+            .lane_list()
+            .iter()
+            .any(|lane| lane.credentials.is_some() && !lane.unused_for(SWEEP_EVERY));
+        let targets = if in_use {
+            lock_unpoisoned(&self.servers).sweep_targets(&held, SWEEP_PROBES)
+        } else {
+            Vec::new()
+        };
         let (mut accepted, mut rejected) = (0, 0);
         for host in &targets {
             let probed =
@@ -1621,6 +1663,13 @@ impl Manager {
             )
         };
         if rotating || !(suspect || full_check || failing_since.contains_key(&lane.slot)) {
+            return;
+        }
+        if lane.is_idle() {
+            // Nobody is using it; a probe would only take a device. The next
+            // real connect starts the failure count again if it is dead.
+            failing_since.remove(&lane.slot);
+            lock_unpoisoned(&lane.state).failures = 0;
             return;
         }
         let probed = probe_exit_via_local_lane(
@@ -2373,6 +2422,46 @@ mod tests {
         client.read_exact(&mut response).unwrap();
         assert_eq!(response, [5, 0xff]);
         worker.join().unwrap();
+    }
+
+    /// An unused Nord lane reports idle and skips proactive rotation, which
+    /// would log in and take a device; a used one and the Proton lane do not.
+    #[test]
+    fn an_idle_nord_lane_skips_proactive_rotation() {
+        let lane = |slot, credentials| {
+            Arc::new(Lane::new(
+                slot,
+                1080,
+                "test".to_string(),
+                "127.0.0.1".to_string(),
+                "198.51.100.1".to_string(),
+                credentials,
+            ))
+        };
+        let nord = || {
+            Some(Credentials {
+                username: b"user".to_vec(),
+                password: b"pass".to_vec(),
+            })
+        };
+        let manager = Manager::new(DEFAULT_BASE_PORT);
+        let (idle, used, proton) = (lane(0, nord()), lane(1, nord()), lane(2, None));
+        lock_unpoisoned(&used.state).last_used = Some(Instant::now());
+        *lock_unpoisoned(&manager.lanes) = vec![idle.clone(), used.clone(), proton.clone()];
+        assert!(idle.is_idle() && !used.is_idle() && !proton.is_idle());
+        let status = manager.status();
+        let flags: Vec<_> = status["lanes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|lane| lane["idle"].as_bool())
+            .collect();
+        assert_eq!(flags, [Some(true), Some(false), Some(false)]);
+        let id = egress_id(&pool_url(DEFAULT_BASE_PORT, 0));
+        assert_eq!(
+            manager.rotate(&id, "proactive", "http://127.0.0.1:9"),
+            json!({"ok": true, "skipped": "idle"})
+        );
     }
 
     #[test]
