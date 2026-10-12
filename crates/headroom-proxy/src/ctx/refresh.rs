@@ -76,13 +76,23 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// Text a person typed in this message: none for a tool result, a reminder or
-/// a harness notice.
+/// a harness notice. A message carrying any `tool_result` is none too, even
+/// with text beside it: it answers the previous exchange's `tool_use`, so
+/// starting an exchange there would split the pair, and a stub would drop
+/// the result.
 fn typed_text(msg: &Value) -> Option<String> {
     if msg.get("role").and_then(Value::as_str) != Some("user") {
         return None;
     }
     let raw = match msg.get("content")? {
         Value::String(s) => s.clone(),
+        Value::Array(blocks)
+            if blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")) =>
+        {
+            return None;
+        }
         Value::Array(blocks) => blocks
             .iter()
             .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
@@ -809,6 +819,20 @@ mod tests {
             ex[0].end, 6,
             "notices stay inside the exchange they interrupt"
         );
+    }
+
+    /// Text typed alongside a tool result stays in the exchange whose
+    /// `tool_use` the result answers: a stub of that message would replace
+    /// the result with a string and orphan the call.
+    #[test]
+    fn text_beside_a_tool_result_does_not_start_an_exchange() {
+        let mut m = transcript();
+        m[5] = json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            {"type": "text", "text": "also please handle the edge case here"}]});
+        let ex = exchanges(&m);
+        assert_eq!(ex.len(), 10);
+        assert_eq!((ex[1].first, ex[1].end), (3, 6));
     }
 
     #[test]
