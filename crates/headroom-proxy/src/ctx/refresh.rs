@@ -36,6 +36,13 @@ const PROTECT_TAIL: usize = 5;
 const MAX_SCORED: usize = 100;
 const CONCURRENCY: usize = 3;
 const COOLDOWN: Duration = Duration::from_secs(30 * 60);
+/// A base unreplayed this long is dropped: the provider's cached prefix is
+/// cold by then, and compaction moves a session to a new key, so the old
+/// base would otherwise stay in memory for the life of the process.
+const BASE_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
+/// Bases kept at most, least recently replayed out first. One is about the
+/// session's size on the wire, a few MB at the 1M ceiling.
+const MAX_BASES: usize = 16;
 const RATE_LIMIT_RETRIES: u32 = 5;
 const JEV_TIMEOUT: Duration = Duration::from_secs(30);
 const TASK_CHARS: usize = 1500;
@@ -468,6 +475,34 @@ struct RefreshBase {
     /// (`base_len - 1`). A rewind can keep the length and the first message
     /// yet change this one; without the check the base would overwrite it.
     last_hash: String,
+    /// Size of the history the base was built from, in estimated tokens.
+    built_tokens: usize,
+    /// Last build or replay; [`prune_bases`] drops the idle ones.
+    last_used: Instant,
+}
+
+/// Drop bases idle past [`BASE_IDLE`], then the least recently used until at
+/// most [`MAX_BASES`] remain.
+fn prune_bases(map: &mut HashMap<String, RefreshBase>, now: Instant) {
+    map.retain(|_, b| now.duration_since(b.last_used) < BASE_IDLE);
+    while map.len() > MAX_BASES {
+        let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, b)| b.last_used)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
+/// True when a session's history has grown enough since its base was built
+/// to be worth another. A rebuild re-scores, Jev's scores move a little from
+/// run to run, and any change to the replayed prefix costs a cache miss; so
+/// wait until the history has grown by the share one build stubs.
+fn grew_enough(base: Option<&RefreshBase>, total_tokens: usize) -> bool {
+    base.is_none_or(|b| total_tokens >= b.built_tokens + b.built_tokens / STUB_QUARTILE_DIVISOR)
 }
 
 fn message_hash(msg: Option<&Value>) -> String {
@@ -489,8 +524,8 @@ fn build_seen() -> &'static Mutex<HashMap<String, Instant>> {
 }
 
 /// True when this session may start a base build now, and marks it started.
-/// Separate from [`claim`]: observe and apply run on their own triggers, and a
-/// rebuild every [`COOLDOWN`] is how the base follows a growing session.
+/// Separate from [`claim`]: observe and apply run on their own triggers. A
+/// rebuild needs both the [`COOLDOWN`] and [`grew_enough`].
 fn claim_build(session_key: &str) -> bool {
     let Ok(mut map) = build_seen().lock() else {
         return false;
@@ -635,6 +670,7 @@ async fn build_base(
     let last_hash = message_hash(base_len.checked_sub(1).and_then(|i| live.get(i)));
     let base_messages = base.len();
     if let Ok(mut map) = bases().lock() {
+        let now = Instant::now();
         map.insert(
             session_key.to_string(),
             RefreshBase {
@@ -642,8 +678,11 @@ async fn build_base(
                 base_len,
                 first_hash,
                 last_hash,
+                built_tokens: total_tokens,
+                last_used: now,
             },
         );
+        prune_bases(&mut map, now);
     }
     let session = crate::cache_stabilization::drift_detector::session_key_log_prefix(session_key);
     tracing::info!(
@@ -687,9 +726,15 @@ pub(crate) fn apply(
         return false;
     };
     let total_tokens = messages.to_string().len() / BYTES_PER_TOKEN;
+    let base = bases().lock().ok().and_then(|mut m| {
+        let b = m.get_mut(session_key)?;
+        b.last_used = Instant::now();
+        Some(b.clone())
+    });
     // A build needs the CCR store: stubs without retrievable originals are
     // dropped history, not refresh.
     if total_tokens >= trigger
+        && grew_enough(base.as_ref(), total_tokens)
         && let Some(ccr) = state.ctx_offload.as_ref().map(|r| r.store.ccr())
         && claim_build(session_key)
     {
@@ -714,10 +759,6 @@ pub(crate) fn apply(
     }
     // Replay AFTER the build clones its snapshot: the build scores the full
     // history, this turn forwards the stored base plus the live tail.
-    let base = bases()
-        .lock()
-        .ok()
-        .and_then(|m| m.get(session_key).cloned());
     let Some(base) = base else {
         return false;
     };
@@ -1157,6 +1198,8 @@ mod tests {
                 base_len,
                 first_hash,
                 last_hash: message_hash(msgs.get(base_len - 1)),
+                built_tokens: 0,
+                last_used: Instant::now(),
             },
         );
         let mut parsed = json!({"model": "claude-muse-spark-1.3", "messages": msgs});
@@ -1185,6 +1228,8 @@ mod tests {
                 base_len: 24,
                 first_hash,
                 last_hash: message_hash(msgs.get(23)),
+                built_tokens: 0,
+                last_used: Instant::now(),
             },
         );
         let mut cleared = json!({"model": "claude-muse-spark-1.3", "messages": msgs[..6].to_vec()});
@@ -1204,6 +1249,8 @@ mod tests {
                 base_len: 24,
                 first_hash: "deadbeef".to_string(),
                 last_hash: message_hash(msgs.get(23)),
+                built_tokens: 0,
+                last_used: Instant::now(),
             },
         );
         let mut compacted = json!({"model": "claude-muse-spark-1.3", "messages": msgs});
@@ -1229,6 +1276,8 @@ mod tests {
                 base_len: 24,
                 first_hash: compute_key(msgs[0].to_string().as_bytes()),
                 last_hash: message_hash(msgs.get(23)),
+                built_tokens: 0,
+                last_used: Instant::now(),
             },
         );
         let mut rewound = msgs[..24].to_vec();
@@ -1250,6 +1299,45 @@ mod tests {
         );
     }
 
+    fn bare_base(built_tokens: usize, last_used: Instant) -> RefreshBase {
+        RefreshBase {
+            base: Vec::new(),
+            base_len: 0,
+            first_hash: String::new(),
+            last_hash: String::new(),
+            built_tokens,
+            last_used,
+        }
+    }
+
+    /// Idle bases go first, then the least recently used past the cap.
+    #[test]
+    fn prune_bases_drops_idle_then_oldest() {
+        let now = Instant::now() + BASE_IDLE * 2;
+        let mut map = HashMap::new();
+        map.insert("idle".to_string(), bare_base(0, now - BASE_IDLE));
+        for i in 0..=MAX_BASES {
+            let age = Duration::from_secs((MAX_BASES - i) as u64);
+            map.insert(format!("s{i}"), bare_base(0, now - age));
+        }
+        prune_bases(&mut map, now);
+        assert_eq!(map.len(), MAX_BASES);
+        assert!(!map.contains_key("idle"));
+        assert!(!map.contains_key("s0"), "the oldest goes past the cap");
+        assert!(map.contains_key(&format!("s{MAX_BASES}")));
+    }
+
+    /// No base: build. A base: rebuild only once the history grew by the
+    /// share one build stubs.
+    #[test]
+    fn rebuild_waits_for_growth() {
+        let base = bare_base(400_000, Instant::now());
+        assert!(grew_enough(None, 1));
+        assert!(!grew_enough(Some(&base), 400_000));
+        assert!(!grew_enough(Some(&base), 499_999));
+        assert!(grew_enough(Some(&base), 500_000));
+    }
+
     /// Off by default: with no flag, even a stored base is never replayed.
     #[tokio::test]
     async fn apply_is_off_unless_the_flag_is_set() {
@@ -1261,6 +1349,8 @@ mod tests {
                 base_len: 0,
                 first_hash: compute_key(msgs[0].to_string().as_bytes()),
                 last_hash: message_hash(None),
+                built_tokens: 0,
+                last_used: Instant::now(),
             },
         );
         let mut parsed = json!({"model": "claude-muse-spark-1.3", "messages": msgs});
