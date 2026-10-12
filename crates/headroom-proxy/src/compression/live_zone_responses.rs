@@ -78,8 +78,8 @@ pub fn compress_openai_responses_request(
 /// [`compress_openai_responses_request`] with the Phase E per-pass,
 /// per-path policy. `effective_auth_mode` is the enforcement-folded
 /// mode: the F1-classified mode when
-/// `--auth-mode-policy-enforcement` is on, `Payg` otherwise. Only
-/// the forward path calls this.
+/// `--auth-mode-policy-enforcement` is on, `Payg` otherwise. The
+/// forward and Codex WebSocket paths call this.
 pub fn compress_openai_responses_request_with_policy(
     body: &Bytes,
     mode: CompressionMode,

@@ -83,6 +83,9 @@ async fn v4a_patch_byte_equal_through_proxy() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -130,6 +133,9 @@ async fn local_shell_call_command_argv_array_preserved() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -186,6 +192,9 @@ async fn codex_phase_commentary_preserved() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -232,6 +241,9 @@ async fn codex_phase_final_answer_preserved() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -278,6 +290,9 @@ async fn compaction_item_byte_equal() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -320,6 +335,9 @@ async fn reasoning_encrypted_content_byte_equal() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -360,6 +378,9 @@ async fn function_call_arguments_string_preserved() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -415,6 +436,9 @@ async fn call_id_referenced_not_id() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -473,6 +497,9 @@ async fn apply_patch_output_below_2kb_no_compression() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -654,6 +681,9 @@ async fn mcp_tool_call_byte_equal() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -700,6 +730,9 @@ async fn computer_call_byte_equal() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -745,6 +778,9 @@ async fn image_generation_call_no_log_redaction_in_test_mode() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -800,6 +836,9 @@ async fn unknown_item_type_logged_warning_byte_equal() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -857,6 +896,9 @@ async fn representative_request_round_trip() {
     let upstream = MockServer::start().await;
     let captured = mount_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })

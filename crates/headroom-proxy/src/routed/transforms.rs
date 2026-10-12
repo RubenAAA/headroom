@@ -885,7 +885,7 @@ fn maybe_compress_routed_body(
         headroom_core::auth_mode::AuthMode::Payg
     };
     let routed_ccr_store = state.ccr_store();
-    let outcome = crate::compression::compress_anthropic_request(
+    let outcome = crate::compression::compress_anthropic_request_with_policy(
         &body,
         state.config.compression_mode,
         state.config.cache_control_auto_frozen,
@@ -897,6 +897,7 @@ fn maybe_compress_routed_body(
         // `sse::ccr_stream`, `handle_buffered_response` directly), so the
         // marker points at a recovery route the model can actually take.
         routed_ccr_store.as_deref(),
+        &state.config.phase_e_passes,
     );
     let outcome = crate::compression::apply_cross_turn_dedup_with_user_text(
         outcome,

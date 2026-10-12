@@ -182,6 +182,9 @@ fn small_responses_payload() -> Vec<u8> {
 async fn streaming_request_bytes_byte_equal_upstream() {
     let (addr, captured, _server) = responses_sse_upstream().await;
     let proxy = start_proxy_with(&format!("http://{addr}"), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
         // Default ON, but pin it explicitly so the test pins behaviour
@@ -348,6 +351,9 @@ async fn streaming_request_no_compression_when_input_below_threshold() {
     // byte-equal upstream, regardless of `Accept: text/event-stream`.
     let (addr, captured, _server) = responses_sse_upstream().await;
     let proxy = start_proxy_with(&format!("http://{addr}"), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })

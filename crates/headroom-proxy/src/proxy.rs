@@ -868,7 +868,7 @@ pub(crate) async fn forward_http(
                 headers_snapshot: &headers_snapshot,
             },
             &path_for_log,
-            auth_mode,
+            effective_auth_mode,
             selected_upstream.base.as_str(),
             skip_model_routing,
             auto_mode_turn,

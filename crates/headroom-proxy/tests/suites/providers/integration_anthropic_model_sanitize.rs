@@ -246,6 +246,9 @@ async fn openai_chat_completions_passthrough_with_1m_model() {
     let upstream = MockServer::start().await;
     let captured = mount_chat_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })
@@ -297,6 +300,9 @@ async fn openai_responses_passthrough_with_1m_model() {
     let upstream = MockServer::start().await;
     let captured = mount_responses_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
+        // E4 reads the enforcement-folded auth mode; the OAuth header
+        // only skips it with enforcement on, as in production.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
         c.compression = true;
         c.compression_mode = headroom_proxy::config::CompressionMode::LiveZone;
     })

@@ -383,6 +383,7 @@ fn compress_response_create_frame(
     auth_mode: AuthMode,
     request_id: &str,
     exclude_tools: &[String],
+    phase_e_passes: &crate::config::PhaseEPassPolicy,
 ) -> FrameCompression {
     let Ok(mut parsed) = serde_json::from_str::<Value>(raw) else {
         return FrameCompression::Passthrough { reason: "non_json" };
@@ -424,12 +425,13 @@ fn compress_response_create_frame(
     // envelope (type/response wrapper keys) never compresses; including
     // it would understate the byte ratio against the token ratio.
     let bytes_before = inner_bytes.len();
-    match compression::compress_openai_responses_request(
+    match compression::compress_openai_responses_request_with_policy(
         &inner_bytes,
         mode,
         auth_mode,
         request_id,
         exclude_tools,
+        phase_e_passes,
     ) {
         Outcome::Compressed {
             body,
@@ -1413,10 +1415,20 @@ async fn compress_frame_bounded(
     mode: CompressionMode,
     auth_mode: AuthMode,
     request_id: String,
-    exclude_tools: Vec<String>,
+    state: &AppState,
 ) -> CompressAttempt {
+    // Same E-gate as the HTTP paths: `--auth-mode-policy-enforcement
+    // disabled` treats every caller as PAYG, and `--phase-e-*-passes`
+    // applies here too.
+    let auth_mode = if state.config.auth_mode_policy_enforcement.is_enabled() {
+        auth_mode
+    } else {
+        AuthMode::Payg
+    };
+    let exclude_tools = state.config.exclude_tools.clone();
+    let passes = state.config.phase_e_passes.clone();
     let handle = tokio::task::spawn_blocking(move || {
-        compress_response_create_frame(&raw, mode, auth_mode, &request_id, &exclude_tools)
+        compress_response_create_frame(&raw, mode, auth_mode, &request_id, &exclude_tools, &passes)
     });
     match tokio::time::timeout(compression_timeout(), handle).await {
         Ok(Ok(result)) => CompressAttempt::Done(result),
@@ -1660,7 +1672,6 @@ async fn run_codex_session_inner(
         let bypass = ctx.bypass;
         let mode = ctx.mode;
         let auth_mode = ctx.auth_mode;
-        let exclude_tools = ctx.state.config.exclude_tools.clone();
         tokio::spawn(async move {
             let mut had_error = false;
             loop {
@@ -1719,13 +1730,12 @@ async fn run_codex_session_inner(
                                 let out = if is_create && !bypass {
                                     let text = shape_create_frame(text, &ctx_state, &request_id);
                                     let comp_started = Instant::now();
-                                    let exclude_tools = exclude_tools.clone();
                                     match compress_frame_bounded(
                                         text.clone(),
                                         mode,
                                         auth_mode,
                                         request_id.clone(),
-                                        exclude_tools,
+                                        &ctx_state,
                                     )
                                     .await
                                     {
@@ -2025,7 +2035,7 @@ async fn compress_first_frame(
         ctx.mode,
         ctx.auth_mode,
         ctx.request_id.clone(),
-        ctx.state.config.exclude_tools.clone(),
+        &ctx.state,
     )
     .await;
     let elapsed_ms = comp_started.elapsed().as_secs_f64() * 1000.0;
@@ -2695,6 +2705,7 @@ mod tests {
             AuthMode::Payg,
             RID,
             &[],
+            &Default::default(),
         );
         assert!(matches!(
             out,
@@ -2711,6 +2722,7 @@ mod tests {
             AuthMode::Payg,
             RID,
             &[],
+            &Default::default(),
         );
         assert!(matches!(
             out,
@@ -2718,6 +2730,54 @@ mod tests {
                 reason: "not_response_create"
             }
         ));
+    }
+
+    /// The live frame path reads `--phase-e-responses-passes` and folds
+    /// `--auth-mode-policy-enforcement` like the HTTP paths: with
+    /// enforcement off an OAuth caller gets the E1 tool sort, and with E1
+    /// unlisted nobody does.
+    #[tokio::test]
+    async fn bounded_frame_honours_phase_e_policy_and_enforcement() {
+        let raw = json!({
+            "type": "response.create",
+            "model": "gpt-4o",
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "hi"}]}],
+            "tools": [
+                {"type": "function", "function": {"name": "zebra"}},
+                {"type": "function", "function": {"name": "apple"}},
+            ],
+        })
+        .to_string();
+        let mut config = crate::config::Config::for_test("http://127.0.0.1:9".parse().unwrap());
+        config.auth_mode_policy_enforcement = crate::config::AuthModePolicyEnforcement::Disabled;
+        let sorted = |a: CompressAttempt| {
+            matches!(a, CompressAttempt::Done(FrameCompression::Compressed { strategies, .. })
+                if strategies.contains(&"tool_array_sort"))
+        };
+        let state = AppState::new(config.clone()).unwrap();
+        let out = compress_frame_bounded(
+            raw.clone(),
+            CompressionMode::LiveZone,
+            AuthMode::OAuth,
+            RID.into(),
+            &state,
+        );
+        assert!(sorted(out.await), "enforcement off: OAuth counts as PAYG");
+
+        config
+            .phase_e_passes
+            .responses
+            .remove(&crate::config::PhaseEPass::E1);
+        let state = AppState::new(config).unwrap();
+        let out = compress_frame_bounded(
+            raw,
+            CompressionMode::LiveZone,
+            AuthMode::Payg,
+            RID.into(),
+            &state,
+        );
+        assert!(!sorted(out.await), "E1 unlisted: no tool sort");
     }
 
     #[test]
@@ -2729,6 +2789,7 @@ mod tests {
             AuthMode::Payg,
             RID,
             &[],
+            &Default::default(),
         );
         assert!(matches!(
             out,
@@ -2745,8 +2806,14 @@ mod tests {
             "response": {"model": "gpt-x", "input": [{"type": "message", "role": "user", "content": "hi"}]}
         })
         .to_string();
-        let out =
-            compress_response_create_frame(&raw, CompressionMode::Off, AuthMode::Payg, RID, &[]);
+        let out = compress_response_create_frame(
+            &raw,
+            CompressionMode::Off,
+            AuthMode::Payg,
+            RID,
+            &[],
+            &Default::default(),
+        );
         assert!(matches!(
             out,
             FrameCompression::Passthrough {
@@ -2782,6 +2849,7 @@ mod tests {
             AuthMode::Payg,
             RID,
             &[],
+            &Default::default(),
         );
         match out {
             FrameCompression::Compressed {
@@ -2834,6 +2902,7 @@ mod tests {
             AuthMode::Payg,
             RID,
             &[],
+            &Default::default(),
         );
         let FrameCompression::Compressed { text, .. } = out else {
             panic!("expected compressed frame, got {out:?}");
@@ -2864,6 +2933,7 @@ mod tests {
             AuthMode::Payg,
             RID,
             &[],
+            &Default::default(),
         );
         match out {
             FrameCompression::Compressed { text, .. } => {

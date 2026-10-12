@@ -266,6 +266,8 @@ async fn oauth_chat_completions_no_injection_byte_equal() {
     let captured = mount_chat_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
+        // Production default; the test config ships it off.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
     })
     .await;
 
@@ -305,6 +307,48 @@ async fn oauth_chat_completions_no_injection_byte_equal() {
     proxy.shutdown().await;
 }
 
+/// `--auth-mode-policy-enforcement disabled` treats every caller as
+/// PAYG for E4 too, as it already does for the compression passes.
+#[tokio::test]
+async fn oauth_chat_completions_injects_when_enforcement_disabled() {
+    let upstream = MockServer::start().await;
+    let captured = mount_chat_capture(&upstream).await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.auth_mode_policy_enforcement =
+            headroom_proxy::config::AuthModePolicyEnforcement::Disabled;
+    })
+    .await;
+
+    let payload = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello"}
+        ]
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", proxy.url()))
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.signature_bytes",
+        )
+        .body(serde_json::to_vec(&payload).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let received_json = parse_json(&captured_body(&captured));
+    assert!(
+        received_json.get("prompt_cache_key").is_some(),
+        "enforcement disabled: OAuth counts as PAYG; got {received_json}"
+    );
+
+    proxy.shutdown().await;
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Subscription: no injection, byte-equal passthrough
 // ────────────────────────────────────────────────────────────────────
@@ -315,6 +359,8 @@ async fn subscription_chat_completions_no_injection_byte_equal() {
     let captured = mount_chat_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
+        // Production default; the test config ships it off.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
     })
     .await;
 
@@ -361,6 +407,8 @@ async fn oauth_responses_no_injection_byte_equal() {
     let captured = mount_responses_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
+        // Production default; the test config ships it off.
+        c.auth_mode_policy_enforcement = headroom_proxy::config::AuthModePolicyEnforcement::Enabled;
     })
     .await;
 
