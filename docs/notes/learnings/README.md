@@ -7,6 +7,9 @@ retests), with status in the file.
 Measurement-led files (`recache-*`, `savings-*`, `proxy-*`) scope every
 number to its window; do not quote across windows.
 
+- [`sqlite-copy-needs-backup-api.md`](sqlite-copy-needs-backup-api.md):
+  a file copy of a live WAL-mode DB without its `-wal` reads as malformed;
+  copy with the backup API.
 - [`trailing-text-after-tool-use-is-prefill.md`](trailing-text-after-tool-use-is-prefill.md):
   with server tool blocks in a turn, text after a `tool_use` draws a
   "prefill" 400 on replay; the CCR splice put answers there and stranded
