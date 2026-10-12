@@ -10,6 +10,15 @@
   summed input and cache reads over every round, telling the client it held
   N times its context; they now report output summed and context from the
   final round (`20c98d250`).
+- **Status 2026-10-12, one-session test done:** after both fixes,
+  `routed_response_completed` logs the provider's `input_tokens` and
+  `cached_tokens` (`058609ffd`). Against Claude Code's transcripts, 24 of 25
+  Spark messages from 16:30Z on carried exactly the provider's numbers
+  (`input_tokens` + `cache_read_input_tokens` = provider input), e.g. a
+  TapBuy session at 107,813-116,880 tokens. One probe turn (`8a51a9de`)
+  kept all-zero usage in the transcript though the proxy finished it
+  normally; the next turn showed the right size, so compaction is not
+  misled for long. Step 2 holds; the `/compact` questions below stay open.
 - **Status:** `[1m]` probe 2026-10-08, INCONCLUSIVE on the window: client
   2.1.294 strips `claude-muse-spark-1.3[1m]` to the plain id before sending
   (`[claude-code:unrecognized_model]`, `query_source: sdk`; zero `[1m]`

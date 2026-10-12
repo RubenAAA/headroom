@@ -16,6 +16,18 @@
   length drops the base instead of replaying a stale last message
   (`e4177b637`). Bases now go after two idle hours (16 at most), and a
   rebuild waits until the history has grown by a quarter (`39d3d8248`).
+- **Observe data 2026-10-12** (every `ctx_refresh_observed` in the logs,
+  2026-09-29..10-12, trigger 400k): 5 sessions crossed it. Two had most of
+  their history in a few exchanges: at a 0.5 score cut, `402ef9` could stub
+  4,475 of 445,653 tokens (1%) and `186600`, `e89617` nothing (1-3
+  exchanges, none scored). Two had many: `aae703` 163,140 of 521,836 (31%),
+  `c6413c` 199,149 of 400,211 (50%, 163 exchanges). The unit is one user
+  exchange and the current one is never stubbed, so a long autonomous run,
+  the case that reaches the 1M window, gives apply mode nothing to cut.
+  **Next:** before any live apply trial, split an exchange into tool rounds
+  as units (keeping each `tool_use`/`tool_result` pair whole), and rerun
+  observe to see whether the one-exchange sessions gain anything. No
+  offline Jev run on captures: it would send client code to opencode.ai.
 - **Idea:** when a session passes a token trigger, Jev judges which parts of
   the history the current task still needs. The proxy keeps those verbatim,
   swaps the rest for stubs the model can fetch back (`headroom_retrieve`), and
