@@ -193,19 +193,25 @@ def _call_local(prompt, timeout):
     return output, None
 
 
-def call(prompt, timeout, worker_marker):
-    """Run the configured transport. Returns (stdout, diagnostic)."""
+def call(prompt, timeout, worker_marker, tools=None):
+    """Run the configured transport. Returns (stdout, diagnostic).
+
+    TOOLS, when given, is passed as `claude --tools`; "" disables them all.
+    """
     if TRANSPORT == "local-direct":
         return _call_local(prompt, timeout)
-    blocked = ("GITLAB_", "OPENCODE_")
-    if worker_marker != "OFFLOADED_TICKET_WORKER":
-        blocked += ("YOUTRACK_",)
+    # The child only writes text; the workers call YouTrack themselves.
+    blocked = ("GITLAB_", "OPENCODE_", "YOUTRACK_")
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(blocked)}
     env.update({worker_marker: "1", "ANTHROPIC_BASE_URL": HEADROOM_URL})
+    argv = ["claude", "-p", "--model", MODEL]
+    if tools is not None:
+        # --tools takes several values; "--" keeps it off the prompt.
+        argv += ["--tools", tools, "--"]
     try:
         result = subprocess.run(
-            ["claude", "-p", "--model", MODEL, prompt],
+            argv + [prompt],
             capture_output=True, text=True, timeout=timeout, env=env,
         )
     except subprocess.TimeoutExpired as error:

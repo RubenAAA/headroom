@@ -4,8 +4,8 @@
 Usage: ticket_file.py SESSION_ID TRANSCRIPT OUTDIR
 
 Mirrors the review offload: a gate hook (ticket-gate.sh) spawns this in
-the background, this uses the configured model backend to file through the
-b2b-amg ai-youtrack CLI (/create-task procedure), and the outcome
+the background, the configured model drafts the ticket fields as JSON with
+no tools, this files them through the b2b-amg ai-youtrack CLI, and the outcome
 lands in per-session state
 files next to the review ones: SESSION.ticket.{context,draft.json,proof.json,
 failed,worker.log}. The gate relays the proof on the next user prompt.
@@ -90,8 +90,7 @@ def ai_youtrack():
                         ".claude", "scripts", "ai-youtrack")
 
 
-DEFAULT_TYPE = "📜 User Story"  # only 4 live types; Backend & co are archived
-DEFAULT_PLATFORM = "Match center"
+DEFAULT_PLATFORM = "Match center"  # sent only to projects whose issues carry it
 DEFAULT_PRIORITY = "Normal"
 
 # ticket-gate.sh supervises the worker for 600s. Keep every model/CLI call
@@ -178,93 +177,65 @@ def extract_turns(transcript):
     return turns
 
 
-def build_prompt(turns, bin_path, project):
-    return """You file exactly one YouTrack ticket, then stop. Procedure
-(b2b-amg /create-task command + ai-youtrack skill):
-
-The divert that started you fired on an explicit "file the ticket"
-instruction -- that IS the skill's required confirmation, so you do not
-ask again. So you file it PUBLISHED: create the draft (the CLI
-requires it as an intermediate step) and publish it in the same run,
-unless the turns explicitly say to leave it as a draft.
-
-0. Credential: YOUTRACK_TOKEN (and YOUTRACK_URL) are in your environment
-   and the CLI below reads them itself -- values already in the
-   environment win over its .env.mcp files. Never print, echo, log, or
-   write the token anywhere, including in your final report. If the CLI
-   says the token is missing or rejected, stop and print TOKEN_INVALID
-   (do not retry, do not print the token).
-1. From the session turns below derive a summary (one line, NO emoji --
-   the server prepends the Type emoji itself, so an emoji in your summary
-   comes out doubled) and a description (markdown: problem, current vs
-   expected behavior, affected files, acceptance criteria -- only the
-   parts the turns actually support). If the turns hold no filable
-   content, print NOTHING_TO_FILE and stop without calling anything.
-   A line like "[Write /path]" or "[Edit /path]" means the session wrote
-   that file. When the ticket text lives in such a file, read its current
-   version; it beats any older wording quoted in the turns.
-2. Type: default "TYPE_DEFAULT". Use "TYPE_BUG" when the turns describe a
-   production defect, "TYPE_SUBTASK" only when the turns name a parent
-   issue, "TYPE_EPIC" only for a container of tasks. NEVER use archived
-   types (Backend, Frontend, Dev Bug, Hotfix): the server files them
-   under a null summary and the draft fails. When unsure a value exists,
-   run "BIN_PLACEHOLDER types" first (--help works offline).
-3. File it with the skill's script -- same args a human passes. No curl,
-   no reimplementing the API:
-   BIN_PLACEHOLDER create-draft --project=PROJECT_ID \\
-     --summary="..." --description=... --type="TYPE_DEFAULT" \\
-     --priority=PRIORITY_DEFAULT --platform="PLATFORM_DEFAULT"
-   (--description takes a literal string, @/path/to/file, or @- on
-   stdin. --assignee defaults to the token owner; pass
-   --assignee=<login> only when the turns name someone. Do NOT set story
-   points, estimation, or tags -- UI-only fields.)
-   The CLI prints JSON on stdout (progress on stderr): {"id": "3-XXXXX",
-   ...}. A null summary means a rejected field value -- fix the value
-   (usually Type) and retry once.
-4. Filing means PUBLISHED. The CLI only creates drafts, so do both steps
-   in this same run: create-draft first, then immediately
-   "BIN_PLACEHOLDER publish-draft --id=<internal-id>" with the draft id
-   from step 3 (--id takes the internal id, never --draft-id=). Skip the
-   publish only when the turns explicitly say to leave a draft/unpublished.
-5. Final line of your output must be exactly: TICKET <readable-id> -- the
-   published ticket id (e.g. TICKET MC-1611). Print nothing after it.
-
-Session turns (last TURNS, oldest first):
----
-CONTEXT
----
-""".replace("BIN_PLACEHOLDER", bin_path).replace(
-        "PROJECT_ID", project).replace(
-        "TYPE_DEFAULT", DEFAULT_TYPE).replace(
-        "TYPE_BUG", "🚨 Production Bug").replace(
-        "TYPE_SUBTASK", "📋 Subtask").replace(
-        "TYPE_EPIC", "🏆 Epic").replace(
-        "PRIORITY_DEFAULT", DEFAULT_PRIORITY).replace(
-        "PLATFORM_DEFAULT", DEFAULT_PLATFORM).replace(
-        # Last: the turns themselves go in after every config placeholder is
-        # resolved, so a turn discussing e.g. PROJECT_ID is never rewritten.
-        "TURNS", str(TURNS)).replace("CONTEXT", turns)
+WRITTEN_FILES = 3          # newest files the turns wrote, inlined for the model
+WRITTEN_FILE_BYTES = 40000
 
 
-def build_local_prompt(turns):
-    """Ask a local model for ticket fields; the worker runs the CLI itself."""
-    return f"""Derive one YouTrack ticket from the session turns below.
-Return ONLY one JSON object with these fields:
-{{"summary": "one line without emoji", "description": "markdown",
+def written_files(turns):
+    """Current text of the newest files the turns wrote ([Write /p], [Edit /p]).
+
+    A session often drafts the ticket text in a file. Inlining it saves the
+    model a tool call; the agent that had to fetch it once read an older
+    ticket's draft and then searched the raw transcript for minutes.
+    """
+    paths = []
+    for path in reversed(re.findall(r"^\[(?:Write|Edit) ([^\]]+)\]$", turns, re.M)):
+        if path not in paths:
+            paths.append(path)
+    out = []
+    for path in paths[:WRITTEN_FILES]:
+        try:
+            if os.path.getsize(path) > WRITTEN_FILE_BYTES:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as f:
+                out.append("Current content of %s:\n```\n%s\n```" % (path, f.read()))
+        except OSError:
+            continue
+    return "\n\n".join(out)
+
+
+def build_prompt(turns):
+    """Ask the model for ticket fields only; the worker files them itself.
+
+    An agent that ran the YouTrack CLI took 30 turns over 9 minutes, broke
+    the summary's shell quoting, and "tested" an update by retitling the
+    published ticket to "X". A JSON draft is one call and cannot do that.
+    """
+    files = written_files(turns)
+    files = ("\n\nFiles the session wrote, newest first. A file can belong to "
+             "an earlier, different ticket; use one only if it matches the "
+             "latest request.\n\n" + files) if files else ""
+    return f"""Draft one YouTrack ticket from the session turns below.
+The user's latest request to file a ticket decides what the ticket is about;
+earlier turns are background. Return ONLY one JSON object:
+{{"summary": "one line, no emoji", "description": "markdown",
  "type": "default|bug|subtask|epic", "assignee": null,
  "publish": true, "nothing_to_file": false}}
 
-Use type=default unless the turns describe a production defect, name a parent
-issue, or ask for a task container. Set assignee only when the turns explicitly
-name one. Set publish=false only when the turns explicitly ask to leave a draft.
-If there is no filable content, set nothing_to_file=true. Do not perform any
-actions, call tools, or claim a ticket was filed. Do not invent facts or
-acceptance criteria. The worker will file the ticket after validating this JSON.
+summary: one line in the language the session uses for this work.
+description: problem, current vs expected behavior, affected files,
+acceptance criteria -- only what the turns support. Do not invent facts.
+type: default unless the turns describe a production defect (bug), name a
+parent issue (subtask), or ask for a container of tasks (epic).
+assignee: a login only when the turns name one.
+publish: false only when the turns explicitly ask to leave a draft.
+nothing_to_file: true when the turns hold nothing to file.
+Do not call tools or claim anything was filed: the worker files the JSON.
 
 Session turns (last {TURNS}, oldest first):
 ---
 {turns}
----
+---{files}
 """
 
 
@@ -334,6 +305,61 @@ def filed_since(bin_path, project, since_ms):
             and isinstance(i.get("created"), int) and i["created"] >= since_ms]
 
 
+# Type names per kind, as projects spell them once the emoji is stripped.
+KIND_TYPES = {
+    "default": ("User Story", "Task"),
+    "bug": ("Production Bug", "Bug"),
+    "subtask": ("Subtask",),
+    "epic": ("Epic",),
+}
+
+
+def project_fields(bin_path, project):
+    """Type names and Platform values on the project's recent issues.
+
+    Projects differ: MC spells types with an emoji ("📜 User Story") and has a
+    Platform field; ANL spells them plain and has none. `get-fields` comes
+    back empty for this token, so the live issues are the source. Returns
+    (types, platforms), or None when YouTrack cannot be asked.
+    """
+    def cli(*args):
+        proc = subprocess.run([bin_path, *args], capture_output=True, text=True,
+                              timeout=120, env=os.environ.copy())
+        return json.loads(proc.stdout) if proc.returncode == 0 else None
+    try:
+        short = next((p.get("shortName") for p in cli("list-projects") or []
+                      if isinstance(p, dict) and p.get("id") == project), None)
+        if not short:
+            return None
+        # Recent issues only: archived types live on old ones.
+        day = time.strftime("%Y-%m-%d", time.localtime(time.time() - 60 * 86400))
+        issues = cli("search", "--project=" + short,
+                     "--query=created: %s .. Today" % day, "--page-size=100")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    if not isinstance(issues, list):
+        return None
+    types, platforms = set(), set()
+    for issue in issues:
+        for field in issue.get("customFields") or [] if isinstance(issue, dict) else []:
+            value = field.get("value") if isinstance(field, dict) else None
+            name = value.get("name") if isinstance(value, dict) else None
+            if name and field.get("name") == "Type":
+                types.add(name)
+            elif name and field.get("name") == "Platform":
+                platforms.add(name)
+    return types, platforms
+
+
+def resolve_type(kind, types):
+    """The project's own spelling of KIND, or None to take its default."""
+    for want in KIND_TYPES[kind]:
+        for name in sorted(types):
+            if re.sub(r"^[^\w]+", "", name).strip().lower() == want.lower():
+                return name
+    return None
+
+
 def file_ticket_locally(plan, outdir, bin_path, project):
     """Validate model fields and run create/publish with argv, never a shell.
 
@@ -343,24 +369,22 @@ def file_ticket_locally(plan, outdir, bin_path, project):
     """
     summary = plan.get("summary")
     description = plan.get("description")
-    kinds = {
-        "default": DEFAULT_TYPE,
-        "bug": "🚨 Production Bug",
-        "subtask": "📋 Subtask",
-        "epic": "🏆 Epic",
-    }
     kind = plan.get("type", "default")
     if not isinstance(summary, str) or not summary.strip() or "\n" in summary:
-        return None, "local model returned an invalid ticket summary", False
+        return None, "model returned an invalid ticket summary", False
     if not isinstance(description, str) or not description.strip():
-        return None, "local model returned an invalid ticket description", False
-    if not isinstance(kind, str) or kind not in kinds:
-        return None, "local model returned an unsupported ticket type", False
+        return None, "model returned an invalid ticket description", False
+    if not isinstance(kind, str) or kind not in KIND_TYPES:
+        return None, "model returned an unsupported ticket type", False
     if not isinstance(plan.get("publish"), bool):
-        return None, "local model returned a non-boolean publish choice", False
+        return None, "model returned a non-boolean publish choice", False
     assignee = plan.get("assignee")
     if assignee is not None and (not isinstance(assignee, str) or not assignee.strip()):
-        return None, "local model returned an invalid assignee", False
+        return None, "model returned an invalid assignee", False
+    fields = project_fields(bin_path, project)
+    if fields is None:
+        return None, "could not read the project's issue types from YouTrack", False
+    types, platforms = fields
 
     description_path = None
     try:
@@ -372,9 +396,15 @@ def file_ticket_locally(plan, outdir, bin_path, project):
         os.chmod(description_path, 0o600)
         args = [
             "create-draft", f"--project={project}", f"--summary={summary.strip()}",
-            f"--description=@{description_path}", f"--type={kinds[kind]}",
-            f"--priority={DEFAULT_PRIORITY}", f"--platform={DEFAULT_PLATFORM}",
+            f"--description=@{description_path}", f"--priority={DEFAULT_PRIORITY}",
         ]
+        # No match leaves the field to the project's default rather than
+        # sending a value its bundle rejects.
+        type_name = resolve_type(kind, types)
+        if type_name:
+            args.append(f"--type={type_name}")
+        if DEFAULT_PLATFORM in platforms:
+            args.append(f"--platform={DEFAULT_PLATFORM}")
         if assignee:
             args.append(f"--assignee={assignee.strip()}")
         created = subprocess.run(
@@ -491,67 +521,34 @@ def main():
         f.write(turns)
     log("context at %s (%d bytes)" % (context_path, len(turns.encode())))
 
-    if model.TRANSPORT == "local-direct":
-        log("drafting ticket fields with configured local model")
-        output, diagnostic = model.call(
-            build_local_prompt(turns), TIMEOUT, "OFFLOADED_TICKET_WORKER")
-        if output is None:
-            return fail(outdir, session, diagnostic or "local model call failed")
-        plan = parse_model_json(output)
-        if not plan:
-            return fail(outdir, session, "local model returned invalid ticket JSON")
-        if plan.get("nothing_to_file") is True:
-            return fail(outdir, session, "no filable content in session turns")
-        log("filing the validated ticket through the YouTrack CLI")
-        ticket_id, diagnostic, published = file_ticket_locally(
-            plan, outdir, cfg_bin, cfg_project)
-        if not ticket_id:
-            return fail(outdir, session, diagnostic or "local ticket filing failed")
-        if not published:
-            # The turns asked for a draft. Record it as the outcome, so the
-            # gate reports it and a repeat request does not create another.
-            proof = {"session_id": session, "idReadable": "draft " + ticket_id,
-                     "url": None, "draft_id": ticket_id,
-                     "summary": "draft created and left unpublished, as the turns asked; "
-                                "publish it in YouTrack"}
-            for path in (draft_path, proof_path):
-                with open(path, "w") as f:
-                    json.dump(proof, f, indent=2)
-            log("draft %s left unpublished; proof at %s" % (ticket_id, proof_path))
-            print("proof: " + proof_path)
-            return 0
-    else:
-        prompt = build_prompt(turns, cfg_bin, cfg_project)
-        log("filing via configured proxy model")
-        output, diagnostic = model.call(
-            prompt, TIMEOUT, "OFFLOADED_TICKET_WORKER")
-        if output is None:
-            # The agent can file and publish, then run out of time tidying
-            # up (2026-10-12: ANL-1963 published at 9 min, killed at the cap).
-            # Report what YouTrack holds, not just the timeout.
-            found = filed_since(cfg_bin, cfg_project, since_ms)
-            if found:
-                return adopt(found, "filed before the worker call ended (%s)"
-                             % (diagnostic or "call failed").splitlines()[0])
-            return fail(outdir, session, diagnostic or "proxy model call failed")
-        ticket_id = ""
-        for line in reversed(output.strip().split("\n")):
-            line = line.strip()
-            if line.startswith("TICKET ") and " " in line:
-                ticket_id = line.split(None, 1)[1].strip()
-                break
-        if ticket_id in ("NOTHING_TO_FILE", "TOKEN_MISSING", "TOKEN_INVALID"):
-            return fail(outdir, session, "no ticket filed; worker said: " + ticket_id)
-        if not ticket_id:
-            found = filed_since(cfg_bin, cfg_project, since_ms)
-            if found:
-                return adopt(found, "the worker reply named no ticket")
-            # The whole reply, head included: its first line is where an
-            # agent summarises what it did.
-            what = ("no ticket filed (YouTrack shows none)" if found is not None else
-                    "no ticket id in the reply, and the YouTrack lookup failed: "
-                    "check YouTrack before retrying")
-            return fail(outdir, session, "%s; worker said: %s" % (what, _redact(output)))
+    log("drafting ticket fields with the configured model")
+    output, diagnostic = model.call(
+        build_prompt(turns), TIMEOUT, "OFFLOADED_TICKET_WORKER", tools="")
+    if output is None:
+        return fail(outdir, session, diagnostic or "model call failed")
+    plan = parse_model_json(output)
+    if not plan:
+        return fail(outdir, session, "model returned invalid ticket JSON")
+    if plan.get("nothing_to_file") is True:
+        return fail(outdir, session, "no filable content in session turns")
+    log("filing the validated ticket through the YouTrack CLI")
+    ticket_id, diagnostic, published = file_ticket_locally(
+        plan, outdir, cfg_bin, cfg_project)
+    if not ticket_id:
+        return fail(outdir, session, diagnostic or "ticket filing failed")
+    if not published:
+        # The turns asked for a draft. Record it as the outcome, so the
+        # gate reports it and a repeat request does not create another.
+        proof = {"session_id": session, "idReadable": "draft " + ticket_id,
+                 "url": None, "draft_id": ticket_id,
+                 "summary": "draft created and left unpublished, as the turns asked; "
+                            "publish it in YouTrack"}
+        for path in (draft_path, proof_path):
+            with open(path, "w") as f:
+                json.dump(proof, f, indent=2)
+        log("draft %s left unpublished; proof at %s" % (ticket_id, proof_path))
+        print("proof: " + proof_path)
+        return 0
 
     return record(ticket_id, "ticket filed and published from session turns")
 

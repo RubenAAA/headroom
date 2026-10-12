@@ -297,72 +297,87 @@ review_tool r1 "curl -X POST https://git.example/api/v4/projects/1/merge_request
 ok "poster calls pass alone; a chained direct write is blocked"
 
 # ── ticket_file.py ──────────────────────────────────────────────────────────
-# The ticket id comes from the CLI's JSON, not from a scan that "UTF-8" on
-# stderr would fool.
-cat >"$T/ytcli" <<'CLI'
+# A fake ai-youtrack CLI. MC spells types with an emoji and has a Platform
+# field; ANL has neither. A search for the owner's tickets finds the one
+# publish-draft filed.
+cat >"$T/ytcli" <<CLI
 #!/bin/sh
-case "$1" in
-  create-draft) echo '{"id":"draft-1"}' ;;
-  publish-draft) echo "encoding UTF-8 ok" >&2; echo '{"idReadable":"MC-1611"}' ;;
+case "\$1" in
+  list-projects) echo '[{"id":"0-39","shortName":"MC"},{"id":"0-15","shortName":"ANL"}]' ;;
+  search) echo "\$@" >>"$T/yt.search"
+    case "\$*" in
+      *"reporter: me"*) [ -f "$T/yt.filed" ] || { echo '[]'; exit 0; }
+        printf '[{"idReadable":"MC-1","created":1000},{"idReadable":"MC-1611","created":%s,"summary":"s"}]' "\$(date +%s)000" ;;
+      *--project=MC*) echo '[{"customFields":[{"name":"Type","value":{"name":"🚨 Production Bug"}},{"name":"Platform","value":{"name":"Match center"}}]},{"customFields":[{"name":"Type","value":{"name":"📜 User Story"}}]}]' ;;
+      *) echo '[{"customFields":[{"name":"Type","value":{"name":"Task"}}]}]' ;;
+    esac ;;
+  create-draft) echo "\$@" >>"$T/yt.create"; echo '{"id":"draft-1"}' ;;
+  publish-draft) touch "$T/yt.filed"; echo "encoding UTF-8 ok" >&2; echo '{"idReadable":"MC-1611"}' ;;
 esac
 CLI
 chmod +x "$T/ytcli"
+
+# Types and Platform follow the project; the ticket id comes from the CLI's
+# JSON, not from a scan that "UTF-8" on stderr would fool.
 GOT=$(cd "$REPO_DIR/contrib/offload-workers" && PYTHONDONTWRITEBYTECODE=1 YOUTRACK_TOKEN=x python3 - "$T" <<'PY'
 import sys
 import ticket_file as t
-plan = {"summary": "s", "description": "d", "type": "default", "publish": True, "assignee": None}
-print(t.file_ticket_locally(plan, sys.argv[1], sys.argv[1] + "/ytcli", "1")[0])
+plan = {"summary": "s", "description": "d", "type": "bug", "publish": True, "assignee": None}
+print(t.file_ticket_locally(plan, sys.argv[1], sys.argv[1] + "/ytcli", "0-39")[0])
+plan["type"] = "default"
+print(t.file_ticket_locally(plan, sys.argv[1], sys.argv[1] + "/ytcli", "0-15")[0])
 plan["publish"] = False
-print(t.file_ticket_locally(plan, sys.argv[1], sys.argv[1] + "/ytcli", "1"))
+print(t.file_ticket_locally(plan, sys.argv[1], sys.argv[1] + "/ytcli", "0-15"))
 PY
 )
+rm -f "$T/yt.filed" "$T/yt.search"
 [[ $(head -1 <<<"$GOT") == MC-1611 ]] || fail "ticket id read as '$(head -1 <<<"$GOT")', want MC-1611"
 ok "the ticket id is read from the CLI's JSON"
 [[ $(tail -1 <<<"$GOT") == "('draft-1', None, False)" ]] || fail "an unpublished draft was not a success: $(tail -1 <<<"$GOT")"
 ok "a draft the turns asked to leave unpublished is a success, not a failure"
+MC=$(sed -n 1p "$T/yt.create") ANL=$(sed -n 2p "$T/yt.create")
+[[ $MC == *"--type=🚨 Production Bug"* && $MC == *"--platform=Match center"* ]] \
+  || fail "MC ticket lost its project's type or platform: $MC"
+[[ $ANL == *"--type=Task"* && $ANL != *--platform* ]] \
+  || fail "ANL ticket got another project's type or a platform: $ANL"
+ok "type and platform follow the project's own issues"
+rm -f "$T/yt.create"
 
-# An agent reply without its TICKET line is not a failure when YouTrack shows
-# the ticket: the id comes from YouTrack, and a retry adopts it instead of
-# filing again. Files the session wrote reach the agent as paths.
-cat >"$T/ytsearch" <<CLI
-#!/bin/sh
-case "\$1" in
-  list-projects) echo '[{"id":"0-39","shortName":"MC"}]' ;;
-  search) echo "\$@" >>"$T/yt.search"
-    # Nothing filed before the first run; the agent's ticket after it.
-    if [ "\$(wc -l <"$T/yt.search")" -eq 1 ]; then echo '[]'; exit 0; fi
-    printf '[{"idReadable":"MC-1","created":1000},{"idReadable":"MC-3979","created":%s,"summary":"epic"}]' "\$(date +%s)000" ;;
-esac
-CLI
-chmod +x "$T/ytsearch"
-{ jq -nc '{message:{role:"user",content:"file the ticket"}}'
-  jq -nc '{message:{role:"assistant",content:[{type:"tool_use",name:"Write",input:{file_path:"/tmp/epic.md",content:"x"}},{type:"text",text:"draft ready"}]}}'
+# The model only drafts: no tools, files the session wrote inlined. The
+# worker files the draft, and a retry adopts the ticket instead of filing
+# again.
+printf 'epic draft body\n' >"$T/epic.md"
+{ jq -nc '{message:{role:"user",content:"draft the epic"}}'
+  jq -nc --arg p "$T/epic.md" '{message:{role:"assistant",content:[{type:"tool_use",name:"Write",input:{file_path:$p,content:"x"}},{type:"text",text:"draft ready"}]}}'
+  jq -nc '{message:{role:"user",content:"file the ticket"}}'
 } >"$T/w.jsonl"
 GOT=$(cd "$REPO_DIR/contrib/offload-workers" && PYTHONDONTWRITEBYTECODE=1 YOUTRACK_TOKEN=x \
-  YOUTRACK_URL=https://yt.example YOUTRACK_PROJECT_ID=0-39 AI_YOUTRACK_BIN="$T/ytsearch" \
+  YOUTRACK_URL=https://yt.example YOUTRACK_PROJECT_ID=0-39 AI_YOUTRACK_BIN="$T/ytcli" \
   python3 - "$T" 2>"$T/w.err" <<'PY'
 import json, os, sys
 import ticket_file as t
 out = sys.argv[1]
 t.backend_config_error = lambda: None
-t.model.TRANSPORT = "headroom"
-replies = ["ам и турнирам: filed the epic.\nVerified: links added."]
-def call(prompt, timeout, marker):
-    assert "[Write /tmp/epic.md]" in prompt, "Write path missing from the context"
-    return replies.pop(0), None
+calls = []
+def call(prompt, timeout, marker, tools=None):
+    assert tools == "", "the drafting model was given tools"
+    assert "epic draft body" in prompt, "the written file is missing from the prompt"
+    calls.append(1)
+    return '{"summary": "s", "description": "d", "type": "epic", "publish": true}', None
 t.model.call = call
 sys.argv = ["ticket_file.py", "s9", out + "/w.jsonl", out]
 proof = out + "/s9.ticket.proof.json"
 print(t.main(), json.load(open(proof))["idReadable"])
 os.remove(proof)
-print(t.main(), json.load(open(proof))["summary"])
+print(t.main(), json.load(open(proof))["summary"], len(calls))
 PY
 ) || fail "worker run crashed: $(tail -5 "$T/w.err")"
 GOT=$(grep -v '^proof: ' <<<"$GOT")
-[[ $(head -1 <<<"$GOT") == "0 MC-3979" ]] || fail "a reply without TICKET was not resolved from YouTrack: $GOT"
-[[ $(tail -1 <<<"$GOT") == "0 filed by an earlier attempt"* ]] || fail "a retry did not adopt the earlier ticket: $GOT"
+[[ $(head -1 <<<"$GOT") == "0 MC-1611" ]] || fail "the drafted ticket was not filed: $GOT"
+[[ $(tail -1 <<<"$GOT") == "0 filed by an earlier attempt"*" 1" ]] || fail "a retry did not adopt the earlier ticket: $GOT"
+[[ $(wc -l <"$T/yt.create") -eq 1 ]] || fail "the ticket was created more than once"
 grep -q -- "--project=MC" "$T/yt.search" || fail "the lookup did not search the session's project"
-ok "a reply without its TICKET line is resolved from YouTrack, and a retry does not file again"
+ok "the model drafts without tools, the worker files, and a retry does not file again"
 
 # ── gitlab_api.py ───────────────────────────────────────────────────────────
 # The token reaches curl in a private header file, not in argv, and no payload
