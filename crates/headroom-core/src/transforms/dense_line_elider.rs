@@ -45,10 +45,128 @@ pub fn is_dense_line(line: &str) -> bool {
     }
     let stripped = line.trim();
     let (first, last) = (stripped.chars().next(), stripped.chars().last());
-    !matches!(
+    if matches!(
         (first, last),
         (Some('{'), Some('}')) | (Some('['), Some(']'))
-    )
+    ) {
+        return false;
+    }
+    // Upstream fd067033: a label can precede compact JSON (`result: {...}`).
+    // Eliding that line rewrites the values. Upstream declines on any JSON
+    // span at all; that would also stop on every `[]` and `{}` in minified
+    // JS, so here the JSON has to make up at least half the line. A scan
+    // that runs out of budget may have missed a document: not dense.
+    match json_document_bytes(line) {
+        Some(json) => json * 2 < line.len(),
+        None => false,
+    }
+}
+
+/// Characters a scan may walk, and JSON it may parse, per input character.
+const SCAN_BUDGET_PER_CHAR: usize = 4;
+const SCAN_BUDGET_FLOOR: usize = 4096;
+
+/// Bytes of `text` inside balanced `{...}` / `[...]` spans that parse as
+/// JSON, nested spans included when their wrapper does not parse; `None` when
+/// the scan ran out of budget. Port of upstream `scan_json_documents`: each
+/// bracket's end is found once (the walk records every nested bracket it
+/// passes), so unmatched braces in source or logs stay linear.
+fn json_document_bytes(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let budget = SCAN_BUDGET_PER_CHAR * bytes.len() + SCAN_BUDGET_FLOOR;
+    // known[i]: for an opener at i, Some(end) when balanced, None when not.
+    let mut known: std::collections::BTreeMap<usize, Option<usize>> = Default::default();
+    let mut spent = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'{' | b'[') {
+            let end = match known.get(&i) {
+                Some(end) => *end,
+                None if spent >= budget => return None,
+                None => {
+                    let (end, walked) = scan_from(bytes, i, &mut known);
+                    spent += walked;
+                    end
+                }
+            };
+            if let Some(end) = end {
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let mut covered_until = 0;
+    let mut parsed = 0;
+    let mut json = 0;
+    for (&a, &end) in &known {
+        let Some(b) = end else { continue };
+        if a < covered_until {
+            continue;
+        }
+        parsed += b - a;
+        if parsed > budget {
+            return None;
+        }
+        match serde_json::from_str::<serde_json::Value>(&text[a..b]) {
+            Ok(_) => {
+                json += b - a;
+                covered_until = b;
+            }
+            Err(e) if e.to_string().contains("recursion limit") => return None,
+            Err(_) => {}
+        }
+    }
+    Some(json)
+}
+
+/// Walk from the opener at `start` to its match, recording the verdict of
+/// every opener passed on the way. Returns `(end, bytes walked)`.
+fn scan_from(
+    bytes: &[u8],
+    start: usize,
+    known: &mut std::collections::BTreeMap<usize, Option<usize>>,
+) -> (Option<usize>, usize) {
+    let mut stack: Vec<usize> = Vec::new();
+    let (mut in_str, mut esc) = (false, false);
+    for (j, &ch) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == b'\\' {
+                esc = true;
+            } else if ch == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            b'"' => in_str = true,
+            b'{' | b'[' => stack.push(j),
+            b'}' | b']' => {
+                let want = if ch == b'}' { b'{' } else { b'[' };
+                match stack.pop() {
+                    Some(p) if bytes[p] == want => {
+                        known.insert(p, Some(j + 1));
+                        if stack.is_empty() {
+                            return (Some(j + 1), j - start + 1);
+                        }
+                    }
+                    popped => {
+                        for p in popped.into_iter().chain(stack) {
+                            known.insert(p, None);
+                        }
+                        return (None, j - start + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for p in stack {
+        known.insert(p, None);
+    }
+    (None, bytes.len() - start)
 }
 
 /// Return `(text_with_dense_lines_elided, lines_elided)`.
@@ -121,6 +239,35 @@ mod tests {
         assert!(!is_dense_line(&line));
         let arr = format!("[{}]", "1,".repeat(200));
         assert!(!is_dense_line(&arr));
+    }
+
+    #[test]
+    fn labelled_compact_json_is_not_elided() {
+        // Upstream fd067033: a prefix before compact JSON hid it from the
+        // whole-line check, and the elider rewrote its values.
+        let records: Vec<String> = (0..40)
+            .map(|i| format!("{{\"id\":{i},\"name\":\"item{i}\"}}"))
+            .collect();
+        let line = format!("result:[{}]", records.join(","));
+        assert!(line.len() >= MIN_LINE_CHARS);
+        assert!(!is_dense_line(&line));
+        // Valid JSON nested inside a wrapper that is not JSON still counts.
+        let wrapped = format!("cb({{rows:[{}]}})", records.join(","));
+        assert!(!is_dense_line(&wrapped));
+    }
+
+    #[test]
+    fn minified_js_with_small_literals_still_elides() {
+        // `[]` and `{}` parse as JSON but are a sliver of a bundle line.
+        let line = "a=[];b={};c=function(d){return(d.x||{}).y||[]};".repeat(20);
+        assert!(is_dense_line(&line));
+    }
+
+    #[test]
+    fn unmatched_braces_stay_within_budget() {
+        let line = "{".repeat(50_000);
+        assert!(json_document_bytes(&line).is_some_and(|n| n == 0));
+        assert!(is_dense_line(&line));
     }
 
     #[test]
