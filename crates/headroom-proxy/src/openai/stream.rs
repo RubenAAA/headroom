@@ -703,12 +703,20 @@ impl StreamTranslator {
         // can count them; hand the entry back unscored, with the first-turn
         // marker so routed sessions delimit the way native ones do.
         if self.translated_turn() {
+            // No usage (a stream dropped before any arrived): release the
+            // entry without the first-turn marker. Two invented zeros would
+            // mark the conversation seen, and its real first turn would never
+            // be counted.
             if let Some(observer) = ctx.usage_observer.as_ref() {
-                observer.complete_translated_first_turn(
-                    &ctx.request_id,
-                    cache_read,
-                    provider_input.saturating_sub(cache_read),
-                );
+                if usage.is_none() {
+                    observer.end_unscored(&ctx.request_id);
+                } else {
+                    observer.complete_translated_first_turn(
+                        &ctx.request_id,
+                        cache_read,
+                        provider_input.saturating_sub(cache_read),
+                    );
+                }
             }
             self.observation_completed = true;
             return;

@@ -1019,6 +1019,31 @@ fn dropped_stream_still_books_the_turn() {
     );
 }
 
+/// A translated stream dropped before any usage arrived releases its parked
+/// entry without the first-turn marker: two invented zeros would mark the
+/// conversation seen, and its real first turn would then go uncounted.
+#[test]
+fn dropped_translated_stream_without_usage_leaves_the_first_turn_open() {
+    use crate::cache_stabilization::usage_observer::UsageObserver;
+    let obs = std::sync::Arc::new(UsageObserver::new());
+    obs.begin_request("req-test", "conv-spark".into(), None, None, None);
+    let (mut t, _logger, _cost) = translator_with_outcome("muse-spark-1.3", 0);
+    t.outcome.as_mut().unwrap().usage_observer = Some(obs.clone());
+    t.process_frame(
+        Some("response.output_text.delta"),
+        &json!({"delta": "partial"}).to_string(),
+    );
+    drop(t);
+
+    obs.begin_request("req-2", "conv-spark".into(), None, None, None);
+    obs.complete_translated_first_turn("req-2", 0, 50_000);
+    assert_eq!(
+        obs.snapshot().first_turn_writes_total,
+        1,
+        "the first turn with usage is still the conversation's first"
+    );
+}
+
 /// `response.failed` routes to `record_failed`, which deliberately skips
 /// the success funnel — a failed turn must not inflate the save rate.
 #[test]
