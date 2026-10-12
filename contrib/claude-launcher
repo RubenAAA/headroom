@@ -385,7 +385,21 @@ env_vars=()
 # sessions had before the regression.
 env_vars+=("CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1")
 # Experiment 2026-10-08: expect compaction to move ~126k to ~630k preTokens if the ~63% trigger holds.
-env_vars+=("CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000")
+# Only Spark serves 1M; Codex and local Qwen windows are far smaller, and a
+# ceiling past them means the session overflows before it compacts. The
+# model is picked with /model after launch, so all this can see is --qwen and
+# an explicit --model: skip for those, keep it for the Spark default.
+launch_model=""
+for ((k = 0; k < ${#passthrough[@]}; k++)); do
+    case "${passthrough[$k]}" in
+        --model) launch_model="${passthrough[$((k + 1))]:-}" ;;
+        --model=*) launch_model="${passthrough[$k]#--model=}" ;;
+    esac
+done
+case "${launch_model,,}" in
+    *codex*|*qwen*) ;;
+    *) [ "$use_qwen" -eq 1 ] || env_vars+=("CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000") ;;
+esac
 if [ "$use_qwen" -eq 1 ]; then
     env_vars+=(
         "ANTHROPIC_CUSTOM_MODEL_OPTION=$QWEN_MODEL"
