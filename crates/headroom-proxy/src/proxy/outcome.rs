@@ -249,12 +249,21 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
         // nothing, not because nothing was saved — do not read them
         // against priced rows.
         let priced_basis = outcome.compression_savings_cost_basis().to_string();
+        // The same split again in subscription-meter percent, which is what a
+        // subscription user's limit actually counts.
+        let tool_schema_meter = outcome.tool_schema_savings_meter_pct_for(tool_schema_saved);
+        let meter_pct = outcome
+            .compression_savings_meter_pct_for(saved - tool_schema_saved)
+            .map(|m| m + tool_schema_meter.unwrap_or(0.0));
         let split = headroom_core::savings_ledger::SavingsSplit {
             new_input_tokens: outcome.new_input_tokens(),
             deferred_tokens: tool_schema_saved,
             deferred_cost_usd: tool_schema_cost,
             overhead_tokens: outcome.hidden_rounds.total_tokens(),
             overhead_usd: outcome.hidden_rounds_cost_usd(),
+            meter_pct,
+            deferred_meter_pct: tool_schema_meter.unwrap_or(0.0),
+            overhead_meter_pct: outcome.hidden_rounds_meter_pct().unwrap_or(0.0),
         };
         let pricing = headroom_core::pricing::lookup(&model);
         let fresh_rate = pricing
@@ -351,6 +360,7 @@ pub(super) fn write_savings_ledger(
                 timestamp: None,
                 cost_usd: Some(offload.saved_usd),
                 cost_basis: Some("model_offload"),
+                meter_pct: offload.saved_meter_pct,
                 fallback_rate: None,
                 path: None,
                 ..Default::default()
@@ -412,6 +422,14 @@ pub(super) fn offload_savings(
         fallback,
     );
     let saved_usd = (would_have_cost - did_cost).max(0.0);
+    // Off the meter on the model it ran on (Spark, Codex) means the whole
+    // turn left the subscription; no meter on the asked-for model means there
+    // is nothing to report.
+    let meter = |model: &str| {
+        headroom_core::meter_weights::meter_pct(model, fresh, out, read, write, write_1h)
+    };
+    let saved_meter_pct =
+        meter(&from_model).map(|would| (would - meter(&outcome.model).unwrap_or(0.0)).max(0.0));
     tracing::info!(
         event = "model_offload_savings",
         request_id = %outcome.request_id,
@@ -425,12 +443,14 @@ pub(super) fn offload_savings(
         would_have_cost_usd = would_have_cost,
         did_cost_usd = did_cost,
         saved_usd,
+        saved_meter_pct,
         "turn served off the client's model: tokens and cost it never billed"
     );
     Some(OffloadSavings {
         from_model,
         tokens,
         saved_usd,
+        saved_meter_pct,
     })
 }
 
@@ -440,6 +460,7 @@ pub(super) struct OffloadSavings {
     pub(super) from_model: String,
     pub(super) tokens: i64,
     pub(super) saved_usd: f64,
+    pub(super) saved_meter_pct: Option<f64>,
 }
 
 /// Tool definitions (name → serialized bytes) and the calls the model made

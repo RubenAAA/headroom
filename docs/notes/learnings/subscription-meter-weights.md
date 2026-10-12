@@ -45,5 +45,11 @@ a hypothesis the meter was tested against.
   not log; Spark and Codex are not on this meter. The 7d window has only 4
   resets and 94 segments, too few to fit freely (API shape: 1.7% held-out).
   Refit after a plan change.
-- **Follow-up:** the savings ledger and statusline still price savings in
-  API dollars. For subscription users they should report meter %.
+- **Applied 2026-10-12:** `headroom_core::meter_weights` holds these
+  weights. Ledger rows carry `meter_pct` next to `cost_usd`, and
+  `headroom savings` reports % of a 5h window (dollars stay in the JSON).
+  The statusline's "vs stock" figure weights each cache class with the Opus
+  fit against fresh input (reads 0.04x, 1h writes 1.58x) instead of the
+  API's 0.1x and 2.0x. The same change prices a conversation the observer
+  lost to a proxy restart at par: a full stock rebuild there had been about
+  a fifth of the claimed saving.

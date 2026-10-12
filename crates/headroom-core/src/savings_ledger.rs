@@ -203,6 +203,15 @@ pub struct SavingsEvent<'a> {
     /// those rounds caused). Charged against the saving, not added to it.
     pub overhead_tokens: i64,
     pub overhead_usd: f64,
+    /// The saving in percent of a 5h Claude subscription window
+    /// ([`crate::meter_weights`]), priced on the same token split as
+    /// `cost_usd`. `None` for models off that meter, and on rows written
+    /// before 2026-10-12.
+    pub meter_pct: Option<f64>,
+    /// The meter share of `deferred_tokens`, and the meter cost of the
+    /// overhead, as for `deferred_cost_usd` and `overhead_usd`.
+    pub deferred_meter_pct: f64,
+    pub overhead_meter_pct: f64,
 }
 
 /// Record a savings event from a completed request, given the count that was
@@ -244,6 +253,9 @@ pub struct SavingsSplit {
     pub deferred_cost_usd: f64,
     pub overhead_tokens: i64,
     pub overhead_usd: f64,
+    pub meter_pct: Option<f64>,
+    pub deferred_meter_pct: f64,
+    pub overhead_meter_pct: f64,
 }
 
 /// As [`record_from_forwarded`], with a request-scoped price derived from the
@@ -278,6 +290,9 @@ pub fn record_from_forwarded_with_cost(
         deferred_cost_usd: split.deferred_cost_usd,
         overhead_tokens: split.overhead_tokens,
         overhead_usd: split.overhead_usd,
+        meter_pct: split.meter_pct,
+        deferred_meter_pct: split.deferred_meter_pct,
+        overhead_meter_pct: split.overhead_meter_pct,
     })
 }
 
@@ -351,6 +366,25 @@ pub fn record_savings_event(event: SavingsEvent) -> bool {
             "overhead_usd".into(),
             json!(round_half_even(overhead_usd, 6)),
         );
+    }
+    if let Some(meter) = event.meter_pct {
+        let meter = meter.max(0.0);
+        obj.insert("meter_pct".into(), json!(round_half_even(meter, 9)));
+        if deferred > 0 {
+            obj.insert(
+                "deferred_meter_pct".into(),
+                json!(round_half_even(
+                    event.deferred_meter_pct.clamp(0.0, meter),
+                    9
+                )),
+            );
+        }
+        if overhead_usd > 0.0 {
+            obj.insert(
+                "overhead_meter_pct".into(),
+                json!(round_half_even(event.overhead_meter_pct.max(0.0), 9)),
+            );
+        }
     }
 
     let target = resolve_path(event.path);
@@ -435,13 +469,26 @@ struct Row {
     deferred_cost: f64,
     overhead_tokens: i64,
     overhead_usd: f64,
+    /// Set only on rows that carry `meter_pct`, with the row's time, so a
+    /// window can say from when its meter totals count.
+    meter: Option<(DateTime<Utc>, f64)>,
+    deferred_meter: f64,
+    overhead_meter: f64,
 }
 
 impl Row {
-    fn parse(obj: &Value) -> Self {
+    fn parse(obj: &Value, ts: DateTime<Utc>) -> Self {
         let saved = coerce_i64(obj.get("saved")).max(0);
         let cost = coerce_f64(obj.get("cost_usd")).max(0.0);
+        let meter = obj
+            .get("meter_pct")
+            .filter(|v| !v.is_null())
+            .map(|v| coerce_f64(Some(v)).max(0.0));
         Row {
+            meter: meter.map(|m| (ts, m)),
+            deferred_meter: coerce_f64(obj.get("deferred_meter_pct"))
+                .clamp(0.0, meter.unwrap_or(0.0)),
+            overhead_meter: coerce_f64(obj.get("overhead_meter_pct")).max(0.0),
             saved,
             before: coerce_i64(obj.get("before")).max(0),
             cost,
@@ -469,12 +516,24 @@ struct Bucket {
     deferred_cost_usd: f64,
     overhead_tokens: i64,
     overhead_usd: f64,
+    meter_pct: f64,
+    deferred_meter_pct: f64,
+    overhead_meter_pct: f64,
+    meter_since: Option<DateTime<Utc>>,
 }
 
 impl Bucket {
     fn add(&mut self, row: &Row) {
         self.overhead_tokens += row.overhead_tokens;
         self.overhead_usd += row.overhead_usd;
+        if let Some((ts, meter)) = row.meter {
+            self.meter_since = Some(self.meter_since.map_or(ts, |s| s.min(ts)));
+            self.overhead_meter_pct += row.overhead_meter;
+            if row.saved > 0 {
+                self.meter_pct += meter;
+                self.deferred_meter_pct += row.deferred_meter;
+            }
+        }
         if row.saved <= 0 {
             // Denominator-only or overhead-only line (see
             // `record_savings_event`): calls, before/saved and cost keep
@@ -536,6 +595,13 @@ impl Bucket {
             "overhead_tokens": self.overhead_tokens,
             "overhead_usd": round_half_even(self.overhead_usd, 6),
             "net_cost_usd": round_half_even(self.cost_usd - self.overhead_usd, 6),
+            "meter_pct": round_half_even(self.meter_pct, 6),
+            "deferred_meter_pct": round_half_even(self.deferred_meter_pct, 6),
+            "overhead_meter_pct": round_half_even(self.overhead_meter_pct, 6),
+            "net_meter_pct": round_half_even(self.meter_pct - self.overhead_meter_pct, 6),
+            "meter_since": self
+                .meter_since
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         })
     }
 }
@@ -659,7 +725,7 @@ pub fn aggregate_savings(
 
     for event in &events {
         let obj = &event.value;
-        let row = Row::parse(obj);
+        let row = Row::parse(obj, event.ts);
 
         windowed.add(&row);
         if event.ts >= today_cutoff {
@@ -965,6 +1031,44 @@ mod tests {
         assert!((usd("deferred_cost_usd") - 0.004).abs() < 1e-9);
         assert!((usd("overhead_usd") - 0.003).abs() < 1e-9);
         assert!((usd("net_cost_usd") - 0.007).abs() < 1e-9);
+    }
+
+    /// Meter figures sum only over rows that carry one, and the window says
+    /// from when: a dollar-only row from before the meter fields must not
+    /// read as a zero-meter saving.
+    #[test]
+    fn meter_totals_count_from_the_first_metered_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("savings_events.jsonl");
+        let now = Utc::now();
+        assert!(record_savings_event(SavingsEvent {
+            cost_usd: Some(0.5),
+            timestamp: Some(now - Duration::days(3)),
+            ..ev(1_000, 0, "c", &path)
+        }));
+        assert!(record_savings_event(SavingsEvent {
+            cost_usd: Some(0.01),
+            meter_pct: Some(0.30),
+            deferred_tokens: 100,
+            deferred_meter_pct: 0.02,
+            overhead_tokens: 10,
+            overhead_usd: 0.001,
+            overhead_meter_pct: 0.05,
+            timestamp: Some(now - Duration::hours(1)),
+            ..ev(1_000, 500, "c", &path)
+        }));
+
+        let life = &aggregate_savings(Some(&path), Some(now), DEFAULT_RETENTION_DAYS).lifetime;
+        assert_eq!(life["calls"], json!(2));
+        let pct = |k: &str| life[k].as_f64().unwrap();
+        assert!((pct("meter_pct") - 0.30).abs() < 1e-9);
+        assert!((pct("deferred_meter_pct") - 0.02).abs() < 1e-9);
+        assert!((pct("net_meter_pct") - 0.25).abs() < 1e-9);
+        let since = life["meter_since"].as_str().unwrap();
+        assert!(
+            parse_timestamp(since).unwrap() > now - Duration::hours(2),
+            "{since}"
+        );
     }
 
     #[test]

@@ -2293,8 +2293,31 @@ impl UsageObserver {
             // shape, not ours, so handing the stock arm a cheaper tail than we
             // got would be inventing a difference the transforms did not make.
             let stock_cacheable = stock_prompt.saturating_sub(usage.input_tokens);
+            // A conversation that arrives with history but no footprint here
+            // existed before this observer saw it: a proxy restart drops every
+            // footprint, and a resume starts a new lineage. A stock client
+            // never restarts, so it reads what the provider still held for
+            // us, scaled like the prompt. Charging it a full rebuild instead
+            // booked about a fifth of the claimed saving on restart turns
+            // (09-29 to 10-12 logs). A real first turn has one message and
+            // keeps the rebuild.
+            let continued_unseen = matches!(m.class, TurnClass::FirstTurn)
+                && prior == 0
+                && pending.first_turn.as_ref().is_some_and(|f| f.msgs > 1);
             let stock_read = if stock_kept {
                 prior.min(stock_cacheable)
+            } else if continued_unseen {
+                let read = usage.cache_read_input_tokens;
+                let scaled = match (
+                    pending.client_request_bytes,
+                    pending.forwarded_request_bytes,
+                ) {
+                    (Some(sent), Some(fwd)) if fwd > 0 => {
+                        ((read as f64) * (sent as f64) / (fwd as f64)).round() as u64
+                    }
+                    _ => read,
+                };
+                scaled.min(stock_cacheable)
             } else {
                 0
             };
@@ -2309,11 +2332,10 @@ impl UsageObserver {
                 rec.stock_footprint = stock_read + stock_write;
             }
 
-            // Priced in input-equivalents rather than dollars: Anthropic's
-            // multipliers (read 0.1x, 5-minute write 1.25x, 1-hour write 2.0x)
-            // are the same for every model, so the ratio of the two arms holds
-            // whatever was routed where, and no price table has to be right
-            // for the comparison to be.
+            // Priced in input-equivalents rather than dollars, with the
+            // subscription meter's weights (see `keys`): one set for every
+            // model, so the ratio of the two arms holds whatever was routed
+            // where.
             let (w5, w1h) = match usage.cache_write_ttl_split {
                 Some((five, hour)) => (five, hour),
                 None => (usage.cache_creation_input_tokens, 0),
@@ -2340,8 +2362,8 @@ impl UsageObserver {
                 None => 0.0,
             };
             ours_effective += ccr_hidden_effective;
-            // The stock client pays the tier its own markers bought: hour
-            // writes at 2.0x, five-minute writes at 1.25x.
+            // The stock client pays the tier its own markers bought, at that
+            // tier's write weight.
             let stock_effective = usage.input_tokens as f64
                 + stock_read as f64 * CACHE_READ_MULTIPLIER
                 + stock_write as f64 * stock_tier.write_multiplier();
@@ -2555,7 +2577,8 @@ impl UsageObserver {
     /// Ground-truth cost ledger, built from figures the proxy cannot
     /// influence — the `usage` block Anthropic returns, which is the bill.
     /// `billed_fresh_equivalents` restates that bill in one comparable unit,
-    /// weighting each class by its published price relative to fresh input.
+    /// weighting each class by its subscription-meter weight against fresh
+    /// input.
     /// Extracted from `complete_with_cache_capability` without behavior change.
     fn record_cost_ledger(
         inner: &mut Inner,
@@ -2576,8 +2599,8 @@ impl UsageObserver {
                 cache_creation_input_tokens,
             ));
         let billed_fresh_equivalents = billed_input as f64
-            + (billed_cache_read as f64 * 0.1)
-            + (billed_cache_write as f64 * 1.25);
+            + (billed_cache_read as f64 * CACHE_READ_MULTIPLIER)
+            + (billed_cache_write as f64 * CACHE_WRITE_5M_MULTIPLIER);
         // Hidden continuation rounds, split out so the ledger joins to
         // `ccr_continuation_usage` without recomputing the difference:
         // billed totals minus the client baseline `complete` was given.
@@ -3991,8 +4014,8 @@ mod tests {
         assert_eq!(snap.recent_cache_read_tokens, 10_000);
         assert_eq!(snap.recent_cache_write_tokens, 400);
         assert_eq!(snap.recent_forwarded_bytes, 2048);
-        // 100 + 10_000 * 0.1 + 400 * 1.25 = 1600 over 2 KB.
-        assert_eq!(snap.recent_cost_per_forwarded_kb, Some(800.0));
+        let billed = 100.0 + 10_000.0 * CACHE_READ_MULTIPLIER + 400.0 * CACHE_WRITE_5M_MULTIPLIER;
+        assert_eq!(snap.recent_cost_per_forwarded_kb, Some(billed / 2.0));
 
         // A turn that never reached the gate has no forwarded size, so it must
         // not price as free work.

@@ -12,6 +12,7 @@ pub mod conversation_savings;
 pub mod cost_tracker;
 pub mod ctx;
 pub mod memory;
+pub mod meter_weights;
 pub mod offline;
 #[cfg(feature = "ml")]
 mod onnx_cpu;

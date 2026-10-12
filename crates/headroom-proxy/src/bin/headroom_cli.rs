@@ -1093,7 +1093,7 @@ fn cmd_savings(as_json: bool, days: u32, reset: bool) -> Result<(), Box<dyn std:
     }
 
     println!();
-    println!("Compression reduction on saving turns");
+    println!("Compression reduction on saving turns (use avoided as % of a 5h Claude window)");
     println!("Scope: pre-compression input selected by transforms; not all provider input.");
     println!("{}", window_line("Today", &report.windows["today"]));
     println!(
@@ -1119,12 +1119,27 @@ fn cmd_savings(as_json: bool, days: u32, reset: bool) -> Result<(), Box<dyn std:
             "  % is of the selected input; 'of new input' is of tokens that newly entered context."
         );
     }
+    // Rows from before the meter fields carry dollars only; say where the
+    // window figures start instead of letting them read as a small saving.
+    if let Some(since) = report.windows["last_30_days"]
+        .get("meter_since")
+        .and_then(|v| v.as_str())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        && since.with_timezone(&chrono::Utc) > chrono::Utc::now() - chrono::Duration::days(span)
+    {
+        println!(
+            "  Window figures count turns since {}; older ledger rows have no meter figure.",
+            since.format("%Y-%m-%d %H:%M UTC")
+        );
+    }
 
     // The headline mixes two savings a token apart in value: a deferred tool
     // schema would have been a cache read, a compressed token new input. And
     // it is gross of the upstream calls the proxy made to earn it.
     println!();
-    println!("Where the dollars came from (net = compression + tool deferral - overhead):");
+    println!(
+        "Where the saved window came from, in % of a 5h window (net = compression + tool deferral - overhead):"
+    );
     println!(
         "{:<12} {:>26}  {:>26}  {:>26}  {:>11}",
         "", "compression", "tool deferral (est.)", "overhead", "net"
@@ -1144,20 +1159,43 @@ fn cmd_savings(as_json: bool, days: u32, reset: bool) -> Result<(), Box<dyn std:
     println!("  Tool deferral is our count of the schemas we asked the provider to defer;");
     println!("  no response confirms it. Overhead is CCR continuation rounds, turn-hook");
     println!("  re-drives, and the recaches those rounds caused.");
+    let week_net = report.windows["last_7_days"]
+        .get("net_meter_pct")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    println!(
+        "  Last 7 days net is about {:.1}% of the weekly limit. Spark and Codex turns are",
+        week_net * headroom_core::meter_weights::WEEK_PER_5H_WINDOW
+    );
+    println!("  off the Claude meter and count as tokens only.");
 
     if !report.by_model.is_empty() {
         println!();
-        println!("Estimated cost avoided per model:");
+        println!("5h window avoided per model:");
         for row in &report.by_model {
             let model = row
                 .get("model")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let cost = row.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            println!("  {:<24} {}", model, fmt_money(cost, 4));
+            let saved = row
+                .get("tokens_saved")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let cell = if headroom_core::meter_weights::rates(model).is_some() {
+                let meter = row.get("meter_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                fmt_meter(meter)
+            } else {
+                "off the Claude meter".to_string()
+            };
+            println!(
+                "  {:<32} {:>20}  {} tokens saved",
+                model,
+                cell,
+                commafy(saved)
+            );
         }
-        println!("  Gross, before overhead. Rows without cost_basis were priced at list input;");
-        println!("  newer proxy rows are priced from each turn's measured cache usage.");
+        println!("  Gross, before overhead; priced from each turn's measured cache usage with");
+        println!("  weights fitted to the subscription meter.");
     }
 
     if !report.by_client.is_empty() {
@@ -1198,8 +1236,8 @@ fn window_line(label: &str, window: &serde_json::Value) -> String {
         .get("tokens_before")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    let cost = window
-        .get("cost_usd")
+    let meter = window
+        .get("meter_pct")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
     let mut line = format!(
@@ -1209,7 +1247,7 @@ fn window_line(label: &str, window: &serde_json::Value) -> String {
         pct,
         commafy(saved),
         commafy(before),
-        fmt_money(cost, 4)
+        fmt_meter(meter)
     );
     // Second basis, only when the window has provider cache data: the share of
     // what newly entered context. The first counts a session's cached history
@@ -1226,24 +1264,34 @@ fn window_line(label: &str, window: &serde_json::Value) -> String {
 }
 
 /// One row of the split table: compression, tool deferral and overhead as
-/// tokens and dollars, then the net.
+/// tokens and 5h-window percent, then the net.
 fn split_line(label: &str, window: &serde_json::Value) -> String {
     let int = |key: &str| window.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
-    let money = |key: &str| window.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let pct = |key: &str| window.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
     let deferred = int("deferred_tokens");
-    let deferred_usd = money("deferred_cost_usd");
-    let cell = |tokens: i64, usd: f64| format!("{} {}", commafy(tokens), fmt_money(usd, 2));
+    let deferred_meter = pct("deferred_meter_pct");
+    let cell = |tokens: i64, meter: f64| format!("{} {}", commafy(tokens), fmt_meter(meter));
     format!(
         "{:<12} {:>26}  {:>26}  {:>26}  {:>11}",
         label,
         cell(
             int("tokens_saved") - deferred,
-            money("cost_usd") - deferred_usd
+            pct("meter_pct") - deferred_meter
         ),
-        cell(deferred, deferred_usd),
-        cell(int("overhead_tokens"), -money("overhead_usd")),
-        fmt_money(money("net_cost_usd"), 2)
+        cell(deferred, deferred_meter),
+        cell(int("overhead_tokens"), -pct("overhead_meter_pct")),
+        fmt_meter(pct("net_meter_pct"))
     )
+}
+
+/// A share of a 5h subscription window: percent below one window, a count of
+/// windows above.
+fn fmt_meter(pct: f64) -> String {
+    if pct.abs() >= 100.0 {
+        format!("{:.1} windows", pct / 100.0)
+    } else {
+        format!("{pct:.2}%")
+    }
 }
 
 fn has_new_input(window: &serde_json::Value) -> bool {
@@ -1276,26 +1324,6 @@ fn commafy(value: i64) -> String {
         format!("-{grouped}")
     } else {
         grouped
-    }
-}
-
-/// Format a monetary value as `$` + thousands-separated integer part + fixed
-/// decimals (mirrors Python `f"${value:,.Nf}"`).
-fn fmt_money(value: f64, places: usize) -> String {
-    let formatted = format!("{:.*}", places, value.abs());
-    let (int_part, frac_part) = match formatted.split_once('.') {
-        Some((i, f)) => (i.to_string(), Some(f.to_string())),
-        None => (formatted, None),
-    };
-    let grouped = group_thousands(&int_part);
-    let sign = if value.is_sign_negative() && value != 0.0 {
-        "-"
-    } else {
-        ""
-    };
-    match frac_part {
-        Some(f) => format!("{sign}${grouped}.{f}"),
-        None => format!("{sign}${grouped}"),
     }
 }
 
@@ -1334,14 +1362,6 @@ mod tests {
         assert_eq!(commafy(1_000), "1,000");
         assert_eq!(commafy(1_234_567), "1,234,567");
         assert_eq!(commafy(-12_345), "-12,345");
-    }
-
-    #[test]
-    fn fmt_money_matches_python_format() {
-        assert_eq!(fmt_money(0.0, 4), "$0.0000");
-        assert_eq!(fmt_money(1234.5, 4), "$1,234.5000");
-        assert_eq!(fmt_money(0.0018, 4), "$0.0018");
-        assert_eq!(fmt_money(1_000_000.0, 2), "$1,000,000.00");
     }
 
     #[test]
@@ -1432,12 +1452,14 @@ mod tests {
             "tokens_saved": 500,
             "tokens_before": 1000,
             "cost_usd": 0.0018,
+            "meter_pct": 0.42,
         });
         let line = window_line("Today", &w);
         assert!(line.starts_with("Today      ")); // label left-justified width 11
         assert!(line.contains(" 50.0%"));
         assert!(line.contains("saved 500 / 1,000 selected tokens"));
-        assert!(line.contains("$0.0018"));
+        assert!(line.contains("0.42%"));
+        assert!(!line.contains('$'));
         assert!(
             !line.contains("new input"),
             "no cache data, no second basis"

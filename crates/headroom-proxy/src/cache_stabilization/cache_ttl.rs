@@ -329,11 +329,13 @@ impl ClientTtl {
 }
 
 impl StockTtl {
-    /// Pricing multiplier for writes at this tier, in base-input units.
+    /// Subscription-meter weight for writes at this tier, in fresh-input
+    /// units (see `usage_observer_keys`).
     pub fn write_multiplier(self) -> f64 {
+        let m = headroom_core::meter_weights::OPUS;
         match self {
-            StockTtl::FiveMinutes => 1.25,
-            StockTtl::OneHour => 2.0,
+            StockTtl::FiveMinutes => m.cache_write_5m / m.input,
+            StockTtl::OneHour => m.cache_write_1h / m.input,
         }
     }
 

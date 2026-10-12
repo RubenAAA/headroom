@@ -60,12 +60,16 @@ pub(super) const SIBLING_COMPLETION_WINDOW: Duration = Duration::from_secs(60);
 pub(super) const RECENT_COMPLETION_CAPACITY: usize = 1024;
 pub(super) const CONVERSATION_CAPACITY: usize = 512;
 
-/// Anthropic's published multipliers against the base input rate. They are the
-/// same for every model on the price list, which is why the stock comparison
-/// can be run in input-equivalent tokens and never has to look up a price.
-pub(super) const CACHE_READ_MULTIPLIER: f64 = 0.1;
-pub(super) const CACHE_WRITE_5M_MULTIPLIER: f64 = 1.25;
-pub(super) const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
+/// What each cache class costs on the Claude subscription meter against fresh
+/// input (Opus fit, [`headroom_core::meter_weights`]): reads about 0.04x,
+/// 1-hour writes about 1.58x. The API price list says 0.1x and 2.0x, but no
+/// user of this proxy pays it. The 5-minute weight is unfitted and keeps the
+/// API's 5m:1h ratio. One set for every model keeps the stock comparison free
+/// of a per-model lookup; Sonnet's reads weigh a little less.
+const METER: headroom_core::meter_weights::MeterRates = headroom_core::meter_weights::OPUS;
+pub(super) const CACHE_READ_MULTIPLIER: f64 = METER.cache_read / METER.input;
+pub(super) const CACHE_WRITE_5M_MULTIPLIER: f64 = METER.cache_write_5m / METER.input;
+pub(super) const CACHE_WRITE_1H_MULTIPLIER: f64 = METER.cache_write_1h / METER.input;
 /// Rolling window for the fleet-wide hit-rate shown in the
 /// statusline (`/cache-health`).
 pub(super) const RECENT_SAMPLE_CAPACITY: usize = 100;

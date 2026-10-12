@@ -39,6 +39,16 @@ impl HiddenRoundUsage {
     }
 }
 
+/// Per-token rates [`RequestOutcome::apportion_removed`] prices with: dollars
+/// or subscription-meter percent.
+#[derive(Clone, Copy)]
+struct RemovedRates {
+    list: f64,
+    read: f64,
+    write_5m: f64,
+    write_1h: f64,
+}
+
 /// Immutable, value-equal snapshot of a completed request.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RequestOutcome {
@@ -317,8 +327,69 @@ impl RequestOutcome {
         let write_rate = pricing
             .cache_write_rate(long)
             .unwrap_or_else(|| pricing.input_rate(long));
-        let write_1h_rate = pricing.cache_write_1h_rate(long).unwrap_or(write_rate);
         let list_rate = pricing.input_rate(long);
+        self.apportion_removed(
+            tokens_saved,
+            read_first,
+            RemovedRates {
+                list: list_rate,
+                read: pricing.cache_read_rate(long).unwrap_or(list_rate),
+                write_5m: write_rate,
+                write_1h: pricing.cache_write_1h_rate(long).unwrap_or(write_rate),
+            },
+        )
+    }
+
+    /// The same counterfactuals as [`Self::compression_savings_cost_usd_for`]
+    /// and [`Self::tool_schema_savings_cost_usd_for`], priced in percent of a
+    /// 5h subscription window instead of dollars. `None` when the model does
+    /// not draw on the Claude subscription meter.
+    pub fn compression_savings_meter_pct_for(&self, tokens_saved: i64) -> Option<f64> {
+        self.meter_removed(tokens_saved, false)
+    }
+
+    pub fn tool_schema_savings_meter_pct_for(&self, tokens_saved: i64) -> Option<f64> {
+        self.meter_removed(tokens_saved, true)
+    }
+
+    /// [`Self::hidden_rounds_cost_usd`] in 5h-meter percent.
+    pub fn hidden_rounds_meter_pct(&self) -> Option<f64> {
+        let r = self.hidden_rounds;
+        let write_1h = if self.cache_write_1h_tokens > 0 {
+            r.cache_write_tokens
+        } else {
+            0
+        };
+        crate::meter_weights::meter_pct(
+            &self.model,
+            r.input_tokens,
+            r.output_tokens,
+            r.cache_read_tokens,
+            r.cache_write_tokens,
+            write_1h,
+        )
+    }
+
+    fn meter_removed(&self, tokens_saved: i64, read_first: bool) -> Option<f64> {
+        let m = crate::meter_weights::rates(&self.model)?;
+        Some(self.apportion_removed(
+            tokens_saved,
+            read_first,
+            RemovedRates {
+                list: m.input,
+                read: m.cache_read,
+                write_5m: m.cache_write_5m,
+                write_1h: m.cache_write_1h,
+            },
+        ))
+    }
+
+    /// Spreads removed tokens over this turn's cache mix, as described on
+    /// [`Self::compression_savings_cost_usd_for`], and prices each part.
+    fn apportion_removed(&self, tokens_saved: i64, read_first: bool, rates: RemovedRates) -> f64 {
+        if tokens_saved <= 0 {
+            return 0.0;
+        }
         // An inferred write duplicates `uncached`: drop it, keep the tokens.
         let (write_5m, write_1h) = if self.cache_inferred {
             (0.0, 0.0)
@@ -333,18 +404,18 @@ impl RequestOutcome {
         } else {
             0.0
         };
-        let read_cost = read * pricing.cache_read_rate(long).unwrap_or(list_rate);
+        let read_cost = read * rates.read;
         let tokens = tokens_saved.max(0) as f64 - read;
         let denom = write_5m + write_1h + uncached;
         if denom <= 0.0 {
-            return read_cost + tokens * list_rate;
+            return read_cost + tokens * rates.list;
         }
         let w5 = tokens * write_5m / denom;
         let w1 = tokens * write_1h / denom;
         // Subtract so the parts sum to `tokens` exactly, no float drift
         // accumulating over a long session.
         let unc = tokens - w5 - w1;
-        read_cost + w5 * write_rate + w1 * write_1h_rate + unc * list_rate
+        read_cost + w5 * rates.write_5m + w1 * rates.write_1h + unc * rates.list
     }
 
     /// Tokens the forwarded request grew by, if it ended up larger.

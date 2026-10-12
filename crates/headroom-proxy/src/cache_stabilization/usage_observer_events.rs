@@ -208,11 +208,10 @@ pub struct CacheHealthSnapshot {
     /// cache universe, different pricing), while the watchdog still scores
     /// them.
     ///
-    /// Both arms are counted in input-equivalent tokens: fresh input at 1x,
-    /// cache reads at 0.1x, 5-minute writes at 1.25x, 1-hour writes at 2.0x.
-    /// Those multipliers are identical across the price list, so mixed routing
-    /// cannot skew the ratio and no price table has to be current for it to
-    /// hold. Ours is billed; stock is modelled, and
+    /// Both arms are counted in input-equivalent tokens weighted by the
+    /// subscription meter: fresh input at 1x, cache reads about 0.04x,
+    /// 5-minute writes about 0.99x, 1-hour writes about 1.58x. One set for
+    /// every model, so mixed routing cannot skew the ratio. Ours is billed; stock is modelled, and
     /// `predicted_read_error_pct` says how much to trust the model.
     pub ours_effective_tokens: u64,
     pub stock_effective_tokens: u64,
@@ -271,8 +270,8 @@ pub struct CacheHealthSnapshot {
     pub recent_cache_read_tokens: u64,
     pub recent_cache_write_tokens: u64,
     pub recent_forwarded_bytes: u64,
-    /// Billed fresh-equivalents per KB actually put on the wire — reads at 0.1x,
-    /// writes at 1.25x. Tokens, not dollars. `null` until a turn with a known
+    /// Billed fresh-equivalents per KB actually put on the wire, with the
+    /// meter weights above (writes at the 5-minute weight). Tokens, not dollars. `null` until a turn with a known
     /// forwarded size lands.
     pub recent_cost_per_forwarded_kb: Option<f64>,
 }
@@ -594,8 +593,11 @@ mod prefix_on_recache_event_tests {
         assert!(line.contains("rounds_input_tokens=10"), "{line}");
         assert!(line.contains("rounds_cache_read_tokens=150000"), "{line}");
         assert!(line.contains("rounds_cache_write_tokens=5000"), "{line}");
-        // 20 + 350000*0.1 + 9000*1.25 = 46270
-        assert!(line.contains("billed_fresh_equivalents=46270"), "{line}");
+        let want = 20.0 + 350_000.0 * CACHE_READ_MULTIPLIER + 9_000.0 * CACHE_WRITE_5M_MULTIPLIER;
+        assert!(
+            line.contains(&format!("billed_fresh_equivalents={want}")),
+            "{line}"
+        );
     }
 
     /// The ledger exists because every other savings figure here is produced
@@ -619,8 +621,11 @@ mod prefix_on_recache_event_tests {
             .lines()
             .find(|l| l.contains("turn_cost_ledger"))
             .unwrap_or_else(|| panic!("no ledger event; captured:\n{joined}"));
-        // 10 + 200000*0.1 + 4000*1.25 = 25010
-        assert!(line.contains("billed_fresh_equivalents=25010"), "{line}");
+        let want = 10.0 + 200_000.0 * CACHE_READ_MULTIPLIER + 4_000.0 * CACHE_WRITE_5M_MULTIPLIER;
+        assert!(
+            line.contains(&format!("billed_fresh_equivalents={want}")),
+            "{line}"
+        );
         assert!(line.contains("client_request_bytes=100000"), "{line}");
         assert!(line.contains("compression_mode=all_messages"), "{line}");
         // The compressor's claim must appear nowhere in it.
@@ -1060,6 +1065,19 @@ mod stabilization_meter_tests {
 mod stock_baseline_tests {
     use super::*;
 
+    const W5: f64 = CACHE_WRITE_5M_MULTIPLIER;
+    const W1: f64 = CACHE_WRITE_1H_MULTIPLIER;
+
+    /// One turn in input-equivalents, summed in the observer's own order:
+    /// fresh, then reads, then `written` at the `write` weight.
+    fn eq(fresh: f64, read: f64, written: f64, write: f64) -> f64 {
+        fresh + read * CACHE_READ_MULTIPLIER + written * write
+    }
+
+    fn saving_pct(ours: f64, stock: f64) -> f64 {
+        (1.0 - ours / stock) * 100.0
+    }
+
     fn hot(head: &str) -> PrefixFingerprint {
         PrefixFingerprint {
             head: head.into(),
@@ -1113,14 +1131,16 @@ mod stock_baseline_tests {
         obs.complete("r2", 100, 10_000, 200, None);
 
         let s = obs.snapshot();
-        // Ours: 10_000 written cold (x1.25), then 100 fresh + 10_000 read
-        // (x0.1) + 200 written (x1.25).
-        assert_eq!(s.ours_effective_tokens, 13_850);
+        // Ours: 10_000 written cold, then 100 fresh + 10_000 read + 200
+        // written.
+        let ours = eq(0.0, 0.0, 10_000.0, W5) + eq(100.0, 10_000.0, 200.0, W5);
+        assert_eq!(s.ours_effective_tokens, ours.round() as u64);
         // Stock: 20_000 written cold, then 20_000 read back, 500 of growth
         // written, and the same 100-token fresh tail we were billed for.
-        assert_eq!(s.stock_effective_tokens, 27_725);
+        let stock = eq(0.0, 0.0, 20_000.0, W5) + eq(100.0, 20_000.0, 500.0, W5);
+        assert_eq!(s.stock_effective_tokens, stock.round() as u64);
         assert!(
-            (s.vs_stock_saving_pct - 50.05).abs() < 0.01,
+            (s.vs_stock_saving_pct - saving_pct(ours, stock)).abs() < 0.01,
             "{}",
             s.vs_stock_saving_pct
         );
@@ -1134,15 +1154,15 @@ mod stock_baseline_tests {
         for (ttl, want_stock) in [
             (
                 crate::cache_stabilization::cache_ttl::ClientTtl::AllFiveMinutes,
-                // Cold turn writes the whole 10_000 at 1.25x; the warm turn
-                // rebuilds everything past a lapsed prefix at the same rate.
-                12_500 + 200 + (12_500.0 * 1.25) as u64,
+                // Cold turn writes the whole 10_000 at the 5m weight; the
+                // warm turn rebuilds everything past a lapsed prefix the same.
+                eq(0.0, 0.0, 10_000.0, W5) + eq(200.0, 0.0, 12_500.0, W5),
             ),
             (
                 crate::cache_stabilization::cache_ttl::ClientTtl::AllOneHour,
                 // Same cold turn, then a 10_000 read plus the 2_500 of
-                // growth since, written at the hour rate.
-                12_500 + 200 + 1_000 + 2_500 * 2,
+                // growth since, written at the hour weight.
+                eq(0.0, 0.0, 10_000.0, W5) + eq(200.0, 10_000.0, 2_500.0, W1),
             ),
         ] {
             let obs = UsageObserver::new();
@@ -1162,10 +1182,15 @@ mod stock_baseline_tests {
             obs.note_client_cache_ttl("g1", ttl);
             obs.complete("g1", 200, 12_000, 500, None);
             let s = obs.snapshot();
-            assert_eq!(s.stock_effective_tokens, want_stock, "{ttl:?}");
-            // Ours never depends on the noted tier: 12_500 cold plus
-            // 200 fresh + 12_000 read + 500 written at 1.25x.
-            assert_eq!(s.ours_effective_tokens, 12_500 + 2025);
+            assert_eq!(
+                s.stock_effective_tokens,
+                want_stock.round() as u64,
+                "{ttl:?}"
+            );
+            // Ours never depends on the noted tier: the cold write plus
+            // 200 fresh + 12_000 read + 500 written at the 5m weight.
+            let ours = eq(0.0, 0.0, 10_000.0, W5) + eq(200.0, 12_000.0, 500.0, W5);
+            assert_eq!(s.ours_effective_tokens, ours.round() as u64);
         }
     }
 
@@ -1189,8 +1214,8 @@ mod stock_baseline_tests {
         obs.complete("r2", 100, 10_000, 200, None);
 
         let after_win = obs.snapshot();
-        assert!(after_win.vs_stock_saving_pct > 50.0);
-        assert!(after_win.vs_stock_saving_pct_recent.unwrap() > 50.0);
+        assert!(after_win.vs_stock_saving_pct > 49.0);
+        assert!(after_win.vs_stock_saving_pct_recent.unwrap() > 49.0);
 
         // Then a full window of cold/warm pairs we did not touch. Each pair
         // prices identically on both arms, so each contributes nothing either
@@ -1270,11 +1295,13 @@ mod stock_baseline_tests {
 
         let s = obs.snapshot();
         assert_eq!(s.stabilization_absorbed_total, 1, "sanity: we absorbed it");
-        assert_eq!(s.ours_effective_tokens, 13_850);
+        let ours = eq(0.0, 0.0, 10_000.0, W5) + eq(100.0, 10_000.0, 200.0, W5);
+        assert_eq!(s.ours_effective_tokens, ours.round() as u64);
         // Stock re-writes the whole 10_200 prefix rather than reading it.
-        assert_eq!(s.stock_effective_tokens, 12_500 + 12_850);
+        let stock = eq(0.0, 0.0, 10_000.0, W5) + eq(100.0, 0.0, 10_200.0, W5);
+        assert_eq!(s.stock_effective_tokens, stock.round() as u64);
         assert!(
-            (s.vs_stock_saving_pct - 45.37).abs() < 0.01,
+            (s.vs_stock_saving_pct - saving_pct(ours, stock)).abs() < 0.01,
             "{}",
             s.vs_stock_saving_pct
         );
@@ -1356,8 +1383,12 @@ mod stock_baseline_tests {
         let s = obs.snapshot();
         assert_eq!(s.stock_turns_compared, 4);
         // Neither arm was touched and the traffic is identical, so both arms
-        // price the same: 62_600 + 10_100 + 5_725 + 1_275.
-        assert_eq!(s.ours_effective_tokens, 79_700);
+        // price the same.
+        let ours = eq(100.0, 0.0, 50_000.0, W5)
+            + eq(100.0, 0.0, 8_000.0, W5)
+            + eq(100.0, 50_000.0, 500.0, W5)
+            + eq(100.0, 8_000.0, 300.0, W5);
+        assert_eq!(s.ours_effective_tokens, ours.round() as u64);
         assert_eq!(s.ours_effective_tokens, s.stock_effective_tokens);
         assert_eq!(s.vs_stock_saving_pct, 0.0);
         assert_eq!(s.vs_stock_saving_pct_recent, Some(0.0));
@@ -1379,15 +1410,52 @@ mod stock_baseline_tests {
         obs.complete("r1", 100, 10_000, 200, None);
 
         let s = obs.snapshot();
-        // Ours: 1_350 baseline + 5_000 + 500 + 625 hidden.
-        assert_eq!(s.ours_effective_tokens, 7_475);
-        // Stock: first turn, full 10_200 rebuild at the 5-minute rate.
-        assert_eq!(s.stock_effective_tokens, 12_850);
+        // Ours: the baseline plus 5_000 fresh, 5_000 read, 500 written hidden.
+        let ours = eq(100.0, 10_000.0, 200.0, W5) + eq(5_000.0, 5_000.0, 500.0, W5);
+        assert_eq!(s.ours_effective_tokens, ours.round() as u64);
+        // Stock: first turn, full 10_200 rebuild at the 5-minute weight.
+        let stock = eq(100.0, 0.0, 10_200.0, W5);
+        assert_eq!(s.stock_effective_tokens, stock.round() as u64);
         assert!(
-            (s.vs_stock_saving_pct - 41.83).abs() < 0.01,
+            (s.vs_stock_saving_pct - saving_pct(ours, stock)).abs() < 0.01,
             "{}",
             s.vs_stock_saving_pct
         );
+    }
+
+    /// After a proxy restart the observer has no footprint for a conversation
+    /// that carries on. The stock client never restarted, so it reads what we
+    /// read; a real one-message first turn still rebuilds.
+    #[test]
+    fn a_conversation_we_lost_to_a_restart_is_par_not_a_rebuild() {
+        for (msgs, want_par) in [(40, true), (1, false)] {
+            let obs = UsageObserver::new();
+            obs.begin_request("r1", "conv".into(), None, None, Some(hot("aaaa")));
+            obs.note_first_turn_context(
+                "r1",
+                crate::cache_stabilization::usage_observer::FirstTurnContext {
+                    msgs,
+                    ..Default::default()
+                },
+            );
+            obs.note_wire_bytes("r1", 1_000, 1_000, "off");
+            obs.complete("r1", 100, 50_000, 200, None);
+
+            let s = obs.snapshot();
+            assert_eq!(s.stock_turns_compared, 1, "msgs={msgs}");
+            let ours = eq(100.0, 50_000.0, 200.0, W5);
+            assert_eq!(s.ours_effective_tokens, ours.round() as u64);
+            let stock = if want_par {
+                ours
+            } else {
+                eq(100.0, 0.0, 50_200.0, W5)
+            };
+            assert_eq!(
+                s.stock_effective_tokens,
+                stock.round() as u64,
+                "msgs={msgs}"
+            );
+        }
     }
 
     /// Bytes we added scale the stock prompt down, symmetrically with how
@@ -1405,10 +1473,16 @@ mod stock_baseline_tests {
         obs.complete("r1", 100, 0, 10_000, None);
 
         let s = obs.snapshot();
-        // Ours: 100 fresh + 10_000 written at 1.25x.
-        assert_eq!(s.ours_effective_tokens, 12_600);
-        // Stock: 5_050 prompt, 100 fresh tail kept, 4_950 rebuilt at 1.25x.
-        assert_eq!(s.stock_effective_tokens, 6_288);
+        // Ours: 100 fresh + 10_000 written.
+        assert_eq!(
+            s.ours_effective_tokens,
+            eq(100.0, 0.0, 10_000.0, W5).round() as u64
+        );
+        // Stock: 5_050 prompt, 100 fresh tail kept, 4_950 rebuilt.
+        assert_eq!(
+            s.stock_effective_tokens,
+            eq(100.0, 0.0, 4_950.0, W5).round() as u64
+        );
         assert!(
             s.vs_stock_saving_pct < 0.0,
             "doubling the wire size with no cache benefit is a loss, not par: {}",
@@ -1465,7 +1539,7 @@ mod stock_baseline_tests {
         assert_eq!(s.stock_turns_compared, 2);
         assert_eq!(s.vs_stock_turns_recent, 2);
         // r3 reads the 10_000 footprint r1 filed, carried through r2: both
-        // arms price 100 + 1_000 + 250, so the comparison is par.
+        // arms price the same turn, so the comparison is par.
         assert_eq!(s.ours_effective_tokens, s.stock_effective_tokens);
         assert_eq!(s.vs_stock_saving_pct, 0.0);
     }
