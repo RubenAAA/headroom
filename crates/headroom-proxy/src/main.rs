@@ -354,24 +354,7 @@ async fn serve(
     }
 
     let savings_tracker = state.savings_tracker.clone();
-    // Savings observability: with the master compression switch on
-    // but the mode off, the dispatcher passes every body through and
-    // tokens_saved reads 0 on the dashboard with no hint why. Say so
-    // once at startup instead of letting the zero look like a bug.
-    if config.compression
-        && matches!(
-            config.compression_mode,
-            headroom_proxy::config::CompressionMode::Off
-        )
-    {
-        tracing::warn!(
-            event = "compression_mode_off",
-            "--compression is on but --compression-mode is `off`: bodies \
-             pass through unmodified and the dashboard's compression \
-             savings will read 0. Set --compression-mode live_zone to \
-             engage the dispatcher."
-        );
-    }
+    warn_if_compression_mode_off(config);
 
     // Savings ledger: background persistence while serving, plus a
     // best-effort final flush after the server drains (capture tasks
@@ -379,15 +362,7 @@ async fn serve(
     // shutdown may still miss it — see observability::capture docs).
     let stats_ledger = state.stats.clone();
     if config.stats {
-        // Pay the vendored price-table parse now, not on the first
-        // recorded request.
-        headroom_proxy::observability::pricing::warm();
-        tracing::info!(
-            event = "stats_enabled",
-            path = ?stats_ledger.path().map(|p| p.display().to_string()),
-            "native savings stats active (/stats, /dashboard)"
-        );
-        headroom_proxy::observability::ledger::spawn_flusher(stats_ledger.clone());
+        start_stats_flusher(&stats_ledger);
     }
 
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -413,6 +388,43 @@ async fn serve(
     // flusher task stops with the runtime; see above).
     stats_ledger.flush().await;
     result
+}
+
+/// Savings observability: with the master compression switch on
+/// but the mode off, the dispatcher passes every body through and
+/// tokens_saved reads 0 on the dashboard with no hint why. Say so
+/// once at startup instead of letting the zero look like a bug.
+fn warn_if_compression_mode_off(config: &Config) {
+    if config.compression
+        && matches!(
+            config.compression_mode,
+            headroom_proxy::config::CompressionMode::Off
+        )
+    {
+        tracing::warn!(
+            event = "compression_mode_off",
+            "--compression is on but --compression-mode is `off`: bodies \
+             pass through unmodified and the dashboard's compression \
+             savings will read 0. Set --compression-mode live_zone to \
+             engage the dispatcher."
+        );
+    }
+}
+
+/// Start the native savings stats for the TCP serve path: warm the price
+/// table, announce the ledger, and spawn its background flusher.
+fn start_stats_flusher(
+    stats_ledger: &std::sync::Arc<headroom_proxy::observability::ledger::Ledger>,
+) {
+    // Pay the vendored price-table parse now, not on the first
+    // recorded request.
+    headroom_proxy::observability::pricing::warm();
+    tracing::info!(
+        event = "stats_enabled",
+        path = ?stats_ledger.path().map(|p| p.display().to_string()),
+        "native savings stats active (/stats, /dashboard)"
+    );
+    headroom_proxy::observability::ledger::spawn_flusher(stats_ledger.clone());
 }
 
 /// Serve the app on a Unix domain socket instead of TCP. Request handling

@@ -582,25 +582,7 @@ impl Ledger {
             );
         }
         let (state, error) = match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<PersistedStats>(&bytes) {
-                Ok(mut s) => {
-                    s.sanitize();
-                    (s, None)
-                }
-                Err(e) => {
-                    let aside = path.with_extension(format!("corrupt-{}", epoch_secs()));
-                    let moved = std::fs::rename(&path, &aside).is_ok();
-                    tracing::error!(
-                        event = "stats_state_corrupt",
-                        path = %path.display(),
-                        preserved = moved,
-                        aside = %aside.display(),
-                        error = %e,
-                        "persisted stats failed to parse; starting fresh"
-                    );
-                    (PersistedStats::default(), Some(e.to_string()))
-                }
-            },
+            Ok(bytes) => Self::parse_state(&path, &bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (PersistedStats::default(), None),
             Err(e) => {
                 tracing::error!(
@@ -613,6 +595,30 @@ impl Ledger {
             }
         };
         Self::from_state(state, Some(path), error)
+    }
+
+    /// Parse the bytes read from `path`. A file that fails to parse is
+    /// moved aside so the next write cannot overwrite it.
+    fn parse_state(path: &Path, bytes: &[u8]) -> (PersistedStats, Option<String>) {
+        match serde_json::from_slice::<PersistedStats>(bytes) {
+            Ok(mut s) => {
+                s.sanitize();
+                (s, None)
+            }
+            Err(e) => {
+                let aside = path.with_extension(format!("corrupt-{}", epoch_secs()));
+                let moved = std::fs::rename(path, &aside).is_ok();
+                tracing::error!(
+                    event = "stats_state_corrupt",
+                    path = %path.display(),
+                    preserved = moved,
+                    aside = %aside.display(),
+                    error = %e,
+                    "persisted stats failed to parse; starting fresh"
+                );
+                (PersistedStats::default(), Some(e.to_string()))
+            }
+        }
     }
 
     fn from_state(persisted: PersistedStats, path: Option<PathBuf>, error: Option<String>) -> Self {
