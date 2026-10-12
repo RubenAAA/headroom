@@ -1,5 +1,12 @@
 # Idea: enable gated E4 prompt_cache_key and measure
 
+- **Status 2026-10-12:** no work left for our traffic. The Claude path
+  is Anthropic (no `prompt_cache_key`); the Codex subscription route keys
+  on the derived session id since 2026-09-29; the Spark/Zen route sets the
+  key to the OpenCode session (`resolve_zen_session`,
+  `routed/translation.rs`), one value for every session, so E4 self-skips
+  on `KeyPresent` and a shared key is already in place. The raw
+  `metadata.user_id` does not reach Zen. Open only for a PAYG canary.
 - **Status:** open (code shipped `573543fc`; gated OFF for our traffic).
   Re-confirmed 2026-09-21: `e4_skipped` fired 7,125 times over six days,
   all `reason=auth_mode` on `/v1/responses`. Gate-blocked, not

@@ -1,5 +1,14 @@
 # Idea: enable gated E3 auto-placement and measure
 
+- **Status 2026-10-12: rejected for our traffic** on an offline replay
+  (`scripts/e-pass-replay.py` over the four `~/headroom-capture-*` sets,
+  14,719 Claude Code bodies, 2026-08-14..09-25, 14,323 same-session turn
+  pairs). The user chose no live run on the subscription.
+  - 147 bodies (1%) carry no marker. All are one-message probes, 0-1
+    tools, mostly under 1 KB: below the minimum cacheable prefix, so a
+    marker buys nothing. Every real turn carries Claude Code's own markers
+    (E3 skips on `MarkerPresent`).
+  - **Reopen:** naive-client traffic without markers, sized first.
 - **Status:** open (code shipped `8672d5c3`; gated OFF for our traffic —
   `e3_skipped{reason: auth_mode}` baseline). Re-confirmed 2026-09-21 over
   six days: 31,008 of 31,008 requests skipped, all on `auth_mode`.
