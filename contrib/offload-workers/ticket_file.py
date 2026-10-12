@@ -526,6 +526,13 @@ def main():
         output, diagnostic = model.call(
             prompt, TIMEOUT, "OFFLOADED_TICKET_WORKER")
         if output is None:
+            # The agent can file and publish, then run out of time tidying
+            # up (2026-10-12: ANL-1963 published at 9 min, killed at the cap).
+            # Report what YouTrack holds, not just the timeout.
+            found = filed_since(cfg_bin, cfg_project, since_ms)
+            if found:
+                return adopt(found, "filed before the worker call ended (%s)"
+                             % (diagnostic or "call failed").splitlines()[0])
             return fail(outdir, session, diagnostic or "proxy model call failed")
         ticket_id = ""
         for line in reversed(output.strip().split("\n")):
