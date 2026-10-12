@@ -14,8 +14,8 @@
   message holding a `tool_result` no longer starts an exchange, so a stub
   cannot orphan the previous `tool_use` (`17cf0de1f`); a rewind to the same
   length drops the base instead of replaying a stale last message
-  (`e4177b637`). Still open from the review: `bases()` never evicts, and a
-  rebuild every 30 min re-scores without checking the history grew.
+  (`e4177b637`). Bases now go after two idle hours (16 at most), and a
+  rebuild waits until the history has grown by a quarter (`39d3d8248`).
 - **Idea:** when a session passes a token trigger, Jev judges which parts of
   the history the current task still needs. The proxy keeps those verbatim,
   swaps the rest for stubs the model can fetch back (`headroom_retrieve`), and
