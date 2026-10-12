@@ -10,7 +10,7 @@ nothing here is on the request path.
 
 | File | Installed as | What it does |
 | --- | --- | --- |
-| `claude-launcher` | `~/.local/bin/claude-launcher`, `cclaude` | Starts/reuses the proxy on the configured lane, sets `ANTHROPIC_BASE_URL`, execs `claude`. Handles several profiles and an optional local Qwen. |
+| `claude-launcher` | `~/.local/bin/claude-launcher`, `cclaude` | Starts/reuses the proxy on the configured lane, sets `ANTHROPIC_BASE_URL`, execs `claude`. Handles several profiles and an optional local Qwen. Started in a Headroom checkout or worktree, it points `CARGO_TARGET_DIR` at the main checkout's `target/` and runs the daily target GC. |
 | `opencode-launcher` | `~/.local/bin/opencode-launcher`, `oopencode`, `oopencode-work` | The `cclaude` equivalent for opencode: starts/reuses the proxy on the configured lane, injects a `headroom` provider via `OPENCODE_CONFIG_CONTENT`, execs `opencode`. `oopencode-work` adds `--context --auto`. |
 | `restart-headroom.sh` | `~/.local/bin/` | Restarts the proxy onto a freshly built binary and rolls back if it fails to come up. Detached, so killing the proxy does not kill the restart. |
 | `update-headroom.sh` | `~/.local/bin/` | Pulls the checkout, reinstalls in the last install's mode, restarts the proxy. Run after `git pull`, or instead of it. |

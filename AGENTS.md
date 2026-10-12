@@ -238,10 +238,16 @@ comment. `.git-blame-ignore-revs` lists the edition-2024 reformat; run
 `git config blame.ignoreRevsFile .git-blame-ignore-revs` once per clone.
 
 `target/` is garbage-collected by `make test` / `make build-proxy` /
-`make build-wheel` (at most once a day, never fails the build) once
-`cargo install cargo-sweep` has run — `install.sh` does that on fresh
-setups. `make gc-check` previews, `make gc` forces. See
-`scripts/cargo-gc.sh` for the policy.
+`make build-wheel`, the pre-push gate and `cclaude` (at most once a day,
+never fails the build) once `cargo install cargo-sweep` has run —
+`install.sh` does that on fresh setups. `make gc-check` previews,
+`make gc` forces. See `scripts/cargo-gc.sh` for the policy.
+
+One `target/` per machine. `cclaude` started in a checkout or worktree
+sets `CARGO_TARGET_DIR` to the main checkout's `target/`; agents keep it.
+Do not point builds at a new target dir, in a worktree or anywhere else:
+each one is 40-80 GB, and several filled the disk on 2026-10-12. A
+build waiting on cargo's lock is the cost, and it is cheaper.
 
 ## Rules
 

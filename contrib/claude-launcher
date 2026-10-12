@@ -366,10 +366,34 @@ update_notice() {
 }
 update_notice || true
 
+# ── cargo target housekeeping ─────────────────────────────────────────────
+# Agents build in worktrees and scratch dirs, each target/ 40-80 GB, and the
+# disk filled on 2026-10-12. A session started in a Headroom checkout shares
+# the main checkout's target/ (cargo locks it: parallel builds wait, they do
+# not collide). The GC keeps it under its size cap; before this only `make`
+# ran it, and agents call cargo directly. Gated to once a day inside.
+shared_target=""
+cargo_housekeeping() {
+    local repo="" common here
+    # shellcheck disable=SC1091
+    [ -r "$HOME/.headroom-paths.sh" ] &&
+        repo=$( (source "$HOME/.headroom-paths.sh" 2>/dev/null; printf '%s' "${HEADROOM_REPO:-}") )
+    [ -n "$repo" ] && [ -f "$repo/scripts/cargo-gc.sh" ] || return 0
+    common=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+    here=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || here=""
+    if [ "$here" = "$common" ] && [ -z "${CARGO_TARGET_DIR:-}" ]; then
+        shared_target="$repo/target"
+    fi
+    setsid nohup bash "$repo/scripts/cargo-gc.sh" --auto >/dev/null 2>&1 </dev/null &
+    disown
+}
+cargo_housekeeping || true
+
 # ── assemble env and exec claude ──────────────────────────────────────────
 env_vars=()
 [ -n "$CONFIG_DIR" ] && env_vars+=("CLAUDE_CONFIG_DIR=$CONFIG_DIR")
 [ "$use_context" -eq 1 ] && env_vars+=("ANTHROPIC_BASE_URL=$PROXY_URL")
+[ -n "$shared_target" ] && env_vars+=("CARGO_TARGET_DIR=$shared_target")
 # Routed model ids (muse-spark-*, claude-codex-*) are unknown to the CLI's
 # model table (zero hits for muse-spark in 2.1.289), so since the 2.1.28x
 # line the CLI enforces an assumed 200k window on them and Spark sessions

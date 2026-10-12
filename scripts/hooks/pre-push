@@ -113,4 +113,7 @@ if command -v cargo-deny >/dev/null; then
 else
     echo "── pre-push (local): cargo deny skipped (cargo install --locked cargo-deny)"
 fi
+# The gate builds every target; keep target/ under its cap (once a day,
+# never fails the push).
+bash scripts/cargo-gc.sh --auto || true
 echo "✅ pre-push (local): PASSED"
