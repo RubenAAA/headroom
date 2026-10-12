@@ -317,7 +317,7 @@ fn parse_gemini_request(body: &Bytes, headers: &HeaderMap) -> Result<GeminiReque
     let body_json: Value = serde_json::from_slice(body).map_err(|e| {
         error_response(
             StatusCode::BAD_GATEWAY,
-            format!("Invalid request body: {e}"),
+            super::invalid_request_body_message(&e),
             400,
         )
     })?;
@@ -476,7 +476,7 @@ pub async fn handle_gemini_action(
                     Err(e) => {
                         return error_response(
                             StatusCode::BAD_REQUEST,
-                            format!("Invalid request body: {e}"),
+                            super::invalid_request_body_message(&e),
                             400,
                         );
                     }

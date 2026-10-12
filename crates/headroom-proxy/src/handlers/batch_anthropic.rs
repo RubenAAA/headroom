@@ -154,7 +154,7 @@ pub async fn anthropic_batch_create(
             return anthropic_error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                format!("Invalid request body: {e}"),
+                super::invalid_request_body_message(&e),
             );
         }
     };

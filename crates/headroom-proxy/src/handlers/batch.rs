@@ -320,7 +320,7 @@ fn serialize_json_body(value: &Value) -> Result<Bytes, Response> {
     serde_json::to_vec(value).map(Bytes::from).map_err(|e| {
         error_response(
             StatusCode::BAD_REQUEST,
-            format!("Invalid request body: {e}"),
+            super::invalid_request_body_message(&e),
             "invalid_json",
         )
     })
@@ -357,7 +357,7 @@ pub async fn google_batch_create(
         Err(e) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                format!("Invalid request body: {e}"),
+                super::invalid_request_body_message(&e),
                 "invalid_json",
             );
         }
@@ -480,7 +480,7 @@ pub async fn google_batch_create(
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::BAD_GATEWAY,
-            format!("Failed to forward batch request: {e}"),
+            super::upstream_failure_message("Failed to forward batch request", &e),
             "upstream_error",
         ),
     }
@@ -502,7 +502,7 @@ pub async fn google_batch_passthrough(
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::BAD_GATEWAY,
-            format!("Failed to forward batch request: {e}"),
+            super::upstream_failure_message("Failed to forward batch request", &e),
             "upstream_error",
         ),
     }
@@ -521,7 +521,7 @@ pub async fn google_batch_results(
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::BAD_GATEWAY,
-            format!("Failed to forward batch results request: {e}"),
+            super::upstream_failure_message("Failed to forward batch results request", &e),
             "upstream_error",
         ),
     }
@@ -540,7 +540,7 @@ pub async fn openai_batch_create(
         Err(e) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                format!("Invalid request body: {e}"),
+                super::invalid_request_body_message(&e),
                 "invalid_json",
             );
         }
@@ -568,7 +568,7 @@ pub async fn openai_batch_create(
             Ok(resp) => resp,
             Err(e) => error_response(
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to forward batch request: {e}"),
+                super::upstream_failure_message("Failed to forward batch request", &e),
                 "upstream_error",
             ),
         };
@@ -589,7 +589,10 @@ pub async fn openai_batch_create(
         Err(e) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to download file {input_file_id}: {e}"),
+                super::upstream_failure_message(
+                    &format!("Failed to download file {input_file_id}"),
+                    &e,
+                ),
                 "file_download_failed",
             );
         }
@@ -606,7 +609,10 @@ pub async fn openai_batch_create(
         Err(e) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to read file {input_file_id}: {e}"),
+                super::upstream_failure_message(
+                    &format!("Failed to read file {input_file_id}"),
+                    &e,
+                ),
                 "file_download_failed",
             );
         }
@@ -653,7 +659,7 @@ pub async fn openai_batch_create(
         Err(e) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to upload compressed file: {e}"),
+                super::upstream_failure_message("Failed to upload compressed file", &e),
                 "upload_failed",
             );
         }
@@ -670,7 +676,7 @@ pub async fn openai_batch_create(
         Err(e) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to parse upload response: {e}"),
+                super::upstream_failure_message("Failed to parse upload response", &e),
                 "upload_failed",
             );
         }
@@ -743,7 +749,7 @@ pub async fn openai_batch_create(
         }
         Err(e) => error_response(
             StatusCode::BAD_GATEWAY,
-            format!("Failed to create batch: {e}"),
+            super::upstream_failure_message("Failed to create batch", &e),
             "upstream_error",
         ),
     }
@@ -757,7 +763,7 @@ pub async fn openai_batch_list(State(state): State<AppState>, headers: HeaderMap
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::BAD_GATEWAY,
-            format!("Failed to forward batch list request: {e}"),
+            super::upstream_failure_message("Failed to forward batch list request", &e),
             "upstream_error",
         ),
     }
@@ -775,7 +781,7 @@ pub async fn openai_batch_get(
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::BAD_GATEWAY,
-            format!("Failed to forward batch get request: {e}"),
+            super::upstream_failure_message("Failed to forward batch get request", &e),
             "upstream_error",
         ),
     }
@@ -793,7 +799,7 @@ pub async fn openai_batch_cancel(
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::BAD_GATEWAY,
-            format!("Failed to forward batch cancel request: {e}"),
+            super::upstream_failure_message("Failed to forward batch cancel request", &e),
             "upstream_error",
         ),
     }
