@@ -22,6 +22,23 @@ use sha2::{Digest, Sha256};
 /// difference counts as measured (upstream `53631adb`).
 pub const MEASURED_MIN_CLUSTERS: usize = 5;
 
+/// [`MEASURED_MIN_CLUSTERS`] decides whether a stratum is a sample at all.
+/// The gates below decide something stricter: whether the measurement has
+/// earned the headline slot away from the baseline estimate (upstream
+/// `2a12e035`). Conversations per arm a stratum needs to count toward the
+/// headline. The band is computed per request, so it reads one long
+/// conversation as many draws; only capped cluster ids are stored, so a
+/// cluster-robust band cannot be computed, and this floor stands in for it.
+/// Must stay at or below [`CLUSTER_CAP`].
+pub const MEASURED_SUPERSEDE_MIN_CLUSTERS: usize = 30;
+
+/// Share of the conversation-labelled treatment requests the measured strata
+/// must cover. Below it the holdout describes a corner of the traffic.
+pub const MEASURED_MIN_COVERAGE: f64 = 0.5;
+
+/// ...and the 95% band must be at least this tight, in percentage points.
+pub const MEASURED_MAX_CI_HALF_WIDTH_PCT: f64 = 10.0;
+
 /// Cluster tracking saturates here: the count is only compared against
 /// [`MEASURED_MIN_CLUSTERS`], and the ledger is rewritten every 25 requests.
 const CLUSTER_CAP: usize = 32;
@@ -448,6 +465,11 @@ impl SavingsLedger {
     /// single 2,500-request session as a precise measurement. Thin strata are
     /// excluded rather than down-weighted (upstream `53631adb`).
     pub fn estimate_from_holdout(&self) -> Option<SavingsEstimate> {
+        self.estimate_from_holdout_min(MEASURED_MIN_CLUSTERS)
+    }
+
+    /// [`Self::estimate_from_holdout`] with a stricter per-arm cluster floor.
+    fn estimate_from_holdout_min(&self, min_clusters: usize) -> Option<SavingsEstimate> {
         let mut total_saved = 0.0;
         let mut total_baseline = 0.0;
         let mut var = 0.0;
@@ -460,8 +482,7 @@ impl SavingsLedger {
             if c.qn == 0 || t.qn == 0 {
                 continue;
             }
-            if c.clusters.len() < MEASURED_MIN_CLUSTERS || t.clusters.len() < MEASURED_MIN_CLUSTERS
-            {
+            if c.clusters.len() < min_clusters || t.clusters.len() < min_clusters {
                 continue;
             }
             contributing += 1;
@@ -567,17 +588,38 @@ impl SavingsLedger {
         })
     }
 
-    /// Strongest available tier: measured > estimated > modelled.
+    /// Strongest believable tier: measured > estimated > modelled.
     ///
     /// `level` enables the modelled fallback; without it the behaviour is
     /// unchanged from before, which keeps every existing caller honest.
+    ///
+    /// Upstream `2a12e035`: a holdout arm fills slowly, and on the bare
+    /// cluster gate a handful of stale control conversations once reported a
+    /// -1439.9% reduction. The measured number displaces the baseline only
+    /// when every stratum it uses holds [`MEASURED_SUPERSEDE_MIN_CLUSTERS`]
+    /// conversations per arm, those strata cover [`MEASURED_MIN_COVERAGE`] of
+    /// the labelled treatment requests, and its band is within
+    /// [`MEASURED_MAX_CI_HALF_WIDTH_PCT`]. With no baseline, the bare-gate
+    /// measurement still reports, since it displaces nothing, but only while
+    /// it covers the traffic.
     pub fn best_estimate_with_level(&self, level: Option<i32>) -> SavingsEstimate {
-        if let Some(measured) = self.estimate_from_holdout() {
+        let labelled: i64 = self.treatment.values().map(|t| t.qn).sum();
+        let covers =
+            |m: &SavingsEstimate| m.n_requests as f64 >= MEASURED_MIN_COVERAGE * labelled as f64;
+        if let Some(measured) = self.estimate_from_holdout_min(MEASURED_SUPERSEDE_MIN_CLUSTERS)
+            && (measured.ci_high_pct - measured.ci_low_pct) / 2.0 <= MEASURED_MAX_CI_HALF_WIDTH_PCT
+            && covers(&measured)
+        {
             return measured;
         }
         let estimated = self.estimate_from_baseline();
         if estimated.n_requests > 0 {
             return estimated;
+        }
+        if let Some(measured) = self.estimate_from_holdout()
+            && covers(&measured)
+        {
+            return measured;
         }
         if let Some(level) = level
             && let Some(modelled) = self.estimate_from_model(level)
@@ -1115,6 +1157,61 @@ mod tests {
         let est = l.estimate_from_holdout().unwrap();
         assert_eq!(est.n_requests, 5);
         assert!((est.pct - 30.0).abs() < 1e-6);
+    }
+
+    /// Upstream 2a12e035: five conversations per arm pass the bare gate but
+    /// do not displace the baseline estimate.
+    #[test]
+    fn thin_holdout_does_not_displace_the_baseline() {
+        let mut l = SavingsLedger::default();
+        l.baseline.observe("k", 100);
+        l.baseline.observe("k", 100);
+        for i in 0..5 {
+            let conv = format!("c{i}");
+            l.record("control", "k", 2_000, Some(&conv));
+            l.record("treatment", "k", 70, Some(&conv));
+        }
+        assert!(l.estimate_from_holdout().is_some());
+        assert_eq!(l.best_estimate().kind, "estimated");
+    }
+
+    #[test]
+    fn thick_tight_covering_holdout_takes_the_headline() {
+        let mut l = SavingsLedger::default();
+        l.baseline.observe("k", 100);
+        for i in 0..30 {
+            let conv = format!("c{i}");
+            l.record("control", "k", 100, Some(&conv));
+            l.record("treatment", "k", 70, Some(&conv));
+        }
+        let best = l.best_estimate();
+        assert_eq!(best.kind, "measured");
+        assert!((best.pct - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn measurement_of_a_corner_of_the_traffic_is_no_headline() {
+        // No baseline. The measured stratum holds 5 of 105 labelled
+        // treatment requests; the rest sit in a stratum with no control.
+        let mut l = SavingsLedger::default();
+        for i in 0..5 {
+            let conv = format!("c{i}");
+            l.record("control", "a", 100, Some(&conv));
+            l.record("treatment", "a", 70, Some(&conv));
+        }
+        for i in 0..100 {
+            l.record("treatment", "b", 70, Some(&format!("b{i}")));
+        }
+        assert!(l.estimate_from_holdout().is_some());
+        assert_ne!(l.best_estimate().kind, "measured");
+        // Covering the traffic, the bare-gate measurement still reports.
+        let mut l = SavingsLedger::default();
+        for i in 0..5 {
+            let conv = format!("c{i}");
+            l.record("control", "a", 100, Some(&conv));
+            l.record("treatment", "a", 70, Some(&conv));
+        }
+        assert_eq!(l.best_estimate().kind, "measured");
     }
 
     #[test]
