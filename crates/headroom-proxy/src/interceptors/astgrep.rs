@@ -149,12 +149,41 @@ pub fn parse_ast_grep_output(output: &str) -> Vec<AstGrepMatch> {
     matches
 }
 
+/// Claude Code's Read token-cap banner: `[Truncated: PARTIAL view -- <path>:
+/// showing lines A-B of T total (...). Call Read with offset=N to see
+/// more.]`. Add a client here only once its exact banner is confirmed.
+static TRUNCATION_BANNER: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+    regex_lite::Regex::new(
+        r"(?i)\[\s*truncated\s*:\s*partial\s+view\b[^\[\]]*?showing\s+lines?\s+(?P<start>\d+)\s*[-–]\s*(?P<end>\d+)\s+of\s+(?P<total>\d+)\s+total[^\[\]]*\]",
+    )
+    .expect("truncation banner regex compiles")
+});
+
+/// `(end_line, total_lines)` when `source` carries a consistent truncation
+/// banner (upstream `1fb4cbae`). `end == total` means the whole file was
+/// shown, and an end past the lines actually present is not this read's.
+pub fn detect_truncation(source: &str) -> Option<(usize, usize)> {
+    let line_count = source.lines().count();
+    TRUNCATION_BANNER.captures_iter(source).find_map(|c| {
+        let start: usize = c["start"].parse().ok()?;
+        let end: usize = c["end"].parse().ok()?;
+        let total: usize = c["total"].parse().ok()?;
+        (start >= 1 && end >= start && end < total && end <= line_count).then_some((end, total))
+    })
+}
+
 /// Build a compact outline from ast-grep matches.
 ///
 /// Emits each definition's signature line + docstring (if next line is a
 /// string literal) + an elision marker. Matches are sorted by byte offset
-/// to track original file order.
-pub fn build_outline(matches: &[AstGrepMatch], source: &str) -> Option<String> {
+/// to track original file order. `truncation` is `(end_line, total_lines)`
+/// from [`detect_truncation`]; the header then says the input was a partial
+/// view instead of implying it is the whole file.
+pub fn build_outline(
+    matches: &[AstGrepMatch],
+    source: &str,
+    truncation: Option<(usize, usize)>,
+) -> Option<String> {
     let lines: Vec<&str> = source.lines().collect();
     let mut outline_chunks = Vec::new();
     let mut seen_starts = HashSet::new();
@@ -197,11 +226,19 @@ pub fn build_outline(matches: &[AstGrepMatch], source: &str) -> Option<String> {
         return None;
     }
 
-    let header = format!(
-        "[headroom: outlined by ast-grep — {} definition(s); \
-         bodies elided. Re-read the file with a line range to see a specific body.]\n",
-        seen_starts.len()
-    );
+    let header = match truncation {
+        Some((end_line, total_lines)) => format!(
+            "[headroom: outlined by ast-grep — {} definition(s) in the visible portion; \
+             input was truncated upstream (showing through line {end_line} of {total_lines} total). \
+             Bodies elided. Re-read remaining lines to see more.]\n",
+            seen_starts.len()
+        ),
+        None => format!(
+            "[headroom: outlined by ast-grep — {} definition(s); \
+             bodies elided. Re-read the file with a line range to see a specific body.]\n",
+            seen_starts.len()
+        ),
+    };
     Some(header + &outline_chunks.join(""))
 }
 
@@ -262,7 +299,7 @@ impl ToolResultInterceptor for AstGrepReadOutline {
     ) -> Option<String> {
         let lang = detect_lang_from_input(tool_input)?;
         let matches = run_ast_grep(lang, tool_output)?;
-        build_outline(&matches, tool_output)
+        build_outline(&matches, tool_output, detect_truncation(tool_output))
     }
 
     fn progressive_disclosure_key(
@@ -505,7 +542,7 @@ mod tests {
                 byte_start: 25,
             },
         ];
-        let outline = build_outline(&matches, source).unwrap();
+        let outline = build_outline(&matches, source, None).unwrap();
         assert!(outline.contains("2 definition(s)"));
         assert!(outline.contains("fn main()"));
         assert!(outline.contains("fn helper()"));
@@ -520,14 +557,14 @@ mod tests {
             line: 0,
             byte_start: 0,
         }];
-        let outline = build_outline(&matches, source).unwrap();
+        let outline = build_outline(&matches, source, None).unwrap();
         assert!(outline.contains("def foo():"));
         assert!(outline.contains("\"\"\"This is a docstring.\"\"\""));
     }
 
     #[test]
     fn build_outline_empty() {
-        let outline = build_outline(&[], "hello world");
+        let outline = build_outline(&[], "hello world", None);
         assert!(outline.is_none());
     }
 
@@ -544,9 +581,48 @@ mod tests {
                 byte_start: 0,
             },
         ];
-        let outline = build_outline(&matches, source);
+        let outline = build_outline(&matches, source, None);
         assert!(outline.is_some());
         assert!(outline.unwrap().contains("1 definition(s)"));
+    }
+
+    // --- truncation banner (upstream 1fb4cbae) ---
+
+    fn truncated_read(shown: usize, total: usize) -> String {
+        let mut src: String = (1..=shown).map(|i| format!("line {i}\n")).collect();
+        src.push_str(&format!(
+            "[Truncated: PARTIAL view -- /src/big.py: showing lines 1-{shown} of {total} total \
+             (token cap). Call Read with offset={} to see more.]\n",
+            shown + 1
+        ));
+        src
+    }
+
+    #[test]
+    fn detects_claude_code_truncation_banner() {
+        assert_eq!(detect_truncation(&truncated_read(40, 900)), Some((40, 900)));
+    }
+
+    #[test]
+    fn rejects_inconsistent_or_absent_banners() {
+        // Whole file shown: not truncated.
+        assert_eq!(detect_truncation(&truncated_read(40, 40)), None);
+        // Claims more lines than are present: not this read's banner.
+        let src = "only line\n[Truncated: PARTIAL view -- x: showing lines 1-500 of 900 total]";
+        assert_eq!(detect_truncation(src), None);
+        assert_eq!(detect_truncation("def f():\n    pass\n"), None);
+    }
+
+    #[test]
+    fn truncated_outline_header_says_partial_view() {
+        let src = truncated_read(40, 900);
+        let matches = vec![AstGrepMatch {
+            line: 0,
+            byte_start: 0,
+        }];
+        let outline = build_outline(&matches, &src, detect_truncation(&src)).unwrap();
+        assert!(outline.contains("in the visible portion"));
+        assert!(outline.contains("showing through line 40 of 900 total"));
     }
 
     // --- AstGrepReadOutline.matches ---
