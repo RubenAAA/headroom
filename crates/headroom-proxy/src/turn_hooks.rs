@@ -302,29 +302,48 @@ mod tests {
         }
 
         register_turn_hook(Arc::new(Undefer));
-        let body = bytes::Bytes::from(
-            serde_json::to_vec(&serde_json::json!({
-                "model": "claude-x",
-                "messages": [],
-                "tools": [
-                    {"name": "hot", "description": "a tool the hook brings back into context", "defer_loading": true},
-                    {"name": "cold", "description": "a tool that stays deferred for the turn", "defer_loading": true},
-                ],
-            }))
-            .unwrap(),
-        );
-        let (_, saved, lowered) = crate::proxy::apply_request_hooks(
-            body,
-            CompressibleEndpoint::AnthropicMessages,
-            "req-test",
-            Some(10_000),
+        let hot = serde_json::json!({"name": "hot", "description": "a tool the hook brings back into context", "defer_loading": true});
+        let cold = serde_json::json!({"name": "cold", "description": "a tool that stays deferred for the turn", "defer_loading": true});
+        let tok = headroom_core::tokenizer::get_tokenizer("claude-x");
+        let count = |v: Value| tok.count_text(&v.to_string()) as i64;
+        let run = |messages: Value, booked: i64| {
+            let body = bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "claude-x",
+                    "messages": messages,
+                    "tools": [hot.clone(), cold.clone()],
+                }))
+                .unwrap(),
+            );
+            crate::proxy::apply_request_hooks(
+                body,
+                CompressibleEndpoint::AnthropicMessages,
+                "req-test",
+                Some(booked),
+            )
+        };
+
+        let (_, saved, credit) = run(
+            serde_json::json!([]),
+            count(serde_json::json!([hot.clone(), cold.clone()])),
         );
         assert_eq!(saved, 0, "dropping the flag is not a saving");
-        let lowered = lowered.expect("the un-deferred tool's credit must go");
-        assert!(
-            lowered > 0 && lowered < 10_000,
-            "only the still-deferred tool stays credited, got {lowered}"
+        let credit = credit.expect("the un-deferred tool's credit must go");
+        assert_eq!(
+            credit.tokens,
+            count(serde_json::json!([cold.clone()])),
+            "only the still-deferred tool stays credited"
         );
+        assert_eq!(credit.tools, 1);
+
+        // `cold` was loaded earlier, so only `hot` was credited. Un-deferring
+        // `hot` must release all of it, however large `cold` is.
+        let loaded = serde_json::json!([{"role": "user", "content": [{
+            "type": "tool_search_tool_result",
+            "content": {"tool_references": [{"type": "tool_reference", "tool_name": "cold"}]},
+        }]}]);
+        let (_, _, credit) = run(loaded, count(serde_json::json!([hot.clone()])));
+        assert_eq!(credit.expect("released").tokens, 0);
         clear_turn_hooks();
     }
 

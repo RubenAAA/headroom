@@ -133,13 +133,13 @@ impl TurnHookUsage {
 /// `booked_deferred_tokens` is the `tool_search_deferred_tokens` credit
 /// already booked for this request. When a hook un-defers some of those
 /// tools, the third value is the lowered credit to book instead (upstream
-/// f8212a39); `None` leaves the tag alone.
+/// f8212a39); `None` leaves the tags alone.
 pub(crate) fn apply_request_hooks(
     body: bytes::Bytes,
     endpoint: compression::CompressibleEndpoint,
     request_id: &str,
     booked_deferred_tokens: Option<i64>,
-) -> (bytes::Bytes, i64, Option<i64>) {
+) -> (bytes::Bytes, i64, Option<DeferredCredit>) {
     let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return (body, 0, None),
@@ -155,6 +155,9 @@ pub(crate) fn apply_request_hooks(
         .cloned()
         .unwrap_or_default();
     let tools = parsed.get("tools").cloned();
+    // The booked credit leaves out tools the transcript already loaded, so
+    // the reconcile must too.
+    let loaded = crate::tool_search_deferral::loaded_tool_names(&messages);
 
     // A hook may shrink the tool array either by replacing it or in place,
     // so the baseline is counted BEFORE the hooks run and the saving off the
@@ -187,11 +190,19 @@ pub(crate) fn apply_request_hooks(
     let deferred_before = booked_deferred_tokens.map(|_| deferred_by_name(ctx.tools.as_ref()));
     crate::turn_hooks::run_request_hooks(&mut ctx);
     let tools_saved = tools_before.saturating_sub(count_tools(&ctx.tools));
-    let deferred_tokens =
+    let deferred_credit =
         booked_deferred_tokens
             .zip(deferred_before)
             .and_then(|(booked, before)| {
-                reconcile_deferred_tokens(booked, &before, ctx.tools.as_ref(), &count_value)
+                let after = deferred_by_name(ctx.tools.as_ref());
+                let credited = before
+                    .iter()
+                    .filter(|(name, _)| !loaded.contains(*name))
+                    .map(|(name, tool)| (name.clone(), tool.clone()))
+                    .collect();
+                let tokens = reconcile_deferred_tokens(booked, &credited, &after, &count_value)?;
+                let tools = before.keys().filter(|n| after.contains_key(*n)).count();
+                Some(DeferredCredit { tokens, tools })
             });
 
     // Write mutated messages/tools back onto the body.
@@ -210,12 +221,20 @@ pub(crate) fn apply_request_hooks(
         }
     }
     match serde_json::to_vec(&parsed) {
-        Ok(v) => (bytes::Bytes::from(v), tools_saved, deferred_tokens),
+        Ok(v) => (bytes::Bytes::from(v), tools_saved, deferred_credit),
         Err(e) => {
             tracing::warn!(event = "turn_hooks_reserialize_failed", request_id = %request_id, error = %e, "turn hooks: re-serialize failed; forwarding original body");
             (body, 0, None)
         }
     }
+}
+
+/// The deferral credit after a hook un-deferred some tools: the lowered
+/// `tool_search_deferred_tokens` and the count of tools still deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeferredCredit {
+    pub tokens: i64,
+    pub tools: usize,
 }
 
 /// The tool array with every `defer_loading` key dropped, as it is measured
@@ -259,10 +278,9 @@ fn deferred_by_name(
 fn reconcile_deferred_tokens(
     booked: i64,
     before: &std::collections::BTreeMap<String, serde_json::Value>,
-    tools_after: Option<&serde_json::Value>,
+    after: &std::collections::BTreeMap<String, serde_json::Value>,
     count: &dyn Fn(&serde_json::Value) -> i64,
 ) -> Option<i64> {
-    let after = deferred_by_name(tools_after);
     let one = |t: &serde_json::Value| count(&serde_json::Value::Array(vec![t.clone()]));
     let kept: Vec<serde_json::Value> = before
         .iter()

@@ -310,15 +310,33 @@ pub(crate) fn run_presend_seam(
             .as_ref()
             .and_then(|ctx| ctx.tags.get("tool_search_deferred_tokens"))
             .and_then(|v| v.parse::<i64>().ok());
-        let (bytes, tools_saved, deferred_tokens) =
+        let (bytes, tools_saved, deferred_credit) =
             apply_request_hooks(body_to_send, endpoint, request_id, booked_deferred);
-        if let Some(lowered) = deferred_tokens
+        if let Some(credit) = deferred_credit
             && let Some(ctx) = outcome_ctx.as_mut()
         {
             ctx.tags.insert(
                 "tool_search_deferred_tokens".to_string(),
-                lowered.to_string(),
+                credit.tokens.to_string(),
             );
+            ctx.tags.insert(
+                "tool_search_deferred_tools".to_string(),
+                credit.tools.to_string(),
+            );
+            // The core share is a slice of the total; the hook cannot say
+            // which tools were core, so cap it rather than let it pass the
+            // total it is divided by.
+            if let Some(core) = ctx
+                .tags
+                .get("core_deferred_tokens")
+                .and_then(|v| v.parse::<i64>().ok())
+                && core > credit.tokens
+            {
+                ctx.tags.insert(
+                    "core_deferred_tokens".to_string(),
+                    credit.tokens.to_string(),
+                );
+            }
         }
         if tools_saved > 0
             && let Some(ctx) = outcome_ctx.as_mut()
