@@ -1169,6 +1169,32 @@ fn cmd_savings(as_json: bool, days: u32, reset: bool) -> Result<(), Box<dyn std:
     );
     println!("  off the Claude meter and count as tokens only.");
 
+    // Turns from an API key pay the price list, so they show in dollars and
+    // stay out of the window figures above.
+    let api = |w: &str| &report.windows[w]["api"];
+    if api("last_30_days")
+        .get("calls")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        > 0
+    {
+        println!();
+        println!(
+            "Paid per token (API key), in dollars (net = compression + tool deferral - overhead):"
+        );
+        println!(
+            "{:<12} {:>26}  {:>26}  {:>26}  {:>11}",
+            "", "compression", "tool deferral (est.)", "overhead", "net"
+        );
+        println!("{}", api_split_line("Today", api("today")));
+        println!("{}", api_split_line("Last 7 days", api("last_7_days")));
+        println!(
+            "{}",
+            api_split_line(&format!("Last {span} days"), api("last_30_days"))
+        );
+        println!("  Priced from each turn's measured cache usage at the model's list price.");
+    }
+
     if !report.by_model.is_empty() {
         println!();
         println!("5h window avoided per model:");
@@ -1266,7 +1292,11 @@ fn window_line(label: &str, window: &serde_json::Value) -> String {
 /// One row of the split table: compression, tool deferral and overhead as
 /// tokens and 5h-window percent, then the net.
 fn split_line(label: &str, window: &serde_json::Value) -> String {
-    let int = |key: &str| window.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    // API-key rows have their own table in dollars; keep their tokens out.
+    let int = |key: &str| {
+        let get = |w: &serde_json::Value| w.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+        get(window) - get(&window["api"])
+    };
     let pct = |key: &str| window.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
     let deferred = int("deferred_tokens");
     let deferred_meter = pct("deferred_meter_pct");
@@ -1282,6 +1312,44 @@ fn split_line(label: &str, window: &serde_json::Value) -> String {
         cell(int("overhead_tokens"), -pct("overhead_meter_pct")),
         fmt_meter(pct("net_meter_pct"))
     )
+}
+
+/// [`split_line`] for the API-key rows of a window, in dollars.
+fn api_split_line(label: &str, api: &serde_json::Value) -> String {
+    let int = |key: &str| api.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    let money = |key: &str| api.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let deferred = int("deferred_tokens");
+    let deferred_usd = money("deferred_cost_usd");
+    let cell = |tokens: i64, usd: f64| format!("{} {}", commafy(tokens), fmt_money(usd, 2));
+    format!(
+        "{:<12} {:>26}  {:>26}  {:>26}  {:>11}",
+        label,
+        cell(
+            int("tokens_saved") - deferred,
+            money("cost_usd") - deferred_usd
+        ),
+        cell(deferred, deferred_usd),
+        cell(int("overhead_tokens"), -money("overhead_usd")),
+        fmt_money(money("net_cost_usd"), 2)
+    )
+}
+
+fn fmt_money(value: f64, places: usize) -> String {
+    let formatted = format!("{:.*}", places, value.abs());
+    let (int_part, frac_part) = match formatted.split_once('.') {
+        Some((i, f)) => (i.to_string(), Some(f.to_string())),
+        None => (formatted, None),
+    };
+    let grouped = group_thousands(&int_part);
+    let sign = if value.is_sign_negative() && value != 0.0 {
+        "-"
+    } else {
+        ""
+    };
+    match frac_part {
+        Some(f) => format!("{sign}${grouped}.{f}"),
+        None => format!("{sign}${grouped}"),
+    }
 }
 
 /// A share of a 5h subscription window: percent below one window, a count of
@@ -1362,6 +1430,14 @@ mod tests {
         assert_eq!(commafy(1_000), "1,000");
         assert_eq!(commafy(1_234_567), "1,234,567");
         assert_eq!(commafy(-12_345), "-12,345");
+    }
+
+    #[test]
+    fn fmt_money_matches_python_format() {
+        assert_eq!(fmt_money(0.0, 4), "$0.0000");
+        assert_eq!(fmt_money(1234.5, 4), "$1,234.5000");
+        assert_eq!(fmt_money(0.0018, 4), "$0.0018");
+        assert_eq!(fmt_money(1_000_000.0, 2), "$1,000,000.00");
     }
 
     #[test]

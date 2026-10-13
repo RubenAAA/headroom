@@ -97,6 +97,9 @@ pub struct RequestOutcome {
     /// `None` on paths that do not distinguish (frozen-prefix providers,
     /// whose `tokens_saved` is already novel-only).
     pub conversation_tokens_saved: Option<i64>,
+    /// The caller pays per token (an API key) rather than drawing on a
+    /// subscription; the savings ledger files the row under `billing: api`.
+    pub pays_per_token: bool,
 
     // ── Cache (provider-agnostic; unused fields stay 0) ──
     pub cache_read_tokens: i64,
@@ -475,6 +478,7 @@ pub struct StreamParams<'a> {
     /// re-sends and recompresses the whole transcript every turn.
     pub conversation_key: Option<String>,
     pub conversation_tokens_saved: Option<i64>,
+    pub pays_per_token: bool,
 }
 
 impl RequestOutcome {
@@ -576,6 +580,7 @@ impl RequestOutcome {
             tokens_saved: p.tokens_saved,
             conversation_key: p.conversation_key,
             conversation_tokens_saved: p.conversation_tokens_saved,
+            pays_per_token: p.pays_per_token,
             attempted_input_tokens: p.optimized_tokens + p.tokens_saved,
             cache_read_tokens: p.cache_read_tokens,
             cache_write_tokens: p.cache_write_tokens,

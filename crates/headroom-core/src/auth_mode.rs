@@ -238,6 +238,27 @@ fn classify_by_authorization(headers: &HeaderMap) -> Option<AuthMode> {
     None
 }
 
+/// Whether the caller pays per token (an API key, or AWS-signed Bedrock)
+/// rather than drawing on a subscription. Savings are reported in dollars
+/// for the first and in subscription-meter percent for the second.
+///
+/// Goes by the credential, not the User-Agent: Claude Code on an API key
+/// still says `claude-cli`, and [`classify`] files it under
+/// [`AuthMode::Subscription`] for compression policy.
+pub fn pays_per_token(headers: &HeaderMap) -> bool {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if auth.starts_with("AWS4-HMAC-SHA256") {
+        return true;
+    }
+    match classify_by_authorization(headers) {
+        Some(mode) => mode == AuthMode::Payg,
+        None => headers.contains_key("x-api-key") || headers.contains_key("x-goog-api-key"),
+    }
+}
+
 #[cfg(test)]
 mod inline_tests {
     //! Smoke tests inlined alongside the function so `cargo test -p
@@ -254,6 +275,22 @@ mod inline_tests {
         assert_eq!(AuthMode::Payg.as_str(), "payg");
         assert_eq!(AuthMode::OAuth.as_str(), "oauth");
         assert_eq!(AuthMode::Subscription.as_str(), "subscription");
+    }
+
+    #[test]
+    fn claude_code_on_an_api_key_pays_per_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("claude-cli/2.1.0"));
+        headers.insert("x-api-key", HeaderValue::from_static("sk-ant-api03-x"));
+        assert_eq!(classify(&headers), AuthMode::Subscription);
+        assert!(pays_per_token(&headers));
+
+        headers.remove("x-api-key");
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer sk-ant-oat01-x"),
+        );
+        assert!(!pays_per_token(&headers));
     }
 
     #[test]

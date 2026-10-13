@@ -53,7 +53,8 @@ hold_pct=$(printf '%s' "$health" | jq -r '
 
 # How the proxy compares with a plain Claude Code client on the same traffic --
 # no compression, no offload, no holds. Both arms in input-equivalent tokens,
-# ours billed and stock modelled from the wire bytes. Positive is cheaper than
+# weighted by the subscription meter (or the API price list for a caller on
+# an API key), ours billed and stock modelled from the wire bytes. Positive is cheaper than
 # stock; negative is a regression and is shown as such rather than clamped.
 # `predicted_read_error_pct` rides along as the model's own error bar; the
 # segment is dropped once that exceeds 25%, because past there the number is

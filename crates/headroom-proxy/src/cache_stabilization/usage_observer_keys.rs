@@ -60,16 +60,51 @@ pub(super) const SIBLING_COMPLETION_WINDOW: Duration = Duration::from_secs(60);
 pub(super) const RECENT_COMPLETION_CAPACITY: usize = 1024;
 pub(super) const CONVERSATION_CAPACITY: usize = 512;
 
-/// What each cache class costs on the Claude subscription meter against fresh
-/// input (Opus fit, [`headroom_core::meter_weights`]): reads about 0.04x,
-/// 1-hour writes about 1.58x. The API price list says 0.1x and 2.0x, but no
-/// user of this proxy pays it. The 5-minute weight is unfitted and keeps the
-/// API's 5m:1h ratio. One set for every model keeps the stock comparison free
-/// of a per-model lookup; Sonnet's reads weigh a little less.
+/// What each cache class costs against fresh input, for one way of paying.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheWeights {
+    pub read: f64,
+    pub write_5m: f64,
+    pub write_1h: f64,
+}
+
+impl CacheWeights {
+    pub const fn for_billing(pays_per_token: bool) -> Self {
+        if pays_per_token {
+            API_WEIGHTS
+        } else {
+            METER_WEIGHTS
+        }
+    }
+
+    /// The write weight for the tier a stock client's markers bought.
+    pub fn write(self, tier: crate::cache_stabilization::cache_ttl::StockTtl) -> f64 {
+        use crate::cache_stabilization::cache_ttl::StockTtl;
+        match tier {
+            StockTtl::FiveMinutes => self.write_5m,
+            StockTtl::OneHour => self.write_1h,
+        }
+    }
+}
+
+/// The Claude subscription meter (Opus fit, [`headroom_core::meter_weights`]):
+/// reads about 0.04x, 1-hour writes about 1.58x. The 5-minute weight is
+/// unfitted and keeps the API's 5m:1h ratio. One set for every model keeps
+/// the stock comparison free of a per-model lookup; Sonnet's reads weigh a
+/// little less.
 const METER: headroom_core::meter_weights::MeterRates = headroom_core::meter_weights::OPUS;
-pub(super) const CACHE_READ_MULTIPLIER: f64 = METER.cache_read / METER.input;
-pub(super) const CACHE_WRITE_5M_MULTIPLIER: f64 = METER.cache_write_5m / METER.input;
-pub(super) const CACHE_WRITE_1H_MULTIPLIER: f64 = METER.cache_write_1h / METER.input;
+pub const METER_WEIGHTS: CacheWeights = CacheWeights {
+    read: METER.cache_read / METER.input,
+    write_5m: METER.cache_write_5m / METER.input,
+    write_1h: METER.cache_write_1h / METER.input,
+};
+/// Anthropic's API price list, the same multipliers for every model, for
+/// callers on an API key.
+pub const API_WEIGHTS: CacheWeights = CacheWeights {
+    read: 0.1,
+    write_5m: 1.25,
+    write_1h: 2.0,
+};
 /// Rolling window for the fleet-wide hit-rate shown in the
 /// statusline (`/cache-health`).
 pub(super) const RECENT_SAMPLE_CAPACITY: usize = 100;

@@ -129,6 +129,14 @@ pub(crate) fn park_session_observations(
         request_id,
         cache_stabilization::cache_ttl::client_ttl_shape(parsed),
     );
+    // An API-key caller compares the arms at API prices, not the
+    // subscription meter's weights.
+    if headers_snapshot
+        .as_ref()
+        .is_some_and(headroom_core::auth_mode::pays_per_token)
+    {
+        state.usage_observer.note_pays_per_token(request_id);
+    }
     // The stock arm is priced in Anthropic input-equivalents.
     // Turns forwarded to another cache universe (OpenAI chat /
     // Responses) bill without a creation counter, TTL split, or

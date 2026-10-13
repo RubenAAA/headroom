@@ -94,11 +94,9 @@ use self::events::RecentHitRateSample;
 use self::fingerprint::PrefixFingerprint;
 use self::fingerprint::hex16;
 use self::first_turn::FirstTurnContext;
-use self::keys::CACHE_READ_MULTIPLIER;
-use self::keys::CACHE_WRITE_1H_MULTIPLIER;
-use self::keys::CACHE_WRITE_5M_MULTIPLIER;
 use self::keys::COMMIT_LATENCY_WINDOW;
 use self::keys::CONVERSATION_CAPACITY;
+use self::keys::CacheWeights;
 use self::keys::DigestSink;
 use self::keys::IDENTICAL_PROMPT_FANOUT_WINDOW;
 use self::keys::IN_FLIGHT_HORIZON;
@@ -106,6 +104,8 @@ use self::keys::PENDING_CAPACITY;
 use self::keys::RECENT_COMPLETION_CAPACITY;
 use self::keys::RECENT_SAMPLE_CAPACITY;
 use self::keys::SIBLING_COMPLETION_WINDOW;
+#[cfg(test)]
+use self::keys::{API_WEIGHTS, METER_WEIGHTS};
 use self::keys::{FIRST_TURN_OPENER_CAPACITY, TRANSLATED_FIRST_TURN_CAPACITY};
 use self::turn::MAX_STREAMS_PER_CONVERSATION;
 use self::turn::TurnClass;
@@ -308,6 +308,9 @@ struct PendingRequest {
     /// pricing it at 1.25x/2.0x with 5m/1h horizons would invent a write
     /// premium the provider never charged.
     stock_eligible: bool,
+    /// The caller pays per token (an API key), so this turn's arms are
+    /// weighted by the API price list instead of the subscription meter.
+    pays_per_token: bool,
 }
 
 struct Inner {
@@ -570,6 +573,7 @@ impl UsageObserver {
                 billed_output: None,
                 client_ttl: super::cache_ttl::ClientTtl::Unmarked,
                 stock_eligible: true,
+                pays_per_token: false,
             },
         );
         if let Some((evicted_id, _)) = evicted
@@ -787,6 +791,15 @@ impl UsageObserver {
         let mut inner = self.lock();
         if let Some(pending) = inner.pending.get_mut(request_id) {
             pending.client_ttl = ttl;
+        }
+    }
+
+    /// Mark a parked turn as paid per token, so its cache classes weigh by the
+    /// API price list rather than the subscription meter.
+    pub fn note_pays_per_token(&self, request_id: &str) {
+        let mut inner = self.lock();
+        if let Some(pending) = inner.pending.get_mut(request_id) {
+            pending.pays_per_token = true;
         }
     }
 
@@ -2333,17 +2346,18 @@ impl UsageObserver {
             }
 
             // Priced in input-equivalents rather than dollars, with the
-            // subscription meter's weights (see `keys`): one set for every
-            // model, so the ratio of the two arms holds whatever was routed
-            // where.
+            // subscription meter's weights, or the API price list for a caller
+            // on an API key (see `keys`): one set for every model, so the
+            // ratio of the two arms holds whatever was routed where.
+            let w = CacheWeights::for_billing(pending.pays_per_token);
             let (w5, w1h) = match usage.cache_write_ttl_split {
                 Some((five, hour)) => (five, hour),
                 None => (usage.cache_creation_input_tokens, 0),
             };
             let mut ours_effective = usage.input_tokens as f64
-                + usage.cache_read_input_tokens as f64 * CACHE_READ_MULTIPLIER
-                + w5 as f64 * CACHE_WRITE_5M_MULTIPLIER
-                + w1h as f64 * CACHE_WRITE_1H_MULTIPLIER;
+                + usage.cache_read_input_tokens as f64 * w.read
+                + w5 as f64 * w.write_5m
+                + w1h as f64 * w.write_1h;
             // Hidden continuation rounds were billed but are not in the client
             // baseline above, and the stock client never runs them — so the
             // stock arm must not include them, but ours must, or the
@@ -2354,10 +2368,9 @@ impl UsageObserver {
             let ccr_hidden_effective = match pending.billed_totals {
                 Some((billed_input, billed_read, billed_write)) => {
                     billed_input.saturating_sub(usage.input_tokens) as f64
-                        + billed_read.saturating_sub(usage.cache_read_input_tokens) as f64
-                            * CACHE_READ_MULTIPLIER
+                        + billed_read.saturating_sub(usage.cache_read_input_tokens) as f64 * w.read
                         + billed_write.saturating_sub(usage.cache_creation_input_tokens) as f64
-                            * CACHE_WRITE_5M_MULTIPLIER
+                            * w.write_5m
                 }
                 None => 0.0,
             };
@@ -2365,8 +2378,8 @@ impl UsageObserver {
             // The stock client pays the tier its own markers bought, at that
             // tier's write weight.
             let stock_effective = usage.input_tokens as f64
-                + stock_read as f64 * CACHE_READ_MULTIPLIER
-                + stock_write as f64 * stock_tier.write_multiplier();
+                + stock_read as f64 * w.read
+                + stock_write as f64 * w.write(stock_tier);
             inner.ours_effective_tokens += ours_effective;
             inner.stock_effective_tokens += stock_effective;
             inner.stock_turns_compared += 1;
@@ -2577,8 +2590,8 @@ impl UsageObserver {
     /// Ground-truth cost ledger, built from figures the proxy cannot
     /// influence — the `usage` block Anthropic returns, which is the bill.
     /// `billed_fresh_equivalents` restates that bill in one comparable unit,
-    /// weighting each class by its subscription-meter weight against fresh
-    /// input.
+    /// weighting each class against fresh input by the subscription meter,
+    /// or by the API price list for a caller on an API key.
     /// Extracted from `complete_with_cache_capability` without behavior change.
     fn record_cost_ledger(
         inner: &mut Inner,
@@ -2598,9 +2611,10 @@ impl UsageObserver {
                 cache_read_input_tokens,
                 cache_creation_input_tokens,
             ));
+        let w = CacheWeights::for_billing(pending.pays_per_token);
         let billed_fresh_equivalents = billed_input as f64
-            + (billed_cache_read as f64 * CACHE_READ_MULTIPLIER)
-            + (billed_cache_write as f64 * CACHE_WRITE_5M_MULTIPLIER);
+            + (billed_cache_read as f64 * w.read)
+            + (billed_cache_write as f64 * w.write_5m);
         // Hidden continuation rounds, split out so the ledger joins to
         // `ccr_continuation_usage` without recomputing the difference:
         // billed totals minus the client baseline `complete` was given.
@@ -4014,7 +4028,7 @@ mod tests {
         assert_eq!(snap.recent_cache_read_tokens, 10_000);
         assert_eq!(snap.recent_cache_write_tokens, 400);
         assert_eq!(snap.recent_forwarded_bytes, 2048);
-        let billed = 100.0 + 10_000.0 * CACHE_READ_MULTIPLIER + 400.0 * CACHE_WRITE_5M_MULTIPLIER;
+        let billed = 100.0 + 10_000.0 * METER_WEIGHTS.read + 400.0 * METER_WEIGHTS.write_5m;
         assert_eq!(snap.recent_cost_per_forwarded_kb, Some(billed / 2.0));
 
         // A turn that never reached the gate has no forwarded size, so it must

@@ -1317,6 +1317,7 @@ fn outcome_ctx_for_sizes(original_tokens: i64, tokens_saved: i64) -> OutcomeCont
         forwarded_tokens_estimate: 0,
         upstream_attempts: 1,
         conversation_key: None,
+        pays_per_token: false,
     }
 }
 

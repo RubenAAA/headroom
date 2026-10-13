@@ -210,8 +210,9 @@ pub struct CacheHealthSnapshot {
     ///
     /// Both arms are counted in input-equivalent tokens weighted by the
     /// subscription meter: fresh input at 1x, cache reads about 0.04x,
-    /// 5-minute writes about 0.99x, 1-hour writes about 1.58x. One set for
-    /// every model, so mixed routing cannot skew the ratio. Ours is billed; stock is modelled, and
+    /// 5-minute writes about 0.99x, 1-hour writes about 1.58x. A turn from an
+    /// API key weighs by the API price list instead: 0.1x, 1.25x, 2.0x. One
+    /// set for every model, so mixed routing cannot skew the ratio. Ours is billed; stock is modelled, and
     /// `predicted_read_error_pct` says how much to trust the model.
     pub ours_effective_tokens: u64,
     pub stock_effective_tokens: u64,
@@ -593,7 +594,7 @@ mod prefix_on_recache_event_tests {
         assert!(line.contains("rounds_input_tokens=10"), "{line}");
         assert!(line.contains("rounds_cache_read_tokens=150000"), "{line}");
         assert!(line.contains("rounds_cache_write_tokens=5000"), "{line}");
-        let want = 20.0 + 350_000.0 * CACHE_READ_MULTIPLIER + 9_000.0 * CACHE_WRITE_5M_MULTIPLIER;
+        let want = 20.0 + 350_000.0 * METER_WEIGHTS.read + 9_000.0 * METER_WEIGHTS.write_5m;
         assert!(
             line.contains(&format!("billed_fresh_equivalents={want}")),
             "{line}"
@@ -621,7 +622,7 @@ mod prefix_on_recache_event_tests {
             .lines()
             .find(|l| l.contains("turn_cost_ledger"))
             .unwrap_or_else(|| panic!("no ledger event; captured:\n{joined}"));
-        let want = 10.0 + 200_000.0 * CACHE_READ_MULTIPLIER + 4_000.0 * CACHE_WRITE_5M_MULTIPLIER;
+        let want = 10.0 + 200_000.0 * METER_WEIGHTS.read + 4_000.0 * METER_WEIGHTS.write_5m;
         assert!(
             line.contains(&format!("billed_fresh_equivalents={want}")),
             "{line}"
@@ -1065,13 +1066,13 @@ mod stabilization_meter_tests {
 mod stock_baseline_tests {
     use super::*;
 
-    const W5: f64 = CACHE_WRITE_5M_MULTIPLIER;
-    const W1: f64 = CACHE_WRITE_1H_MULTIPLIER;
+    const W5: f64 = METER_WEIGHTS.write_5m;
+    const W1: f64 = METER_WEIGHTS.write_1h;
 
     /// One turn in input-equivalents, summed in the observer's own order:
     /// fresh, then reads, then `written` at the `write` weight.
     fn eq(fresh: f64, read: f64, written: f64, write: f64) -> f64 {
-        fresh + read * CACHE_READ_MULTIPLIER + written * write
+        fresh + read * METER_WEIGHTS.read + written * write
     }
 
     fn saving_pct(ours: f64, stock: f64) -> f64 {
@@ -1144,6 +1145,30 @@ mod stock_baseline_tests {
             "{}",
             s.vs_stock_saving_pct
         );
+    }
+
+    /// The same shrunk body from a caller on an API key prices at the API
+    /// list: reads 0.1x, five-minute writes 1.25x.
+    #[test]
+    fn an_api_key_caller_prices_both_arms_at_api_rates() {
+        let obs = UsageObserver::new();
+
+        for (id, read, write) in [("r1", 0, 10_000), ("r2", 10_000, 200)] {
+            obs.begin_request(id, "conv".into(), None, None, Some(hot("aaaa")));
+            obs.note_pays_per_token(id);
+            obs.note_wire_bytes(id, 2_000, 1_000, "on");
+            let fresh = if read == 0 { 0 } else { 100 };
+            obs.complete(id, fresh, read, write, None);
+        }
+
+        let s = obs.snapshot();
+        assert_eq!(API_WEIGHTS.read, 0.1);
+        // Ours: 10_000 written cold (x1.25), then 100 fresh + 10_000 read
+        // (x0.1) + 200 written (x1.25).
+        assert_eq!(s.ours_effective_tokens, 13_850);
+        // Stock: 20_000 written cold, then 100 fresh + 20_000 read + 500
+        // written.
+        assert_eq!(s.stock_effective_tokens, 27_725);
     }
 
     /// A 30-minute gap ends a five-minute prefix but not an hour one. Same

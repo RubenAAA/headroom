@@ -264,6 +264,7 @@ impl headroom_core::request_outcome::OutcomeSink for ProxyOutcomeSink {
             meter_pct,
             deferred_meter_pct: tool_schema_meter.unwrap_or(0.0),
             overhead_meter_pct: outcome.hidden_rounds_meter_pct().unwrap_or(0.0),
+            pays_per_token: outcome.pays_per_token,
         };
         let pricing = headroom_core::pricing::lookup(&model);
         let fresh_rate = pricing
@@ -592,6 +593,9 @@ pub(super) struct OutcomeContext {
     /// shape); `None` keeps ordinary per-request accounting, which is
     /// already novel-only on frozen-prefix paths.
     pub(super) conversation_key: Option<String>,
+    /// The caller pays per token (an API key); see
+    /// [`headroom_core::auth_mode::pays_per_token`].
+    pub(super) pays_per_token: bool,
 }
 
 /// Book this request's wire bytes against the usage the provider reported for
@@ -810,6 +814,7 @@ pub(super) fn emit_openai_stream_outcome(
         output_tokens: output_tok,
         tokens_saved: ctx.tokens_saved,
         conversation_key: ctx.conversation_key.clone(),
+        pays_per_token: ctx.pays_per_token,
         conversation_tokens_saved: Some(ctx.tokens_saved),
         attempted_input_tokens: ctx.attempted(input_tok),
         cache_read_tokens: cached_tok,

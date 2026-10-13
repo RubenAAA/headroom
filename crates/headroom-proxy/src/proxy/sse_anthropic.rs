@@ -567,6 +567,7 @@ pub(super) fn emit_anthropic_outcome(close: &AnthropicClose<'_>) {
             output_tokens: close.state.usage.output_tokens as i64 + close.ccr_rounds.output_tokens,
             tokens_saved: ctx.tokens_saved,
             conversation_key: ctx.conversation_key.clone(),
+            pays_per_token: ctx.pays_per_token,
             conversation_tokens_saved: Some(ctx.tokens_saved),
             attempted_input_tokens: ctx.attempted(attempted_input),
             cache_read_tokens: close.state.usage.cache_read_input_tokens as i64

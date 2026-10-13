@@ -394,6 +394,7 @@ pub(crate) fn emit_buffered_outcome(
             output_tokens: output_tok,
             tokens_saved: ctx.tokens_saved,
             conversation_key: ctx.conversation_key.clone(),
+            pays_per_token: ctx.pays_per_token,
             conversation_tokens_saved: Some(ctx.tokens_saved),
             attempted_input_tokens: ctx.attempted(attempted_input),
             cache_read_tokens: cache_read,
@@ -940,6 +941,9 @@ pub(crate) fn build_outcome_context(
                         .and_then(|v| v.to_str().ok())
                 }),
             ),
+            pays_per_token: headers_snapshot
+                .as_ref()
+                .is_some_and(headroom_core::auth_mode::pays_per_token),
         }
     }
 }

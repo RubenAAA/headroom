@@ -212,6 +212,10 @@ pub struct SavingsEvent<'a> {
     /// overhead, as for `deferred_cost_usd` and `overhead_usd`.
     pub deferred_meter_pct: f64,
     pub overhead_meter_pct: f64,
+    /// The caller pays per token (an API key). Written as `billing: "api"`
+    /// so the report can show such rows in dollars; rows without the field
+    /// draw on a subscription.
+    pub pays_per_token: bool,
 }
 
 /// Record a savings event from a completed request, given the count that was
@@ -256,6 +260,7 @@ pub struct SavingsSplit {
     pub meter_pct: Option<f64>,
     pub deferred_meter_pct: f64,
     pub overhead_meter_pct: f64,
+    pub pays_per_token: bool,
 }
 
 /// As [`record_from_forwarded`], with a request-scoped price derived from the
@@ -293,6 +298,7 @@ pub fn record_from_forwarded_with_cost(
         meter_pct: split.meter_pct,
         deferred_meter_pct: split.deferred_meter_pct,
         overhead_meter_pct: split.overhead_meter_pct,
+        pays_per_token: split.pays_per_token,
     })
 }
 
@@ -344,6 +350,9 @@ pub fn record_savings_event(event: SavingsEvent) -> bool {
     obj.insert("client".into(), json!(label(event.client)));
     obj.insert("source".into(), json!(event.source.unwrap_or(UNKNOWN)));
     obj.insert("pid".into(), json!(std::process::id()));
+    if event.pays_per_token {
+        obj.insert("billing".into(), json!("api"));
+    }
     let deferred = event.deferred_tokens.clamp(0, saved);
     if let Some(new_input) = event.new_input_tokens {
         obj.insert("new_input".into(), json!(new_input.max(0)));
@@ -405,7 +414,14 @@ fn write_locked_line(target: &Path, event: &Value) -> std::io::Result<()> {
     let line = format!("{}\n", serde_json::to_string(event)?);
     let mut handle = OpenOptions::new().create(true).append(true).open(target)?;
     flock(handle.as_fd(), FlockOperation::LockExclusive)?;
+    // A failed write (the disk filled on 2026-10-12) leaves its bytes in
+    // the file, and the next event joins them on one unreadable line. Cut
+    // back to where this write started while the lock is still held.
+    let start = handle.metadata().map(|m| m.len());
     let write_res = handle.write_all(line.as_bytes());
+    if let (Err(_), Ok(start)) = (&write_res, start) {
+        let _ = handle.set_len(start);
+    }
     let _ = flock(handle.as_fd(), FlockOperation::Unlock);
     write_res
 }
@@ -474,6 +490,9 @@ struct Row {
     meter: Option<(DateTime<Utc>, f64)>,
     deferred_meter: f64,
     overhead_meter: f64,
+    /// Written from an API key (`billing: "api"`): counted in dollars, off
+    /// the subscription meter.
+    api: bool,
 }
 
 impl Row {
@@ -500,7 +519,47 @@ impl Row {
             deferred_cost: coerce_f64(obj.get("deferred_cost_usd")).clamp(0.0, cost),
             overhead_tokens: coerce_i64(obj.get("overhead_tokens")).max(0),
             overhead_usd: coerce_f64(obj.get("overhead_usd")).max(0.0),
+            api: obj.get("billing").and_then(Value::as_str) == Some("api"),
         }
+    }
+}
+
+/// The API-key rows of a [`Bucket`], in dollars.
+#[derive(Default, Clone)]
+struct ApiBucket {
+    calls: i64,
+    tokens_saved: i64,
+    deferred_tokens: i64,
+    overhead_tokens: i64,
+    cost_usd: f64,
+    deferred_cost_usd: f64,
+    overhead_usd: f64,
+}
+
+impl ApiBucket {
+    fn add(&mut self, row: &Row) {
+        self.overhead_tokens += row.overhead_tokens;
+        self.overhead_usd += row.overhead_usd;
+        if row.saved > 0 {
+            self.calls += 1;
+            self.tokens_saved += row.saved;
+            self.deferred_tokens += row.deferred;
+            self.cost_usd += row.cost;
+            self.deferred_cost_usd += row.deferred_cost;
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        json!({
+            "calls": self.calls,
+            "tokens_saved": self.tokens_saved,
+            "deferred_tokens": self.deferred_tokens,
+            "overhead_tokens": self.overhead_tokens,
+            "cost_usd": round_half_even(self.cost_usd, 6),
+            "deferred_cost_usd": round_half_even(self.deferred_cost_usd, 6),
+            "overhead_usd": round_half_even(self.overhead_usd, 6),
+            "net_cost_usd": round_half_even(self.cost_usd - self.overhead_usd, 6),
+        })
     }
 }
 
@@ -520,13 +579,17 @@ struct Bucket {
     deferred_meter_pct: f64,
     overhead_meter_pct: f64,
     meter_since: Option<DateTime<Utc>>,
+    api: ApiBucket,
 }
 
 impl Bucket {
     fn add(&mut self, row: &Row) {
         self.overhead_tokens += row.overhead_tokens;
         self.overhead_usd += row.overhead_usd;
-        if let Some((ts, meter)) = row.meter {
+        if row.api {
+            self.api.add(row);
+        }
+        if let Some((ts, meter)) = row.meter.filter(|_| !row.api) {
             self.meter_since = Some(self.meter_since.map_or(ts, |s| s.min(ts)));
             self.overhead_meter_pct += row.overhead_meter;
             if row.saved > 0 {
@@ -602,6 +665,7 @@ impl Bucket {
             "meter_since": self
                 .meter_since
                 .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            "api": self.api.to_value(),
         })
     }
 }
@@ -1069,6 +1133,36 @@ mod tests {
             parse_timestamp(since).unwrap() > now - Duration::hours(2),
             "{since}"
         );
+    }
+
+    #[test]
+    fn api_key_rows_count_in_dollars_and_stay_off_the_meter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("savings_events.jsonl");
+        let now = Utc::now();
+        assert!(record_savings_event(SavingsEvent {
+            meter_pct: Some(0.30),
+            timestamp: Some(now - Duration::hours(1)),
+            ..ev(1_000, 500, "c", &path)
+        }));
+        assert!(record_savings_event(SavingsEvent {
+            cost_usd: Some(0.40),
+            meter_pct: Some(0.20),
+            overhead_tokens: 10,
+            overhead_usd: 0.05,
+            pays_per_token: true,
+            timestamp: Some(now - Duration::hours(1)),
+            ..ev(1_000, 200, "c", &path)
+        }));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"billing\":\"api\"").count(), 1, "{text}");
+
+        let life = &aggregate_savings(Some(&path), Some(now), DEFAULT_RETENTION_DAYS).lifetime;
+        assert!((life["meter_pct"].as_f64().unwrap() - 0.30).abs() < 1e-9);
+        let api = &life["api"];
+        assert_eq!(api["calls"], json!(1));
+        assert_eq!(api["tokens_saved"], json!(800));
+        assert!((api["net_cost_usd"].as_f64().unwrap() - 0.35).abs() < 1e-9);
     }
 
     #[test]

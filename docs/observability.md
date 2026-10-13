@@ -378,7 +378,8 @@ only), `recache_events_total`, `recache_wasted_tokens_total`,
 `stabilization_absorbed_total` + tokens + `stabilization_absorb_pct`),
 vs-stock comparison (`ours/stock_effective_tokens`,
 `stock_turns_compared`, `vs_stock_saving_pct[_recent]`,
-`predicted_read_error_pct`), recent-window cost
+`predicted_read_error_pct`; cache classes weighted by the subscription
+meter, or by the API price list on turns from an API key), recent-window cost
 (`recent_cache_read/write_tokens`, `recent_forwarded_bytes`,
 `recent_cost_per_forwarded_kb`), and `last_event` (the most recent
 `RecacheEvent`:

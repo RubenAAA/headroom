@@ -329,16 +329,6 @@ impl ClientTtl {
 }
 
 impl StockTtl {
-    /// Subscription-meter weight for writes at this tier, in fresh-input
-    /// units (see `usage_observer_keys`).
-    pub fn write_multiplier(self) -> f64 {
-        let m = headroom_core::meter_weights::OPUS;
-        match self {
-            StockTtl::FiveMinutes => m.cache_write_5m / m.input,
-            StockTtl::OneHour => m.cache_write_1h / m.input,
-        }
-    }
-
     /// How long an entry at this tier lives without a refreshing read.
     pub fn horizon(self) -> Duration {
         match self {
