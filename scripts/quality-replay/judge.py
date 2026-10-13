@@ -16,6 +16,8 @@ Two candidate next turns for the assistant follow, each written with the full
 conversation above. Judge which is the better next step for the user's task:
 correct beliefs about what the conversation established, sensible action,
 no repeated or wasted work. Equivalent means neither is clearly better.
+headroom_retrieve is a real tool: it fetches tool output that was cut short,
+so calling it costs a round, not a wrong step.
 
 <candidate_1>
 {one}
