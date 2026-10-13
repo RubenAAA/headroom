@@ -14,6 +14,14 @@
   flip both. `--force-kompress-all` is still a no-op in Rust; the forced arm
   needs it built first (route every non-excluded type to Kompress in
   `live_zone/dispatch.rs`, size gate kept).
+- **2026-10-13, offline re-forward:** the installed binary is built
+  without the `ml` feature, so the on-arm does nothing: startup logs
+  `kompress_warm` with `kompress_ready=false` and no block takes
+  Kompress. Bytes removed over the four captures: 652,048,667 off vs
+  652,046,148 on. The model on disk is not enough; the A/B first needs
+  a `--features ml` build and a libonnxruntime (`ORT_DYLIB_PATH`).
+  Re-run with `reforward.py --set --enable-kompress=true --set
+  --disable-kompress=false` against that build.
 - **Also unlocks (2026-09-28):** the Responses `instructions` slot. Codex
   sends a 10–33KB prose system prompt on every turn (89/89 Codex turns,
   0/961 Spark in the 09-25 capture); no compressor takes it while Kompress

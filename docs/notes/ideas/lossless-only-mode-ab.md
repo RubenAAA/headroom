@@ -6,6 +6,12 @@
   adapters copy the gate into `DispatchConfig.lossless` per request, and
   dispatch routes every block losslessly (every tool lands in `LosslessOnly`;
   all other blocks take the reversible fold via `compact_one_block_lossless`).
+- **2026-10-13, offline re-forward** (`reforward.py --set --lossless=true`,
+  four captures, 14,274 matched bodies): bytes removed fall from 652.0 MB
+  to 590.5 MB (−9.4%); retrieval markers from 50,357 to 5,545; ctx offload
+  untouched (13,043 markers both arms). So lossless gives up about a tenth
+  of what the proxy removes. The cache side it hopes to win cannot be
+  measured offline; that still needs the live A/B under **Next**.
 - **Source:** 2026-09-18 lossless audit. `--lossless` is `false` live
   (`config.rs:1742-1744`, `contrib/headroom-flags.sh:601`), so lossy
   SmartCrusher/Log/Search/Diff arms run. Every other lossless stabilizer is

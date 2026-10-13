@@ -16,6 +16,8 @@ empty, recall injection has nothing to inject; a live turn could differ by
 that block.
 
 --sessions N keeps the N sessions with the most turns (default: all).
+--set --flag=value overrides one flag from the flags file, for an A/B
+against a run without it (repeatable).
 """
 import collections, glob, json, os, shutil, socket, subprocess, sys, threading, time
 import urllib.request
@@ -92,6 +94,18 @@ def proxy_flags(home):
     return [a.decode() for a in flags.split(b'\0') if a], exported
 
 
+def override(flags, name, value):
+    """Set `name` to `value` whether the file wrote `--x v` or `--x=v`."""
+    for i, a in enumerate(flags):
+        if a == name and i + 1 < len(flags):
+            flags[i + 1] = value
+            return
+        if a.startswith(name + '='):
+            flags[i] = f'{name}={value}'
+            return
+    flags += [name, value]
+
+
 def load_body(path):
     b = json.load(open(path)).get('body')
     return json.loads(b) if isinstance(b, str) else b
@@ -132,6 +146,11 @@ def main():
         i = args.index('--sessions')
         sessions = int(args[i + 1])
         del args[i:i + 2]
+    sets = []
+    while '--set' in args:
+        i = args.index('--set')
+        sets.append(args[i + 1].split('=', 1))
+        del args[i:i + 2]
     out_dir, dirs = os.path.abspath(args[0]), args[1:]
     if os.path.exists(os.path.join(out_dir, 'out')):
         sys.exit(f'{out_dir} already holds a capture; pick a new directory')
@@ -145,6 +164,8 @@ def main():
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
 
     flags, exported = proxy_flags(home)
+    for name, value in sets:
+        override(flags, name, value)
     env = {**os.environ, **exported, 'HOME': home,
            'XDG_STATE_HOME': os.path.join(home, '.local/state'),
            'HF_HOME': os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface')),
