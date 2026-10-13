@@ -351,6 +351,24 @@ def project_fields(bin_path, project):
     return types, platforms
 
 
+def cli_types(bin_path):
+    """Type values `create-draft --type` accepts, read from its help.
+
+    The CLI hard-codes MC's emoji names, so a project spelling outside them
+    (ANL's plain "Task") fails argument parsing before anything is filed.
+    Returns an empty set when the help cannot be read.
+    """
+    try:
+        proc = subprocess.run([bin_path, "create-draft", "--help"], capture_output=True,
+                              text=True, timeout=60, env=os.environ.copy())
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    # argparse wraps the help line; names hold single spaces only.
+    text = re.sub(r"\s+", " ", proc.stdout)
+    m = re.search(r"Type value: (.+?)(?: --|$)", text)
+    return {t.strip() for t in m.group(1).split("|")} if m else set()
+
+
 def resolve_type(kind, types):
     """The project's own spelling of KIND, or None to take its default."""
     for want in KIND_TYPES[kind]:
@@ -399,8 +417,8 @@ def file_ticket_locally(plan, outdir, bin_path, project):
             f"--description=@{description_path}", f"--priority={DEFAULT_PRIORITY}",
         ]
         # No match leaves the field to the project's default rather than
-        # sending a value its bundle rejects.
-        type_name = resolve_type(kind, types)
+        # sending a value its bundle, or the CLI's fixed list, rejects.
+        type_name = resolve_type(kind, types & cli_types(bin_path))
         if type_name:
             args.append(f"--type={type_name}")
         if DEFAULT_PLATFORM in platforms:

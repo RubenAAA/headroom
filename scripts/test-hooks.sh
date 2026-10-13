@@ -321,7 +321,10 @@ case "\$1" in
       *--project=MC*) echo '[{"customFields":[{"name":"Type","value":{"name":"🚨 Production Bug"}},{"name":"Platform","value":{"name":"Match center"}}]},{"customFields":[{"name":"Type","value":{"name":"📜 User Story"}}]}]' ;;
       *) echo '[{"customFields":[{"name":"Type","value":{"name":"Task"}}]}]' ;;
     esac ;;
-  create-draft) echo "\$@" >>"$T/yt.create"; echo '{"id":"draft-1"}' ;;
+  create-draft) case "\$2" in
+      --help) printf '  --type TYPE           Type value: 📜 User Story | 🏆 Epic |\n                        🚨 Production Bug | 📋 Subtask\n  --priority PRIORITY\n' ;;
+      *) echo "\$@" >>"$T/yt.create"; echo '{"id":"draft-1"}' ;;
+    esac ;;
   publish-draft) touch "$T/yt.filed"; echo "encoding UTF-8 ok" >&2; echo '{"idReadable":"MC-1611"}' ;;
 esac
 CLI
@@ -348,9 +351,10 @@ ok "a draft the turns asked to leave unpublished is a success, not a failure"
 MC=$(sed -n 1p "$T/yt.create") ANL=$(sed -n 2p "$T/yt.create")
 [[ $MC == *"--type=🚨 Production Bug"* && $MC == *"--platform=Match center"* ]] \
   || fail "MC ticket lost its project's type or platform: $MC"
-[[ $ANL == *"--type=Task"* && $ANL != *--platform* ]] \
-  || fail "ANL ticket got another project's type or a platform: $ANL"
-ok "type and platform follow the project's own issues"
+# ANL's "Task" is not in the CLI's fixed --type list: leave its default.
+[[ $ANL != *--type* && $ANL != *--platform* ]] \
+  || fail "ANL ticket got a type the CLI rejects, or a platform: $ANL"
+ok "type and platform follow the project's own issues and the CLI's choices"
 rm -f "$T/yt.create"
 
 # The model only drafts: no tools, files the session wrote inlined. The
