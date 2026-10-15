@@ -289,7 +289,8 @@ struct PendingRequest {
     /// the bill, and the stock comparison's ours arm prices it the same way —
     /// while the stock arm stays on the baseline, since a stock client never
     /// runs continuation rounds. `None` on the common single-round path.
-    billed_totals: Option<(u64, u64, u64)>,
+    /// The fourth figure is the hidden rounds' 1-hour write share.
+    billed_totals: Option<(u64, u64, u64, u64)>,
     /// Completion tokens, where the path that billed them reports them.
     /// The ledger line is the richest per-turn record on disk for a turn that
     /// saved nothing, and turn cost cannot be rebuilt from it without this.
@@ -715,6 +716,7 @@ impl UsageObserver {
         input_tokens: u64,
         cache_read_input_tokens: u64,
         cache_creation_input_tokens: u64,
+        hidden_cache_write_1h_tokens: u64,
     ) {
         let mut inner = self.lock();
         if let Some(pending) = inner.pending.get_mut(request_id) {
@@ -722,6 +724,7 @@ impl UsageObserver {
                 input_tokens,
                 cache_read_input_tokens,
                 cache_creation_input_tokens,
+                hidden_cache_write_1h_tokens,
             ));
         }
     }
@@ -2362,15 +2365,16 @@ impl UsageObserver {
             // baseline above, and the stock client never runs them — so the
             // stock arm must not include them, but ours must, or the
             // comparison reports less than the bill. The extra write prices at
-            // the 5-minute rate, matching the ground-truth ledger below, which
-            // prices every billed write the same way; the true cost can only
-            // be higher (up to the 1-hour rate), never lower.
+            // the tier it was billed at: its 1-hour share at the 1-hour rate,
+            // the rest at the 5-minute rate.
             let ccr_hidden_effective = match pending.billed_totals {
-                Some((billed_input, billed_read, billed_write)) => {
+                Some((billed_input, billed_read, billed_write, hidden_1h)) => {
                     billed_input.saturating_sub(usage.input_tokens) as f64
                         + billed_read.saturating_sub(usage.cache_read_input_tokens) as f64 * w.read
-                        + billed_write.saturating_sub(usage.cache_creation_input_tokens) as f64
-                            * w.write_5m
+                        + w.write_split(
+                            billed_write.saturating_sub(usage.cache_creation_input_tokens),
+                            hidden_1h,
+                        )
                 }
                 None => 0.0,
             };
@@ -2605,16 +2609,24 @@ impl UsageObserver {
         // Bill every round, not just the client's. When the proxy answered
         // a retrieval itself, the rounds it added were billed too, and the
         // baseline above deliberately excludes them.
-        let (billed_input, billed_cache_read, billed_cache_write) =
+        let (billed_input, billed_cache_read, billed_cache_write, hidden_write_1h) =
             pending.billed_totals.unwrap_or((
                 input_tokens,
                 cache_read_input_tokens,
                 cache_creation_input_tokens,
+                0,
             ));
         let w = CacheWeights::for_billing(pending.pays_per_token);
+        // Each write at the tier it was billed at. Pricing them all at the
+        // 5-minute rate put every forced 1-hour write 37% under its cost.
+        let client_write_1h = cache_write_ttl_split.map_or(0, |(_, h1)| h1);
         let billed_fresh_equivalents = billed_input as f64
             + (billed_cache_read as f64 * w.read)
-            + (billed_cache_write as f64 * w.write_5m);
+            + w.write_split(cache_creation_input_tokens, client_write_1h)
+            + w.write_split(
+                billed_cache_write.saturating_sub(cache_creation_input_tokens),
+                hidden_write_1h,
+            );
         // Hidden continuation rounds, split out so the ledger joins to
         // `ccr_continuation_usage` without recomputing the difference:
         // billed totals minus the client baseline `complete` was given.

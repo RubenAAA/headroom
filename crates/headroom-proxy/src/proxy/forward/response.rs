@@ -340,7 +340,14 @@ pub(crate) fn emit_buffered_outcome(
         let output_tok = output_tok + ccr_round_usage.output_tokens;
         let cache_read = cache_read + ccr_round_usage.cache_read_tokens;
         let cache_write = cache_write + ccr_round_usage.cache_write_tokens;
-        let uncached_input = uncached_input + ccr_round_usage.input_tokens;
+        // Same split as the turn-hook rounds below: OpenAI shapes count the
+        // cached prefix inside input, so it comes off before booking uncached.
+        let ccr_uncached_input = if ctx.provider == "anthropic" {
+            ccr_round_usage.input_tokens
+        } else {
+            (ccr_round_usage.input_tokens - ccr_round_usage.cache_read_tokens).max(0)
+        };
+        let uncached_input = uncached_input + ccr_uncached_input;
         // Same for a turn hook's re-drives. The usage parsed
         // above describes the one response the hook handed
         // back; anything it called on the way there was just
@@ -370,11 +377,12 @@ pub(crate) fn emit_buffered_outcome(
         let cache_read = cache_read + turn_hook_usage.cache_read_tokens;
         let cache_write = cache_write + turn_hook_usage.cache_write_tokens;
         let uncached_input = uncached_input + hook_uncached_input;
-        // Read off the pre-CCR `usage`: continuation rounds fold
-        // into the write total above but carry no TTL breakdown,
-        // so the split stays a subset of it and pricing charges
-        // the remainder at the cheaper 5m rate.
+        // The final response's split plus the rounds' 1-hour writes.
+        // Turn-hook re-drives carry no breakdown, so the split stays a
+        // subset of the write total and pricing charges the remainder
+        // at the cheaper 5m rate.
         let (cache_write_5m, cache_write_1h) = anthropic_cache_ttl_split(usage);
+        let cache_write_1h = cache_write_1h + ccr_round_usage.cache_write_1h_tokens;
         let outcome = headroom_core::request_outcome::RequestOutcome {
             request_id: request_id.to_owned(),
             provider: ctx.provider.clone(),
@@ -404,7 +412,7 @@ pub(crate) fn emit_buffered_outcome(
             uncached_input_tokens: uncached_input,
             // Uncached counts, the same way they were folded in above.
             hidden_rounds: headroom_core::request_outcome::HiddenRoundUsage {
-                input_tokens: ccr_round_usage.input_tokens + hook_uncached_input,
+                input_tokens: ccr_uncached_input + hook_uncached_input,
                 output_tokens: ccr_round_usage.output_tokens + turn_hook_usage.output_tokens,
                 cache_read_tokens: ccr_round_usage.cache_read_tokens
                     + turn_hook_usage.cache_read_tokens,

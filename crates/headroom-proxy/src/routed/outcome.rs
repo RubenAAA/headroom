@@ -248,6 +248,14 @@ pub(crate) fn book_routed_outcome_with_ccr(
         .max(get("completion_tokens"))
         .max(fallback_output_tokens)
         + ccr_rounds.output_tokens;
+    // With usage, the rounds' input above includes their cached prefix, so
+    // their reads join the first round's here; without them every hidden
+    // round's cached prefix was booked as uncached input.
+    let rounds_cached = if usage.is_some() {
+        ccr_rounds.cache_read_tokens
+    } else {
+        0
+    };
     let cached = usage
         .and_then(|u| {
             u.get("input_tokens_details")
@@ -255,7 +263,8 @@ pub(crate) fn book_routed_outcome_with_ccr(
         })
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        + rounds_cached;
 
     // What the reroute actually bought, once per rerouted turn. Pair it with
     // the `model_route_rerouted` line on the same request id to see which

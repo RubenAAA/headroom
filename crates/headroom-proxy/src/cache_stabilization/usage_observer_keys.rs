@@ -85,6 +85,12 @@ impl CacheWeights {
             StockTtl::OneHour => self.write_1h,
         }
     }
+
+    /// `total` written tokens, `one_hour` of them at the 1-hour tier.
+    pub fn write_split(self, total: u64, one_hour: u64) -> f64 {
+        let one_hour = one_hour.min(total);
+        (total - one_hour) as f64 * self.write_5m + one_hour as f64 * self.write_1h
+    }
 }
 
 /// The Claude subscription meter (Opus fit, [`headroom_core::meter_weights`]):

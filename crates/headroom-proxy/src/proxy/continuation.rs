@@ -133,6 +133,13 @@ pub(crate) struct CcrRoundUsage {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    /// The 1-hour share of `cache_write_tokens`, where a round's usage split
+    /// it. The rest prices at the 5-minute rate.
+    pub cache_write_1h_tokens: i64,
+    /// Responses logged by [`Self::add_response_logged`], usage or not: the
+    /// `round` it logs. `rounds` skips a response without usage, so it put the
+    /// first hidden round of a streamed turn at round 0, beside the client's.
+    pub responses_logged: i64,
     /// Usage of the first upstream response that the proxy replaced with an
     /// internal continuation. This is the cache footprint of the client's
     /// original request; the next client turn does not contain proxy-private
@@ -144,6 +151,27 @@ pub(crate) struct CcrRoundUsage {
     /// folded in: the context the client holds once the turn settles.
     /// `None` when that response carried no `usage` block.
     pub last_round_context: Option<(i64, i64)>,
+    /// Usage of the client's own request on a streamed turn, set by the
+    /// stream rewriter. The rewriter hands the
+    /// resolver that response with its usage stripped, so it is not among the
+    /// rounds above, and the first round that is — the first hidden one — is
+    /// what `client_*` then record. Its usage also never reaches the stream's
+    /// close intact: the synthesised `message_delta` carries the final round's
+    /// counts, which the stream state max-merges over it. On 2026-10-15 that
+    /// booked a hidden round's 20.8K fresh input as the client's, and the final
+    /// round's write twice, on every streamed retrieval turn.
+    pub stream_seed: Option<StreamSeed>,
+}
+
+/// See [`CcrRoundUsage::stream_seed`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StreamSeed {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_5m_tokens: u64,
+    pub cache_write_1h_tokens: u64,
 }
 
 impl CcrRoundUsage {
@@ -185,17 +213,20 @@ impl CcrRoundUsage {
         self.output_tokens += output;
         self.cache_read_tokens += cached;
         self.cache_write_tokens += get("cache_creation_input_tokens");
+        self.cache_write_1h_tokens += usage
+            .get("cache_creation")
+            .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
     }
 
     /// [`add_response`](Self::add_response), and log what that response's own
     /// usage block said. `kind` is `superseded` for a response a continuation
     /// replaced and `terminal` for the one that returned as the turn.
     ///
-    /// Streamed CCR turns book exactly twice round 0's cache counts in
-    /// `turn_cost_ledger`, so the final round's usage is not visible there;
-    /// `has_usage=false` on a `terminal` line is the direct confirmation, and a
-    /// `terminal` line with counts shows what the final round really read and
-    /// wrote.
+    /// A `superseded` line with `has_usage=false` is a streamed turn's own
+    /// request, whose usage arrives through
+    /// [`note_stream_seed`](Self::note_stream_seed) instead.
     pub(crate) fn add_response_logged(
         &mut self,
         response: &serde_json::Value,
@@ -213,13 +244,14 @@ impl CcrRoundUsage {
             event = "ccr_round_usage",
             request_id = %request_id,
             kind = kind,
-            round = self.rounds,
+            round = self.responses_logged,
             has_usage = usage.is_some(),
             input_tokens = get("input_tokens"),
             cache_read_input_tokens = get("cache_read_input_tokens"),
             cache_creation_input_tokens = get("cache_creation_input_tokens"),
             "usage of one hidden-round response"
         );
+        self.responses_logged += 1;
         self.add_response(response);
     }
 
@@ -235,15 +267,46 @@ impl CcrRoundUsage {
             self.last_round_context = other.last_round_context;
         }
         self.rounds += other.rounds;
+        self.responses_logged += other.responses_logged;
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_write_tokens += other.cache_write_tokens;
+        self.cache_write_1h_tokens += other.cache_write_1h_tokens;
     }
 
     /// True when there is nothing extra to account for.
     pub fn is_empty(&self) -> bool {
         self.rounds == 0
+    }
+
+    /// Record the client's own request on a streamed turn, from the turn the
+    /// rewriter rebuilt before resolving it. See [`Self::stream_seed`].
+    pub(crate) fn note_stream_seed(&mut self, seed: &serde_json::Value) {
+        let Some(usage) = seed.get("usage") else {
+            return;
+        };
+        let get = |key: &str| {
+            usage
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        let split = |key: &str| {
+            usage
+                .get("cache_creation")
+                .and_then(|c| c.get(key))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        self.stream_seed = Some(StreamSeed {
+            input_tokens: get("input_tokens"),
+            output_tokens: get("output_tokens"),
+            cache_read_tokens: get("cache_read_input_tokens"),
+            cache_write_tokens: get("cache_creation_input_tokens"),
+            cache_write_5m_tokens: split("ephemeral_5m_input_tokens"),
+            cache_write_1h_tokens: split("ephemeral_1h_input_tokens"),
+        });
     }
 
     /// Cache counters that describe the request the client actually made.
@@ -254,7 +317,13 @@ impl CcrRoundUsage {
         final_cache_read: u64,
         final_cache_write: u64,
     ) -> (u64, u64, u64) {
-        if self.rounds > 0 {
+        if let (true, Some(seed)) = (self.rounds > 0, self.stream_seed) {
+            (
+                seed.input_tokens,
+                seed.cache_read_tokens,
+                seed.cache_write_tokens,
+            )
+        } else if self.rounds > 0 {
             (
                 self.client_input_tokens,
                 self.client_cache_read_tokens,

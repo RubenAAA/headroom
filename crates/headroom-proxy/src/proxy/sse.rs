@@ -503,7 +503,7 @@ pub(super) async fn run_sse_state_machine(
     // branches compile out cleanly and the hot path stays monomorphic.
     match kind {
         SseStreamKind::Anthropic => {
-            let state = sse_anthropic::drive_anthropic_stream(
+            let mut state = sse_anthropic::drive_anthropic_stream(
                 rx,
                 framer,
                 &request_id,
@@ -519,6 +519,18 @@ pub(super) async fn run_sse_state_machine(
                 .as_ref()
                 .and_then(|u| u.lock().ok().map(|g| *g))
                 .unwrap_or_default();
+            // The stream closed on the final round's counts max-merged over
+            // the client request's, and the final round is already among the
+            // hidden rounds. Every consumer below adds the rounds to this
+            // state, so it has to hold the client request alone.
+            if let (true, Some(seed)) = (ccr_rounds.rounds > 0, ccr_rounds.stream_seed) {
+                state.usage.input_tokens = seed.input_tokens;
+                state.usage.output_tokens = seed.output_tokens;
+                state.usage.cache_read_input_tokens = seed.cache_read_tokens;
+                state.usage.cache_creation_input_tokens = seed.cache_write_tokens;
+                state.usage.cache_creation_5m_input_tokens = seed.cache_write_5m_tokens;
+                state.usage.cache_creation_1h_input_tokens = seed.cache_write_1h_tokens;
+            }
             let (cache_baseline_input, cache_baseline_read, cache_baseline_write) = ccr_rounds
                 .client_cache_baseline(
                     state.usage.input_tokens,

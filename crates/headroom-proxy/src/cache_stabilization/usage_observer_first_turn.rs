@@ -340,13 +340,15 @@ impl UsageObserver {
         }
         let dctx = pending.first_turn.clone().unwrap_or_default();
         let (rounds_in, rounds_read, rounds_write) =
-            pending.billed_totals.map_or((0, 0, 0), |(bi, bcr, bcw)| {
-                (
-                    bi.saturating_sub(usage.input_tokens),
-                    bcr.saturating_sub(usage.cache_read_input_tokens),
-                    bcw.saturating_sub(usage.cache_creation_input_tokens),
-                )
-            });
+            pending
+                .billed_totals
+                .map_or((0, 0, 0), |(bi, bcr, bcw, _)| {
+                    (
+                        bi.saturating_sub(usage.input_tokens),
+                        bcr.saturating_sub(usage.cache_read_input_tokens),
+                        bcw.saturating_sub(usage.cache_creation_input_tokens),
+                    )
+                });
         let (write_5m, write_1h) = usage
             .cache_write_ttl_split
             .map_or((-1_i64, -1_i64), |(m5, h1)| (m5 as i64, h1 as i64));
@@ -511,7 +513,7 @@ mod first_turn_attribution_tests {
             obs.complete("d1", 300, 0, 50_000, None);
             obs.begin_request("d2", "conv-d".into(), None, None, Some(fp_msgs(2)));
             obs.note_first_turn_context("d2", ctx(1, "h1", false));
-            obs.note_billed_totals("d2", 310, 5_000, 52_000);
+            obs.note_billed_totals("d2", 310, 5_000, 52_000, 0);
             obs.complete("d2", 300, 0, 50_000, None);
             // A continuation of the tracked stream: healthy, no diagnostic.
             obs.begin_request("d3", "conv-d".into(), None, None, Some(fp_msgs(41)));

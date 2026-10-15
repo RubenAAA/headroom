@@ -532,6 +532,13 @@ pub(crate) fn rebuild_message(state: &AnthropicStreamState) -> Value {
             "output_tokens": state.usage.output_tokens,
             "cache_read_input_tokens": state.usage.cache_read_input_tokens,
             "cache_creation_input_tokens": state.usage.cache_creation_input_tokens,
+            // Without the split a streamed hidden round's write could only be
+            // priced at the 5-minute rate, under `--force-1h-cache-ttl` 37%
+            // below what the 1-hour write cost.
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": state.usage.cache_creation_5m_input_tokens,
+                "ephemeral_1h_input_tokens": state.usage.cache_creation_1h_input_tokens,
+            },
         },
     })
 }
@@ -1841,6 +1848,11 @@ async fn resolve_orphan_turn(
     let Some(round_two) = orphan_nudge_round(ctx, seed_bytes.clone(), provider).await else {
         return rebuilt.clone();
     };
+    if matches!(ctx.shape, CcrShape::Anthropic)
+        && let Ok(mut guard) = round_usage.lock()
+    {
+        guard.note_stream_seed(rebuilt);
+    }
     let Some(settled) =
         settle_orphan_round(ctx, round_usage, round_two, seed_bytes, provider).await
     else {
@@ -2141,6 +2153,9 @@ async fn resolve_retrieval(
         usage.add_response_logged(&final_turn, &ctx.request_id, "terminal");
     }
 
+    if matches!(ctx.shape, CcrShape::Anthropic) {
+        usage.note_stream_seed(&rebuilt);
+    }
     if let Ok(mut guard) = round_usage.lock() {
         *guard = usage;
     }

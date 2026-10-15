@@ -92,7 +92,7 @@ async fn ccr_upstream_asking(
                                     rounds.fetch_add(1, Ordering::SeqCst);
                                     let payload = concat!(
                                         "event: message_start\n",
-                                        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude\",\"usage\":{\"input_tokens\":900,\"output_tokens\":0}}}\n\n",
+                                        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude\",\"usage\":{\"input_tokens\":900,\"output_tokens\":0,\"cache_creation_input_tokens\":300,\"cache_creation\":{\"ephemeral_5m_input_tokens\":100,\"ephemeral_1h_input_tokens\":200}}}}\n\n",
                                         "event: content_block_start\n",
                                         "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\",\"x_block\":\"BLOCK_EXTRA\"},\"x_block_start\":\"START_EXTRA\"}\n\n",
                                         "event: content_block_delta\n",
@@ -138,7 +138,7 @@ async fn ccr_upstream_asking(
                                 >(16);
                                 tokio::spawn(async move {
                                     let frames: Vec<Vec<u8>> = vec![
-                                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":500,\"output_tokens\":0}}}\n\n".to_vec(),
+                                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":500,\"output_tokens\":0,\"cache_creation_input_tokens\":40,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":40}}}}\n\n".to_vec(),
                                         b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_vec(),
                                         b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"VISIBLE_PREFIX\"}}\n\n".to_vec(),
                                         b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_vec(),
@@ -472,6 +472,62 @@ async fn retrieval_is_resolved_without_reaching_the_client() {
         sse.contains("VISIBLE_PREFIX"),
         "text streamed before the retrieval must survive:\n{sse}"
     );
+}
+
+/// The client's own request (500 in, 9 out) and the one hidden round (900 in,
+/// 12 out) are billed once each, and the request is the client's baseline.
+/// The round's write keeps its tier split: a forced 1-hour write priced at
+/// the 5-minute rate reads as 37% cheaper than it was.
+///
+/// The rewriter hands the resolver the client's response with its usage
+/// stripped, and the stream closes on the final round's usage max-merged over
+/// the client's. Before `stream_seed`, this turn booked 900 + 900 in and
+/// 12 + 12 out, and called the hidden round's 900 the client's input — the
+/// "uncached" share live sessions blamed on their own prompts.
+#[tokio::test]
+async fn a_streamed_retrieval_turn_bills_the_client_request_and_the_round_once_each() {
+    let _capture = common::tracing_capture::serial().await;
+    let buf = common::tracing_capture::buffer();
+    buf.lock().unwrap().clear();
+
+    let dir = TempDir::new().unwrap();
+    let rounds = Arc::new(AtomicUsize::new(0));
+    client_stream(&dir, rounds.clone()).await;
+    assert_eq!(rounds.load(Ordering::SeqCst), 1);
+
+    // The close runs on its own task after the client's stream ends.
+    let event = |name: &str| -> Option<serde_json::Value> {
+        let text = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|l| l["fields"].clone())
+            .find(|f| f["event"] == name)
+    };
+    common::wait_until(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(20),
+        || event("ccr_continuation_usage").is_some(),
+    )
+    .await;
+    let rounds_line = event("ccr_continuation_usage").expect("hidden rounds logged");
+    assert_eq!(rounds_line["rounds"], 1, "{rounds_line}");
+    assert_eq!(rounds_line["input_tokens"], 900, "{rounds_line}");
+    assert_eq!(rounds_line["output_tokens"], 12, "{rounds_line}");
+    assert_eq!(rounds_line["cache_write_tokens"], 300, "{rounds_line}");
+    assert_eq!(rounds_line["cache_write_1h_tokens"], 200, "{rounds_line}");
+
+    let closed = String::from_utf8_lossy(&buf.lock().unwrap())
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|l| l["fields"].clone())
+        .find(|f| f["message"] == "sse stream closed")
+        .expect("stream close logged");
+    assert_eq!(
+        closed["input_tokens"], 500,
+        "the close must describe the client's request, not the hidden round: {closed}"
+    );
+    assert_eq!(closed["output_tokens"], 9, "{closed}");
+    assert_eq!(closed["cache_creation_input_tokens"], 40, "{closed}");
 }
 
 #[tokio::test]

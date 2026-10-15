@@ -132,6 +132,7 @@ pub(super) fn note_anthropic_billed_totals(close: &AnthropicClose<'_>) {
                 .usage
                 .cache_creation_input_tokens
                 .saturating_add(close.ccr_rounds.cache_write_tokens.max(0) as u64),
+            close.ccr_rounds.cache_write_1h_tokens.max(0) as u64,
         );
     }
 }
@@ -532,6 +533,7 @@ pub(super) fn emit_anthropic_outcome(close: &AnthropicClose<'_>) {
             input_tokens = close.ccr_rounds.input_tokens,
             output_tokens = close.ccr_rounds.output_tokens,
             cache_write_tokens = close.ccr_rounds.cache_write_tokens,
+            cache_write_1h_tokens = close.ccr_rounds.cache_write_1h_tokens,
             // Folded into RequestOutcome since CCR-1 but never logged,
             // so `turn_cost_ledger` (which sums the rounds in) could
             // not be reconciled against `sse stream closed` (which
@@ -575,7 +577,8 @@ pub(super) fn emit_anthropic_outcome(close: &AnthropicClose<'_>) {
             cache_write_tokens: close.state.usage.cache_creation_input_tokens as i64
                 + close.ccr_rounds.cache_write_tokens,
             cache_write_5m_tokens: close.state.usage.cache_creation_5m_input_tokens as i64,
-            cache_write_1h_tokens: close.state.usage.cache_creation_1h_input_tokens as i64,
+            cache_write_1h_tokens: close.state.usage.cache_creation_1h_input_tokens as i64
+                + close.ccr_rounds.cache_write_1h_tokens,
             // Anthropic's `input_tokens` already excludes cache reads
             // and writes, so it *is* the uncached count. Python's
             // Bedrock path has to subtract instead, because there

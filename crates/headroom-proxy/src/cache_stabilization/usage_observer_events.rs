@@ -580,7 +580,7 @@ mod prefix_on_recache_event_tests {
             obs.note_wire_bytes("ccr-1", 100_000, 90_000, "all_messages");
             // Client turn read 200k and wrote 4k; the continuation round read
             // another 150k and wrote another 5k.
-            obs.note_billed_totals("ccr-1", 20, 350_000, 9_000);
+            obs.note_billed_totals("ccr-1", 20, 350_000, 9_000, 0);
             obs.complete("ccr-1", 10, 200_000, 4_000, None);
         });
         let joined = cap.lock().unwrap().fields.join("\n");
@@ -1431,7 +1431,7 @@ mod stock_baseline_tests {
         obs.note_wire_bytes("r1", 1_000, 1_000, "off");
         // Baseline prices 100 + 10_000 + 200; the proxy burned an extra 5_000
         // fresh, 5_000 read and 500 written behind the client's back.
-        obs.note_billed_totals("r1", 5_100, 15_000, 700);
+        obs.note_billed_totals("r1", 5_100, 15_000, 700, 0);
         obs.complete("r1", 100, 10_000, 200, None);
 
         let s = obs.snapshot();
