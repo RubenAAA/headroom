@@ -376,6 +376,10 @@ pub struct SessionReplayStore {
     /// by [`SessionReplayStore::take_adoption`] so the usage observer can name
     /// the donor on that turn's first-turn event.
     pub(super) recent_adoptions: Arc<Mutex<LruCache<String, String>>>,
+    /// Session key → hashes its hidden rounds fetched (see [`super::fetched`]).
+    /// Apart from the trackers so a rebuild boundary, which resets a tracker,
+    /// does not send the session back to fetching what it already has.
+    pub(super) fetched: Arc<Mutex<LruCache<String, std::collections::HashSet<String>>>>,
 }
 
 impl std::fmt::Debug for SessionReplayStore {
@@ -495,7 +499,17 @@ impl SessionReplayStore {
             adoption_hook: None,
             persist_lock: Arc::new(Mutex::new(())),
             recent_adoptions: Arc::new(Mutex::new(LruCache::new(pending_cap))),
+            fetched: Arc::new(Mutex::new(LruCache::new(cap))),
         }
+    }
+
+    /// The hashes this session has fetched back with `headroom_retrieve`.
+    pub fn fetched_hashes(&self, session_key: &str) -> std::collections::HashSet<String> {
+        self.fetched
+            .lock()
+            .ok()
+            .and_then(|guard| guard.peek(session_key).cloned())
+            .unwrap_or_default()
     }
 
     /// The donor hash if `session_key` adopted another session's prefix and
@@ -1133,9 +1147,17 @@ impl SessionReplayStore {
             Ok(mut g) => g.pop(request_id),
             Err(_) => None,
         };
+        let fetched = super::fetched::take_fetched(request_id);
         let Some(pending) = pending else {
             return;
         };
+        if !fetched.is_empty()
+            && let Ok(mut guard) = self.fetched.lock()
+        {
+            guard
+                .get_or_insert_mut(pending.session_key.clone(), Default::default)
+                .extend(fetched);
+        }
         // Taken before the tracker lock and released after the rename, which
         // orders whole snapshot-and-write sequences rather than just writes.
         // Disk I/O under it stalls only other completions, not the request

@@ -570,6 +570,7 @@ pub(super) async fn fetch_one_ccr_call(
         event = "ccr_retrieval_call",
         "ccr: model asked for hash"
     );
+    crate::cache_stabilization::prefix_replay::note_fetched(request_id, &call.hash_key);
     let fetched = ccr_store.get(&call.hash_key);
     // Count the tool-driven retrieval here, at the only place both
     // outcomes are known. `/ctx/get` counts the HTTP surface, which

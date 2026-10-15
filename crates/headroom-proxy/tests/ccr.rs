@@ -29,3 +29,6 @@ mod continuation_cache_prefix;
 
 #[path = "suites/ccr/integration_ccr_attachments.rs"]
 mod integration_ccr_attachments;
+
+#[path = "suites/ccr/fetched_block_restore.rs"]
+mod fetched_block_restore;

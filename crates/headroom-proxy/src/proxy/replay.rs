@@ -1013,6 +1013,21 @@ fn replay_prefix(
         Some(store.confirmed_frozen_count(session_key)),
     );
     let replayed_prefix = overlaid != optimized;
+    // After the overlay, which would otherwise put last turn's digest back.
+    let mut overlaid = overlaid;
+    let restored = cache_stabilization::prefix_replay::restore_fetched_blocks(
+        &mut overlaid,
+        &original_messages,
+        &store.fetched_hashes(session_key),
+    );
+    if restored > 0 {
+        tracing::info!(
+            event = "prefix_replay_fetched_restored",
+            request_id = %request_id,
+            blocks = restored,
+            "prefix replay: blocks the model already fetched go out raw"
+        );
+    }
     if let Some(reason) = skip_reason {
         log_replay_decline(
             reason,

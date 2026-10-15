@@ -1039,7 +1039,7 @@ pub(crate) fn stale_read_warning(path: &str) -> String {
 }
 
 /// Pull the hash out of `<<ctx:HASH>>`, if this text is one of our digests.
-fn marker_hash(text: &str) -> Option<String> {
+pub(crate) fn marker_hash(text: &str) -> Option<String> {
     let start = text.find(MARKER_PREFIX)? + MARKER_PREFIX.len();
     let rest = &text[start..];
     let end = rest.find(">>")?;
@@ -1431,7 +1431,7 @@ pub fn offload_tool_use_inputs(
 /// Concatenated text of a `tool_result` `content` field. `content` is either a
 /// string or an array of blocks; only `text` blocks contribute (matching how
 /// the client renders tool output). `None` when there is no text at all.
-fn tool_result_text(content: &Value) -> Option<String> {
+pub(crate) fn tool_result_text(content: &Value) -> Option<String> {
     match content {
         Value::String(s) => Some(s.clone()),
         Value::Array(blocks) => {

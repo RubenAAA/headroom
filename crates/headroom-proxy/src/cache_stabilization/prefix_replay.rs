@@ -157,6 +157,7 @@ const MAX_ALTERNATE_MESSAGES: usize = 4_000;
 mod breakpoints;
 mod compare;
 mod divergence;
+mod fetched;
 mod overlay;
 mod store;
 mod tracker;
@@ -165,7 +166,9 @@ mod tracker;
 // API, the rest stay in-crate. Modules with no `pub` item would
 // otherwise warn that they re-export nothing.
 #[allow(unused_imports)]
-pub use self::{breakpoints::*, compare::*, divergence::*, overlay::*, store::*, tracker::*};
+pub use self::{
+    breakpoints::*, compare::*, divergence::*, fetched::*, overlay::*, store::*, tracker::*,
+};
 
 /// Why a turn declined to replay its cached prefix. Non-replaying turns were
 /// 19% of measured traffic and carried 97% of booked re-cache waste, and the
