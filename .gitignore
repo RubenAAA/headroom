@@ -41,6 +41,7 @@ upstream-python/scripts/*
 !upstream-python/scripts/refresh_tool_hashes.py
 !upstream-python/scripts/record_kompress_fixtures.py
 !upstream-python/scripts/record_code_compressor_fixtures.py
+!upstream-python/scripts/codeql_triage.sh
 !upstream-python/scripts/proxy_log_audit.py
 
 # Rust / Cargo build artifacts
