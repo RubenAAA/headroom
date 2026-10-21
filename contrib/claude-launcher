@@ -394,6 +394,14 @@ env_vars=()
 [ -n "$CONFIG_DIR" ] && env_vars+=("CLAUDE_CONFIG_DIR=$CONFIG_DIR")
 [ "$use_context" -eq 1 ] && env_vars+=("ANTHROPIC_BASE_URL=$PROXY_URL")
 [ -n "$shared_target" ] && env_vars+=("CARGO_TARGET_DIR=$shared_target")
+# Since 2.1.304 the CLI defers Monitor, TaskStop, SendMessage, LSP and
+# WebFetch behind its own ToolSearch and splices each into tools[] on first
+# use, which rewrites the whole cached prefix: 30 busts / ~2.4M tokens on
+# 2026-10-20/21. With it off every tool is sent from turn 1, and the proxy's
+# own server-side deferral (tool_search_deferral.rs, cache-safe) takes over
+# keeping MCP schemas out of the prompt. A value already set wins.
+# Revisit: docs/notes/ideas/cache-safe-client-tool-search.md.
+[ "$use_context" -eq 1 ] && [ -z "${ENABLE_TOOL_SEARCH+x}" ] && env_vars+=("ENABLE_TOOL_SEARCH=false")
 # Routed model ids (muse-spark-*, claude-codex-*) are unknown to the CLI's
 # model table (zero hits for muse-spark in 2.1.289), so since the 2.1.28x
 # line the CLI enforces an assumed 200k window on them and Spark sessions
