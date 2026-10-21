@@ -202,6 +202,19 @@ fn warn_on_inert_settings(config: &Config) {
              needs either"
         );
     }
+
+    // Both flags parse for flag-file compatibility and do nothing in any
+    // mode (see their docs in config.rs). Upstream warns the same way for
+    // cache mode (ba824539d); here it is every mode.
+    if config.read_lifecycle || config.read_maturation {
+        tracing::warn!(
+            event = "read_flags_inert",
+            read_lifecycle = config.read_lifecycle,
+            read_maturation = config.read_maturation,
+            "--read-lifecycle and --read-maturation are accepted but not wired \
+             into this proxy; setting them changes nothing"
+        );
+    }
 }
 
 /// PR-D1: resolve AWS credentials at startup via the `aws-config`
