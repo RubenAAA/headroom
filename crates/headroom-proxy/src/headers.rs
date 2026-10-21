@@ -203,6 +203,28 @@ pub fn set_single(headers: &mut HeaderMap, name: HeaderName, value: &str) {
     }
 }
 
+/// Hosts that run many replicas, each with its own prompt cache, and route on
+/// a header. Fireworks: docs.fireworks.ai prompt caching.
+const AFFINITY_HEADERS: &[(&str, &str)] = &[("api.fireworks.ai", "x-session-affinity")];
+
+/// Keep one conversation on one replica of a provider that routes on a
+/// header, so each turn finds the cache the previous one built. Port of
+/// upstream `30b22df7f`. Every other upstream is left untouched, and a header
+/// the client already set wins. The value is a hash of the session key: the
+/// key itself folds in tenant identity and must not leave the proxy.
+pub fn insert_session_affinity(headers: &mut HeaderMap, upstream_host: &str, session_key: &str) {
+    use sha2::{Digest, Sha256};
+    let Some((_, name)) = AFFINITY_HEADERS.iter().find(|(h, _)| *h == upstream_host) else {
+        return;
+    };
+    if session_key.is_empty() || headers.contains_key(*name) {
+        return;
+    }
+    let digest = Sha256::digest(session_key.as_bytes());
+    let value: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    set_single(headers, HeaderName::from_static(name), &value);
+}
+
 /// Remove every header whose name starts with `INTERNAL_HEADER_PREFIX`
 /// (case-insensitive). Mutates in place. Returns the number of header
 /// entries removed for structured logging.
@@ -342,6 +364,36 @@ mod tests {
         assert!(is_hop_by_hop(&HeaderName::from_static("transfer-encoding")));
         assert!(is_hop_by_hop(&HeaderName::from_static("upgrade")));
         assert!(!is_hop_by_hop(&HeaderName::from_static("authorization")));
+    }
+
+    #[test]
+    fn session_affinity_only_for_listed_hosts_and_never_over_the_client() {
+        let mut h = HeaderMap::new();
+        insert_session_affinity(&mut h, "api.fireworks.ai", "session:abc");
+        let first = h["x-session-affinity"].to_str().unwrap().to_string();
+        assert_eq!(first.len(), 32);
+        assert!(
+            !first.contains("abc"),
+            "the raw key must not leave the proxy"
+        );
+
+        let mut again = HeaderMap::new();
+        insert_session_affinity(&mut again, "api.fireworks.ai", "session:abc");
+        assert_eq!(
+            again["x-session-affinity"],
+            first.as_str(),
+            "stable per key"
+        );
+
+        let mut other = HeaderMap::new();
+        insert_session_affinity(&mut other, "api.anthropic.com", "session:abc");
+        insert_session_affinity(&mut other, "api.fireworks.ai", "");
+        assert!(other.is_empty());
+
+        let mut client = HeaderMap::new();
+        client.insert("x-session-affinity", HeaderValue::from_static("mine"));
+        insert_session_affinity(&mut client, "api.fireworks.ai", "session:abc");
+        assert_eq!(client["x-session-affinity"], "mine");
     }
 
     #[test]
