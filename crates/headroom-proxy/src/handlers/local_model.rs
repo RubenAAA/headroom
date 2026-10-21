@@ -93,6 +93,15 @@ pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
     axum::Json(json!({ "data": data }))
 }
 
+/// A `:chat:` route keeps Chat Completions, so translation gets no target
+/// (a target selects the Responses shape) and the upstream model name is set
+/// on the translated body instead.
+fn set_chat_target(openai_body: &mut Value, chat: bool, target_model: Option<&str>) {
+    if chat && let Some(target) = target_model {
+        openai_body["model"] = Value::String(target.to_string());
+    }
+}
+
 /// Handle POST `/v1/messages` with local model routing.
 ///
 /// 1. Buffer the body
@@ -276,9 +285,7 @@ pub async fn handle_messages(
         Err(resp) => return resp,
     };
     let mut openai_body = translated.openai_body;
-    if chat && let Some(target) = &target_model {
-        openai_body["model"] = Value::String(target.clone());
-    }
+    set_chat_target(&mut openai_body, chat, target_model.as_deref());
     let upstream_url = translated.upstream_url;
     let downstream_is_stream = translated.downstream_is_stream;
     // The wire shape, decided once in translation. Arm pick and CCR shape

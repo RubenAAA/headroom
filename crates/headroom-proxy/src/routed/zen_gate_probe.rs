@@ -161,51 +161,44 @@ fn classify(exited_ok: Option<bool>, output: &str) -> Outcome {
 }
 
 fn log(model: &str, egress_slot: Option<usize>, lane_tried: bool, verdict: &Verdict) {
-    match verdict {
-        Verdict::Upstream => tracing::warn!(
-            event = "zen_gate_probe",
-            verdict = "upstream",
-            model = %model,
-            egress_slot = ?egress_slot,
-            lane_tried,
-            "stock OpenCode is refused too: the free tier is down on OpenCode's side, not a proxy fault"
+    let (name, message) = match verdict {
+        Verdict::Inconclusive(reason) => {
+            tracing::warn!(
+                event = "zen_gate_probe",
+                verdict = "inconclusive",
+                model = %model,
+                egress_slot = ?egress_slot,
+                lane_tried,
+                reason = %reason,
+                "could not tell whether Zen refuses stock OpenCode too"
+            );
+            return;
+        }
+        Verdict::Upstream => (
+            "upstream",
+            "stock OpenCode is refused too: the free tier is down on OpenCode's side, not a proxy fault",
         ),
-        Verdict::Proxy => tracing::error!(
-            event = "zen_gate_probe",
-            verdict = "proxy",
-            model = %model,
-            egress_slot = ?egress_slot,
-            lane_tried,
+        Verdict::Proxy => (
+            "proxy",
             "stock OpenCode is served through the same lane while the proxy is refused: compare its \
-             request with ours (tool names, stream flag, headers)"
+             request with ours (tool names, stream flag, headers)",
         ),
-        Verdict::Lane => tracing::error!(
-            event = "zen_gate_probe",
-            verdict = "lane",
-            model = %model,
-            egress_slot = ?egress_slot,
-            lane_tried,
+        Verdict::Lane => (
+            "lane",
             "stock OpenCode is refused through this lane but served from this machine: Zen blocks \
-             the lane's exit address; rotate it"
+             the lane's exit address; rotate it",
         ),
-        Verdict::ProxyOrLane => tracing::error!(
-            event = "zen_gate_probe",
-            verdict = "proxy_or_lane",
-            model = %model,
-            egress_slot = ?egress_slot,
-            lane_tried,
+        Verdict::ProxyOrLane => (
+            "proxy_or_lane",
             "stock OpenCode is served from this machine, but the lane could not be tried: either our \
-             request shape drifted or the lane's exit address is blocked"
+             request shape drifted or the lane's exit address is blocked",
         ),
-        Verdict::Inconclusive(reason) => tracing::warn!(
-            event = "zen_gate_probe",
-            verdict = "inconclusive",
-            model = %model,
-            egress_slot = ?egress_slot,
-            lane_tried,
-            reason = %reason,
-            "could not tell whether Zen refuses stock OpenCode too"
-        ),
+    };
+    // An outage on OpenCode's side is theirs to fix; the rest are ours.
+    if matches!(verdict, Verdict::Upstream) {
+        tracing::warn!(event = "zen_gate_probe", verdict = name, model = %model, egress_slot = ?egress_slot, lane_tried, "{message}");
+    } else {
+        tracing::error!(event = "zen_gate_probe", verdict = name, model = %model, egress_slot = ?egress_slot, lane_tried, "{message}");
     }
 }
 

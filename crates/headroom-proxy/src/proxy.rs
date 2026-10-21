@@ -923,13 +923,11 @@ pub(crate) async fn forward_http(
                 &mut outgoing_headers,
             );
         }
-        if let Some(host) = upstream_url.host_str() {
-            crate::headers::insert_session_affinity(
-                &mut outgoing_headers,
-                host,
-                &request_session_key,
-            );
-        }
+        crate::headers::insert_session_affinity(
+            &mut outgoing_headers,
+            &upstream_url,
+            &request_session_key,
+        );
         let body_to_send = forward::run_finalize_pipeline(
             body_to_send,
             endpoint,

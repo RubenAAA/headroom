@@ -212,9 +212,10 @@ const AFFINITY_HEADERS: &[(&str, &str)] = &[("api.fireworks.ai", "x-session-affi
 /// upstream `30b22df7f`. Every other upstream is left untouched, and a header
 /// the client already set wins. The value is a hash of the session key: the
 /// key itself folds in tenant identity and must not leave the proxy.
-pub fn insert_session_affinity(headers: &mut HeaderMap, upstream_host: &str, session_key: &str) {
+pub fn insert_session_affinity(headers: &mut HeaderMap, upstream: &url::Url, session_key: &str) {
     use sha2::{Digest, Sha256};
-    let Some((_, name)) = AFFINITY_HEADERS.iter().find(|(h, _)| *h == upstream_host) else {
+    let host = upstream.host_str().unwrap_or_default();
+    let Some((_, name)) = AFFINITY_HEADERS.iter().find(|(h, _)| *h == host) else {
         return;
     };
     if session_key.is_empty() || headers.contains_key(*name) {
@@ -366,10 +367,14 @@ mod tests {
         assert!(!is_hop_by_hop(&HeaderName::from_static("authorization")));
     }
 
+    fn fireworks() -> url::Url {
+        url::Url::parse("https://api.fireworks.ai/inference/v1").unwrap()
+    }
+
     #[test]
     fn session_affinity_only_for_listed_hosts_and_never_over_the_client() {
         let mut h = HeaderMap::new();
-        insert_session_affinity(&mut h, "api.fireworks.ai", "session:abc");
+        insert_session_affinity(&mut h, &fireworks(), "session:abc");
         let first = h["x-session-affinity"].to_str().unwrap().to_string();
         assert_eq!(first.len(), 32);
         assert!(
@@ -378,7 +383,7 @@ mod tests {
         );
 
         let mut again = HeaderMap::new();
-        insert_session_affinity(&mut again, "api.fireworks.ai", "session:abc");
+        insert_session_affinity(&mut again, &fireworks(), "session:abc");
         assert_eq!(
             again["x-session-affinity"],
             first.as_str(),
@@ -386,13 +391,17 @@ mod tests {
         );
 
         let mut other = HeaderMap::new();
-        insert_session_affinity(&mut other, "api.anthropic.com", "session:abc");
-        insert_session_affinity(&mut other, "api.fireworks.ai", "");
+        insert_session_affinity(
+            &mut other,
+            &url::Url::parse("https://api.anthropic.com/v1").unwrap(),
+            "session:abc",
+        );
+        insert_session_affinity(&mut other, &fireworks(), "");
         assert!(other.is_empty());
 
         let mut client = HeaderMap::new();
         client.insert("x-session-affinity", HeaderValue::from_static("mine"));
-        insert_session_affinity(&mut client, "api.fireworks.ai", "session:abc");
+        insert_session_affinity(&mut client, &fireworks(), "session:abc");
         assert_eq!(client["x-session-affinity"], "mine");
     }
 

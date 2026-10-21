@@ -1807,6 +1807,20 @@ fn orphan_seed_request(request: &mut Value, items_field: &str, assistant: Value)
     serde_json::to_vec(&request).ok().map(Bytes::from)
 }
 
+/// Record the client's own request from the rebuilt turn (see
+/// `CcrRoundUsage::note_stream_seed`). Anthropic streams only.
+fn note_anthropic_seed(
+    ctx: &CcrStreamContext,
+    round_usage: &Arc<Mutex<crate::proxy::CcrRoundUsage>>,
+    rebuilt: &Value,
+) {
+    if matches!(ctx.shape, CcrShape::Anthropic)
+        && let Ok(mut guard) = round_usage.lock()
+    {
+        guard.note_stream_seed(rebuilt);
+    }
+}
+
 /// Send an orphaned turn back upstream with [`ORPHAN_NUDGE`] appended, then
 /// settle whatever the extra round reaches for through the same alternation
 /// the retrieval path runs. Returns the settled turn in Anthropic shape for
@@ -1848,11 +1862,7 @@ async fn resolve_orphan_turn(
     let Some(round_two) = orphan_nudge_round(ctx, seed_bytes.clone(), provider).await else {
         return rebuilt.clone();
     };
-    if matches!(ctx.shape, CcrShape::Anthropic)
-        && let Ok(mut guard) = round_usage.lock()
-    {
-        guard.note_stream_seed(rebuilt);
-    }
+    note_anthropic_seed(ctx, round_usage, rebuilt);
     let Some(settled) =
         settle_orphan_round(ctx, round_usage, round_two, seed_bytes, provider).await
     else {
