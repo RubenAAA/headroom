@@ -266,6 +266,9 @@ fn is_internal_v6(v6: Ipv6Addr) -> bool {
         || (s[0] & 0xffc0) == 0xfe80
         // 2001:db8::/32, documentation.
         || (s[0] == 0x2001 && s[1] == 0x0db8)
+        // 64:ff9b:1::/48, NAT64 local use (RFC 8215). Never unwrapped: where
+        // its IPv4 bits sit depends on the operator's prefix length.
+        || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)
 }
 
 fn resolved_addresses_allowed(addresses: &[SocketAddr], allow_internal: bool) -> bool {
@@ -391,6 +394,8 @@ mod tests {
         assert!(is_internal_address("2002:0a00:0001::1".parse().unwrap()));
         // NAT64 well-known prefix around metadata.
         assert!(is_internal_address("64:ff9b::a9fe:a9fe".parse().unwrap()));
+        // NAT64 local use is never unwrapped, whatever it embeds.
+        assert!(is_internal_address("64:ff9b:1::808:808".parse().unwrap()));
         // Teredo carrying 10.0.0.1, stored inverted (0xf5fffffe).
         assert!(is_internal_address(
             "2001:0:0:0:0:0:f5ff:fffe".parse().unwrap()
@@ -404,6 +409,9 @@ mod tests {
     fn transition_addresses_to_public_space_still_pass() {
         // 6to4 around 8.8.8.8.
         assert!(!is_internal_address("2002:0808:0808::1".parse().unwrap()));
+        // NAT64 well-known prefix around 8.8.8.8: the translator delivers it
+        // there, so an IPv4-only upstream on a DNS64 network still passes.
+        assert!(!is_internal_address("64:ff9b::808:808".parse().unwrap()));
         // 2001:4860::/32 is Google, not Teredo — only 2001:0000::/32 is.
         assert!(!is_internal_address(
             "2001:4860:4860::8888".parse().unwrap()
