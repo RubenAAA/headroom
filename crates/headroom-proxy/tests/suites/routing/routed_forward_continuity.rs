@@ -102,6 +102,7 @@ async fn an_appended_turn_keeps_its_prefix_and_an_edited_one_breaks_it() {
                 cursor_agent: None,
                 target_model: Some("spark-test-model".to_string()),
                 auth_env: Some("none".to_string()),
+                chat: false,
             }];
         },
         |state| state,
@@ -174,6 +175,7 @@ async fn a_system_message_mid_conversation_leaves_the_prefix_and_head_alone() {
                 cursor_agent: None,
                 target_model: Some("spark-sys-model".to_string()),
                 auth_env: Some("none".to_string()),
+                chat: false,
             }];
         },
         |state| state,
@@ -254,6 +256,7 @@ async fn a_side_request_between_two_turns_is_not_a_break() {
                 cursor_agent: None,
                 target_model: Some("spark-side-model".to_string()),
                 auth_env: Some("none".to_string()),
+                chat: false,
             }];
         },
         |state| state,

@@ -17,6 +17,7 @@ fn spark_route(upstream: &str) -> ProviderRoute {
         cursor_agent: None,
         target_model: Some("muse-spark-1.3-contributor-free".into()),
         auth_env: Some("none".into()),
+        chat: false,
     }
 }
 
@@ -39,6 +40,7 @@ fn cursor_route() -> ProviderRoute {
         cursor_agent: Some("grok-4.6".into()),
         target_model: None,
         auth_env: None,
+        chat: false,
     }
 }
 
@@ -119,6 +121,7 @@ async fn count_tokens_anthropic_target_alias_answered_locally() {
             cursor_agent: None,
             target_model: Some("union-alpha".into()),
             auth_env: Some("none".into()),
+            chat: false,
         });
     })
     .await;

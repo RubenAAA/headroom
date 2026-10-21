@@ -792,6 +792,7 @@ mod tests {
                 cursor_agent: None,
                 target_model: Some("muse-spark-1.3-contributor-free".to_string()),
                 auth_env: None,
+                chat: false,
             }];
         }
         c

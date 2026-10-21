@@ -250,6 +250,7 @@ async fn debug_inflight_counts_zen_requests_per_egress_until_the_stream_ends() {
             cursor_agent: None,
             target_model: Some("muse-spark-1.3".to_string()),
             auth_env: Some("none".to_string()),
+            chat: false,
         }];
     })
     .await;

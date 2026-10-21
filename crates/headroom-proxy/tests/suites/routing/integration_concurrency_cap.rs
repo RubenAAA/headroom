@@ -226,6 +226,7 @@ async fn routed_turn_sheds_with_429_past_the_cap() {
             cursor_agent: None,
             target_model: Some("gpt-5.5".to_string()),
             auth_env: None,
+            chat: false,
         }];
     })
     .await;

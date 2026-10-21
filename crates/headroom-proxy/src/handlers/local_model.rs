@@ -205,6 +205,7 @@ pub async fn handle_messages(
         translate,
         target_model,
         auth_env,
+        chat,
     } = target;
 
     let anthropic_target = !translate && target_model.is_some();
@@ -260,10 +261,12 @@ pub async fn handle_messages(
     let parsed = prepared.parsed;
     let egress_lane_key = prepared.ctx_report.lane_key.clone();
 
+    // A target selects the Responses shape; a `:chat:` route keeps Chat
+    // Completions and gets its upstream model name set after translation.
     let translated = match translate_routed_request(
         &parsed,
         &headers,
-        target_model.as_deref(),
+        target_model.as_deref().filter(|_| !chat),
         &upstream,
         is_chatgpt_auth,
         body_model,
@@ -272,7 +275,10 @@ pub async fn handle_messages(
         Ok(translated) => translated,
         Err(resp) => return resp,
     };
-    let openai_body = translated.openai_body;
+    let mut openai_body = translated.openai_body;
+    if chat && let Some(target) = &target_model {
+        openai_body["model"] = Value::String(target.clone());
+    }
     let upstream_url = translated.upstream_url;
     let downstream_is_stream = translated.downstream_is_stream;
     // The wire shape, decided once in translation. Arm pick and CCR shape

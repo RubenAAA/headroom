@@ -464,6 +464,7 @@ async fn the_routed_entry_path_also_shrinks_the_sidecar() {
             cursor_agent: None,
             target_model: Some("gpt-5.5".to_string()),
             auth_env: None,
+            chat: false,
         }];
     })
     .await;
@@ -886,6 +887,7 @@ fn zen_route(zen: &MockServer) -> ProviderRoute {
         cursor_agent: None,
         target_model: Some("muse-spark-1.2-contributor-free".to_string()),
         auth_env: Some("none".to_string()),
+        chat: false,
     }
 }
 
@@ -958,6 +960,7 @@ fn chat_route(upstream: &MockServer) -> ProviderRoute {
         cursor_agent: None,
         target_model: None,
         auth_env: Some("none".to_string()),
+        chat: false,
     }
 }
 
@@ -1110,6 +1113,7 @@ async fn a_chat_route_that_stalls_mid_reply_falls_back_to_the_fixed_line() {
             cursor_agent: None,
             target_model: None,
             auth_env: Some("none".to_string()),
+            chat: false,
         }];
     })
     .await;

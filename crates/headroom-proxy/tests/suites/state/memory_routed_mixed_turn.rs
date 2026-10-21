@@ -205,6 +205,7 @@ async fn run_turn(mixed: bool, with_text: bool) -> (String, Vec<String>) {
                 cursor_agent: None,
                 target_model: Some("spark-test-model".to_string()),
                 auth_env: Some("none".to_string()),
+                chat: false,
             }];
         },
         |state| state,

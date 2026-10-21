@@ -1070,6 +1070,31 @@ fn continuation_json_truncation_signature() {
     );
 }
 
+/// Zen's Chat route always streams, so a chat continuation can be cut the
+/// SSE way: retry a stream that never reached a `finish_reason`, not one
+/// that stopped on its own (a `length` stop would repeat on resend).
+#[test]
+fn chat_stream_continuation_cut_signature() {
+    let sse = "text/event-stream";
+    let delta = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+    assert!(continuation_cut_retryable(delta.as_bytes(), sse, "openai"));
+    for reason in ["stop", "length"] {
+        let finished = format!(
+            "{delta}data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{reason}\"}}]}}\n\n"
+        );
+        assert!(!continuation_cut_retryable(
+            finished.as_bytes(),
+            sse,
+            "openai"
+        ));
+    }
+    assert!(!continuation_cut_retryable(
+        br#"{"choices":[]}"#,
+        "application/json",
+        "openai"
+    ));
+}
+
 /// All retrievals failed: the loop must answer the errors in place
 /// instead of paying a full-prefix continuation round to deliver them.
 #[tokio::test]

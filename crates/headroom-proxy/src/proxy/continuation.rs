@@ -483,8 +483,14 @@ pub(super) fn continuation_cut_retryable(body: &[u8], content_type: &str, provid
             continuation_stream_terminal(body, provider).is_none()
                 && continuation_body_is_sse(body, Some(content_type))
         }
-        // Chat completions fold JSON only: truncated JSON (not ending like
-        // a complete value) reads as cut mid-write.
+        // Zen Chat routes always stream (see `routed::translation`): a
+        // stream that never reached a `finish_reason` was cut.
+        "openai" if continuation_body_is_sse(body, Some(content_type)) => {
+            crate::openai::response::chat_stream_to_completion(&String::from_utf8_lossy(body))
+                .is_none_or(|turn| turn["choices"][0]["finish_reason"].is_null())
+        }
+        // Buffered chat completions: truncated JSON (not ending like a
+        // complete value) reads as cut mid-write.
         "openai" => continuation_json_looks_truncated(body),
         _ => false,
     }
@@ -543,7 +549,7 @@ pub(crate) fn continuation_turn_from_body(
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
         return Some(v);
     }
-    if !matches!(provider, "openai_responses" | "anthropic") {
+    if !matches!(provider, "openai_responses" | "anthropic" | "openai") {
         return None;
     }
     // A missing Content-Type is not "not SSE": on 2026-09-14 eleven
@@ -558,6 +564,10 @@ pub(crate) fn continuation_turn_from_body(
         return crate::sse::ccr_stream::anthropic_stream_to_turn(body);
     }
     let text = std::string::String::from_utf8_lossy(body);
+    // Zen Chat routes always stream (see `routed::translation`).
+    if provider == "openai" {
+        return crate::openai::response::chat_stream_to_completion(&text);
+    }
     let (turn, _) = crate::openai::response::responses_stream_to_turn(&text);
     let has_blocks = turn
         .get("output")

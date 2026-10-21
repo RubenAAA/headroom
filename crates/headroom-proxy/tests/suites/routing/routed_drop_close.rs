@@ -98,6 +98,7 @@ async fn dropped_turn(on_drop: Option<&str>) -> (String, bool) {
                 cursor_agent: None,
                 target_model: Some("spark-test-model".to_string()),
                 auth_env: Some("none".to_string()),
+                chat: false,
             }];
         },
         |state| state,

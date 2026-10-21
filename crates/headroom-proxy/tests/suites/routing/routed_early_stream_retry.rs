@@ -118,6 +118,7 @@ async fn a_truncated_first_attempt_is_resent_not_surfaced() {
                 cursor_agent: None,
                 target_model: Some("spark-test-model".to_string()),
                 auth_env: Some("none".to_string()),
+                chat: false,
             }];
         },
         |state| state,
@@ -236,6 +237,7 @@ async fn a_complete_small_turn_is_not_resent() {
                 cursor_agent: None,
                 target_model: Some("spark-test-model".to_string()),
                 auth_env: Some("none".to_string()),
+                chat: false,
             }];
         },
         |state| state,

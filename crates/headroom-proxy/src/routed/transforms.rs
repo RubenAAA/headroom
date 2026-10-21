@@ -443,13 +443,13 @@ fn offload_tool_results(
 const SPARK_OFFLOAD_TAIL: usize = 20;
 
 /// The Spark offload threshold when it applies to this request: the flag is
-/// set and the model is a Spark one.
+/// set and the model is a Spark or GLM one.
 pub(crate) fn spark_offload_min_bytes(state: &AppState, parsed: &Value) -> Option<usize> {
     let min = state.config.ctx_offload_spark_min_bytes;
     let is_spark = parsed
         .get("model")
         .and_then(Value::as_str)
-        .is_some_and(|m| m.contains("spark"));
+        .is_some_and(|m| m.contains("spark") || m.contains("glm"));
     (min > 0 && is_spark).then_some(min)
 }
 

@@ -90,6 +90,8 @@ pub(crate) struct RouteTarget {
     pub translate: bool,
     pub target_model: Option<String>,
     pub auth_env: Option<String>,
+    /// Chat Completions despite a target; see [`crate::config::ProviderRoute::chat`].
+    pub chat: bool,
 }
 
 /// Find a matching route: first the legacy `local_model` alias (backward
@@ -102,7 +104,7 @@ pub(crate) fn find_route_target(
     let matched =
         if let (Some(model), Some(upstream)) = (&config.local_model, &config.local_upstream) {
             if body_model == model.as_str() {
-                Some((upstream.clone(), true, None, None))
+                Some((upstream.clone(), true, None, None, false))
             } else {
                 None
             }
@@ -121,16 +123,18 @@ pub(crate) fn find_route_target(
                     r.translate,
                     r.target_model.clone(),
                     r.auth_env.clone(),
+                    r.chat,
                 ))
             })
     });
 
     matched.map(
-        |(upstream, translate, target_model, auth_env)| RouteTarget {
+        |(upstream, translate, target_model, auth_env, chat)| RouteTarget {
             upstream,
             translate,
             target_model,
             auth_env,
+            chat,
         },
     )
 }

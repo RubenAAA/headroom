@@ -164,6 +164,7 @@ async fn run_turn(first_phase: &'static str, nudge_calls: bool) -> (String, Vec<
                 cursor_agent: None,
                 target_model: Some("spark-test-model".to_string()),
                 auth_env: Some("none".to_string()),
+                chat: false,
             }];
         },
         |state| state,

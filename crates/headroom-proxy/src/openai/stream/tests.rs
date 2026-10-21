@@ -440,6 +440,42 @@ fn signature_only_block_closes_open_text_first() {
     assert_eq!(indices, unique, "two content blocks opened on one index");
 }
 
+/// DeepSeek on Zen sends `"content": ""` and `"reasoning_content": ""` on
+/// every tool-call chunk. Empty deltas must not open blocks, or one call
+/// comes out as several `tool_use` blocks sharing an id.
+#[test]
+fn empty_chat_deltas_keep_one_tool_block() {
+    let mut t = StreamTranslator::new("deepseek-v4.1-flash-free".to_string());
+    let mut sse = String::new();
+    for frame in [
+        json!({"choices": [{"delta": {"content": "", "reasoning_content": "", "tool_calls": [
+            {"index": 0, "id": "call_1", "type": "function", "function": {"name": "bash", "arguments": ""}}
+        ]}}]}),
+        json!({"choices": [{"delta": {"content": "", "reasoning_content": "", "tool_calls": [
+            {"index": 0, "function": {"arguments": "{\"command\""}}
+        ]}}]}),
+        json!({"choices": [{"delta": {"content": "", "reasoning_content": "", "tool_calls": [
+            {"index": 0, "function": {"arguments": ": \"ls\"}"}}
+        ]}}]}),
+        json!({"choices": [{"delta": {"content": ""}, "finish_reason": "tool_calls"}]}),
+    ] {
+        sse.extend(t.process_frame(None, &frame.to_string()));
+    }
+    let starts: Vec<String> = sse
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+        .filter(|e| e["type"] == "content_block_start")
+        .map(|e| {
+            e["content_block"]["type"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(starts, ["tool_use"]);
+}
+
 /// An id with no blob (or the reverse) is not replayable, so no signature
 /// is minted and the summary stays a plain thinking block.
 #[test]

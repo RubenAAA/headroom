@@ -71,6 +71,7 @@ mod tests {
             cursor_agent: cursor.map(str::to_string),
             target_model: target.map(str::to_string),
             auth_env: None,
+            chat: false,
         }
     }
 

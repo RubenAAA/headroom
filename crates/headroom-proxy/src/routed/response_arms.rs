@@ -260,7 +260,11 @@ fn parse_buffered_turn(body_text: &str, is_responses: bool) -> Result<(Value, i6
             }
         }
     } else {
-        match serde_json::from_str(body_text) {
+        // Zen Chat routes always stream upstream (see `translate_shaped_body`),
+        // so a non-streaming client turn arrives here as SSE.
+        match serde_json::from_str(body_text)
+            .or_else(|e| crate::openai::response::chat_stream_to_completion(body_text).ok_or(e))
+        {
             Ok(v) => Ok((v, 0)),
             Err(e) => {
                 tracing::warn!(

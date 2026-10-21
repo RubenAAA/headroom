@@ -719,7 +719,7 @@ fn mint_workdir() -> std::path::PathBuf {
 /// Locate the `opencode` binary: `$HEADROOM_OPENCODE_BIN` when it names
 /// an existing file, else the first `opencode` on `PATH`. `None` when
 /// OpenCode is not installed — minting is impossible, fail open.
-fn resolve_opencode_bin() -> Option<std::path::PathBuf> {
+pub(crate) fn resolve_opencode_bin() -> Option<std::path::PathBuf> {
     if let Ok(custom) = std::env::var(ZEN_OPENCODE_BIN_ENV) {
         let p = std::path::PathBuf::from(custom.trim());
         if p.is_file() {

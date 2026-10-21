@@ -248,10 +248,146 @@ pub(crate) fn openai_to_anthropic_response(openai: &Value, original: &Value) -> 
     })
 }
 
+/// Fold a Chat Completions SSE stream into the buffered `chat.completion`
+/// body that [`openai_to_anthropic_response`] reads. For upstreams that only
+/// answer streamed: Zen's free tier refuses `stream: false` with
+/// `FreeTierError` (probed 2026-10-15 on deepseek-v4.1-flash-free), so a
+/// non-streaming client turn is streamed upstream and folded here. `None`
+/// when the body carries no `data:` chunk at all.
+pub(crate) fn chat_stream_to_completion(body: &str) -> Option<Value> {
+    let mut model = Value::Null;
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    // (id, name, arguments) per tool-call index, in first-seen order.
+    let mut calls: Vec<(u64, String, String, String)> = Vec::new();
+    let mut finish_reason = Value::Null;
+    let mut usage = Value::Null;
+    let mut chunks = 0;
+    for data in body.lines().filter_map(|l| l.strip_prefix("data:")) {
+        let Ok(chunk) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        chunks += 1;
+        if let Some(m) = chunk.get("model").filter(|m| !m.is_null()) {
+            model = m.clone();
+        }
+        if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+            usage = u.clone();
+        }
+        let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
+            continue;
+        };
+        if let Some(r) = choice.get("finish_reason").filter(|r| !r.is_null()) {
+            finish_reason = r.clone();
+        }
+        let Some(delta) = choice.get("delta") else {
+            continue;
+        };
+        if let Some(t) = delta.get("content").and_then(Value::as_str) {
+            content.push_str(t);
+        }
+        if let Some(t) = delta.get("reasoning_content").and_then(Value::as_str) {
+            reasoning.push_str(t);
+        }
+        for tc in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let slot = match calls.iter().position(|c| c.0 == index) {
+                Some(i) => i,
+                None => {
+                    calls.push((index, String::new(), String::new(), String::new()));
+                    calls.len() - 1
+                }
+            };
+            let call = &mut calls[slot];
+            if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                call.1 = id.to_string();
+            }
+            let function = tc.get("function");
+            if let Some(name) = function.and_then(|f| f.get("name")).and_then(Value::as_str) {
+                call.2.push_str(name);
+            }
+            if let Some(args) = function
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str)
+            {
+                call.3.push_str(args);
+            }
+        }
+    }
+    if chunks == 0 {
+        return None;
+    }
+    let mut message = json!({"role": "assistant", "content": content});
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = json!(reasoning);
+    }
+    if !calls.is_empty() {
+        message["tool_calls"] = calls
+            .into_iter()
+            .map(|(_, id, name, arguments)| {
+                json!({"id": id, "type": "function", "function": {"name": name, "arguments": arguments}})
+            })
+            .collect();
+    }
+    Some(json!({
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": usage,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A streamed Chat turn as Zen sends it for DeepSeek: empty content on
+    /// tool-call chunks, arguments split across chunks, usage last with no
+    /// choices. Folded, it reads like the buffered body.
+    #[test]
+    fn chat_stream_folds_to_a_completion() {
+        let stream = concat!(
+            "data: {\"model\":\"deepseek-v4.1-flash-free\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"think\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Run it.\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\": \\\"ls\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let body = chat_stream_to_completion(stream).expect("folds");
+        let msg = &body["choices"][0]["message"];
+        assert_eq!(msg["content"], json!("Run it."));
+        assert_eq!(msg["reasoning_content"], json!("think"));
+        assert_eq!(msg["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(msg["tool_calls"][0]["function"]["name"], json!("bash"));
+        assert_eq!(
+            msg["tool_calls"][0]["function"]["arguments"],
+            json!("{\"command\": \"ls\"}")
+        );
+        assert_eq!(body["choices"][0]["finish_reason"], json!("tool_calls"));
+
+        let turn =
+            openai_to_anthropic_response(&body, &json!({"model": "claude-deepseek-v4.1-flash"}));
+        assert_eq!(turn["stop_reason"], json!("tool_use"));
+        assert_eq!(turn["usage"]["output_tokens"], json!(5));
+        let types: Vec<&str> = turn["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["type"].as_str())
+            .collect();
+        assert_eq!(types, ["thinking", "text", "tool_use"]);
+
+        assert!(chat_stream_to_completion("not a stream").is_none());
+    }
+
     #[test]
     fn responses_stream_keeps_tool_calls() {
         let stream = concat!(

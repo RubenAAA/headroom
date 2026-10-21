@@ -91,7 +91,7 @@ pub(crate) fn translate_routed_request(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let upstream_is_stream = is_stream || is_responses;
+    let upstream_is_stream = openai_body.get("stream").and_then(Value::as_bool) == Some(true);
     let downstream_is_stream = is_stream;
 
     // Endpoint selection is the provider quirk (P6): ChatGPT-subscription
@@ -167,6 +167,13 @@ fn translate_shaped_body(
                     obj.remove("parallel_tool_calls");
                 }
             }
+            // Zen's free tier refuses `stream: false` on Chat Completions with
+            // `FreeTierError` (probed 2026-10-15). Stream upstream as OpenCode
+            // does; a non-streaming client gets the fold in `response_arms`.
+            if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen && !is_responses {
+                v["stream"] = serde_json::json!(true);
+                v["stream_options"] = serde_json::json!({"include_usage": true});
+            }
             // The translator keys the cache on the raw `metadata.user_id`, which
             // carries the device and account ids. The Codex CLI sends its session
             // id as both the key and the `session-id` header; do the same, so the
@@ -194,9 +201,9 @@ fn translate_shaped_body(
             // OpenCode-native lowercase (`read`, not `Read`). Rename the
             // translated body (definitions, history calls, forced choice)
             // and map the model's calls back before delivery — see
-            // `routed::tool_alias`. Responses shape only: Chat routes
-            // have no Zen free-tier configuration today.
-            if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen && is_responses {
+            // `routed::tool_alias`. Both shapes: Chat-only free models
+            // (`deepseek-v4.1-flash-free`) sit behind the same gate.
+            if kind == crate::routed::quirks::UpstreamKind::OpenCodeZen {
                 let alias = crate::routed::tool_alias::ToolAlias::derive(
                     parsed.get("tools").and_then(|t| t.as_array()),
                 );
@@ -682,6 +689,36 @@ mod tests {
         .expect("translates");
         assert_eq!(tool_names(&out), vec!["Read", "Bash"]);
         assert_eq!(history_names(&out), vec!["Read"]);
+
+        // Chat route on Zen (no target): the gate reads the same names,
+        // nested under `function` (probed live 2026-10-15 on
+        // deepseek-v4.1-flash-free: `read` 200s, `Read` 403s).
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            None,
+            &zen,
+            false,
+            "deepseek-v4.1-flash-free",
+            "req-zen-chat",
+        )
+        .expect("translates");
+        let chat_names: Vec<&str> = out.openai_body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert_eq!(chat_names, ["read", "bash", "edit", "glob", "grep"]);
+        let chat_history: Vec<&str> = out.openai_body["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter_map(|m| m["tool_calls"].as_array())
+            .flatten()
+            .filter_map(|c| c["function"]["name"].as_str())
+            .collect();
+        assert_eq!(chat_history, ["read"]);
     }
 
     /// The Zen turn the client actually receives back: renamed calls are
@@ -793,6 +830,27 @@ mod tests {
             out.upstream_url.ends_with("/v1/chat/completions"),
             "{}",
             out.upstream_url
+        );
+        assert_eq!(out.openai_body["stream"], json!(false));
+
+        // Zen's free tier refuses `stream: false`: the same turn streams
+        // upstream while the client still gets one buffered body.
+        let zen: url::Url = "https://opencode.ai/zen/v1".parse().unwrap();
+        let out = translate_routed_request(
+            &parsed,
+            &HeaderMap::new(),
+            None,
+            &zen,
+            false,
+            "deepseek-v4.1-flash-free",
+            "req-zen-buffered",
+        )
+        .expect("translates");
+        assert!(!out.downstream_is_stream);
+        assert_eq!(out.openai_body["stream"], json!(true));
+        assert_eq!(
+            out.openai_body["stream_options"]["include_usage"],
+            json!(true)
         );
     }
 

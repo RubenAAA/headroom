@@ -156,6 +156,7 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
                 cursor_agent: None,
                 target_model: Some("gpt-5.5".to_string()),
                 auth_env: None,
+                chat: false,
             },
             ProviderRoute {
                 model_prefix: "codex-*".to_string(),
@@ -165,6 +166,7 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
                 cursor_agent: None,
                 target_model: Some("gpt-5.5".to_string()),
                 auth_env: None,
+                chat: false,
             },
             ProviderRoute {
                 model_prefix: "anthropic-routed".to_string(),
@@ -174,6 +176,7 @@ async fn gateway_model_discovery_lists_discoverable_routes() {
                 cursor_agent: Some("cursor-grok-4.6-high".to_string()),
                 target_model: None,
                 auth_env: None,
+                chat: false,
             },
         ];
     })
@@ -235,6 +238,7 @@ async fn gateway_model_discovery_lists_advertised_models() {
             cursor_agent: None,
             target_model: Some("gpt-5.5".to_string()),
             auth_env: None,
+            chat: false,
         }];
         cfg.advertised_models = vec![
             "claude-sonnet-5-5".to_string(),
@@ -309,6 +313,7 @@ async fn codex_translate_route_uses_responses_endpoint() {
             cursor_agent: None,
             target_model: Some("gpt-5.5".to_string()),
             auth_env: None,
+            chat: false,
         }];
     })
     .await;
@@ -403,6 +408,7 @@ async fn redacted_routed_turn_hides_home_upstream_and_restores_for_client() {
             cursor_agent: None,
             target_model: Some("muse-spark-1.3-contributor-free".to_string()),
             auth_env: None,
+            chat: false,
         }];
     })
     .await;
@@ -579,6 +585,7 @@ async fn zen_hold_recovers_after_fast_budget_spent() {
             cursor_agent: None,
             target_model: Some("gpt-5".to_string()),
             auth_env: None,
+            chat: false,
         }];
     })
     .await;
@@ -636,6 +643,7 @@ async fn spark_offload_stubs_old_tool_results_and_keeps_the_newest_twenty_messag
                 cursor_agent: None,
                 target_model: Some("gpt-5".to_string()),
                 auth_env: None,
+                chat: false,
             }];
         })
         .await;
@@ -721,6 +729,7 @@ async fn user_text_dedup_folds_old_repeats_on_a_routed_model_and_keeps_the_tail(
                     cursor_agent: None,
                     target_model: Some("gpt-5".to_string()),
                     auth_env: None,
+                    chat: false,
                 }];
             })
             .await;
@@ -805,6 +814,7 @@ async fn refresh_observe_asks_jev_about_a_long_spark_history_and_changes_nothing
             cursor_agent: None,
             target_model: Some("gpt-5".to_string()),
             auth_env: None,
+            chat: false,
         }];
     })
     .await;
@@ -943,6 +953,7 @@ async fn codex_translate_route_buffers_non_stream_responses() {
             cursor_agent: None,
             target_model: Some("gpt-5.5".to_string()),
             auth_env: None,
+            chat: false,
         }];
     })
     .await;
@@ -1012,6 +1023,7 @@ async fn over_cap_retry_after_returns_immediately_and_preserves_header() {
                 cursor_agent: None,
                 target_model: Some("gpt-5.5".to_string()),
                 auth_env: None,
+                chat: false,
             }];
         },
         move |mut state| {
@@ -1192,6 +1204,7 @@ fn spark_router_config(zen: &MockServer) -> (String, ProviderRoute, ModelRouterC
         cursor_agent: None,
         target_model: Some("muse-spark-1.3".to_string()),
         auth_env: Some("none".to_string()),
+        chat: false,
     };
     let router = ModelRouterConfig::from_env(
         Some("1"),
@@ -1786,6 +1799,7 @@ async fn passthrough_route_forwards_verbatim_and_books_usage() {
                 cursor_agent: None,
                 target_model: None,
                 auth_env: Some("none".to_string()),
+                chat: false,
             }];
         },
         move |state| {
@@ -1883,6 +1897,7 @@ async fn cursor_turn_books_cli_reported_counts() {
                 cursor_agent: Some("grok-4.6-high".to_string()),
                 target_model: None,
                 auth_env: None,
+                chat: false,
             }];
         },
         move |state| {
@@ -1978,6 +1993,7 @@ async fn anthropic_target_route_rewrites_model_and_auth() {
             cursor_agent: None,
             target_model: Some("union-alpha".to_string()),
             auth_env: Some("HEADROOM_TEST_ZEN_KEY".to_string()),
+            chat: false,
         }];
     })
     .await;
@@ -2049,6 +2065,7 @@ async fn anthropic_target_route_missing_auth_is_reported() {
             cursor_agent: None,
             target_model: Some("union-alpha".to_string()),
             auth_env: Some("HEADROOM_TEST_ZEN_MISSING".to_string()),
+            chat: false,
         }];
     })
     .await;
@@ -2092,6 +2109,7 @@ async fn anthropic_target_route_is_discoverable() {
             cursor_agent: None,
             target_model: Some("union-alpha".to_string()),
             auth_env: Some("OPENCODE_API_KEY".to_string()),
+            chat: false,
         }];
     })
     .await;
@@ -2211,6 +2229,7 @@ async fn anthropic_target_route_streams_sse() {
                 cursor_agent: None,
                 target_model: Some("union-alpha".to_string()),
                 auth_env: Some("none".to_string()),
+                chat: false,
             }];
         },
         move |state| {

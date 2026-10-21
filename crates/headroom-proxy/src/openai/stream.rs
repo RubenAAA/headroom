@@ -95,14 +95,17 @@ fn output_index(chunk: &Value) -> Option<u64> {
     chunk.get("output_index").and_then(Value::as_u64)
 }
 
-/// A client alias for a translated route (Spark, Codex) rather than a native
-/// Anthropic turn. Both bill from a different cache universe than the
+/// A client alias for a translated route (Spark, Codex, DeepSeek, GLM) rather
+/// than a native Anthropic turn. All bill from a different cache universe than the
 /// Anthropic footprint the usage observer scores — translated prefix, no
 /// write/TTL telemetry — so scoring them reads as a bust on nearly every
 /// turn. Case-insensitive, matching the guards this replaces.
 pub(crate) fn translated_route_model(model: &str) -> bool {
     let lower = model.to_lowercase();
-    lower.contains("spark") || lower.contains("codex")
+    lower.contains("spark")
+        || lower.contains("codex")
+        || lower.contains("deepseek")
+        || lower.contains("glm")
 }
 
 #[cfg(test)]
@@ -117,6 +120,8 @@ mod translated_route_model_tests {
             "claude-codex-6-luna",
             "claude-codex-5.6",
             "claude-muse-spark-1.3",
+            "claude-deepseek-v4.1-flash",
+            "claude-glm-5.3-flash",
             "gpt-5.6-codex",
         ] {
             assert!(translated_route_model(model), "{model} is translated");
@@ -947,12 +952,23 @@ impl StreamTranslator {
 
         if let Some(delta) = delta {
             // Handle reasoning_content (thinking tokens from models like Qwen).
-            if let Some(thinking) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+            // Empty strings are skipped: DeepSeek sends `"content": ""` and
+            // `"reasoning_content": ""` on every tool-call chunk, and opening
+            // a block for each one split a single call into many.
+            if let Some(thinking) = delta
+                .get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 self.open_block(OpenBlock::Thinking, &mut events);
                 events.push(self.emit_thinking_delta(thinking));
             }
 
-            if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+            if let Some(text) = delta
+                .get("content")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 self.open_block(OpenBlock::Text, &mut events);
                 events.push(self.emit_text_delta(text));
                 self.record_text_emitted(text);

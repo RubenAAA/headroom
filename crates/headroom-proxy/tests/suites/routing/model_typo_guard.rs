@@ -44,6 +44,7 @@ fn routes(zen: &MockServer) -> Vec<ProviderRoute> {
             cursor_agent: None,
             target_model: Some("muse-spark-1.3".to_string()),
             auth_env: Some("none".to_string()),
+            chat: false,
         },
         ProviderRoute {
             model_prefix: "claude-union-alpha".to_string(),
@@ -53,6 +54,7 @@ fn routes(zen: &MockServer) -> Vec<ProviderRoute> {
             cursor_agent: None,
             target_model: Some("union-alpha".to_string()),
             auth_env: Some(UNSET_KEY.to_string()),
+            chat: false,
         },
     ]
 }

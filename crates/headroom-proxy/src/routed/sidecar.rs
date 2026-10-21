@@ -31,6 +31,7 @@ pub(crate) fn sidecar_responses_route<'a>(
         r.matches(sidecar_model)
             && r.translate
             && r.target_model.is_some()
+            && !r.chat
             && r.cursor_agent.is_none()
             && r.upstream.is_some()
     })
@@ -542,6 +543,7 @@ mod tests {
                 cursor_agent: cursor.map(str::to_string),
                 target_model: target.map(str::to_string),
                 auth_env: None,
+                chat: false,
             }
         }
         let zen = route(
@@ -691,6 +693,7 @@ mod tests {
                 cursor_agent: None,
                 target_model: Some("muse-spark-1.3-contributor-free".to_string()),
                 auth_env: None,
+                chat: false,
             }];
         });
         // Secret sits in the tail (kept by the shrink) while the describe

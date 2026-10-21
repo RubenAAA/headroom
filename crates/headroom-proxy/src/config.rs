@@ -1622,6 +1622,8 @@ pub struct CliArgs {
     /// endpoint: with a target the request goes to the agentic Responses API
     /// (`/v1/responses`, or the ChatGPT Codex backend under Codex auth);
     /// without one it goes to `/v1/chat/completions`. Codex needs the former.
+    /// `:chat:TARGET_MODEL_ID` in place of `:openai:TARGET_MODEL_ID` keeps the
+    /// rename but stays on `/v1/chat/completions`, for models served only there.
     ///
     /// `:auth=ENV_VAR` names the environment variable holding this route's
     /// bearer token — the name, so nothing written here is a secret. It also
@@ -1639,6 +1641,7 @@ pub struct CliArgs {
     ///   --extra-model-route "claude-codex-terra=https://api.openai.com/v1:openai:gpt-5.6-terra"
     ///   --extra-model-route "claude-grok-4.6=https://api.x.ai/v1:openai:grok-4.6:auth=XAI_API_KEY"
     ///   --extra-model-route "claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=none"
+    ///   --extra-model-route "claude-deepseek-v4.1-flash=https://opencode.ai/zen/v1:chat:deepseek-v4.1-flash-free:auth=none"
     // The doc comment is also `--help` text (and docs/flags.md), so its
     // example URLs stay bare rather than wrapped in rustdoc's `<...>`.
     #[allow(rustdoc::bare_urls)]
@@ -2468,6 +2471,12 @@ pub struct ProviderRoute {
     /// Codex headers when `--codex-auth-file` is set, the caller's
     /// `Authorization` otherwise.
     pub auth_env: Option<String>,
+    /// Speak Chat Completions even though `target_model` is set. Written
+    /// `:chat:TARGET`. A target normally selects the Responses API; this
+    /// keeps the rename for models served only over Chat Completions
+    /// (Zen's `deepseek-v4.1-flash-free`), so they can have a `claude-*`
+    /// alias.
+    pub chat: bool,
 }
 
 impl ProviderRoute {
@@ -2633,6 +2642,10 @@ fn shadowed_routes(routes: &[ProviderRoute]) -> Vec<(&str, &str)> {
 /// [`warn_on_ambiguous_codex_routes`].
 const TRANSLATE_KEYWORDS: [&str; 2] = ["translate", "openai"];
 
+/// Keyword for a translated route that keeps Chat Completions with a
+/// `TARGET_MODEL_ID` (see [`ProviderRoute::chat`]).
+const CHAT_KEYWORD: &str = "chat";
+
 /// The `:auth=` marker introducing a route's own credential.
 const AUTH_MARKER: &str = ":auth=";
 
@@ -2672,8 +2685,8 @@ fn split_auth_env(rest: &str) -> Result<(&str, Option<String>), String> {
 fn parse_model_route(spec: &str) -> Result<ProviderRoute, String> {
     let (model, rest) = spec.split_once('=').ok_or_else(|| {
         format!(
-            "expected MODEL=URL[:translate[:TARGET_ID]][:auth=ENV_VAR] or \
-             MODEL=cursor:ID, got: {spec}"
+            "expected MODEL=URL[:translate[:TARGET_ID]][:auth=ENV_VAR], \
+             MODEL=URL:chat:TARGET_ID[:auth=ENV_VAR] or MODEL=cursor:ID, got: {spec}"
         )
     })?;
     let model = model.trim().to_string();
@@ -2689,6 +2702,7 @@ fn parse_model_route(spec: &str) -> Result<ProviderRoute, String> {
             cursor_agent: Some(cursor_model.trim().to_string()),
             target_model: None,
             auth_env: None,
+            chat: false,
         });
     }
 
@@ -2697,7 +2711,11 @@ fn parse_model_route(spec: &str) -> Result<ProviderRoute, String> {
     // Check for a trailing `:<kw>` or `:<kw>:TARGET_ID` suffix, where `<kw>`
     // is any of TRANSLATE_KEYWORDS (but not `://` from the scheme).
     let mut parsed_suffix = None;
-    for kw in TRANSLATE_KEYWORDS.into_iter().chain(["anthropic"]) {
+    let mut chat = false;
+    for kw in TRANSLATE_KEYWORDS
+        .into_iter()
+        .chain(["anthropic", CHAT_KEYWORD])
+    {
         let with_target = format!(":{kw}:");
         if let Some(idx) = rest.find(&with_target) {
             let target = rest[idx + with_target.len()..].trim();
@@ -2707,12 +2725,13 @@ fn parse_model_route(spec: &str) -> Result<ProviderRoute, String> {
                 ));
             }
             parsed_suffix = Some((&rest[..idx], kw != "anthropic", Some(target.to_string())));
+            chat = kw == CHAT_KEYWORD;
             break;
         }
         let bare = format!(":{kw}");
         if rest.ends_with(&bare) {
-            if kw == "anthropic" {
-                return Err(format!("expected :anthropic:TARGET_MODEL_ID in {spec}"));
+            if kw == "anthropic" || kw == CHAT_KEYWORD {
+                return Err(format!("expected :{kw}:TARGET_MODEL_ID in {spec}"));
             }
             parsed_suffix = Some((&rest[..rest.len() - bare.len()], true, None));
             break;
@@ -2733,6 +2752,7 @@ fn parse_model_route(spec: &str) -> Result<ProviderRoute, String> {
         cursor_agent: None,
         target_model,
         auth_env,
+        chat,
     })
 }
 
@@ -4036,6 +4056,27 @@ mod model_route_tests {
             "https://opencode.ai/zen/v1"
         );
         assert!(r.matches("claude-muse-spark-1.3"));
+        assert!(!r.chat);
+    }
+
+    /// `:chat:TARGET` keeps the rename but not the Responses shape: Zen
+    /// serves DeepSeek only over Chat Completions. The bare form has no
+    /// target to rename to, so it is an error.
+    #[test]
+    fn parse_chat_target_route() {
+        let r = parse_model_route(
+            "claude-deepseek-v4.1-flash=https://opencode.ai/zen/v1:chat:deepseek-v4.1-flash-free:auth=none",
+        )
+        .unwrap();
+        assert!(r.translate);
+        assert!(r.chat);
+        assert_eq!(r.target_model.as_deref(), Some("deepseek-v4.1-flash-free"));
+        assert_eq!(r.auth_env.as_deref(), Some("none"));
+        assert_eq!(
+            r.upstream.as_ref().unwrap().as_str(),
+            "https://opencode.ai/zen/v1"
+        );
+        assert!(parse_model_route("m=https://opencode.ai/zen/v1:chat").is_err());
     }
 
     #[test]

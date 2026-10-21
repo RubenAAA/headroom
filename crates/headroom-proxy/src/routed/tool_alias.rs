@@ -72,7 +72,17 @@ fn shadow_description(name: &str) -> &'static str {
 }
 
 /// A shadow definition for a core name missing from the turn.
-fn shadow_tool(name: &str) -> Value {
+fn shadow_tool(name: &str, chat: bool) -> Value {
+    if chat {
+        return serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": shadow_description(name),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        });
+    }
     serde_json::json!({
         "type": "function",
         "name": name,
@@ -82,10 +92,23 @@ fn shadow_tool(name: &str) -> Value {
     })
 }
 
-/// Append the missing core names to an OpenAI Responses request body so
-/// the turn clears Zen's gate. Always tops up to the full core set:
-/// extras the client brings (memory tools, MCP servers, unknown names)
-/// must not count toward it — probed live, a turn with ten tools but
+/// Chat Completions bodies carry `messages`; Responses bodies carry `input`.
+fn is_chat_body(openai_body: &Value) -> bool {
+    openai_body.get("messages").is_some()
+}
+
+/// A tool definition's name in either wire shape: Responses puts it at the
+/// top level, Chat Completions under `function`.
+fn tool_def_name(tool: &Value) -> Option<&str> {
+    tool.get("name")
+        .or_else(|| tool.get("function").and_then(|f| f.get("name")))
+        .and_then(|n| n.as_str())
+}
+
+/// Append the missing core names to an OpenAI request body (Responses or
+/// Chat Completions) so the turn clears Zen's gate. Always tops up to the
+/// full core set: extras the client brings (memory tools, MCP servers,
+/// unknown names) must not count toward it — probed live, a turn with ten tools but
 /// only five known ones still 403s. Names already present (exact match,
 /// post-rename) are never duplicated. Returns how many shadows were
 /// appended, for logging.
@@ -96,13 +119,14 @@ fn shadow_tool(name: &str) -> Value {
 /// when it uniquely matches a real client tool case-insensitively,
 /// otherwise untouched exactly like any tool the client never declared.
 pub(crate) fn ensure_gate_tools(openai_body: &mut Value) -> usize {
+    let chat = is_chat_body(openai_body);
     let exact: HashSet<String> = openai_body
         .get("tools")
         .and_then(|t| t.as_array())
         .map(|tools| {
             tools
                 .iter()
-                .filter_map(|tool| tool.get("name").and_then(|n| n.as_str()))
+                .filter_map(tool_def_name)
                 .map(str::to_string)
                 .collect()
         })
@@ -121,10 +145,11 @@ pub(crate) fn ensure_gate_tools(openai_body: &mut Value) -> usize {
     let tools = openai_body.get_mut("tools").and_then(|t| t.as_array_mut());
     match tools {
         Some(arr) => {
-            arr.extend(missing.iter().map(|n| shadow_tool(n)));
+            arr.extend(missing.iter().map(|n| shadow_tool(n, chat)));
         }
         None => {
-            openai_body["tools"] = Value::Array(missing.iter().map(|n| shadow_tool(n)).collect());
+            openai_body["tools"] =
+                Value::Array(missing.iter().map(|n| shadow_tool(n, chat)).collect());
         }
     }
     // A tool_choice naming a real client tool still constrains decoding;
@@ -151,15 +176,20 @@ pub(crate) const NO_CLIENT_TOOLS_NOTE: &str =
 /// "auto"`, so the request cannot forbid a call; without this a model
 /// asked to compute something sometimes calls `bash`, and the client, which
 /// has no such tool, gets a `tool_use` and no text. The note goes on the
-/// first developer item (or becomes one), so the prefix stays the same from
-/// turn to turn.
+/// first developer item (Chat: system message) or becomes one, so the
+/// prefix stays the same from turn to turn.
 pub(crate) fn note_no_client_tools(openai_body: &mut Value) {
-    let Some(input) = openai_body.get_mut("input").and_then(Value::as_array_mut) else {
+    let (field, role) = if is_chat_body(openai_body) {
+        ("messages", "system")
+    } else {
+        ("input", "developer")
+    };
+    let Some(input) = openai_body.get_mut(field).and_then(Value::as_array_mut) else {
         return;
     };
     if let Some(text) = input
         .first_mut()
-        .filter(|item| item.get("role").and_then(Value::as_str) == Some("developer"))
+        .filter(|item| item.get("role").and_then(Value::as_str) == Some(role))
         .and_then(|item| item.get_mut("content"))
         && let Some(current) = text.as_str()
     {
@@ -168,7 +198,7 @@ pub(crate) fn note_no_client_tools(openai_body: &mut Value) {
     }
     input.insert(
         0,
-        serde_json::json!({"role": "developer", "content": NO_CLIENT_TOOLS_NOTE}),
+        serde_json::json!({"role": role, "content": NO_CLIENT_TOOLS_NOTE}),
     );
 }
 
@@ -277,10 +307,12 @@ impl ToolAlias {
             && self.reverse_name(upstream_name) == upstream_name
     }
 
-    /// Rename an OpenAI Responses request body in place: `tools[]`
-    /// definitions, `input[]` function-call history, a forced tool choice,
-    /// and `output[]` function-call items (the shape CCR rebuilt turns
-    /// arrive in). Returns how many names actually changed, for logging.
+    /// Rename an OpenAI request body in place: `tools[]` definitions,
+    /// `input[]` function-call history, a forced tool choice, and `output[]`
+    /// function-call items (the shape CCR rebuilt turns arrive in); for
+    /// Chat Completions, the nested `function` definitions and assistant
+    /// `tool_calls` instead. Returns how many names actually changed, for
+    /// logging.
     pub(crate) fn forward_body(&self, openai_body: &mut Value) -> usize {
         if !self.active() {
             return 0;
@@ -288,18 +320,32 @@ impl ToolAlias {
         let mut renamed = 0;
         if let Some(tools) = openai_body.get_mut("tools").and_then(|t| t.as_array_mut()) {
             for tool in tools.iter_mut() {
-                if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
-                    let mapped = self.forward_name(name);
-                    if mapped != name {
-                        tool["name"] = Value::String(mapped.to_string());
-                        renamed += 1;
-                    }
+                // Chat Completions nests the definition under `function`.
+                if tool.get("function").is_some() {
+                    renamed += self.forward_named(&mut tool["function"]);
+                } else {
+                    renamed += self.forward_named(tool);
                 }
             }
         }
         for field in ["input", "output"] {
             if let Some(items) = openai_body.get_mut(field).and_then(|i| i.as_array_mut()) {
                 renamed += self.forward_items(items);
+            }
+        }
+        // Chat Completions history: assistant `tool_calls[].function.name`.
+        if let Some(messages) = openai_body
+            .get_mut("messages")
+            .and_then(|m| m.as_array_mut())
+        {
+            for call in messages
+                .iter_mut()
+                .filter_map(|m| m.get_mut("tool_calls").and_then(|c| c.as_array_mut()))
+                .flatten()
+            {
+                if let Some(function) = call.get_mut("function") {
+                    renamed += self.forward_named(function);
+                }
             }
         }
         if let Some(name) = openai_body
@@ -314,6 +360,19 @@ impl ToolAlias {
             }
         }
         renamed
+    }
+
+    /// Rename the `name` field of one object in place; 1 when it changed.
+    fn forward_named(&self, named: &mut Value) -> usize {
+        let Some(name) = named.get("name").and_then(|n| n.as_str()) else {
+            return 0;
+        };
+        let mapped = self.forward_name(name);
+        if mapped == name {
+            return 0;
+        }
+        named["name"] = Value::String(mapped.to_string());
+        1
     }
 
     /// Rename `function_call` item names inside one item array.
