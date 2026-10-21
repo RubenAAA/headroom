@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use headroom_core::transforms::magika_detector::{magika_detect, MagikaDetectorError};
+use headroom_core::transforms::magika_detector::{MagikaDetectorError, magika_detect};
 
 #[cfg(target_os = "linux")]
 fn os_thread_count() -> usize {
