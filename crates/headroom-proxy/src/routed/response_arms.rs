@@ -97,6 +97,11 @@ pub(crate) async fn handle_routed_error_response(
         outbound_bytes = outbound_bytes.unwrap_or(0),
         "routed upstream returned error"
     );
+    if let Some(ctx) = outcome.as_ref()
+        && crate::routed::zen_gate_probe::is_free_tier_refusal(upstream_status, &body_text)
+    {
+        crate::routed::zen_gate_probe::trigger(&ctx.model, ctx.egress_slot);
+    }
     if upstream_status == StatusCode::PAYLOAD_TOO_LARGE {
         let bytes = outbound_bytes.unwrap_or(0);
         let body = serde_json::json!({

@@ -165,6 +165,8 @@ reactively for 429s.
 The Rust `egress-relay` binary turns VPN egresses into loopback SOCKS5 lanes
 for Headroom's per-egress rotation hook. Each provider is optional; the relay
 runs the lanes of whichever are set up and refuses to start with none.
+Each lane port also takes HTTP `CONNECT`. The proxy's Zen gate probe needs
+this: the OpenCode CLI runs on Bun, whose fetch refuses SOCKS proxies.
 
 - **Nord** (eight or ten lanes): Nord's remote SOCKS5 service, which needs a
   paid NordVPN plan. It takes the plan's service credentials, not your login:

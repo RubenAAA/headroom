@@ -36,6 +36,10 @@ number to its window; do not quote across windows.
 - [`zen-fresh-opencode-session.md`](zen-fresh-opencode-session.md): a
   never-logged-in OpenCode install mints a session Zen's free tier accepts
   (200; a made-up id 403s), so Spark needs the CLI but no account.
+- [`zen-anonymous-free-403-2026-10-14.md`](zen-anonymous-free-403-2026-10-14.md):
+  OpenCode's server refused the anonymous route, stock clients included,
+  from 2026-10-14 to 10-15. Outside outages the gate refuses some request
+  shapes; `zen_gate_probe` in the log tells which case a 403 is.
 - [`egress-rotation-handoff.md`](egress-rotation-handoff.md): close the
   per-lane admission race before dropping old SOCKS tunnels; reactive lane
   rotations must not postpone the pool-wide timed pass.

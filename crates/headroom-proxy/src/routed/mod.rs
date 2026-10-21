@@ -17,4 +17,5 @@ pub(crate) mod tool_alias;
 pub(crate) mod transforms;
 pub(crate) mod translation;
 pub(crate) mod upstream_gate;
+pub(crate) mod zen_gate_probe;
 pub(crate) mod zen_hold;

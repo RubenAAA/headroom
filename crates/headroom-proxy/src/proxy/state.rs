@@ -426,13 +426,16 @@ impl AppState {
         let mut clients = Vec::with_capacity(config.zen_http_proxy_pool.len());
         let mut egress_ids = Vec::with_capacity(config.zen_http_proxy_pool.len());
         let mut seen = std::collections::HashSet::new();
+        let mut lane_urls = Vec::with_capacity(config.zen_http_proxy_pool.len());
         for proxy_url in &config.zen_http_proxy_pool {
             if !seen.insert(proxy_url) {
                 continue;
             }
             clients.push(Self::build_client_for_proxy(config, Some(proxy_url))?);
             egress_ids.push(provider_egress_id(Some(proxy_url)));
+            lane_urls.push(proxy_url);
         }
+        crate::routed::zen_gate_probe::set_lanes(&lane_urls);
         if clients.is_empty() {
             Ok(None)
         } else {

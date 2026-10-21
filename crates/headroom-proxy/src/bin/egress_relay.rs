@@ -1,5 +1,6 @@
 //! Per-lane local SOCKS5 relays over VPN egresses: Nord's authenticated
-//! SOCKS5 endpoints, and a Proton WireGuard tunnel run by `wireproxy`.
+//! SOCKS5 endpoints, and a Proton WireGuard tunnel run by `wireproxy`. Each
+//! lane port also takes HTTP `CONNECT`, for clients without SOCKS support.
 //!
 //! This is an operator sidecar, not part of Headroom's HTTP request path. Its
 //! CLI and line-delimited Unix-socket control protocol intentionally remain
@@ -54,6 +55,13 @@ const MAX_LANES: usize = NORD_MAX_LANES + 1;
 const DEFAULT_BASE_PORT: u16 = 18_600;
 const UPSTREAM_PORT: u16 = 1080;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Lanes also answer HTTP `CONNECT`: the OpenCode CLI runs on Bun, whose
+/// fetch refuses SOCKS proxies (`UnsupportedProxyProtocol`), and the proxy's
+/// Zen gate probe runs that CLI through the lane a refused request used.
+const HTTP_HEAD_LIMIT: usize = 8192;
+const HTTP_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
+const HTTP_BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+const HTTP_UNAVAILABLE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
 const EGRESS_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 /// Answers with the caller's public address: how every lane's exit is read.
 const EXIT_PROBE_URL: &str = "https://api.ipify.org";
@@ -619,6 +627,48 @@ fn send_socks_failure(stream: &mut TcpStream, reply: u8) {
     let _ = stream.write_all(&[5, reply, 0, 1, 0, 0, 0, 0, 0, 0]);
 }
 
+/// Whether a new client speaks HTTP `CONNECT` rather than SOCKS5: a SOCKS
+/// greeting starts with byte 5, an HTTP one with the method name.
+fn is_http_connect(client: &TcpStream) -> bool {
+    let mut first = [0_u8; 1];
+    client.set_read_timeout(Some(CONNECT_TIMEOUT)).is_ok()
+        && client.peek(&mut first).is_ok_and(|read| read == 1)
+        && first[0] == b'C'
+}
+
+/// Read an HTTP `CONNECT host:port` head and return the SOCKS request for
+/// the same destination. Reads a byte at a time so nothing past the head
+/// (the client's TLS hello) is consumed.
+fn read_http_connect<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let invalid = |what| io::Error::new(io::ErrorKind::InvalidData, what);
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() >= HTTP_HEAD_LIMIT {
+            return Err(invalid("HTTP CONNECT head too long"));
+        }
+        head.extend(read_exact_vec(reader, 1)?);
+    }
+    let line = head.split(|&byte| byte == b'\r').next().unwrap_or_default();
+    let target = std::str::from_utf8(line)
+        .ok()
+        .and_then(|line| line.strip_prefix("CONNECT "))
+        .and_then(|rest| rest.split(' ').next())
+        .ok_or_else(|| invalid("not an HTTP CONNECT request"))?;
+    let (host, port) = target
+        .rsplit_once(':')
+        .ok_or_else(|| invalid("CONNECT target has no port"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port: u16 = port.parse().map_err(|_| invalid("bad CONNECT port"))?;
+    let length = u8::try_from(host.len())
+        .ok()
+        .filter(|&length| length > 0)
+        .ok_or_else(|| invalid("bad CONNECT host"))?;
+    let mut request = vec![5, 1, 0, 3, length];
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(&port.to_be_bytes());
+    Ok(request)
+}
+
 impl Lane {
     fn new(
         slot: usize,
@@ -713,17 +763,18 @@ impl Lane {
     }
 
     fn handle(self: Arc<Self>, mut client: TcpStream) {
+        let http = is_http_connect(&client);
         let started = match self.begin_connection(&client) {
             Ok(Some(started)) => started,
             Ok(None) => {
-                let _ = client.write_all(&[5, 0xff]);
+                let _ = client.write_all(if http { HTTP_UNAVAILABLE } else { &[5, 0xff] });
                 return;
             }
             Err(_) => return,
         };
         let (connection_id, snapshot) = started;
         let connects_before = lock_unpoisoned(&self.state).connects;
-        let result = self.handle_connected(connection_id, &snapshot, &mut client);
+        let result = self.handle_connected(connection_id, &snapshot, &mut client, http);
         if let Err(error) = result {
             if error.kind() != io::ErrorKind::Interrupted {
                 let mut state = lock_unpoisoned(&self.state);
@@ -739,7 +790,11 @@ impl Lane {
                 snapshot.upstream_host,
                 error.kind()
             );
-            send_socks_failure(&mut client, 1);
+            if http {
+                let _ = client.write_all(HTTP_BAD_GATEWAY);
+            } else {
+                send_socks_failure(&mut client, 1);
+            }
         }
         self.unregister(connection_id);
     }
@@ -785,18 +840,23 @@ impl Lane {
         connection_id: u64,
         snapshot: &LaneSnapshot,
         client: &mut TcpStream,
+        http: bool,
     ) -> io::Result<()> {
         client.set_read_timeout(Some(CONNECT_TIMEOUT))?;
         client.set_write_timeout(Some(CONNECT_TIMEOUT))?;
-        let mut version_and_count = [0_u8; 2];
-        client.read_exact(&mut version_and_count)?;
-        let methods = read_exact_vec(client, usize::from(version_and_count[1]))?;
-        if version_and_count[0] != 5 || !methods.contains(&0) {
-            client.write_all(&[5, 0xff])?;
-            return Ok(());
-        }
-        client.write_all(&[5, 0])?;
-        let request = read_socks_request(client)?;
+        let request = if http {
+            read_http_connect(client)?
+        } else {
+            let mut version_and_count = [0_u8; 2];
+            client.read_exact(&mut version_and_count)?;
+            let methods = read_exact_vec(client, usize::from(version_and_count[1]))?;
+            if version_and_count[0] != 5 || !methods.contains(&0) {
+                client.write_all(&[5, 0xff])?;
+                return Ok(());
+            }
+            client.write_all(&[5, 0])?;
+            read_socks_request(client)?
+        };
 
         let mut upstream = trace_upstream(
             self.slot,
@@ -859,8 +919,16 @@ impl Lane {
         // clients reject malformed bound addresses even on CONNECT success.
         // CONNECT clients do not use the bound endpoint, so preserve REP and
         // return a canonical unspecified IPv4 address instead.
-        let client_response = [5, response_head[1], 0, 1, 0, 0, 0, 0, 0, 0];
-        client.write_all(&client_response)?;
+        if http {
+            client.write_all(if response_head[1] == 0 {
+                HTTP_ESTABLISHED
+            } else {
+                HTTP_BAD_GATEWAY
+            })?;
+        } else {
+            let client_response = [5, response_head[1], 0, 1, 0, 0, 0, 0, 0, 0];
+            client.write_all(&client_response)?;
+        }
         if response_head[1] != 0 {
             if std::env::var_os("HEADROOM_EGRESS_RELAY_TRACE").is_some() {
                 let destination = socks_destination(&request)
@@ -2585,6 +2653,77 @@ mod tests {
         worker.join().unwrap();
         upstream.join().unwrap();
         assert_eq!(lock_unpoisoned(&lane.state).connects, 1);
+    }
+
+    /// The OpenCode CLI can only use an HTTP proxy. The lane turns its
+    /// `CONNECT` into the same upstream SOCKS request, answers in HTTP, and
+    /// keeps the bytes the client sends right after the head.
+    #[test]
+    fn http_connect_client_tunnels_through_the_lane() {
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let upstream = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+            assert_eq!(read_exact_vec(&mut stream, 3).unwrap(), [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+            let request = read_socks_request(&mut stream).unwrap();
+            assert_eq!(
+                socks_destination(&request),
+                Some(("opencode.ai".to_string(), 443))
+            );
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                .unwrap();
+            let payload = read_exact_vec(&mut stream, 4).unwrap();
+            stream.write_all(&payload).unwrap();
+        });
+
+        let lane_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let lane_address = lane_listener.local_addr().unwrap();
+        let lane = Arc::new(Lane::new(
+            0,
+            upstream_port,
+            "proton:NL-FREE-1".to_string(),
+            "127.0.0.1".to_string(),
+            "198.51.100.1".to_string(),
+            None,
+        ));
+        let worker_lane = lane.clone();
+        let worker = thread::spawn(move || {
+            let (stream, _) = lane_listener.accept().unwrap();
+            worker_lane.handle(stream);
+        });
+
+        let mut client = TcpStream::connect(lane_address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .write_all(b"CONNECT opencode.ai:443 HTTP/1.1\r\nHost: opencode.ai:443\r\n\r\nping")
+            .unwrap();
+        assert_eq!(
+            read_exact_vec(&mut client, HTTP_ESTABLISHED.len()).unwrap(),
+            HTTP_ESTABLISHED
+        );
+        assert_eq!(read_exact_vec(&mut client, 4).unwrap(), b"ping");
+        drop(client);
+        worker.join().unwrap();
+        upstream.join().unwrap();
+        assert_eq!(lock_unpoisoned(&lane.state).connects, 1);
+    }
+
+    #[test]
+    fn http_connect_head_rejects_what_it_cannot_route() {
+        for head in [
+            &b"GET / HTTP/1.1\r\n\r\n"[..],
+            b"CONNECT opencode.ai HTTP/1.1\r\n\r\n",
+            b"CONNECT opencode.ai:https HTTP/1.1\r\n\r\n",
+            b"CONNECT :443 HTTP/1.1\r\n\r\n",
+        ] {
+            assert!(read_http_connect(&mut &head[..]).is_err(), "{head:?}");
+        }
+        let ipv6 = read_http_connect(&mut &b"CONNECT [::1]:8443 HTTP/1.1\r\n\r\n"[..]).unwrap();
+        assert_eq!(socks_destination(&ipv6), Some(("::1".to_string(), 8443)));
     }
 
     /// wireproxy reports a dead tunnel only as a refused CONNECT, so on the
