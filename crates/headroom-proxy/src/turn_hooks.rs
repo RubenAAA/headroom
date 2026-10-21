@@ -274,6 +274,53 @@ mod tests {
         clear_turn_hooks();
     }
 
+    /// Upstream 85520c294: a hook that adds a tool reports it as negative, so
+    /// the booking can take it off the saving instead of dropping it.
+    #[test]
+    fn apply_request_hooks_reports_tool_growth_as_negative() {
+        use crate::compression::CompressibleEndpoint;
+        let _g = REGISTRY_LOCK.blocking_lock();
+        clear_turn_hooks();
+
+        struct AddSearch;
+        impl TurnHook for AddSearch {
+            fn name(&self) -> &str {
+                "add_search"
+            }
+            fn on_request(&self, ctx: &mut TurnContext) {
+                if let Some(Value::Array(tools)) = &mut ctx.tools {
+                    tools.push(serde_json::json!({
+                        "name": "search_skills",
+                        "description": "find a skill by what it does instead of listing every one",
+                    }));
+                }
+            }
+        }
+
+        register_turn_hook(Arc::new(AddSearch));
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-x",
+                "messages": [],
+                "tools": [{"name": "keep"}],
+            }))
+            .unwrap(),
+        );
+        let (out, delta, _) = crate::proxy::apply_request_hooks(
+            body,
+            CompressibleEndpoint::AnthropicMessages,
+            "req-test",
+            None,
+        );
+        assert!(
+            delta < 0,
+            "an added tool must come back negative, got {delta}"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["tools"].as_array().unwrap().len(), 2);
+        clear_turn_hooks();
+    }
+
     /// Upstream f8212a39: un-deferring a tool only drops the flag text, which
     /// must not book as a saving; and the deferral credit for that tool goes,
     /// because it is billed now.

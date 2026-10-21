@@ -292,7 +292,9 @@ pub(crate) fn emit_buffered_outcome(
                     get_i64(usage, "input_tokens"),
                     get_i64(usage, "output_tokens"),
                     cached,
-                    0,
+                    usage
+                        .and_then(crate::proxy::responses_cache_write)
+                        .unwrap_or(0),
                 )
             }
             // openai_chat (and any other) shape.
@@ -313,11 +315,14 @@ pub(crate) fn emit_buffered_outcome(
         // Anthropic's `input_tokens` already excludes cache
         // reads and writes, so it *is* the uncached count.
         // Both OpenAI shapes report a total that includes the
-        // cached prefix, so there the read has to come off.
+        // cached prefix (and Responses its reported write), so
+        // there those have to come off.
         let uncached_input = if ctx.provider == "anthropic" {
             attempted_input
         } else {
-            attempted_input.saturating_sub(cache_read)
+            attempted_input
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_write)
         };
         observe_proactive_expansion_cache_write(ctx, u64::try_from(cache_write).unwrap_or(0));
         // Fold in the CCR continuation rounds. The client saw
@@ -345,7 +350,10 @@ pub(crate) fn emit_buffered_outcome(
         let ccr_uncached_input = if ctx.provider == "anthropic" {
             ccr_round_usage.input_tokens
         } else {
-            (ccr_round_usage.input_tokens - ccr_round_usage.cache_read_tokens).max(0)
+            (ccr_round_usage.input_tokens
+                - ccr_round_usage.cache_read_tokens
+                - ccr_round_usage.cache_write_tokens)
+                .max(0)
         };
         let uncached_input = uncached_input + ccr_uncached_input;
         // Same for a turn hook's re-drives. The usage parsed
@@ -370,7 +378,10 @@ pub(crate) fn emit_buffered_outcome(
         let hook_uncached_input = if ctx.provider == "anthropic" {
             turn_hook_usage.input_tokens
         } else {
-            (turn_hook_usage.input_tokens - turn_hook_usage.cache_read_tokens).max(0)
+            (turn_hook_usage.input_tokens
+                - turn_hook_usage.cache_read_tokens
+                - turn_hook_usage.cache_write_tokens)
+                .max(0)
         };
         let attempted_input = attempted_input + turn_hook_usage.input_tokens;
         let output_tok = output_tok + turn_hook_usage.output_tokens;

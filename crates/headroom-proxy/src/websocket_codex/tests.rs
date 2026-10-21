@@ -296,6 +296,26 @@ fn usage_extracted_with_cache_details() {
     assert_eq!(u.uncached_tokens, 40);
 }
 
+/// Upstream 46306024e: Responses reports its billed write inside
+/// `input_tokens`. It is the provider's figure, so it is booked as the write
+/// and comes off the uncached span instead of being dropped.
+#[test]
+fn usage_books_a_reported_cache_write() {
+    let ev = json!({
+        "type": "response.completed",
+        "response": {"usage": {
+            "input_tokens": 12_497,
+            "output_tokens": 80,
+            "input_tokens_details": {"cached_tokens": 9_568, "cache_write_tokens": 2_926}
+        }}
+    });
+    let u = extract_responses_usage(&ev);
+    assert_eq!(u.cache_read_tokens, 9_568);
+    assert_eq!(u.cache_write_tokens, 2_926);
+    assert_eq!(u.uncached_tokens, 3);
+    assert!(u.write_reported);
+}
+
 #[test]
 fn usage_tolerates_top_level_usage_and_garbage() {
     let ev =
