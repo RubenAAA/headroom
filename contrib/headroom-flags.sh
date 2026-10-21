@@ -78,7 +78,7 @@ export HEADROOM_MEMORY_MODE=tool
 #   from_models       restrict the rule to these client model ids.
 #   name              the label the decision log prints.
 export HEADROOM_MODEL_ROUTER_ENABLED=1
-export HEADROOM_MODEL_ROUTES='[{"name": "no-tools->spark", "require_no_tools": true, "to_model": "claude-muse-spark-1.3"}]'
+export HEADROOM_MODEL_ROUTES='[{"name": "no-tools->glm", "require_no_tools": true, "to_model": "claude-glm-5.3-flash"}]'
 
 # How long a routed target is skipped after a turn had to fall back to the
 # client's own model, in seconds. Default 300, `0` disables the skip so every
@@ -583,6 +583,20 @@ HEADROOM_FLAGS=(
   --extra-model-route claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=none
   --extra-model-route claude-union-alpha=https://opencode.ai/zen:anthropic:union-alpha:auth=OPENCODE_API_KEY
 
+  # DeepSeek V4.1 Flash, free on Zen. Chat Completions only (its Responses
+  # endpoint answers ModelProtocolUnsupported, probed 2026-10-15), hence
+  # `:chat:` rather than `:openai:`. The same free-tier gate applies: the
+  # proxy lowercases tool names on this shape too.
+  --extra-model-route claude-deepseek-v4.1-flash=https://opencode.ai/inference/openai/v1:chat:deepseek-v4.1-flash-free:auth=none
+
+  # GLM-5.3 Flash, free on Zen, for the `glm` and `glm-explore` agents and
+  # the no-tools rule above, since Zen retired muse-spark-1.3-contributor-free
+  # (410 "deprecated", 2026-10-18). Chat Completions only, like DeepSeek.
+  # 200k context, 32k output. OpenCode 1.18.34 posts to /inference/openai/v1;
+  # the old /zen/v1 path answered every free model 429 "Rate limit exceeded"
+  # from every exit on 2026-10-18 while the new path served them all.
+  --extra-model-route claude-glm-5.3-flash=https://opencode.ai/inference/openai/v1:chat:glm-5.3-flash-free:auth=none
+
   # Weaker, faster sibling for the spinner sidecar was 1.2 (~250 tokens
   # vs 1.3's ~500-1000, measured 2026-09-06) until Zen retired
   # muse-spark-1.2-contributor-free: every sidecar call 404s since
@@ -596,10 +610,12 @@ HEADROOM_FLAGS=(
   # come from space-bunny-free on Zen's Chat Completions endpoint: free,
   # ~1-2 s, and its provider keeps no data and does not train on it. The
   # route is named for the upstream model (no target model, so the chat shape).
-  # longcat-2.5-preview-free was tried and is refused by Zen's free-tier gate.
+  # longcat-2.5-preview-free was refused by Zen's free-tier gate when tried in
+  # September. It is served as of 2026-10-15, but reasons before answering
+  # and took 3-5.5 s per summary against space-bunny's 0.9-1.9 s.
   # The fixed line below answers when Zen fails, so the fallback spends no
   # Claude quota (it was Haiku before 2026-09-30).
-  --extra-model-route space-bunny-free=https://opencode.ai/zen/v1:openai:auth=none
+  --extra-model-route space-bunny-free=https://opencode.ai/inference/openai/v1:openai:auth=none
   --sidecar-model space-bunny-free
   --sidecar-local-answer Working
 

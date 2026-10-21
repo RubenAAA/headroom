@@ -247,6 +247,21 @@ static TABLE: &[(&str, ModelPricing)] = &[
     // Revisit if the tier ever starts charging; nothing here detects that.
     ("claude-muse-spark", per_1m(0.0, 0.0, Some(0.0), Some(0.0))),
     ("muse-spark", per_1m(0.0, 0.0, Some(0.0), Some(0.0))),
+    // Same two spellings for DeepSeek's free model on Zen.
+    (
+        "claude-deepseek-v4.1-flash",
+        per_1m(0.0, 0.0, Some(0.0), Some(0.0)),
+    ),
+    (
+        "deepseek-v4.1-flash-free",
+        per_1m(0.0, 0.0, Some(0.0), Some(0.0)),
+    ),
+    // And GLM-5.3 Flash.
+    (
+        "claude-glm-5.3-flash",
+        per_1m(0.0, 0.0, Some(0.0), Some(0.0)),
+    ),
+    ("glm-5.3-flash-free", per_1m(0.0, 0.0, Some(0.0), Some(0.0))),
     // ---- OpenAI (cache_write not published → None) ----
     ("gpt-5-mini", per_1m(0.25, 2.0, Some(0.025), None)),
     ("gpt-5-nano", per_1m(0.05, 0.4, Some(0.005), None)),
@@ -454,6 +469,8 @@ mod tests {
             "claude-muse-spark-1.3",
             "muse-spark-1.3-contributor-free",
             "muse-spark-1.2-contributor-free",
+            "claude-glm-5.3-flash",
+            "glm-5.3-flash-free",
         ] {
             let p = lookup(model).unwrap_or_else(|| panic!("{model} must resolve"));
             assert_eq!(p.input_cost_per_token, 0.0, "{model} input");

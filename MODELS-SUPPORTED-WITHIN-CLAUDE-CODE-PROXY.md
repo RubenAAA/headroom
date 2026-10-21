@@ -16,7 +16,9 @@ the proxy; the session, tools, and cache stay intact.
 | `claude-grok-4.6` | Grok 4.6 (effort from `/effort`) | Cursor subscription | — |
 | `claude-grok-4.6-xhigh` | Grok 4.6 Extra High | Cursor subscription | `grok-xhigh` |
 | `claude-muse-spark-1.3` | Muse Spark 1.3 | OpenCode Zen, free tier | `spark`, `spark-explore` |
+| `claude-glm-5.3-flash` | GLM-5.3 Flash | OpenCode Zen, free tier | `glm`, `glm-explore` |
 | `claude-union-alpha` | Union Alpha Free | OpenCode Zen, Anthropic Messages | — |
+| `claude-deepseek-v4.1-flash` | DeepSeek V4.1 Flash | OpenCode Zen, free tier | — |
 
 Anthropic model IDs supported by Claude Code pass through to Anthropic unchanged;
 that set follows Claude Code and Anthropic's current model catalog, rather than a
@@ -36,6 +38,11 @@ Notes:
   serves only requests that carry a real OpenCode session, and the proxy
   takes one from the CLI. `install.sh` installs it; without it `/models`
   shows Spark as not connected.
+- DeepSeek V4.1 Flash is served by Zen only over Chat Completions, so its
+  route uses `:chat:` instead of `:openai:`. The Spark terms apply.
+- Zen retired free Muse Spark 1.3 on 2026-10-18 (410 "deprecated"). GLM-5.3
+  Flash is free too, Chat-only like DeepSeek, with a 200k-token window, a fifth
+  of Spark's. `glm-explore` is its read-only agent.
 - Union Alpha uses Zen's Anthropic Messages endpoint with the
   `OPENCODE_API_KEY` environment variable. Its upstream model ID is `union-alpha`.
 - `/models` shows which of these this machine can use right now, read from
