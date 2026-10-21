@@ -96,9 +96,14 @@ impl BatchContextStore {
     pub fn store(&self, mut context: BatchContext) {
         let mut map = self.contexts.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Enforce memory limit
-        if map.len() >= self.max_contexts {
-            self.cleanup_oldest_locked(&mut map);
+        // Enforce memory limit. Replacing a batch takes no new slot, so it
+        // must not evict another live one; a new batch reclaims expired
+        // entries before the oldest live ones go.
+        if !map.contains_key(&context.batch_id) && map.len() >= self.max_contexts {
+            map.retain(|_, ctx| !ctx.is_expired());
+            if map.len() >= self.max_contexts {
+                self.cleanup_oldest_locked(&mut map);
+            }
         }
 
         // Set expiration
@@ -278,6 +283,57 @@ mod tests {
         }
         let stats = store.stats();
         assert!(stats.total_contexts <= 5);
+    }
+
+    #[test]
+    fn replacing_at_capacity_keeps_other_live_batches() {
+        let store = BatchContextStore::new(Duration::from_secs(60), 2);
+        for id in ["first", "second"] {
+            store.store(BatchContext::new(
+                id.to_string(),
+                "anthropic".to_string(),
+                Duration::from_secs(60),
+            ));
+        }
+        let mut replacement = BatchContext::new(
+            "second".to_string(),
+            "anthropic".to_string(),
+            Duration::from_secs(60),
+        );
+        replacement.add_request(make_request("req"));
+        store.store(replacement);
+
+        assert!(store.get("first").is_some());
+        assert!(store.get("second").unwrap().get_request("req").is_some());
+    }
+
+    #[test]
+    fn expired_batches_go_before_live_ones_at_capacity() {
+        let store = BatchContextStore::new(Duration::from_secs(60), 2);
+        for id in ["older_live", "newer_expired"] {
+            store.store(BatchContext::new(
+                id.to_string(),
+                "anthropic".to_string(),
+                Duration::from_secs(60),
+            ));
+        }
+        store
+            .contexts
+            .lock()
+            .unwrap()
+            .get_mut("newer_expired")
+            .unwrap()
+            .expires_at = Instant::now() - Duration::from_secs(1);
+
+        store.store(BatchContext::new(
+            "new".to_string(),
+            "anthropic".to_string(),
+            Duration::from_secs(60),
+        ));
+
+        assert!(store.get("older_live").is_some());
+        assert!(store.get("new").is_some());
+        assert_eq!(store.stats().total_contexts, 2);
     }
 
     #[test]

@@ -246,11 +246,18 @@ fn openai_responses_usage(usage: &Value) -> Option<Usage> {
         .and_then(|d| u64_at(d, "cached_tokens"))
         .unwrap_or(0)
         .min(input);
+    // Upstream 46306024e: Responses reports its billed write inside the same
+    // total.
+    let written = usage
+        .get("input_tokens_details")
+        .and_then(|d| u64_at(d, "cache_write_tokens"))
+        .unwrap_or(0)
+        .min(input - cached);
     Some(Usage {
-        input_tokens: input - cached,
+        input_tokens: input - cached - written,
         output_tokens: u64_at(usage, "output_tokens").unwrap_or(0),
         cache_read_tokens: cached,
-        cache_write_tokens: 0,
+        cache_write_tokens: written,
     })
 }
 

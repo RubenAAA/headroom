@@ -672,7 +672,7 @@ pub(super) fn emit_failed_http_outcome(
                 .and_then(|value| value.get("cached_tokens"))
                 .and_then(|value| value.as_i64())
                 .unwrap_or(0),
-            0,
+            usage.and_then(super::responses_cache_write).unwrap_or(0),
         ),
         _ => (
             get("prompt_tokens"),
@@ -709,7 +709,9 @@ pub(super) fn emit_failed_http_outcome(
         uncached_input_tokens: if ctx.provider == "anthropic" {
             get("input_tokens")
         } else {
-            provider_input.saturating_sub(cache_read)
+            provider_input
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_write)
         },
         total_latency_ms: ctx.started_at.elapsed().as_secs_f64() * 1000.0,
         overhead_ms: ctx.overhead_ms,
@@ -791,12 +793,15 @@ pub(super) fn stream_outcome_status(upstream_status: StatusCode, failed_in_band:
 /// Anthropic arm is deliberately not folded in — it also carries cache-write
 /// tiers, a wire footprint, and CCR continuation totals that neither OpenAI
 /// shape has.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_openai_stream_outcome(
     ctx: &OutcomeContext,
     request_id: &str,
     ttfb_ms: f64,
     input_tok: i64,
     cached_tok: i64,
+    // Responses' reported write (`responses_cache_write`); 0 for Chat.
+    cache_write_tok: i64,
     output_tok: i64,
     // Upstream 4949cd55: the HTTP status the stream arrived with. The old
     // code left this at the `Default` 0 (success), so an exhausted 529
@@ -818,9 +823,13 @@ pub(super) fn emit_openai_stream_outcome(
         conversation_tokens_saved: Some(ctx.tokens_saved),
         attempted_input_tokens: ctx.attempted(input_tok),
         cache_read_tokens: cached_tok,
-        // Both providers report a total that includes the cached prefix, unlike
-        // Anthropic's `input_tokens`, so the uncached remainder is a subtraction.
-        uncached_input_tokens: input_tok.saturating_sub(cached_tok),
+        cache_write_tokens: cache_write_tok,
+        // Both providers report a total that includes the cached prefix (and
+        // Responses its write), unlike Anthropic's `input_tokens`, so the
+        // uncached remainder is a subtraction.
+        uncached_input_tokens: input_tok
+            .saturating_sub(cached_tok)
+            .saturating_sub(cache_write_tok),
         total_latency_ms: ctx.total_latency_ms,
         overhead_ms: ctx.overhead_ms,
         ttfb_ms,

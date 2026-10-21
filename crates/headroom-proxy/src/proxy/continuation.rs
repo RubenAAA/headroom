@@ -118,6 +118,21 @@ pub(crate) fn usage_counts(usage: &serde_json::Value) -> (i64, i64, i64) {
     (input, output, cached)
 }
 
+/// The cache write a Responses `usage` block bills, from
+/// `input_tokens_details.cache_write_tokens` (upstream 46306024e).
+///
+/// Responses counts it inside `input_tokens` beside the read, priced at the
+/// write rate, so every Responses site takes it off the uncached remainder.
+/// `None` when the block reports none (Chat Completions, older Responses);
+/// those turns book no write, as before.
+pub(crate) fn responses_cache_write(usage: &serde_json::Value) -> Option<i64> {
+    usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(serde_json::Value::as_i64)
+        .map(|w| w.max(0))
+}
+
 /// Upstream usage from CCR continuation rounds the client never sees.
 ///
 /// `handle_ccr_response` resolves a `headroom_retrieve` call server-side by
@@ -195,10 +210,12 @@ impl CcrRoundUsage {
         // Anthropic key as a fallback: older usage blocks carry no details
         // section.
         let (input, output, cached) = usage_counts(usage);
+        let write =
+            get("cache_creation_input_tokens").max(responses_cache_write(usage).unwrap_or(0));
         if self.rounds == 0 {
             self.client_input_tokens = input.max(0) as u64;
             self.client_cache_read_tokens = cached.max(0) as u64;
-            self.client_cache_write_tokens = get("cache_creation_input_tokens").max(0) as u64;
+            self.client_cache_write_tokens = write.max(0) as u64;
         }
         // OpenAI input counts include cached tokens; the Anthropic key
         // marks a block whose input already excludes them.
@@ -212,7 +229,7 @@ impl CcrRoundUsage {
         self.input_tokens += input;
         self.output_tokens += output;
         self.cache_read_tokens += cached;
-        self.cache_write_tokens += get("cache_creation_input_tokens");
+        self.cache_write_tokens += write;
         self.cache_write_1h_tokens += usage
             .get("cache_creation")
             .and_then(|c| c.get("ephemeral_1h_input_tokens"))

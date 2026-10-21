@@ -246,6 +246,7 @@ pub(super) fn close_openai_chat_stream(
             ttfb_ms,
             input_tok,
             cached_tok,
+            0,
             output_tok,
             super::outcome::stream_outcome_status(upstream_status, failed_in_band),
         );
@@ -380,11 +381,11 @@ pub(super) fn note_responses_tier_status(
     }
 }
 
-/// Read the Responses final usage triple (input, cached, output),
+/// Read the Responses final usage (input, cached, cache write, output),
 /// zeros when the stream carried no usage chunk.
 pub(super) fn extract_responses_usage(
     state: &crate::sse::openai_responses::ResponseState,
-) -> (i64, i64, i64) {
+) -> (i64, i64, i64, i64) {
     if let Some(ref usage) = state.usage {
         let input = usage
             .get("input_tokens")
@@ -399,9 +400,10 @@ pub(super) fn extract_responses_usage(
             .get("output_tokens")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        (input, cached, output)
+        let write = super::responses_cache_write(usage).unwrap_or(0);
+        (input, cached, write, output)
     } else {
-        (0, 0, 0)
+        (0, 0, 0, 0)
     }
 }
 
@@ -429,7 +431,7 @@ pub(super) fn close_openai_responses_stream(
         "sse stream closed"
     );
     if let Some(ctx) = outcome_ctx {
-        let (input_tok, cached_tok, output_tok) = extract_responses_usage(state);
+        let (input_tok, cached_tok, cache_write_tok, output_tok) = extract_responses_usage(state);
         // `response.incomplete` is a normal end (e.g. the output cap);
         // only `response.failed` or `error` is a failed request. A
         // stream with no terminal event is not failed, for the reason
@@ -441,6 +443,7 @@ pub(super) fn close_openai_responses_stream(
             ttfb_ms,
             input_tok,
             cached_tok,
+            cache_write_tok,
             output_tok,
             super::outcome::stream_outcome_status(upstream_status, failed_in_band),
         );

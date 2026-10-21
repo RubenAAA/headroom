@@ -265,6 +265,11 @@ pub(crate) fn book_routed_outcome_with_ccr(
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
         + rounds_cached;
+    // Responses' reported write, which its input total also counts. The
+    // rounds' writes stay in `hidden_rounds`, as before.
+    let cache_write = usage
+        .and_then(crate::proxy::responses_cache_write)
+        .unwrap_or(0);
 
     // What the reroute actually bought, once per rerouted turn. Pair it with
     // the `model_route_rerouted` line on the same request id to see which
@@ -311,11 +316,16 @@ pub(crate) fn book_routed_outcome_with_ccr(
         // See `OutcomeContext::attempted` on the Claude path for why.
         attempted_input_tokens: input_tokens + ctx.tokens_saved.max(0),
         cache_read_tokens: cached,
-        uncached_input_tokens: (input_tokens - cached).max(0),
+        cache_write_tokens: cache_write,
+        uncached_input_tokens: (input_tokens - cached - cache_write).max(0),
         // OpenAI shapes report input as a total that includes the cached
-        // prefix, so the rounds' uncached share is what is left after it.
+        // prefix and any reported write, so the rounds' uncached share is
+        // what is left after them.
         hidden_rounds: headroom_core::request_outcome::HiddenRoundUsage {
-            input_tokens: (ccr_rounds.input_tokens - ccr_rounds.cache_read_tokens).max(0),
+            input_tokens: (ccr_rounds.input_tokens
+                - ccr_rounds.cache_read_tokens
+                - ccr_rounds.cache_write_tokens)
+                .max(0),
             output_tokens: ccr_rounds.output_tokens,
             cache_read_tokens: ccr_rounds.cache_read_tokens,
             cache_write_tokens: ccr_rounds.cache_write_tokens,
@@ -703,6 +713,28 @@ mod tests {
         .expect("context builds");
         assert_eq!(chat.model, "codex-5.5");
         assert_eq!(chat.provider, "openai_chat");
+    }
+
+    /// Upstream 46306024e: a Responses turn that reports its cache write books
+    /// it, so the cache split matches the bill. Before, the write read as 0
+    /// and every turn with a read showed a 100% hit rate.
+    #[test]
+    fn a_reported_responses_cache_write_is_booked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = context(None, dir.path());
+        let usage = json!({
+            "input_tokens": 12_497,
+            "output_tokens": 80,
+            "input_tokens_details": {"cached_tokens": 9_568, "cache_write_tokens": 2_926},
+        });
+        let joined = lines_from(|| book_routed_outcome(&ctx, Some(&usage), 0, 0.0, 200));
+        let perf = joined
+            .lines()
+            .find(|l| l.contains(" PERF "))
+            .unwrap_or_else(|| panic!("no PERF line: {joined}"));
+        assert!(perf.contains("cache_read=9568 "), "{perf}");
+        assert!(perf.contains("cache_write=2926 "), "{perf}");
+        assert!(perf.contains("cache_hit_pct=77 "), "{perf}");
     }
 
     /// C7 flip B: a passthrough turn books its upstream usage verbatim —

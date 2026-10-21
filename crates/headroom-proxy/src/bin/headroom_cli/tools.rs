@@ -406,7 +406,7 @@ fn extract_member_from_zip(archive: &Path, member: &str, dest: &Path) -> Result<
         if file.is_dir() {
             continue;
         }
-        let base = Path::new(file.name())
+        let base = Path::new(file.name()?.as_ref())
             .file_name()
             .map(|n| n.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
@@ -784,6 +784,27 @@ mod tests {
             libc: "gnu".to_string(),
         };
         assert!(asset_for_platform("difft", difft, &plat).is_ok());
+    }
+
+    #[test]
+    fn zip_member_is_found_by_base_name_inside_a_folder() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("tool.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&archive).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.add_directory("tool-1.0/", opts).unwrap();
+        zip.start_file("tool-1.0/README", opts).unwrap();
+        zip.write_all(b"not this").unwrap();
+        zip.start_file("tool-1.0/Tool.EXE", opts).unwrap();
+        zip.write_all(b"binary").unwrap();
+        zip.finish().unwrap();
+
+        let dest = dir.path().join("out");
+        extract_member_from_zip(&archive, "tool.exe", &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"binary");
+        assert!(extract_member_from_zip(&archive, "missing", &dest).is_err());
     }
 
     #[test]

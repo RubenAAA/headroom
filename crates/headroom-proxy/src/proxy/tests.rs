@@ -1346,6 +1346,45 @@ fn outcome_ctx_for_sizes(original_tokens: i64, tokens_saved: i64) -> OutcomeCont
     }
 }
 
+/// Upstream 46306024e: a hidden Responses round's reported write is billed
+/// like an Anthropic `cache_creation_input_tokens`, so the round folds it in.
+#[test]
+fn a_responses_round_folds_its_reported_cache_write() {
+    let mut rounds = CcrRoundUsage::default();
+    rounds.add_response(&serde_json::json!({"usage": {
+        "input_tokens": 1_000,
+        "output_tokens": 5,
+        "input_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 300},
+    }}));
+    assert_eq!(rounds.cache_read_tokens, 600);
+    assert_eq!(rounds.cache_write_tokens, 300);
+    assert_eq!(
+        responses_cache_write(&serde_json::json!({"input_tokens": 9})),
+        None,
+        "an unreported write stays unbooked"
+    );
+}
+
+/// Upstream 85520c294: a tool a turn hook adds is sent on every request, so
+/// it comes off the booked saving; a removed one still lands on the tag.
+#[test]
+fn hook_tool_growth_comes_off_the_saving() {
+    let mut grew = outcome_ctx_for_sizes(1_000, 300);
+    book_hook_tool_delta(&mut grew, -120);
+    assert_eq!(grew.tokens_saved, 180);
+    assert_eq!(grew.sizes(0), (1_000, 820));
+    assert!(!grew.tags.contains_key("turn_hook_tools_saved_tokens"));
+
+    let mut swamped = outcome_ctx_for_sizes(1_000, 50);
+    book_hook_tool_delta(&mut swamped, -120);
+    assert_eq!(swamped.tokens_saved, 0, "clamped once, never negative");
+
+    let mut shrank = outcome_ctx_for_sizes(1_000, 300);
+    book_hook_tool_delta(&mut shrank, 40);
+    assert_eq!(shrank.tokens_saved, 300);
+    assert_eq!(shrank.tags["turn_hook_tools_saved_tokens"], "40");
+}
+
 #[test]
 fn proactive_expansion_cache_write_is_attributed_only_to_injected_requests() {
     let registry = crate::observability::prometheus::registry();

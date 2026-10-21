@@ -316,13 +316,16 @@ struct ResponsesUsage {
     cache_read_tokens: i64,
     cache_write_tokens: i64,
     uncached_tokens: i64,
+    /// The block carried `input_tokens_details.cache_write_tokens`.
+    write_reported: bool,
 }
 
 /// Port of `openai.py::_extract_responses_usage` (L656-687): non-zero only
 /// for `response.completed`; reads `response.usage` (falling back to a
-/// top-level `usage`); the uncached span `max(input - cached, 0)` is kept
-/// in `uncached_tokens` only — `cache_write_tokens` stays 0 because the
-/// write leg is inferred, not billed (FINDING-025).
+/// top-level `usage`). A reported `cache_write_tokens` (upstream 46306024e)
+/// is booked as the write and taken off the uncached span. Without one the
+/// span `max(input - cached, 0)` is kept in `uncached_tokens` only and the
+/// write stays 0: it would be inferred, not billed (FINDING-025).
 fn extract_responses_usage(event: &Value) -> ResponsesUsage {
     if event.get("type").and_then(Value::as_str) != Some("response.completed") {
         return ResponsesUsage::default();
@@ -342,17 +345,19 @@ fn extract_responses_usage(event: &Value) -> ResponsesUsage {
         .get("input_tokens_details")
         .filter(|v| v.is_object())
         .and_then(|d| d.get("cached_tokens")));
-    // FINDING-025: cache-write is inferred (not billed) here — the write
-    // leg is zeroed downstream via cache_inferred=true, so record it as 0
-    // and keep the span in uncached only. Storing the same span in both
+    // FINDING-025: an unreported write is not inferred here — record it as
+    // 0 and keep the span in uncached only. Storing the same span in both
     // fields double-counts every summed consumer (add_usage totals,
     // cost-tracker cache_write buckets, /cache-health).
+    let reported = crate::proxy::responses_cache_write(usage);
+    let write = reported.unwrap_or(0);
     ResponsesUsage {
         input_tokens,
         output_tokens,
         cache_read_tokens: cached,
-        cache_write_tokens: 0,
-        uncached_tokens: (input_tokens - cached).max(0),
+        cache_write_tokens: write,
+        uncached_tokens: (input_tokens - cached - write).max(0),
+        write_reported: reported.is_some(),
     }
 }
 
@@ -653,6 +658,9 @@ struct SessionTotals {
 
     model: String,
     num_messages: i64,
+    /// The latest `response.completed` reported its cache write; see
+    /// `cache_inferred` in `emit_per_turn_outcome`.
+    cache_write_reported: bool,
 }
 
 impl SessionTotals {
@@ -673,6 +681,9 @@ impl SessionTotals {
         self.cache_read_total += u.cache_read_tokens;
         self.cache_write_total += u.cache_write_tokens;
         self.uncached_total += u.uncached_tokens;
+        if u.write_reported {
+            self.cache_write_reported = true;
+        }
     }
 }
 
@@ -919,11 +930,11 @@ fn emit_per_turn_outcome(ctx: &SessionCtx, totals: &mut SessionTotals) {
         cache_read_tokens: cache_read_delta.max(0),
         cache_write_tokens: cache_write_delta.max(0),
         uncached_input_tokens: uncached_delta.max(0),
-        // The WS usage extractor infers (not bills) cache-write as
-        // max(input - cached, 0) while also reporting the same span as
-        // uncached (see extract_responses_usage). Mark inferred so the cost
-        // tracker zeroes the write leg and bills input once (FINDING-025).
-        cache_inferred: true,
+        // Without a reported write the extractor books none and keeps the
+        // span as uncached (see extract_responses_usage); mark it inferred
+        // so the cost tracker bills input once (FINDING-025). A reported
+        // write is the provider's own figure and is priced as a write.
+        cache_inferred: !totals.cache_write_reported,
         total_latency_ms,
         overhead_ms: overhead_delta.max(0.0),
         ttfb_ms,

@@ -202,6 +202,19 @@ fn warn_on_inert_settings(config: &Config) {
              needs either"
         );
     }
+
+    // Both flags parse for flag-file compatibility and do nothing in any
+    // mode (see their docs in config.rs). Upstream warns the same way for
+    // cache mode (ba824539d); here it is every mode.
+    if config.read_lifecycle || config.read_maturation {
+        tracing::warn!(
+            event = "read_flags_inert",
+            read_lifecycle = config.read_lifecycle,
+            read_maturation = config.read_maturation,
+            "--read-lifecycle and --read-maturation are accepted but not wired \
+             into this proxy; setting them changes nothing"
+        );
+    }
 }
 
 /// PR-D1: resolve AWS credentials at startup via the `aws-config`
@@ -533,12 +546,17 @@ async fn drive_serve(
     tokio::pin!(serve);
 
     // Idle until the signal arrives, so the deadline bounds the drain and not
-    // the proxy's whole uptime.
+    // the proxy's whole uptime. A second signal ends the drain at once: on
+    // 2026-10-21 earlyoom sent SIGTERM seven times over 123s of drain, freeing
+    // nothing while swap sat at zero, because a repeat signal was ignored.
     let deadline = async move {
         if drain_started_rx.await.is_err() {
             std::future::pending::<()>().await;
         }
-        tokio::time::sleep(grace).await;
+        tokio::select! {
+            _ = tokio::time::sleep(grace) => false,
+            _ = shutdown_signal() => true,
+        }
     };
     tokio::pin!(deadline);
 
@@ -547,8 +565,12 @@ async fn drive_serve(
             log_drained(signalled_at);
             result?;
         }
-        _ = &mut deadline => {
-            log_drain_timed_out(grace, signalled_at);
+        repeated = &mut deadline => {
+            if repeated {
+                log_drain_cut_short(signalled_at);
+            } else {
+                log_drain_timed_out(grace, signalled_at);
+            }
         }
     }
 
@@ -589,6 +611,14 @@ fn log_drain_timed_out(
         timeout_s = grace.as_secs(),
         drain_ms = drain_ms(signalled_at),
         "requests were still in flight when the grace period expired; exiting anyway"
+    );
+}
+
+fn log_drain_cut_short(signalled_at: &std::sync::OnceLock<std::time::Instant>) {
+    tracing::warn!(
+        event = "shutdown_drain_cut_short",
+        drain_ms = drain_ms(signalled_at),
+        "second signal during the drain; exiting with requests still in flight"
     );
 }
 

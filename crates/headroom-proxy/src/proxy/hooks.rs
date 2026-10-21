@@ -53,7 +53,7 @@ pub(super) fn response_usage(response: &serde_json::Value, provider: &str) -> (i
             get("input_tokens"),
             get("output_tokens"),
             cached("input_tokens_details"),
-            0,
+            usage.and_then(super::responses_cache_write).unwrap_or(0),
         ),
         _ => (
             get("prompt_tokens"),
@@ -125,8 +125,9 @@ impl TurnHookUsage {
 /// Pre-send `on_request` seam. Parses the outbound body, lets registered hooks
 /// inspect/mutate `messages`/`tools`, and re-serializes only if a hook changed
 /// them. Returns the body unchanged on any parse/serialize failure, plus the
-/// tool-schema tokens hooks removed (measured on the final tools object, so
-/// in-place shrinks count; growth clamps to zero). Callers MUST gate on a
+/// signed tool-schema delta, tokens before minus after (measured on the final
+/// tools object, so in-place shrinks count; negative when a hook added a
+/// tool). [`book_hook_tool_delta`] books it. Callers MUST gate on a
 /// non-empty registry so the empty-registry path is a byte-identical no-op
 /// (this fn re-serializes and would perturb bytes).
 ///
@@ -189,7 +190,7 @@ pub(crate) fn apply_request_hooks(
     let tools_before = count_tools(&ctx.tools);
     let deferred_before = booked_deferred_tokens.map(|_| deferred_by_name(ctx.tools.as_ref()));
     crate::turn_hooks::run_request_hooks(&mut ctx);
-    let tools_saved = tools_before.saturating_sub(count_tools(&ctx.tools));
+    let tools_delta = tools_before.saturating_sub(count_tools(&ctx.tools));
     let deferred_credit =
         booked_deferred_tokens
             .zip(deferred_before)
@@ -221,11 +222,36 @@ pub(crate) fn apply_request_hooks(
         }
     }
     match serde_json::to_vec(&parsed) {
-        Ok(v) => (bytes::Bytes::from(v), tools_saved, deferred_credit),
+        Ok(v) => (bytes::Bytes::from(v), tools_delta, deferred_credit),
         Err(e) => {
             tracing::warn!(event = "turn_hooks_reserialize_failed", request_id = %request_id, error = %e, "turn hooks: re-serialize failed; forwarding original body");
             (body, 0, None)
         }
+    }
+}
+
+/// Book a hook's tool delta from [`apply_request_hooks`].
+///
+/// Shrinkage is deferral-shaped (removes schemas counting never saw), so it
+/// lands on the `turn_hook_tools_saved_tokens` tag, additive to
+/// `tokens_saved`. Growth is a tool sent on every request, so it comes off
+/// `tokens_saved` (upstream 85520c294); before, it was dropped and a hook that
+/// added a search tool booked the fold alone.
+pub(super) fn book_hook_tool_delta(ctx: &mut OutcomeContext, tools_delta: i64) {
+    if tools_delta > 0 {
+        let entry = ctx
+            .tags
+            .entry("turn_hook_tools_saved_tokens".to_string())
+            .or_insert_with(|| "0".to_string());
+        *entry = entry
+            .parse::<i64>()
+            .unwrap_or(0)
+            .saturating_add(tools_delta)
+            .to_string();
+        ctx.transforms_applied
+            .push(format!("turn_hook:tools:{tools_delta}tok"));
+    } else if tools_delta < 0 {
+        ctx.tokens_saved = ctx.tokens_saved.saturating_add(tools_delta).max(0);
     }
 }
 

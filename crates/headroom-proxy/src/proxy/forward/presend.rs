@@ -301,7 +301,8 @@ pub(crate) fn run_presend_seam(
     // touching the body at all, matching Python's "inert unless a hook is
     // registered" contract. A hook that shrinks the tool array is
     // deferral-shaped (removes schemas counting never saw), so its
-    // saving lands in tags, additive to `tokens_saved`.
+    // saving lands in tags, additive to `tokens_saved`; one that grows it
+    // costs the saving (see `book_hook_tool_delta`).
 
     if crate::turn_hooks::registered_turn_hooks().is_empty() {
         body_to_send
@@ -310,7 +311,7 @@ pub(crate) fn run_presend_seam(
             .as_ref()
             .and_then(|ctx| ctx.tags.get("tool_search_deferred_tokens"))
             .and_then(|v| v.parse::<i64>().ok());
-        let (bytes, tools_saved, deferred_credit) =
+        let (bytes, tools_delta, deferred_credit) =
             apply_request_hooks(body_to_send, endpoint, request_id, booked_deferred);
         if let Some(credit) = deferred_credit
             && let Some(ctx) = outcome_ctx.as_mut()
@@ -338,20 +339,8 @@ pub(crate) fn run_presend_seam(
                 );
             }
         }
-        if tools_saved > 0
-            && let Some(ctx) = outcome_ctx.as_mut()
-        {
-            let entry = ctx
-                .tags
-                .entry("turn_hook_tools_saved_tokens".to_string())
-                .or_insert_with(|| "0".to_string());
-            *entry = entry
-                .parse::<i64>()
-                .unwrap_or(0)
-                .saturating_add(tools_saved)
-                .to_string();
-            ctx.transforms_applied
-                .push(format!("turn_hook:tools:{tools_saved}tok"));
+        if let Some(ctx) = outcome_ctx.as_mut() {
+            book_hook_tool_delta(ctx, tools_delta);
         }
         bytes
     }
