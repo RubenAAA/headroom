@@ -397,12 +397,52 @@ pub fn record_savings_event(event: SavingsEvent) -> bool {
     }
 
     let target = resolve_path(event.path);
-    if write_locked_line(&target, &Value::Object(obj)).is_err() {
+    if let Err(e) = write_locked_line(&target, &Value::Object(obj)) {
+        warn_append_failure(&target, &e);
         return false;
     }
+    failing_paths()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&target);
 
     maybe_compact(&target);
     true
+}
+
+/// Ledger paths whose last append failed. Callers ignore `append`'s result,
+/// so without this an unwritable ledger dropped every saving with no trace.
+/// The first failure per path warns; repeats log at debug so a persistent
+/// failure cannot flood the log; a successful append re-arms the path.
+fn failing_paths() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static PATHS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    PATHS.get_or_init(Default::default)
+}
+
+/// Returns whether this failure warned (the first since the path last worked).
+fn warn_append_failure(target: &Path, error: &std::io::Error) -> bool {
+    let first = failing_paths()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(target.to_path_buf());
+    if first {
+        tracing::warn!(
+            event = "savings_ledger_append_failed",
+            path = %target.display(),
+            error = %error,
+            "savings ledger append failed; savings will not be recorded. Make \
+             the directory writable or set HEADROOM_SAVINGS_EVENTS_PATH"
+        );
+    } else {
+        tracing::debug!(
+            event = "savings_ledger_append_failed",
+            path = %target.display(),
+            error = %error,
+            "savings ledger append failed again"
+        );
+    }
+    first
 }
 
 fn write_locked_line(target: &Path, event: &Value) -> std::io::Result<()> {
@@ -992,6 +1032,33 @@ mod tests {
         maybe_compact(&path);
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(!body.contains("not json") && !body.contains("2020-01-01"));
+    }
+
+    /// An unwritable ledger warns once, not on every turn, and a write that
+    /// works again re-arms the warning for the next outage.
+    #[test]
+    fn failed_append_warns_once_per_outage() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not_a_dir");
+        std::fs::write(&blocker, "").unwrap();
+        let path = blocker.join("savings_events.jsonl");
+        let failing = || {
+            failing_paths()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&path)
+        };
+
+        assert!(!record_savings_event(ev(1000, 600, "t", &path)));
+        assert!(failing());
+        let err = std::io::Error::other("still unwritable");
+        assert!(!warn_append_failure(&path, &err), "a repeat must not warn");
+
+        std::fs::remove_file(&blocker).unwrap();
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(record_savings_event(ev(1000, 600, "t", &path)));
+        assert!(!failing());
+        assert!(warn_append_failure(&path, &err), "a new outage warns again");
     }
 
     #[test]
