@@ -41,12 +41,15 @@ pub const DEFAULT_MAX_CONVERSATIONS: usize = 512;
 /// 1. The request names one conversation. Only an explicit id counts: a
 ///    top-level `conversation_id`/`session_id`/`thread_id`, one of those
 ///    inside `metadata`/`client_metadata`, or a transport-scoped `session_id`
-///    the caller vouches for. Two things are deliberately NOT accepted: the
-///    holdout key's fallbacks (instructions prefix, literal `"responses"`)
-///    — two independent conversations with the same instructions would share
-///    a running total and suppress each other's savings — and
-///    `prompt_cache_key`, which OpenAI documents as shared across a user's
-///    sessions and forks.
+///    the caller vouches for. A `thread_id` wins over a `session_id` beside
+///    it: Codex sends the root thread's id as `session_id` on every request,
+///    so a guardian or subagent turn would reset the root's running total
+///    and the root's next turn would re-book its history. Two things are
+///    deliberately NOT accepted: the holdout key's fallbacks (instructions
+///    prefix, literal `"responses"`) — two independent conversations with
+///    the same instructions would share a running total and suppress each
+///    other's savings — and `prompt_cache_key`, which OpenAI documents as
+///    shared across a user's sessions and forks.
 /// 2. The request carries the whole transcript. With `previous_response_id`
 ///    or a server-side `conversation` the provider holds prior context and
 ///    the payload is this turn's increment, so `tokens_saved` is already
@@ -66,7 +69,7 @@ pub fn savings_conversation_key(body: &Value, session_id: Option<&str>) -> Optio
     }
 
     let mut identity = String::new();
-    for key in ["conversation_id", "session_id", "thread_id"] {
+    for key in ["conversation_id", "thread_id", "session_id"] {
         let value = explicit_id(map.get(key));
         if !value.is_empty() {
             identity = format!("{key}:{value}");
@@ -81,8 +84,8 @@ pub fn savings_conversation_key(body: &Value, session_id: Option<&str>) -> Optio
             for key in [
                 "conversation_id",
                 "conversation_key",
-                "session_id",
                 "thread_id",
+                "session_id",
                 "codex_session_id",
             ] {
                 let value = explicit_id(container.get(key));
@@ -291,6 +294,38 @@ mod tests {
         assert!(savings_conversation_key(&bare, Some("s-1")).is_some());
         // Empty session fallback counts as no identity.
         assert!(savings_conversation_key(&bare, Some("")).is_none());
+    }
+
+    #[test]
+    fn thread_id_wins_over_the_session_beside_it() {
+        // Codex sends the root thread's id as `session_id` on every request;
+        // keyed on it, a guardian turn reset the root's total and the root's
+        // next turn re-booked its history.
+        let codex = |thread: &str| {
+            savings_conversation_key(
+                &json!({
+                    "input": "hi",
+                    "client_metadata": {"session_id": "root-thread", "thread_id": thread},
+                }),
+                None,
+            )
+            .expect("key")
+        };
+        let root = codex("root-thread");
+        let guardian = codex("guardian-thread");
+        assert_ne!(root, guardian);
+        assert_ne!(root, codex("subagent-thread"));
+        let ledger = ConversationSavings::new();
+        assert_eq!(ledger.novel(Some(&root), Some(1000)), Some(1000));
+        assert_eq!(ledger.novel(Some(&guardian), Some(0)), Some(0));
+        assert_eq!(ledger.novel(Some(&root), Some(1200)), Some(200));
+
+        let top = json!({"input": "x", "session_id": "s-1", "thread_id": "t-1"});
+        let thread_only = json!({"input": "y", "thread_id": "t-1"});
+        assert_eq!(
+            savings_conversation_key(&top, None),
+            savings_conversation_key(&thread_only, None)
+        );
     }
 
     #[test]
