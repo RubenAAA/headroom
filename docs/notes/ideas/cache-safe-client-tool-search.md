@@ -23,6 +23,18 @@
   prefix on each load. `2e81ef096` (port of upstream `18a588b3`) keeps them
   out of the hash on first-party upstreams. Capture one tool-search
   session with the launcher workaround off before dropping it.
+- **2026-11-02, on the wire (2.1.316, sonnet, `ENABLE_TOOL_SEARCH=true`,
+  `claude -p` through a body-capturing shim in front of the proxy):** turn
+  1 sent 9 tools, one deferred, plus the placeholder. Turn 2 had loaded
+  WebFetch: 10 tools, WebFetch still `defer_loading: true`, and one
+  `tool_reference` block in the ToolSearch result. The API read the whole
+  turn-1 prompt (15,818 read, 478 written) and the proxy kept its replay
+  (`replayed_prefix: true`). So 2.1.316 already does the open candidate
+  below on its own, and the 10-20 busts belong to the older CLI.
+  `tool_roster_changed` still fires on such a load (`added: WebFetch`), so
+  `roster+` below now counts harmless loads; judge by `tools_waste`.
+  Next: drop the launcher line, but after 2026-11-09, so it does not land
+  inside the `--subagent-5m-ttl` measurement week.
 - **Why the workaround is cheap:** with tool search off, the client sends
   no ToolSearch tool, so `client_uses_tool_search` is false and the proxy's
   own deferral (`tool_search_deferral.rs`) defers non-core schemas again
