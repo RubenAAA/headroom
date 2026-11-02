@@ -165,8 +165,9 @@ pub fn compress_openai_chat_live_zone_with_config(
             Some((id, name))
         })
         .collect();
-    // Read once per request: the threshold cannot change mid-walk.
+    // Read once per request: the thresholds cannot change mid-walk.
     let mcp_min_chars = mcp_result_min_chars();
+    let shell_min_chars = shell_result_min_chars();
 
     for (msg_idx, slot) in all_slots {
         // Operator + builtin guard for tool outputs only (user prose has no
@@ -229,6 +230,22 @@ pub fn compress_openai_chat_live_zone_with_config(
                     block_type: slot.block_type,
                     action: BlockAction::Excluded {
                         reason: ExclusionReason::SmallMcpResult,
+                    },
+                });
+                continue;
+            }
+            // Small shell results stay verbatim (#3590): twin of the
+            // Anthropic `SmallShellResult` guard, so Codex `exec_command` /
+            // `shell` output under the floor keeps the lines it was run for.
+            if tool_name.is_some_and(is_shell_tool_name)
+                && mcp_result_is_small(&slot.content_text, shell_min_chars)
+            {
+                block_outcomes.push(BlockOutcome {
+                    message_index: msg_idx,
+                    block_index: slot.block_index,
+                    block_type: slot.block_type,
+                    action: BlockAction::Excluded {
+                        reason: ExclusionReason::SmallShellResult,
                     },
                 });
                 continue;
@@ -694,6 +711,75 @@ mod openai_chat_tests {
         assert!(
             matches!(out, LiveZoneOutcome::Modified { .. }),
             "control: unattributed tool payload must still compress"
+        );
+    }
+
+    /// Port of the Anthropic `small_shell_result_stays_verbatim` (#3590) to
+    /// this wire: a shell result under 2000 chars reaches the model as sent.
+    /// Lossy compression of a short `ls` / `git status` / grep cut the lines
+    /// the command was run for. The control shows the same payload under a
+    /// non-shell name compresses, so the name is what holds it.
+    #[test]
+    fn small_shell_tool_result_stays_verbatim() {
+        let payload = "{\"k\": \"v\", \"n\": 1}\n".repeat(60);
+        assert!(payload.len() > 512 && payload.len() < 2000);
+        let chat = |name: &str| {
+            body(json!({
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "running",
+                     "tool_calls": [{"id": "t1", "type": "function",
+                                    "function": {"name": name, "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "t1", "content": payload},
+                ]
+            }))
+        };
+        let out =
+            compress_openai_chat_live_zone(&chat("get_rows"), AuthMode::Payg, "gpt-4o").unwrap();
+        assert!(
+            matches!(out, LiveZoneOutcome::Modified { .. }),
+            "control: non-shell tool payload must still compress"
+        );
+        for name in ["exec_command", "shell", "Shell_Command", "write_stdin"] {
+            let out =
+                compress_openai_chat_live_zone(&chat(name), AuthMode::Payg, "gpt-4o").unwrap();
+            let LiveZoneOutcome::NoChange { manifest } = &out else {
+                panic!("{name}: small shell tool message must not rewrite the body")
+            };
+            let tool_block = manifest
+                .block_outcomes
+                .iter()
+                .find(|b| b.block_type == "tool_content")
+                .expect("tool block recorded");
+            assert!(
+                matches!(
+                    tool_block.action,
+                    BlockAction::Excluded {
+                        reason: ExclusionReason::SmallShellResult
+                    }
+                ),
+                "{name}: got {:?}",
+                tool_block.action
+            );
+        }
+    }
+
+    /// Build and test logs past the shell floor still compress.
+    #[test]
+    fn long_shell_tool_result_still_compresses() {
+        let b = body(json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "running",
+                 "tool_calls": [{"id": "t1", "type": "function",
+                                "function": {"name": "exec_command", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": bulky_log_payload()},
+            ]
+        }));
+        let out = compress_openai_chat_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+        assert!(
+            matches!(out, LiveZoneOutcome::Modified { .. }),
+            "long shell output must compress, got {out:?}"
         );
     }
 

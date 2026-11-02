@@ -145,8 +145,17 @@ pub fn compress_openai_responses_live_zone_with_config(
     // item fail open (normal compression), matching the Anthropic
     // unknown-id path.
     let mut call_name_by_id: HashMap<&str, &str> = HashMap::new();
+    // Shell calls whose short output stays verbatim (#3590). A native
+    // `local_shell_call` carries no `name`, so it joins by type.
+    let mut shell_call_ids: HashSet<&str> = HashSet::new();
+    let shell_min_chars = shell_result_min_chars();
     for item in items {
         let type_tag = item.get("type").and_then(Value::as_str).unwrap_or("");
+        if type_tag == "local_shell_call"
+            && let Some(call_id) = item.get("call_id").and_then(Value::as_str)
+        {
+            shell_call_ids.insert(call_id);
+        }
         if type_tag == "function_call" {
             let name = item.get("name").and_then(Value::as_str).unwrap_or("");
             // An orchestrator wrapper (`execute`, `exec`, `functions.exec`)
@@ -166,6 +175,9 @@ pub fn compress_openai_responses_live_zone_with_config(
                 }
                 if is_byte_exact_excluded(name) {
                     byte_exact_tool_call_ids.insert(call_id);
+                }
+                if is_shell_tool_name(name) {
+                    shell_call_ids.insert(call_id);
                 }
             }
         }
@@ -366,6 +378,24 @@ pub fn compress_openai_responses_live_zone_with_config(
                     &tokenizer,
                     &mut replacements,
                 ));
+                continue;
+            }
+            // Small shell results stay verbatim (#3590): twin of the
+            // Anthropic `SmallShellResult` guard, after exclusion like it.
+            let is_shell = items
+                .get(msg_idx)
+                .and_then(|item| item.get("call_id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| shell_call_ids.contains(id));
+            if is_shell && mcp_result_is_small(&slot.content_text, shell_min_chars) {
+                block_outcomes.push(BlockOutcome {
+                    message_index: msg_idx,
+                    block_index: slot.block_index,
+                    block_type: slot.block_type,
+                    action: BlockAction::Excluded {
+                        reason: ExclusionReason::SmallShellResult,
+                    },
+                });
                 continue;
             }
         }
@@ -836,6 +866,89 @@ mod openai_responses_tests {
                 );
             }
         }
+    }
+
+    /// Port of the Anthropic `small_shell_result_stays_verbatim` (#3590) to
+    /// this wire. Codex runs commands as a `function_call` (`exec_command`,
+    /// `shell`) or as its native `local_shell_call`, which carries no name,
+    /// so both shapes must hold a short output verbatim. The control shows
+    /// the same payload under a non-shell name compresses.
+    #[test]
+    fn small_shell_output_stays_verbatim() {
+        let payload = "{\"k\": \"v\", \"n\": 1}\n".repeat(60);
+        assert!(payload.len() > RESPONSES_OUTPUT_MIN_BYTES && payload.len() < 2000);
+        let function_call = |name: &str| {
+            body(json!({
+                "model": "gpt-4o",
+                "input": [
+                    {"type": "function_call", "call_id": "c1", "name": name, "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "c1", "output": payload},
+                ]
+            }))
+        };
+        let out = compress_openai_responses_live_zone(
+            &function_call("get_rows"),
+            AuthMode::Payg,
+            "gpt-4o",
+        )
+        .unwrap();
+        assert!(
+            matches!(out, LiveZoneOutcome::Modified { .. }),
+            "control: non-shell output must still compress"
+        );
+        let local_shell = body(json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "local_shell_call", "call_id": "c1", "status": "completed",
+                 "action": {"type": "exec", "command": ["cat", "rows.jsonl"]}},
+                {"type": "local_shell_call_output", "call_id": "c1", "output": payload},
+            ]
+        }));
+        let cases = [
+            ("exec_command", function_call("exec_command")),
+            ("shell", function_call("shell")),
+            ("local_shell_call", local_shell),
+        ];
+        for (name, b) in cases {
+            let out = compress_openai_responses_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+            let LiveZoneOutcome::NoChange { manifest } = &out else {
+                panic!("{name}: small shell output must not rewrite the body")
+            };
+            assert_eq!(manifest.block_outcomes.len(), 1, "{name}");
+            assert!(
+                matches!(
+                    manifest.block_outcomes[0].action,
+                    BlockAction::Excluded {
+                        reason: ExclusionReason::SmallShellResult
+                    }
+                ),
+                "{name}: got {:?}",
+                manifest.block_outcomes[0].action
+            );
+        }
+    }
+
+    /// Build and test logs past the shell floor still compress.
+    #[test]
+    fn long_shell_output_still_compresses() {
+        let mut log = String::new();
+        for i in 0..400 {
+            log.push_str(&format!(
+                "./src/foo_{i}.rs:12: error[E0308]: mismatched types in module foo_{i}\n"
+            ));
+        }
+        let b = body(json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": log},
+            ]
+        }));
+        let out = compress_openai_responses_live_zone(&b, AuthMode::Payg, "gpt-4o").unwrap();
+        assert!(
+            matches!(out, LiveZoneOutcome::Modified { .. }),
+            "long shell output must compress, got {out:?}"
+        );
     }
 
     /// Prose long enough for the plain-text path, which only Kompress serves.
