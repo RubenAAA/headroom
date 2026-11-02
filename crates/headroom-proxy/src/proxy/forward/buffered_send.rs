@@ -84,6 +84,32 @@ pub(crate) async fn read_buffered_body(
     Ok(buffered)
 }
 
+/// Body for the unbuffered passthrough arm: streamed as it came, except a
+/// non-bypass `/v1/responses` JSON POST, which goes through
+/// [`read_responses_passthrough_body`] while web_search history dropping is on.
+pub(crate) async fn passthrough_body(
+    body: Body,
+    is_llm_json_post: bool,
+    bypass: bool,
+    path: &str,
+    max: usize,
+    body_bytes_hint: Option<u64>,
+    request_id: &str,
+) -> reqwest::Body {
+    if is_llm_json_post
+        && !bypass
+        && crate::compression::classify_compressible_path(path)
+            == Some(crate::compression::CompressibleEndpoint::OpenAiResponses)
+        && crate::handlers::responses::web_search_history_enabled()
+    {
+        return read_responses_passthrough_body(body, max, body_bytes_hint, request_id).await;
+    }
+    reqwest::Body::wrap_stream(TryStreamExt::map_err(
+        body.into_data_stream(),
+        std::io::Error::other,
+    ))
+}
+
 /// Passthrough body for a `/v1/responses` POST when compression is off.
 ///
 /// The compression arm drops `web_search_call` history a request declares no

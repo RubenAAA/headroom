@@ -145,17 +145,10 @@ pub fn compress_openai_responses_live_zone_with_config(
     // item fail open (normal compression), matching the Anthropic
     // unknown-id path.
     let mut call_name_by_id: HashMap<&str, &str> = HashMap::new();
-    // Shell calls whose short output stays verbatim (#3590). A native
-    // `local_shell_call` carries no `name`, so it joins by type.
-    let mut shell_call_ids: HashSet<&str> = HashSet::new();
+    let shell_call_ids = shell_call_ids(items);
     let shell_min_chars = shell_result_min_chars();
     for item in items {
         let type_tag = item.get("type").and_then(Value::as_str).unwrap_or("");
-        if type_tag == "local_shell_call"
-            && let Some(call_id) = item.get("call_id").and_then(Value::as_str)
-        {
-            shell_call_ids.insert(call_id);
-        }
         if type_tag == "function_call" {
             let name = item.get("name").and_then(Value::as_str).unwrap_or("");
             // An orchestrator wrapper (`execute`, `exec`, `functions.exec`)
@@ -175,9 +168,6 @@ pub fn compress_openai_responses_live_zone_with_config(
                 }
                 if is_byte_exact_excluded(name) {
                     byte_exact_tool_call_ids.insert(call_id);
-                }
-                if is_shell_tool_name(name) {
-                    shell_call_ids.insert(call_id);
                 }
             }
         }
@@ -382,12 +372,12 @@ pub fn compress_openai_responses_live_zone_with_config(
             }
             // Small shell results stay verbatim (#3590): twin of the
             // Anthropic `SmallShellResult` guard, after exclusion like it.
-            let is_shell = items
-                .get(msg_idx)
-                .and_then(|item| item.get("call_id"))
-                .and_then(Value::as_str)
-                .is_some_and(|id| shell_call_ids.contains(id));
-            if is_shell && mcp_result_is_small(&slot.content_text, shell_min_chars) {
+            if is_small_shell_output(
+                items.get(msg_idx),
+                &shell_call_ids,
+                &slot.content_text,
+                shell_min_chars,
+            ) {
                 block_outcomes.push(BlockOutcome {
                     message_index: msg_idx,
                     block_index: slot.block_index,
@@ -620,6 +610,37 @@ pub(super) fn plan_responses_item(
         }
         _ => Ok(None),
     }
+}
+
+/// Call ids of shell calls, whose short output stays verbatim (#3590). A
+/// native `local_shell_call` carries no `name`, so it joins by type; a
+/// `function_call` joins by its unwrapped name.
+fn shell_call_ids(items: &[Value]) -> HashSet<&str> {
+    items
+        .iter()
+        .filter(|item| match item.get("type").and_then(Value::as_str) {
+            Some("local_shell_call") => true,
+            Some("function_call") => {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                is_shell_tool_name(unwrap_tool_call_name(name, item.get("arguments")))
+            }
+            _ => false,
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .collect()
+}
+
+/// Whether `item` answers a shell call and its output is under the floor.
+fn is_small_shell_output(
+    item: Option<&Value>,
+    shell_call_ids: &HashSet<&str>,
+    text: &str,
+    min_chars: usize,
+) -> bool {
+    item.and_then(|item| item.get("call_id"))
+        .and_then(Value::as_str)
+        .is_some_and(|id| shell_call_ids.contains(id))
+        && mcp_result_is_small(text, min_chars)
 }
 
 #[cfg(test)]

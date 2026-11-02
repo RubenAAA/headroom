@@ -1036,32 +1036,26 @@ pub(crate) async fn forward_http(
         // `/v1/responses` JSON POST with compression off: it is read whole so
         // `web_search_call` history it declares no tool for can leave (see
         // `read_responses_passthrough_body`). Its bytes change only then.
-        let reqwest_body = if is_llm_json_post
-            && !gate_decision.bypass_header_set
-            && compression::classify_compressible_path(uri.path())
-                == Some(compression::CompressibleEndpoint::OpenAiResponses)
-            && crate::handlers::responses::web_search_history_enabled()
-        {
-            forward::read_responses_passthrough_body(
-                req.into_body(),
-                state.config.compression_max_body_bytes as usize,
-                body_bytes_hint,
-                &request_id,
-            )
-            .await
-        } else {
-            let body_stream =
-                TryStreamExt::map_err(req.into_body().into_data_stream(), std::io::Error::other);
-            reqwest::Body::wrap_stream(body_stream)
-        };
-        if allow_slow_path_probe {
-            slow_upstream_probe = crate::upstream_route_probe::SlowUpstreamProbe::arm(
-                upstream_client.clone(),
-                &upstream_url,
-                &request_id,
-                configured_http_proxy,
-            );
-        }
+        let reqwest_body = forward::passthrough_body(
+            req.into_body(),
+            is_llm_json_post,
+            gate_decision.bypass_header_set,
+            uri.path(),
+            state.config.compression_max_body_bytes as usize,
+            body_bytes_hint,
+            &request_id,
+        )
+        .await;
+        slow_upstream_probe = allow_slow_path_probe
+            .then(|| {
+                crate::upstream_route_probe::SlowUpstreamProbe::arm(
+                    upstream_client.clone(),
+                    &upstream_url,
+                    &request_id,
+                    configured_http_proxy,
+                )
+            })
+            .flatten();
         (
             upstream_client
                 .request(reqwest_method.clone(), upstream_url.clone())
