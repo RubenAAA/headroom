@@ -117,7 +117,9 @@ const SHELL_RESULT_MIN_CHARS_ENV: &str = "HEADROOM_SHELL_RESULT_MIN_CHARS";
 const DEFAULT_SHELL_RESULT_MIN_CHARS: usize = 2000;
 
 /// Shell tool names across harnesses, compared lowercase. Mirrors Python
-/// `ContentRouterConfig.bash_tool_names`.
+/// `ContentRouterConfig.bash_tool_names`, plus two Codex names upstream
+/// lacks: `shell_command` (its string-command shell tool) and
+/// `write_stdin` (more output from a running `exec_command` session).
 const SHELL_TOOL_NAMES: &[&str] = &[
     "bash",
     "shell",
@@ -128,11 +130,13 @@ const SHELL_TOOL_NAMES: &[&str] = &[
     "terminal",
     "run_command",
     "run_terminal_command",
+    "shell_command",
+    "write_stdin",
 ];
 
 /// The live threshold. Missing, blank or unparseable reads as the default;
 /// negatives clamp to 0 (off), like the MCP floor.
-fn shell_result_min_chars() -> usize {
+pub(super) fn shell_result_min_chars() -> usize {
     match std::env::var(SHELL_RESULT_MIN_CHARS_ENV) {
         Ok(s) if !s.trim().is_empty() => s
             .trim()
@@ -143,7 +147,7 @@ fn shell_result_min_chars() -> usize {
     }
 }
 
-fn is_shell_tool_name(name: &str) -> bool {
+pub(super) fn is_shell_tool_name(name: &str) -> bool {
     SHELL_TOOL_NAMES
         .iter()
         .any(|shell| shell.eq_ignore_ascii_case(name))

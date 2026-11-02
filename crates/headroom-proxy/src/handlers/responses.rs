@@ -364,8 +364,7 @@ pub(crate) fn drop_undeclared_web_search_calls(
             .and_then(serde_json::Value::as_str)
             .is_some_and(|ty| ty.starts_with("web_search"))
     });
-    if declares_search || !env_value_enabled(std::env::var(WEB_SEARCH_HISTORY_ENV).ok().as_deref())
-    {
+    if declares_search || !web_search_history_enabled() {
         return 0;
     }
     let kept: Vec<serde_json::Value> = items
@@ -383,6 +382,12 @@ pub(crate) fn drop_undeclared_web_search_calls(
         "dropped web_search_call history from a request with no web_search tool"
     );
     dropped
+}
+
+/// `HEADROOM_WEB_SEARCH_HISTORY` is not set to off. Read per request, so the
+/// passthrough arm can skip buffering when the drop is disabled.
+pub(crate) fn web_search_history_enabled() -> bool {
+    env_value_enabled(std::env::var(WEB_SEARCH_HISTORY_ENV).ok().as_deref())
 }
 
 /// Skip the parse unless the bytes could hold a `web_search_call` item. JSON

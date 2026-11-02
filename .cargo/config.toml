@@ -38,4 +38,7 @@ debug = "line-tables-only"
 # (2026-09-28: 587 fake `gpt-4o` rows there), skewing `headroom savings`.
 # Applies to every process cargo launches, so `cargo run` of a proxy books here
 # too; the installed binaries are not launched by cargo and are unaffected.
-HEADROOM_SAVINGS_EVENTS_PATH = { value = "target/test-savings-events.jsonl", relative = true }
+# Outside the checkout: `relative = true` resolved against the worktree, so a
+# test run in a worktree created a `target/` there next to the shared one
+# CARGO_TARGET_DIR points at. Nothing reads this file back.
+HEADROOM_SAVINGS_EVENTS_PATH = "/tmp/headroom-test-savings-events.jsonl"

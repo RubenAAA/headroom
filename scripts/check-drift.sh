@@ -8,8 +8,8 @@
 #      contrib/headroom-flags.sh (catches renamed-but-undocumented flags).
 #   4. review-gate.sh stands down on ticket-gate.sh's exact TICKET_INTENT.
 #
-# Usage: bash scripts/check-drift.sh [--build] (default reuses an existing
-# binary when present, else builds debug once).
+# Usage: bash scripts/check-drift.sh [--build] (default reuses the newest
+# binary unless the proxy source is newer; --build always rebuilds debug).
 
 set -euo pipefail
 
@@ -17,18 +17,25 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FAIL=0
 
 # ── 1. flags.md freshness ─────────────────────────────────────────────
+# Look where cargo builds: CARGO_TARGET_DIR when set (worktrees share the main
+# checkout's target/), else ./target. Take the newer of release and debug, and
+# rebuild debug when any proxy source is newer than it: a stale release binary
+# from weeks ago once failed this check on a correct docs/flags.md.
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN=""
-if [[ -x "$ROOT/target/release/headroom-proxy" ]]; then
-    BIN="$ROOT/target/release/headroom-proxy"
-elif [[ -x "$ROOT/target/debug/headroom-proxy" ]]; then
-    BIN="$ROOT/target/debug/headroom-proxy"
-else
-    echo "check-drift: no binary found, building debug headroom-proxy once..."
+for cand in "$TARGET_DIR/release/headroom-proxy" "$TARGET_DIR/debug/headroom-proxy"; do
+    if [[ -x "$cand" && ( -z "$BIN" || "$cand" -nt "$BIN" ) ]]; then
+        BIN="$cand"
+    fi
+done
+if [[ "${1:-}" == "--build" || -z "$BIN" ]] \
+    || [[ -n "$(find "$ROOT/crates/headroom-proxy/src" -name '*.rs' -newer "$BIN" -print -quit)" ]]; then
+    echo "check-drift: building debug headroom-proxy (binary missing or older than the source)..."
     (cd "$ROOT" && cargo build -p headroom-proxy >/dev/null 2>&1) || {
         echo "FAIL: cargo build -p headroom-proxy failed" >&2
         exit 1
     }
-    BIN="$ROOT/target/debug/headroom-proxy"
+    BIN="$TARGET_DIR/debug/headroom-proxy"
 fi
 
 TMP="$(mktemp -d)"
