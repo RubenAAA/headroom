@@ -522,6 +522,17 @@ Options:
           [default: false]
           [possible values: true, false]
 
+      --subagent-5m-ttl <SUBAGENT_5M_TTL>
+          Leave Claude Code subagent bodies on the 5-minute default instead of pinning them to `1h`.
+          
+          Claude Code stopped sending explicit `5m` markers in September, so `--respect-client-5m-ttl` no longer sees subagents. They arrive with unmarked TTLs and `cc_is_subagent=true` in the `system[0]` billing header, run start to finish in minutes, and rarely leave a gap the hour buys back. Over 2026-10-26..11-02 their 1h writes were 6.3M tokens a week, and vs-stock on subagent conversations was -10.5%. Main-conversation bodies (also unmarked on their last request before compaction) keep the pin.
+          
+          Default `false`. Do not judge it by `vs_stock`: that figure prices 5m writes at an assumed weight, so it shows a win by construction. Refit the meter (`scripts/meter-fit/`) once 5m writes are in the window and compare usage per turn.
+          
+          [env: HEADROOM_PROXY_SUBAGENT_5M_TTL=]
+          [default: false]
+          [possible values: true, false]
+
       --replay-store-dir <REPLAY_STORE_DIR>
           Persist forwarded prefixes here so a proxy restart does not throw them away. Empty (the default) keeps them in memory only.
           

@@ -89,6 +89,28 @@ pub fn pin_billing_header_in_body(body: bytes::Bytes) -> bytes::Bytes {
     }
 }
 
+/// Whether `system[0]` carries a billing header that says
+/// `cc_is_subagent=true`. Only that block counts: a conversation that
+/// quotes the field elsewhere is not a subagent. The byte scan keeps the
+/// JSON parse off bodies that cannot match.
+pub fn is_subagent_body(body: &[u8]) -> bool {
+    if memchr::memmem::find(body, b"cc_is_subagent=true").is_none() {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(rest) = parsed
+        .pointer("/system/0/text")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| text.strip_prefix(HEADER_PREFIX))
+    else {
+        return false;
+    };
+    rest.split(';')
+        .any(|field| field.trim() == "cc_is_subagent=true")
+}
+
 /// Pure core: rebuild the header text with a pinned version and `cli`
 /// entrypoint. Takes the cell so tests can latch in isolation instead of
 /// racing the process-wide static.
