@@ -23,9 +23,6 @@ use serde_json::{Map, Value, json};
 /// [`crate::request_outcome`], not duplicated here).
 pub use crate::request_outcome::summarize_transforms;
 
-/// Hard cap on retained cost entries (memory bound).
-pub const MAX_COST_ENTRIES: usize = 100_000;
-
 /// Provider cache discount multipliers: `(read_multiplier, write_multiplier,
 /// label)` — the fraction of the input price a cache read/write costs.
 pub struct CacheEconomics {
@@ -217,7 +214,9 @@ struct PerModel {
 }
 
 struct Inner {
-    /// Costs inside the current budget period, oldest first.
+    /// Costs inside the current budget period, oldest first. Bounded by the
+    /// period (`expire`), not by a count: evicting an in-period cost would
+    /// drop spend that still counts against the budget (upstream #4416).
     costs: VecDeque<(DateTime<Local>, f64)>,
     /// Running sum of `costs`, so a budget check never scans them.
     period_cost: f64,
@@ -418,11 +417,6 @@ impl CostTracker {
             self.expire(&mut inner, now);
             inner.costs.push_back((now, cost));
             inner.period_cost += cost;
-            while inner.costs.len() > MAX_COST_ENTRIES {
-                if let Some((_, c)) = inner.costs.pop_front() {
-                    inner.period_cost -= c;
-                }
-            }
         }
     }
 
@@ -1724,6 +1718,32 @@ mod tests {
         t.record_tokens("claude-sonnet-4", &rec);
         t.reset_runtime();
         assert_eq!(t.get_period_cost(), 0.0);
+    }
+
+    #[test]
+    fn budget_keeps_in_period_costs_past_entry_cap() {
+        // Upstream #4416: evicting the oldest in-period cost at the entry cap
+        // subtracted spend that still counts, so the budget never tripped.
+        let t = CostTracker::new(Some(1_000_000.0), "monthly");
+        {
+            let mut inner = t.inner.lock().unwrap();
+            let now = Local::now();
+            for _ in 0..100_000 {
+                inner.costs.push_back((now, 1.0));
+            }
+            inner.period_cost = 100_000.0;
+        }
+        let rec = TokenRecord {
+            tokens_sent: 1_000_000,
+            uncached_tokens: 1_000_000,
+            ..Default::default()
+        };
+        t.record_tokens("claude-sonnet-4", &rec);
+        let one = t
+            .estimate_cost("claude-sonnet-4", 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(t.inner.lock().unwrap().costs.len(), 100_001);
+        assert!((t.get_period_cost() - (100_000.0 + one)).abs() < 1e-6);
     }
 
     #[test]
