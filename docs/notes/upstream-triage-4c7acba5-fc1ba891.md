@@ -4,7 +4,7 @@ Merged as `7ca63e6c` on `upstream-sync-2026-11-02`. Fetched 2026-11-02.
 Classes as in [`upstream-triage-976aa714-4c7acba5.md`](upstream-triage-976aa714-4c7acba5.md):
 PORT, ALREADY-THERE, N/A. Python paths map to `upstream-python/headroom/`.
 
-Totals: **25 PORT (16 landed here, 9 deferred), 2 merged as Rust from upstream, 18 ALREADY-THERE, 68 N/A**.
+Totals: **25 PORT (22 landed here, 3 skipped), 2 merged as Rust from upstream, 18 ALREADY-THERE, 68 N/A**.
 
 ## Merge
 
@@ -37,36 +37,39 @@ Totals: **25 PORT (16 landed here, 9 deferred), 2 merged as Rust from upstream, 
 | `89545fbd` | `cd4a26d1` | Headroom's MCP retrieval aliases count as the retrieval tool |
 | `d9958bfd` | `d0285840` | cc-switch loop guard matches every local spelling of the proxy |
 | `f59c8ffc` | `75ac81dd` | a non-2xx turn-hook re-drive returns Null; the original response stands |
+| `185454be` | `7de42dbc` | CCR store refuses the original: live zone, diff and log forward the input, no marker (Redis half N/A) |
+| `4bf1bf55` | `8f7ad544` | Gemini compression keeps snake_case, code-execution and thought parts |
+| `4fd9cddf` | `3758a78a`, `a107c4a1` | bypass header honoured on Anthropic, OpenAI and Google batch create |
+| `2a70d128` | `d83bf4e5` | Responses drops `web_search_call` history when no web_search tool is declared (HTTP + Codex WS); `HEADROOM_WEB_SEARCH_HISTORY=0` off. Not on the unbuffered `--compression false` HTTP path |
+| `18a588b3` | `2e81ef09` | `defer_loading` tools out of the drift tools hash, first-party upstreams only |
+| `4ee61645` | `c66fe553` | Anthropic shell results under 2000 chars stay verbatim (`HEADROOM_SHELL_RESULT_MIN_CHARS`); 1.96% of Bash tokens in 10,574 captured results; not on OpenAI paths |
 
-## Deferred
+## Skipped
 
-Log counts are over all five proxy logs, 2026-10-26 to 11-02.
-
-- `4ee61645` shell results under 2000 chars stay verbatim: costs savings,
-  changes live bytes. The failure it fixes (the model fetching back a
-  compressed short result) barely happens here: 6 `ccr_retrieval_call` in
-  the week. Needs an A/B before it could pay.
-- `2a70d128` drop `web_search_call` history with no web_search tool: 0
-  `web_search_call` in the logs.
-- `18a588b3` keep `defer_loading` tools out of the drift tools hash: 0
-  `defer_loading` in the logs; inert while the launcher sets
-  `ENABLE_TOOL_SEARCH=false` (`3253bfd9`).
-- `fc1ba891` document blocks priced by page: `count_messages` has no
-  production caller; the proxy prices documents in `handlers/count_tokens.rs`.
-- `4bf1bf55` Gemini snake_case parts, `4fd9cddf` batch bypass header: real
-  gaps, no traffic (no Gemini; `--enable-batch-api false`). `handlers/batch.rs`
-  OpenAI/Google batch create ignore the bypass header too.
+- `fc1ba891` document blocks priced by page: `Tokenizer::count_messages` has
+  no production caller. End to end, a 4-page PDF in a `tool_result` counted
+  `tokens_before=0`; no savings path prices base64 as text. The proxy prices
+  documents itself in `handlers/count_tokens.rs` (decoded bytes / 750).
 - `40cd7e75`, `534cec0e` batch-compression guards, YAML block scalars:
   modules have no production callers.
-- `185454be` (non-Redis half): forward the original when the CCR store
-  write fails, instead of a dangling marker. 0 `ccr_put_failed` in the logs.
+
+Ported for colleagues' traffic, though our logs (2026-10-26..11-02) had none:
+0 Gemini, batch off, 0 `web_search_call`, 0 `defer_loading`, 0 `ccr_put_failed`.
 
 ## Found on the way, not upstream
 
 - Chat prefix replay never fires when `messages[0]` is `role: system`, the
   usual OpenAI chat shape: `first_illegal_system_position`
   (`prefix_replay/compare.rs:174`) is Anthropic-only and declines every such
-  turn with `system_adjacency_broken`.
+  turn with `system_adjacency_broken`. Fixed in `125a25af`; 0 native chat
+  requests in our logs, Zen chat routes replay before translation.
+- `--subagent-5m-ttl` (`d2d610f1`, default off): unmarked bodies with
+  `cc_is_subagent=true` skip the 1h pin. Judge by a meter refit, not
+  `vs_stock`.
+- Open: ctx offload (`ctx_offload.rs` ~1269) turns an array `tool_result`
+  over 20 KB into one text block, dropping sibling image/document blocks
+  the store cannot give back.
+- Tool search: see the 11-02 entry in `ideas/cache-safe-client-tool-search.md`.
 - Response-cache lookup keys on the transformed body, store on the original
   (`proxy.rs:512,623` vs `:440`). Cache is off and rejected; noted only.
 
