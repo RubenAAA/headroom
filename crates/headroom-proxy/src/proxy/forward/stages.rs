@@ -99,6 +99,12 @@ pub(crate) fn prepare_replay_inputs(
 ) {
     let (buffered, additional_tools_restore_plan) =
         if matches!(endpoint, compression::CompressibleEndpoint::OpenAiResponses) {
+            // Before the lift, which moves `additional_tools` declarations:
+            // a Codex compaction holding `web_search_call` history and no
+            // web_search tool gets a dead in-band error upstream.
+            let buffered = crate::handlers::responses::drop_undeclared_web_search_calls_body(
+                buffered, request_id,
+            );
             crate::handlers::responses::lift_codex_additional_tools_body(buffered, request_id)
         } else {
             (buffered, None)
