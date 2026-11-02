@@ -253,7 +253,7 @@ fn optimize_content_block(item: &Value, provider: &str) -> Option<(Value, TileOp
             return None;
         }
 
-        let resized = img.resize(opt_w, opt_h, image::imageops::FilterType::Lanczos3);
+        let resized = jpeg_ready(img.resize(opt_w, opt_h, image::imageops::FilterType::Lanczos3));
         let mut buf = std::io::Cursor::new(Vec::new());
         let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
         resized.write_with_encoder(encoder).ok()?;
@@ -303,7 +303,7 @@ fn optimize_content_block(item: &Value, provider: &str) -> Option<(Value, TileOp
             return None;
         }
 
-        let resized = img.resize(opt_w, opt_h, image::imageops::FilterType::Lanczos3);
+        let resized = jpeg_ready(img.resize(opt_w, opt_h, image::imageops::FilterType::Lanczos3));
         let mut buf = std::io::Cursor::new(Vec::new());
         let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
         resized.write_with_encoder(encoder).ok()?;
@@ -480,6 +480,25 @@ pub fn optimize_images_in_messages_cached(
     }
 
     (optimized, results)
+}
+
+/// Composite any alpha onto white before the JPEG encode.
+///
+/// JPEG has no alpha and the encoder simply drops it, so transparent pixels
+/// showed their stored colour, usually black: a dark diagram on a clear
+/// background came out as a solid black image.
+fn jpeg_ready(img: image::DynamicImage) -> image::DynamicImage {
+    if !img.color().has_alpha() {
+        return img;
+    }
+    let rgba = img.to_rgba8();
+    let flat = image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let [r, g, b, a] = rgba.get_pixel(x, y).0;
+        let a = u32::from(a);
+        let over_white = |c: u8| ((u32::from(c) * a + 255 * (255 - a) + 127) / 255) as u8;
+        image::Rgb([over_white(r), over_white(g), over_white(b)])
+    });
+    image::DynamicImage::ImageRgb8(flat)
 }
 
 /// Decode base64 image data from a data URL.
@@ -676,6 +695,32 @@ mod tests {
             res.tokens_after
         );
         assert_eq!(new_item["source"]["media_type"], json!("image/jpeg"));
+    }
+
+    /// A transparent PNG (stored colour black, as most exporters write it)
+    /// must come out white. Encoding to JPEG drops alpha, which used to show
+    /// the hidden colour: a diagram on a clear background became solid black.
+    #[test]
+    fn transparent_image_is_flattened_onto_white() {
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(1800, 1800));
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png.into_inner());
+        let item = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64}
+        });
+
+        let (new_item, _) = optimize_content_block(&item, "anthropic").expect("resized");
+        let jpeg = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            new_item["source"]["data"].as_str().unwrap(),
+        )
+        .unwrap();
+        let out = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        let px = out.get_pixel(out.width() / 2, out.height() / 2);
+        assert!(px.0.iter().all(|&c| c > 245), "centre pixel {px:?}");
     }
 
     #[test]
