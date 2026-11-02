@@ -596,6 +596,9 @@ HEADROOM_FLAGS=(
   # spends the authenticated free-pool quota and currently returns a long
   # 429 window. Keep the free route anonymous; the OpenCode headers are the
   # identity gate, not the bearer token.
+  # The session id comes from OpenCode's local DB. To pin one, set
+  # HEADROOM_ZEN_SESSION (and HEADROOM_ZEN_PROJECT) in the proxy's
+  # environment; both are read on each request, so no restart is needed.
   --extra-model-route claude-muse-spark-1.3=https://opencode.ai/zen/v1:openai:muse-spark-1.3-contributor-free:auth=none
   --extra-model-route claude-union-alpha=https://opencode.ai/zen:anthropic:union-alpha:auth=OPENCODE_API_KEY
 
