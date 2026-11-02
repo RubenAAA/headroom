@@ -66,9 +66,11 @@ Ported for colleagues' traffic, though our logs (2026-10-26..11-02) had none:
 - `--subagent-5m-ttl` (`d2d610f1`, default off): unmarked bodies with
   `cc_is_subagent=true` skip the 1h pin. Judge by a meter refit, not
   `vs_stock`.
-- Open: ctx offload (`ctx_offload.rs` ~1269) turns an array `tool_result`
-  over 20 KB into one text block, dropping sibling image/document blocks
-  the store cannot give back.
+- ctx offload turned an array `tool_result` into one text block, dropping
+  sibling image/document blocks the store (text only) could not give back,
+  and `vs_stock` credited the dropped base64 as savings. Same class as
+  FINDING-024. Fixed with this sync: the digest replaces the text blocks only.
+  0 of 117 captured mixed results (all screenshots) had text over 1000 chars.
 - Tool search: see the 11-02 entry in `ideas/cache-safe-client-tool-search.md`.
 - Response-cache lookup keys on the transformed body, store on the original
   (`proxy.rs:512,623` vs `:440`). Cache is off and rejected; noted only.

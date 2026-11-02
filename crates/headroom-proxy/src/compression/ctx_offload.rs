@@ -1260,18 +1260,32 @@ fn offload_tool_result(
     // Strictly positive: the gate above returned on `>=`.
     let tokens_saved = (original_tokens - digest_tokens) as i64;
 
-    // Replace content, preserving the client's shape: string stays string,
-    // array becomes a single text block. Both are deterministic.
+    // Replace content, preserving the client's shape: string stays string;
+    // in an array the digest takes the first text block's place and the other
+    // text blocks go. Image and document blocks stay where they were: the
+    // store holds only the text, so a dropped one could never be retrieved.
+    // Both are deterministic.
     match block.get("content") {
         Some(Value::String(_)) => {
             block["content"] = Value::String(digest);
         }
-        _ => {
-            block["content"] = Value::Array(vec![serde_json::json!({
-                "type": "text",
-                "text": digest,
-            })]);
+        Some(Value::Array(blocks)) => {
+            let mut digest = Some(digest);
+            let kept = blocks
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(Value::as_str) != Some("text") {
+                        return Some(b.clone());
+                    }
+                    digest
+                        .take()
+                        .map(|text| serde_json::json!({"type": "text", "text": text}))
+                })
+                .collect();
+            block["content"] = Value::Array(kept);
         }
+        // `tool_result_text` returned text, so content is a string or array.
+        _ => return BlockOutcome::Skipped,
     }
 
     // PR-J4 (I3, monotonicity): once converted, the hash stays in the session
@@ -1601,6 +1615,41 @@ mod tests {
                 ]}
             ]
         })
+    }
+
+    /// A screenshot tool returns its page text beside the image. Offload
+    /// stores only the text, so the image must stay in the block: dropped,
+    /// no retrieval could bring it back.
+    #[test]
+    fn offload_keeps_image_and_document_blocks_beside_the_digest() {
+        let image = json!({"type":"image","source":{"type":"base64",
+            "media_type":"image/png","data":"iVBORw0KGgo="}});
+        let document = json!({"type":"document","source":{"type":"base64",
+            "media_type":"application/pdf","data":"JVBERi0x"}});
+        let mut parsed = req("");
+        parsed["messages"][1]["content"][0]["content"] = json!([
+            {"type":"text","text": big_body()},
+            image.clone(),
+            {"type":"text","text": big_body()},
+            document.clone(),
+        ]);
+        let out = offload_anthropic_request(&mut parsed, &cfg(200), None);
+        assert_eq!(out.blocks_offloaded, 1);
+
+        let content = parsed["messages"][1]["content"][0]["content"]
+            .as_array()
+            .expect("array stays an array");
+        let types: Vec<&str> = content.iter().filter_map(|b| b["type"].as_str()).collect();
+        assert_eq!(types, ["text", "image", "document"]);
+        assert_eq!(content[1], image);
+        assert_eq!(content[2], document);
+        assert!(content[0]["text"].as_str().unwrap().contains(MARKER_PREFIX));
+
+        // Re-running on the digest is a no-op (idempotency).
+        let again = parsed.clone();
+        let out = offload_anthropic_request(&mut parsed, &cfg(200), None);
+        assert_eq!(out.blocks_offloaded, 0);
+        assert_eq!(parsed, again);
     }
 
     fn first_tool_result_text(parsed: &Value) -> String {
