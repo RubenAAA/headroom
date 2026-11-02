@@ -1032,10 +1032,28 @@ pub(crate) async fn forward_http(
     } else {
         // Pure streaming path — the original passthrough behaviour. No peek
         // here: passthrough is byte-faithful by contract, and this path has no
-        // retry loop to feed anyway.
-        let body_stream =
-            TryStreamExt::map_err(req.into_body().into_data_stream(), std::io::Error::other);
-        let reqwest_body = reqwest::Body::wrap_stream(body_stream);
+        // retry loop to feed anyway. The one exception is a non-bypass
+        // `/v1/responses` JSON POST with compression off: it is read whole so
+        // `web_search_call` history it declares no tool for can leave (see
+        // `read_responses_passthrough_body`). Its bytes change only then.
+        let reqwest_body = if is_llm_json_post
+            && !gate_decision.bypass_header_set
+            && compression::classify_compressible_path(uri.path())
+                == Some(compression::CompressibleEndpoint::OpenAiResponses)
+            && crate::handlers::responses::web_search_history_enabled()
+        {
+            forward::read_responses_passthrough_body(
+                req.into_body(),
+                state.config.compression_max_body_bytes as usize,
+                body_bytes_hint,
+                &request_id,
+            )
+            .await
+        } else {
+            let body_stream =
+                TryStreamExt::map_err(req.into_body().into_data_stream(), std::io::Error::other);
+            reqwest::Body::wrap_stream(body_stream)
+        };
         if allow_slow_path_probe {
             slow_upstream_probe = crate::upstream_route_probe::SlowUpstreamProbe::arm(
                 upstream_client.clone(),

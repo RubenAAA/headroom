@@ -84,6 +84,49 @@ pub(crate) async fn read_buffered_body(
     Ok(buffered)
 }
 
+/// Passthrough body for a `/v1/responses` POST when compression is off.
+///
+/// The compression arm drops `web_search_call` history a request declares no
+/// tool for; the streaming arm never saw the body, so a Codex compaction on
+/// `--compression false` still got the dead in-band error. This reads the
+/// body up to `max` (the compression buffer limit) and applies the same drop.
+/// Past the limit, or on a client read error, it forwards what it read
+/// followed by the rest of the stream, exactly as the streaming arm would,
+/// rather than the compression arm's 413.
+pub(crate) async fn read_responses_passthrough_body(
+    body: Body,
+    max: usize,
+    body_bytes_hint: Option<u64>,
+    request_id: &str,
+) -> reqwest::Body {
+    let into_stream =
+        |body: Body| TryStreamExt::map_err(body.into_data_stream(), std::io::Error::other);
+    if body_bytes_hint.is_some_and(|len| len as usize > max) {
+        return reqwest::Body::wrap_stream(into_stream(body));
+    }
+    let mut body = body;
+    let mut acc = bytes::BytesMut::with_capacity(body_bytes_hint.map(|n| n as usize).unwrap_or(0));
+    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) => {
+                let read =
+                    futures_util::stream::iter([Ok(acc.freeze()), Err(std::io::Error::other(e))]);
+                return reqwest::Body::wrap_stream(read);
+            }
+        };
+        if let Ok(data) = frame.into_data() {
+            acc.extend_from_slice(&data);
+        }
+        if acc.len() > max {
+            let read = futures_util::stream::iter([Ok(acc.freeze())]);
+            return reqwest::Body::wrap_stream(read.chain(into_stream(body)));
+        }
+    }
+    crate::handlers::responses::drop_undeclared_web_search_calls_body(acc.freeze(), request_id)
+        .into()
+}
+
 /// Sends the buffered request body upstream, retrying transient failures.
 ///
 /// Covers 429/529/5xx with `Retry-After` cap and backoff, a leading in-band
