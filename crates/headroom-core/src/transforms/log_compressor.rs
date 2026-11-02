@@ -1198,11 +1198,28 @@ impl LogCompressor {
             } else if let Some(store) = store {
                 let key = md5_hex_24(content);
                 if !store.put(&key, content) {
+                    // A marker whose original never reached the store points
+                    // the model at a hash it cannot fetch. Return the log as
+                    // it came (upstream 185454be).
                     tracing::warn!(
                         event = "ccr_put_failed",
                         target = "ccr.log_compressor",
                         hash = %key,
-                        "ccr_put_failed; marker will point at an unretrievable hash"
+                        "ccr_put_failed; returning the original log"
+                    );
+                    stats.ccr_skip_reason = Some("ccr store refused the original");
+                    return (
+                        LogCompressionResult {
+                            compressed: content.to_string(),
+                            original: content.to_string(),
+                            original_line_count,
+                            compressed_line_count: original_line_count,
+                            format_detected: format,
+                            compression_ratio: 1.0,
+                            cache_key: None,
+                            stats: BTreeMap::new(),
+                        },
+                        stats,
                     );
                 }
                 // Descriptive so the reader/agent can tell whether the
@@ -2311,6 +2328,39 @@ mod tests {
         assert!(stats.ccr_emitted);
         let key = result.cache_key.as_ref().unwrap();
         assert_eq!(store.get(key).unwrap(), content);
+    }
+
+    #[test]
+    fn failed_ccr_put_returns_input_unchanged() {
+        // Upstream 185454be: a marker whose original never reached the
+        // store points at a hash the model cannot fetch.
+        struct Refusing;
+        impl CcrStore for Refusing {
+            fn put(&self, _: &str, _: &str) -> bool {
+                false
+            }
+            fn get(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn len(&self) -> usize {
+                0
+            }
+        }
+        let c = LogCompressor::new(LogCompressorConfig {
+            max_total_lines: 5,
+            min_lines_for_ccr: 5,
+            min_compression_ratio_for_ccr: 0.95,
+            ..Default::default()
+        });
+        let mut content = String::new();
+        for i in 0..50 {
+            content.push_str(&format!("INFO line {}\n", i));
+        }
+        content.push_str("ERROR boom\n");
+        let (result, stats) = c.compress_with_store(&content, 1.0, Some(&Refusing));
+        assert_eq!(result.compressed, content);
+        assert!(result.cache_key.is_none());
+        assert!(!stats.ccr_emitted);
     }
 
     #[test]

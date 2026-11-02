@@ -618,12 +618,25 @@ pub(super) fn compress_one_block(
                             "ccr marker offered"
                         );
                     } else {
+                        // A marker whose original never reached the store
+                        // points the model at a hash it cannot fetch, and
+                        // the dropped content is lost. Forward the block as
+                        // it came (upstream 185454be).
                         tracing::warn!(
                             event = "ccr_put_failed",
                             target = "ccr.live_zone",
                             hash = %hash,
-                            "ccr_put_failed; marker will point at an unretrievable hash"
+                            "ccr_put_failed; forwarding the original block"
                         );
+                        return BlockOutcome {
+                            message_index,
+                            block_index,
+                            block_type,
+                            action: BlockAction::CompressorError {
+                                strategy,
+                                error: "ccr store refused the original".to_string(),
+                            },
+                        };
                     }
                 }
                 let replacement_bytes = serde_json::to_vec(&compressed_for_replacement)
