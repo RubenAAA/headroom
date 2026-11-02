@@ -654,15 +654,17 @@ impl ReadLifecycleManager {
             .map(|b| format!("{:02x}", b))
             .collect();
 
-        // Best-effort CCR persistence
+        // A marker whose original never reached the store points the model
+        // at a hash it cannot fetch, so a refused write keeps the read.
         if let Some(ref store) = self.store
             && !store.put(&ccr_hash, content)
         {
             tracing::warn!(
                 event = "ccr_store_failed",
                 tool_call_id = %classification.tool_call_id,
-                "read_lifecycle: CCR store failed"
+                "read_lifecycle: CCR store failed; keeping the read verbatim"
             );
+            return (false, content.to_string(), None);
         }
 
         let file_display = if classification.file_path.is_empty() {
@@ -859,6 +861,29 @@ mod tests {
         assert!(content.to_lowercase().contains("stale"));
         assert!(content.contains("/src/app.py"));
         assert!(content.contains("hash="));
+    }
+
+    /// A marker whose original never reached the store points the model at
+    /// a hash it cannot fetch. A refused write keeps the read verbatim.
+    #[test]
+    fn refused_store_write_keeps_read_verbatim() {
+        let config = ReadLifecycleConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let store: Arc<dyn CcrStore> = Arc::new(crate::ccr::RefusingCcrStore);
+        let mgr = ReadLifecycleManager::new(config, Some(store));
+        let lc = large_content();
+
+        let messages = vec![
+            make_openai_read("r1", "/src/app.py"),
+            make_openai_tool_result("r1", &lc),
+            make_openai_edit("e1", "/src/app.py"),
+            make_openai_tool_result("e1", "edit success"),
+        ];
+
+        let result = mgr.apply(&messages, 0);
+        assert_eq!(result.messages[1]["content"].as_str().unwrap(), lc);
     }
 
     #[test]
