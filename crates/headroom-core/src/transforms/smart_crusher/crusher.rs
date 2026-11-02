@@ -971,7 +971,10 @@ impl SmartCrusher {
             match kind {
                 super::compaction::OpaqueKind::Base64Blob
                 | super::compaction::OpaqueKind::HtmlChunk => {
-                    let marker = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref());
+                    let Some(marker) = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref())
+                    else {
+                        return (Value::String(s.to_string()), String::new());
+                    };
                     let kind_label = opaque_kind_label(&kind);
                     return (Value::String(marker), format!("string_ccr:{kind_label}"));
                 }
@@ -986,8 +989,9 @@ impl SmartCrusher {
             return (Value::String(compressed), format!("string_prose:{key}"));
         }
 
-        if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.to_string()), &cfg) {
-            let marker = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref());
+        if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.to_string()), &cfg)
+            && let Some(marker) = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref())
+        {
             let kind_label = opaque_kind_label(&kind);
             return (Value::String(marker), format!("string_ccr:{kind_label}"));
         }
@@ -1191,15 +1195,8 @@ impl SmartCrusher {
             let canonical = canonical_array_json(ccr_source);
             let h = hash_canonical(&canonical);
             let marker = format!("<<ccr:{h} {dropped_count}_rows_offloaded>>");
-            if let Some(store) = &self.ccr_store
-                && !store.put(&h, &canonical)
-            {
-                tracing::warn!(
-                    event = "ccr_put_failed",
-                    target = "ccr.crusher",
-                    hash = %h,
-                    "ccr_put_failed; marker will point at an unretrievable hash"
-                );
+            if !self.ccr_put(&h, &canonical) {
+                return CrushArrayResult::kept_whole(items);
             }
             (Some(h), marker)
         } else {
@@ -1357,7 +1354,8 @@ impl SmartCrusher {
     /// `hash_canonical` (SHA256, first 12 hex chars — the same scheme the
     /// Python bridge and retrieval use), and stored in the CCR store so
     /// the marker round-trips through retrieval. No-op when nothing was
-    /// dropped or `enable_ccr_marker` is false.
+    /// dropped or `enable_ccr_marker` is false; restores `original` when
+    /// the store refuses the write.
     fn append_scalar_drop_sentinel(&self, kept: &mut Vec<Value>, original: &[Value]) {
         let dropped = original.len().saturating_sub(kept.len());
         if dropped == 0 || !self.config.enable_ccr_marker {
@@ -1365,8 +1363,9 @@ impl SmartCrusher {
         }
         let canonical = canonical_array_json(original);
         let hash = hash_canonical(&canonical);
-        if let Some(store) = &self.ccr_store {
-            store.put(&hash, &canonical);
+        if !self.ccr_put(&hash, &canonical) {
+            *kept = original.to_vec();
+            return;
         }
         kept.push(Value::String(format!(
             "… {dropped} more items <<ccr:{hash} {dropped}_items_offloaded>>"

@@ -202,6 +202,25 @@ pub fn marker_for(hash: &str) -> String {
     format!("<<ccr:{hash}>>")
 }
 
+/// A store whose writes always fail, as a full disk or a dropped Redis
+/// connection does. Tests use it to check that no marker goes out for an
+/// original that never reached the store.
+#[cfg(test)]
+pub(crate) struct RefusingCcrStore;
+
+#[cfg(test)]
+impl CcrStore for RefusingCcrStore {
+    fn put(&self, _hash: &str, _payload: &str) -> bool {
+        false
+    }
+    fn get(&self, _hash: &str) -> Option<String> {
+        None
+    }
+    fn len(&self) -> usize {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -88,12 +88,18 @@ impl OffloadTransform for ProseFieldOffload {
             ));
         };
         if !store.put(&key, content) {
+            // A marker whose original never reached the store points the
+            // model at a hash it cannot fetch. Leave the content as it came.
             tracing::warn!(
                 event = "ccr_put_failed",
                 target = "ccr.prose_field",
                 hash = %key,
-                "ccr_put_failed; marker will point at an unretrievable hash"
+                "ccr_put_failed; returning the original"
             );
+            return Err(TransformError::skipped(
+                NAME,
+                "ccr store refused the original",
+            ));
         }
         Ok(OffloadOutput::from_lengths(content.len(), output, key))
     }
@@ -106,7 +112,7 @@ impl OffloadTransform for ProseFieldOffload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccr::InMemoryCcrStore;
+    use crate::ccr::{InMemoryCcrStore, RefusingCcrStore};
     use crate::transforms::pipeline::config::PipelineConfig;
 
     fn offload() -> ProseFieldOffload {
@@ -142,6 +148,16 @@ mod tests {
         let result = offload().apply(&input, &CompressionContext::default(), &store);
         assert!(result.is_err());
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn store_refusal_leaves_content_unchanged() {
+        // A marker whose original never reached the store points the
+        // model at a hash it cannot fetch.
+        let input = prose();
+        assert!(offload().compress(&input, "").is_some());
+        let result = offload().apply(&input, &CompressionContext::default(), &RefusingCcrStore);
+        assert!(matches!(result, Err(TransformError::Skipped { .. })));
     }
 
     #[test]

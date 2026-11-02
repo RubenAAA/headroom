@@ -35,6 +35,7 @@
 mod analyzer;
 mod anchors;
 mod builder;
+mod ccr_put;
 mod classifier;
 pub mod compaction;
 mod config;

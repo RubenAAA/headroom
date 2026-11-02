@@ -114,7 +114,8 @@ pub fn compact(items: &[Value], cfg: &CompactConfig) -> Compaction {
 /// The IR (and therefore the rendered marker text) is identical whether or
 /// not a store is supplied — the store only adds a side-effecting write, so
 /// `compact(items, cfg)` and `compact_with_store(items, cfg, Some(store))`
-/// return the same [`Compaction`].
+/// return the same [`Compaction`]. The exception is a write the store
+/// refuses: that cell keeps its original value instead of a marker.
 pub fn compact_with_store(
     items: &[Value],
     cfg: &CompactConfig,
@@ -271,12 +272,15 @@ fn cell_from_value(v: &Value, cfg: &CompactConfig, store: Option<&Arc<dyn CcrSto
             if let Some(store) = store
                 && !store.put(&ccr_hash, s)
             {
+                // A marker whose original never reached the store points
+                // the model at a hash it cannot fetch. Keep the value.
                 tracing::warn!(
                     event = "ccr_put_failed",
                     target = "ccr.compactor",
                     hash = %ccr_hash,
-                    "ccr_put_failed; marker will point at an unretrievable hash"
+                    "ccr_put_failed; keeping the original cell"
                 );
+                return CellValue::Scalar(v.clone());
             }
             CellValue::OpaqueRef {
                 ccr_hash,
@@ -829,6 +833,37 @@ mod tests {
         assert_eq!(store.get(&hash).as_deref(), Some(big.as_str()));
         // Lock the key<->marker contract: stored key == hash_opaque(payload).
         assert_eq!(hash, hash_opaque(big.as_bytes()));
+    }
+
+    #[test]
+    fn refused_opaque_payload_keeps_original_cell() {
+        use crate::ccr::{CcrStore, RefusingCcrStore};
+        use std::sync::Arc;
+
+        // A marker whose original never reached the store points the
+        // model at a hash it cannot fetch.
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let items = vec![
+            json!({"id": 1, "blob": big.clone()}),
+            json!({"id": 2, "blob": big.clone()}),
+        ];
+
+        let store: Arc<dyn CcrStore> = Arc::new(RefusingCcrStore);
+        let c = compact_with_store(&items, &cfg(), Some(&store));
+        match &c {
+            Compaction::Table { rows, schema, .. } => {
+                let blob_idx = schema
+                    .fields
+                    .iter()
+                    .position(|f| f.name == "blob")
+                    .expect("blob col");
+                match &rows[0].0[blob_idx] {
+                    CellValue::Scalar(v) => assert_eq!(v, &json!(big)),
+                    other => panic!("expected the original value, got {other:?}"),
+                }
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
     }
 
     #[test]

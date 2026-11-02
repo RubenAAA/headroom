@@ -175,12 +175,18 @@ impl OffloadTransform for DiffNoise {
         // CCR: hash original, stash, append marker.
         let key = md5_hex_24(content);
         if !store.put(&key, content) {
+            // A marker whose original never reached the store points the
+            // model at a hash it cannot fetch. Leave the content as it came.
             tracing::warn!(
                 event = "ccr_put_failed",
                 target = "ccr.diff_noise",
                 hash = %key,
-                "ccr_put_failed; marker will point at an unretrievable hash"
+                "ccr_put_failed; returning the original"
             );
+            return Err(TransformError::skipped(
+                NAME,
+                "ccr store refused the original",
+            ));
         }
         output.push_str(&format!("\n[diff_noise CCR: hash={key}]"));
 
@@ -344,7 +350,7 @@ fn md5_hex_24(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccr::InMemoryCcrStore;
+    use crate::ccr::{InMemoryCcrStore, RefusingCcrStore};
     use crate::transforms::pipeline::config::PipelineConfig;
 
     fn cfg() -> DiffNoiseConfig {
@@ -465,6 +471,27 @@ mod tests {
                 .contains("[diff_noise: whitespace-only hunks dropped")
         );
         assert!(r.bytes_saved > 0);
+    }
+
+    #[test]
+    fn apply_skipped_when_store_refuses_original() {
+        // A marker whose original never reached the store points the
+        // model at a hash it cannot fetch, and the lockfile hunks are lost.
+        let big_lock_body: Vec<String> = (0..200)
+            .flat_map(|i| vec![format!("-old{i}"), format!("+new{i}")])
+            .collect();
+        let body_refs: Vec<&str> = big_lock_body.iter().map(|s| s.as_str()).collect();
+        let diff = build_diff(&[
+            ("Cargo.lock", &body_refs),
+            ("Cargo.toml", &["-foo = \"1\"", "+foo = \"2\""]),
+        ]);
+        let err = offload()
+            .apply(&diff, &CompressionContext::default(), &RefusingCcrStore)
+            .expect_err("no marker without a stored original");
+        match err {
+            TransformError::Skipped { .. } => {}
+            _ => panic!("expected Skipped, got {err:?}"),
+        }
     }
 
     #[test]

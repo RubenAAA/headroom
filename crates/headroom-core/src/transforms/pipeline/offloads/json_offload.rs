@@ -176,12 +176,18 @@ impl OffloadTransform for JsonOffload {
         // retrieves the full original via this outer hash.
         let key = md5_hex_24(content);
         if !store.put(&key, content) {
+            // A marker whose original never reached the store points the
+            // model at a hash it cannot fetch. Leave the content as it came.
             tracing::warn!(
                 event = "ccr_put_failed",
                 target = "ccr.json_offload",
                 hash = %key,
-                "ccr_put_failed; marker will point at an unretrievable hash"
+                "ccr_put_failed; returning the original"
             );
+            return Err(TransformError::skipped(
+                NAME,
+                "ccr store refused the original",
+            ));
         }
         let mut output = result.compressed;
         output.push_str("\n[json_offload CCR: hash=");
@@ -231,7 +237,7 @@ fn md5_hex_24(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccr::InMemoryCcrStore;
+    use crate::ccr::{InMemoryCcrStore, RefusingCcrStore};
     use crate::transforms::pipeline::config::PipelineConfig;
 
     fn cfg() -> JsonOffloadConfig {
@@ -439,6 +445,20 @@ mod tests {
         assert!(r.output.contains("[json_offload CCR: hash="));
         // Original recoverable through the orchestrator's store.
         assert_eq!(store.get(&r.cache_key).as_deref(), Some(arr.as_str()));
+    }
+
+    #[test]
+    fn apply_skipped_when_store_refuses_original() {
+        // A marker whose original never reached the store points the
+        // model at a hash it cannot fetch.
+        let arr = build_tabular_array(500);
+        let err = offload()
+            .apply(&arr, &CompressionContext::default(), &RefusingCcrStore)
+            .expect_err("no marker without a stored original");
+        match err {
+            TransformError::Skipped { transform, .. } => assert_eq!(transform, "json_offload"),
+            _ => panic!("expected Skipped, got {err:?}"),
+        }
     }
 
     #[test]
