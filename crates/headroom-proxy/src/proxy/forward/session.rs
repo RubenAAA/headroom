@@ -272,6 +272,7 @@ pub(crate) struct SessionAnalysisOut<'a> {
 pub(crate) fn analyze_buffered_session(
     parsed: &mut serde_json::Value,
     auto_mode_turn: bool,
+    deferred_tools_unkeyed: bool,
     scope: RequestScope<'_>,
     client_addr: &std::net::SocketAddr,
     out: SessionAnalysisOut<'_>,
@@ -348,7 +349,14 @@ pub(crate) fn analyze_buffered_session(
         } else {
             None
         };
-        let hash = compute_structural_hash(parsed, kind);
+        // A ToolSearch load that reaches the provider still deferred leaves
+        // its cache key alone; counting it as drift dropped the stored
+        // prefix. See `compute_structural_hash_with`.
+        let hash = cache_stabilization::drift_detector::compute_structural_hash_with(
+            parsed,
+            kind,
+            deferred_tools_unkeyed,
+        );
         // Restore in reverse order: the sentence preview saw the
         // directory-held view, so its copy goes back first.
         if let (Some(original), Some(slot)) = (sentence_previewed, parsed.get_mut("system")) {

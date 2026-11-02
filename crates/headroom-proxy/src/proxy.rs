@@ -596,6 +596,12 @@ pub(crate) async fn forward_http(
             if let Some(shed) = forward::analyze_buffered_session(
                 &mut parsed,
                 auto_mode_turn,
+                // Third-party upstreams get `defer_loading` stripped
+                // (`maybe_inject_tool_search`), so only first-party ones
+                // forward deferred tools still deferred.
+                !crate::tool_search_deferral::is_custom_anthropic_base_url(Some(
+                    selected_upstream.base.as_str(),
+                )),
                 forward::RequestScope {
                     state: &state,
                     endpoint,
