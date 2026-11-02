@@ -187,17 +187,17 @@ impl ProjectResolver {
         if system_prompt.is_empty() {
             return None;
         }
+        // Only at the start of a line (after an optional "- " bullet): a
+        // `find` anywhere let prose that quotes the prefix set the project.
         for prefix in CWD_PREFIXES {
-            if let Some(idx) = system_prompt.find(prefix) {
-                let start = idx + prefix.len();
-                let end = system_prompt[start..].find('\n');
-                let chunk = match end {
-                    Some(e) => &system_prompt[start..start + e],
-                    None => &system_prompt[start..],
-                };
-                let trimmed = chunk.trim().to_string();
-                if !trimmed.is_empty() {
-                    return Some(trimmed);
+            for line in system_prompt.split('\n') {
+                let line = line.trim();
+                let line = line.strip_prefix('-').map_or(line, str::trim_start);
+                if let Some(rest) = line.strip_prefix(prefix) {
+                    let trimmed = rest.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
                 }
             }
         }
@@ -240,10 +240,9 @@ impl ProjectResolver {
             return None;
         }
         let normalised = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
-        let s = normalised
-            .to_string_lossy()
-            .trim_end_matches('/')
-            .to_string();
+        // A symlink to a name with no UTF-8 form: a lossy string would merge
+        // distinct directories onto one project, so leave it unresolved.
+        let s = normalised.to_str()?.trim_end_matches('/').to_string();
         Some(if s.is_empty() { "/".to_string() } else { s })
     }
 
@@ -988,6 +987,40 @@ mod tests {
     #[test]
     fn extract_cwd_empty() {
         assert!(ProjectResolver::extract_cwd_from_system_prompt("").is_none());
+    }
+
+    #[test]
+    fn extract_cwd_ignores_prefix_inside_prose() {
+        let prompt = "The tool printed Working directory: /etc in its log.\nEnd";
+        assert!(ProjectResolver::extract_cwd_from_system_prompt(prompt).is_none());
+    }
+
+    #[test]
+    fn extract_cwd_accepts_bulleted_line() {
+        let prompt = "See cwd: /wrong here\n  - Working directory:   /home/user/code  \n";
+        assert_eq!(
+            ProjectResolver::extract_cwd_from_system_prompt(prompt).as_deref(),
+            Some("/home/user/code")
+        );
+    }
+
+    /// Two directories whose names differ only in bytes that are not UTF-8.
+    /// A lossy conversion maps both onto `U+FFFD` and so onto one project.
+    #[cfg(unix)]
+    #[test]
+    fn cwd_without_utf8_form_is_unresolved() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        for (bytes, link) in [(b"proj\xff".as_slice(), "a"), (b"proj\xfe", "b")] {
+            let real = tmp.path().join(std::ffi::OsStr::from_bytes(bytes));
+            std::fs::create_dir(&real).unwrap();
+            let link = tmp.path().join(link);
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(
+                ProjectResolver::identity_from_cwd(link.to_str().unwrap()),
+                None
+            );
+        }
     }
 
     // --- BackendRouter ---
