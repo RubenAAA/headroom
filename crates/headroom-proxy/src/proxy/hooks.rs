@@ -381,6 +381,12 @@ impl crate::turn_hooks::CallModel for ProxyCallModel {
             .send()
             .await;
         match resp {
+            // An error envelope parses as JSON too; handed to a hook as the
+            // re-drive's answer, it went back to the client as a 200.
+            Ok(r) if !r.status().is_success() => {
+                tracing::warn!(event = "turn_hooks_call_model_status_failed", request_id = %self.request_id, status = r.status().as_u16(), "turn hooks call_model: upstream returned a non-success status");
+                serde_json::Value::Null
+            }
             Ok(r) => match r.bytes().await {
                 Ok(bytes) => {
                     let parsed: serde_json::Value =
@@ -465,6 +471,13 @@ pub(super) async fn apply_response_hooks(
         usage_provider: usage_provider.to_string(),
     };
     let out = crate::turn_hooks::run_response_hooks(&ctx, response, &call_model).await;
+    // A hook that hands back a failed re-drive hands back `Null`; keep the
+    // response we have rather than send the client a 200 with no body.
+    let out = if out.is_null() {
+        serde_json::from_slice(&body_bytes).unwrap_or(out)
+    } else {
+        out
+    };
     let mut hook_usage = *usage.lock().unwrap_or_else(|e| e.into_inner());
 
     // Settle against the body the caller will actually go on to read, which on
@@ -478,4 +491,40 @@ pub(super) async fn apply_response_hooks(
     };
     hook_usage.settle(&final_response, usage_provider);
     (final_bytes, hook_usage)
+}
+
+#[cfg(test)]
+mod redrive_status_tests {
+    use super::*;
+    use crate::turn_hooks::CallModel;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// An upstream error envelope is not a re-drive result: handed to a hook,
+    /// it went back to the client as a 200.
+    #[tokio::test]
+    async fn a_non_success_redrive_is_a_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(529).set_body_json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"}
+            })))
+            .mount(&server)
+            .await;
+
+        let usage = Arc::new(std::sync::Mutex::new(TurnHookUsage::default()));
+        let call_model = ProxyCallModel {
+            template: serde_json::json!({"model": "claude-x", "messages": []}),
+            upstream_url: format!("{}/v1/messages", server.uri()).parse().unwrap(),
+            client: reqwest::Client::new(),
+            headers: http::HeaderMap::new(),
+            request_id: "req-hook".to_string(),
+            usage: Arc::clone(&usage),
+            usage_provider: "anthropic".to_string(),
+        };
+
+        assert!(call_model.call(vec![]).await.is_null());
+        assert!(usage.lock().unwrap().is_empty());
+    }
 }
