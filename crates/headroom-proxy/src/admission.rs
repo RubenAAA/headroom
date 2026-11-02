@@ -251,7 +251,11 @@ fn estimate_request_tokens(path: &str, body: &[u8]) -> u64 {
         .or_else(|| parsed.get("model").and_then(Value::as_str))
         .unwrap_or("");
     if (path.ends_with("/v1/messages") || anthropic_on_cloud.is_some()) && parsed.is_object() {
-        crate::handlers::count_tokens::estimate_input_tokens(&parsed, model)
+        crate::handlers::count_tokens::estimate_input_tokens(
+            &parsed,
+            model,
+            crate::handlers::count_tokens::DocumentPricing::Billed,
+        )
     } else {
         headroom_core::tokenizer::get_tokenizer(model).count_text(&String::from_utf8_lossy(body))
             as u64
