@@ -394,7 +394,7 @@ impl DiffCompressor {
         compressed_output: &mut String,
         store: Option<&dyn CcrStore>,
         stats: &mut DiffCompressorStats,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, ()> {
         let savings_threshold = self.config.min_compression_ratio_for_ccr;
         if self.config.enable_ccr
             && (compressed_line_count as f64) < (original_line_count as f64) * savings_threshold
@@ -410,6 +410,9 @@ impl DiffCompressor {
             // the LLM's retrieval tool call. When `None`, the caller
             // (typically the Python shim) is responsible — see the
             // method-level docs.
+            // A marker whose original never reached the store points the
+            // model at a hash it cannot fetch. `Err` tells the caller to
+            // return the input unchanged (upstream 185454be).
             if let Some(s) = store
                 && !s.put(&key, content)
             {
@@ -417,14 +420,16 @@ impl DiffCompressor {
                     target: "ccr.diff_compressor",
                     event = "ccr_put_failed",
                     hash = %key,
-                    "ccr_put_failed; marker will point at an unretrievable hash"
+                    "ccr_put_failed; returning the original diff"
                 );
+                stats.ccr_skipped_reason = Some("ccr store refused the original".into());
+                return Err(());
             }
             stats.cache_key_emitted = true;
-            Some(key)
+            Ok(Some(key))
         } else if !self.config.enable_ccr {
             stats.ccr_skipped_reason = Some("ccr disabled".into());
-            None
+            Ok(None)
         } else {
             stats.ccr_skipped_reason = Some(format!(
                 "compression ratio {:.3} above threshold {:.3}",
@@ -435,7 +440,7 @@ impl DiffCompressor {
                 },
                 savings_threshold
             ));
-            None
+            Ok(None)
         }
     }
 
@@ -577,14 +582,30 @@ impl DiffCompressor {
         // line than `compressed_line_count` reports, by design — Python
         // does the same. Mismatching this by recounting after the append
         // breaks parity by 1.
-        let cache_key = self.maybe_attach_ccr_marker(
+        let Ok(cache_key) = self.maybe_attach_ccr_marker(
             content,
             original_line_count,
             compressed_line_count,
             &mut compressed_output,
             store,
             &mut stats,
-        );
+        ) else {
+            stats.output_lines = original_line_count;
+            stats.compression_ratio = 1.0;
+            stats.processing_duration_us = start.elapsed().as_micros() as u64;
+            let result = DiffCompressionResult {
+                compressed: content.to_string(),
+                original_line_count,
+                compressed_line_count: original_line_count,
+                files_affected,
+                additions: total_additions,
+                deletions: total_deletions,
+                hunks_kept: hunks_kept_total + hunks_removed_total,
+                hunks_removed: 0,
+                cache_key: None,
+            };
+            return (result, emit_span_and_return(stats));
+        };
 
         stats.output_lines = compressed_line_count;
         stats.compression_ratio = if original_line_count == 0 {
@@ -1593,6 +1614,31 @@ mod tests {
         assert!(r.compressed.contains(&format!("hash={key}")));
         // Original must round-trip through the store.
         assert_eq!(store.get(&key).as_deref(), Some(input.as_str()));
+    }
+
+    #[test]
+    fn compress_with_store_returns_input_when_put_fails() {
+        // Upstream 185454be: a marker whose original never reached the
+        // store points at a hash the model cannot fetch. Return the diff
+        // as it came instead.
+        struct Refusing;
+        impl CcrStore for Refusing {
+            fn put(&self, _: &str, _: &str) -> bool {
+                false
+            }
+            fn get(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn len(&self) -> usize {
+                0
+            }
+        }
+        let input = build_synthetic_diff(8);
+        let (r, _) = DiffCompressor::default().compress_with_store(&input, "", Some(&Refusing));
+        assert_eq!(r.compressed, input);
+        assert!(r.cache_key.is_none());
+        assert_eq!(r.hunks_removed, 0);
+        assert_eq!(r.compressed_line_count, r.original_line_count);
     }
 
     #[test]

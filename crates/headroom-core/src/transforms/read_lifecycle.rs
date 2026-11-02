@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::ccr::CcrStore;
@@ -114,6 +114,48 @@ fn is_read_tool(name: &str) -> bool {
 
 fn is_mutating_tool(name: &str) -> bool {
     EDIT_TOOL_NAMES.contains(&name) || WRITE_TOOL_NAMES.contains(&name)
+}
+
+/// True when a tool_result's text is a `<tool_use_error>` validation error.
+fn rejected_before_running(content: Option<&Value>) -> bool {
+    let text = match content {
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .find(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .and_then(|b| b.get("text"))
+            .and_then(Value::as_str),
+        Some(v) => v.as_str(),
+        None => None,
+    };
+    text.is_some_and(|t| t.trim_start().starts_with("<tool_use_error>"))
+}
+
+/// Ids of Anthropic tool_use blocks the harness rejected before they ran.
+///
+/// Only an is_error tool_result whose text is a `<tool_use_error>` (e.g.
+/// "String to replace not found") proves the file was not touched. Any other
+/// error, such as an interrupted call that may have partly run, still counts
+/// as an edit.
+fn failed_tool_use_ids(messages: &[Value]) -> HashSet<&str> {
+    let mut failed = HashSet::new();
+    for msg in messages {
+        let Some(content) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result")
+                || block.get("is_error").and_then(Value::as_bool) != Some(true)
+            {
+                continue;
+            }
+            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str)
+                && rejected_before_running(block.get("content"))
+            {
+                failed.insert(id);
+            }
+        }
+    }
+    failed
 }
 
 /// Output of lifecycle management pass.
@@ -299,6 +341,7 @@ impl ReadLifecycleManager {
         tool_metadata: &HashMap<String, ToolMeta>,
     ) -> HashMap<String, Vec<FileOperation>> {
         let mut file_ops: HashMap<String, Vec<FileOperation>> = HashMap::new();
+        let failed_ids = failed_tool_use_ids(messages);
 
         for (tc_id, (name, file_path, offset, limit)) in tool_metadata {
             let file_path = match file_path {
@@ -308,7 +351,9 @@ impl ReadLifecycleManager {
 
             let operation = if is_read_tool(name) {
                 "read"
-            } else if is_mutating_tool(name) {
+            } else if is_mutating_tool(name) && !failed_ids.contains(tc_id.as_str()) {
+                // A rejected Edit/Write left the file unchanged, so earlier
+                // Reads stay valid.
                 "edit"
             } else {
                 continue;
@@ -1136,6 +1181,70 @@ mod tests {
         assert_eq!(result.reads_fresh, 1);
         let user_msg = &result.messages[1];
         assert_eq!(user_msg["content"][0]["content"].as_str().unwrap(), &lc);
+    }
+
+    fn make_anthropic_error_result(tc_id: &str, content: Value) -> Value {
+        json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tc_id,
+                "is_error": true,
+                "content": content
+            }]
+        })
+    }
+
+    #[test]
+    fn anthropic_rejected_edit_keeps_read_fresh() {
+        let mgr = ReadLifecycleManager::new(ReadLifecycleConfig::default(), None);
+        let lc = large_content();
+
+        // String form and text-block-list form of the validation error.
+        for err in [
+            json!("<tool_use_error>String to replace not found in file.</tool_use_error>"),
+            json!([{"type": "text", "text": "  <tool_use_error>File has not been read yet.</tool_use_error>"}]),
+        ] {
+            let messages = vec![
+                make_anthropic_read("r1", "/src/app.py"),
+                make_anthropic_tool_result("r1", &lc),
+                make_anthropic_edit("e1", "/src/app.py"),
+                make_anthropic_error_result("e1", err),
+            ];
+            let result = mgr.apply(&messages, 0);
+            assert_eq!(result.reads_stale, 0);
+            assert_eq!(result.reads_fresh, 1);
+            assert_eq!(result.messages[1]["content"][0]["content"], json!(lc));
+        }
+    }
+
+    #[test]
+    fn anthropic_other_edit_errors_still_make_read_stale() {
+        let mgr = ReadLifecycleManager::new(ReadLifecycleConfig::default(), None);
+        let lc = large_content();
+
+        // An interrupted call may have partly run; not a <tool_use_error>.
+        let interrupted = vec![
+            make_anthropic_read("r1", "/src/app.py"),
+            make_anthropic_tool_result("r1", &lc),
+            make_anthropic_edit("e1", "/src/app.py"),
+            make_anthropic_error_result("e1", json!("Interrupted by user")),
+        ];
+        assert_eq!(mgr.apply(&interrupted, 0).reads_stale, 1);
+
+        // A later successful Edit still counts after a rejected one.
+        let rejected_then_ok = vec![
+            make_anthropic_read("r1", "/src/app.py"),
+            make_anthropic_tool_result("r1", &lc),
+            make_anthropic_edit("e1", "/src/app.py"),
+            make_anthropic_error_result(
+                "e1",
+                json!("<tool_use_error>String to replace not found</tool_use_error>"),
+            ),
+            make_anthropic_edit("e2", "/src/app.py"),
+            make_anthropic_tool_result("e2", "edit success"),
+        ];
+        assert_eq!(mgr.apply(&rejected_then_ok, 0).reads_stale, 1);
     }
 
     // ── Transform Tracking ───────────────────────────────────────────────

@@ -357,9 +357,7 @@ pub(crate) fn inject_ccr_retrieve_tool(
         && can_resolve
         && let Some(tools) = value.get_mut("tools").and_then(|v| v.as_array_mut())
     {
-        let already_has = tools
-            .iter()
-            .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("headroom_retrieve"));
+        let already_has = crate::routed::transforms::client_has_retrieval_tool(tools);
         if !already_has {
             let ccr_tool = match endpoint {
                 compression::CompressibleEndpoint::AnthropicMessages => {
@@ -616,5 +614,37 @@ mod request_carries_memory_tools_tests {
             b"not json"
         )));
         assert!(!request_carries_memory_tools(&bytes::Bytes::new()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// OpenCode registers the retrieval tool as `headroom_headroom_retrieve`;
+    /// adding a bare `headroom_retrieve` beside it gives the model a tool the
+    /// client cannot run.
+    #[test]
+    fn ccr_tool_is_not_duplicated_for_a_client_mcp_alias() {
+        let state = crate::test_support::test_state(|c| c.ccr_inject_tool = true);
+        for alias in [
+            "headroom_headroom_retrieve",
+            "mcp__headroom__headroom_retrieve",
+            "mcp_headroom_headroom_retrieve",
+        ] {
+            let tools = serde_json::json!([{"name": alias, "input_schema": {"type": "object"}}]);
+            let mut body = serde_json::json!({"messages": [], "tools": tools.clone()});
+            let mut changed = false;
+            inject_ccr_retrieve_tool(
+                &mut body,
+                compression::CompressibleEndpoint::AnthropicMessages,
+                &state,
+                "req-test",
+                1,
+                &mut changed,
+            );
+            assert_eq!(body["tools"], tools, "{alias}");
+            assert!(!changed, "{alias}");
+        }
     }
 }

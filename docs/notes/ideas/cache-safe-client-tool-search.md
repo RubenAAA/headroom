@@ -14,6 +14,15 @@
   stock client busts the same way, so the proxy did not cause it. The
   roster pin (B3) puts a new tool at the end of `tools[]`, which saves only
   the tools before it.
+- **2026-11-02, read from the 2.1.316 binary, not seen on the wire:** a
+  loaded tool arrives still `defer_loading: true`, and a
+  `DeferredToolPlaceholder` rides on every request. Only the
+  `tool_addition` fallback drops the flag. That sits badly with the
+  stock-side busts above, so one of the two readings is wrong. Either way
+  the proxy's drift hash counted deferred tools and dropped the replay
+  prefix on each load. `2e81ef096` (port of upstream `18a588b3`) keeps them
+  out of the hash on first-party upstreams. Capture one tool-search
+  session with the launcher workaround off before dropping it.
 - **Why the workaround is cheap:** with tool search off, the client sends
   no ToolSearch tool, so `client_uses_tool_search` is false and the proxy's
   own deferral (`tool_search_deferral.rs`) defers non-core schemas again

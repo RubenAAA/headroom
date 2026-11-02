@@ -401,6 +401,33 @@ fn record_request_updates_lifetime_session_history() {
 }
 
 #[test]
+fn history_points_clip_the_client_model_name() {
+    // Upstream 33e5f674: the model string comes from the request body and
+    // was stored in full on every history point.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy_savings.json");
+    let t = tracker(&path);
+    let long = "m".repeat(1000);
+    assert!(t.record_request(&RequestRecord {
+        model: &long,
+        input_tokens: 500,
+        tokens_saved: 1000,
+        uncached_input_tokens: 500,
+        ..Default::default()
+    }));
+    assert!(t.record_compression_savings(&long, 10, None, None, None, None));
+    let snap = t.snapshot();
+    let history = snap["history"].as_array().unwrap();
+    assert_eq!(history.len(), 2);
+    for point in history {
+        assert_eq!(
+            point["model"],
+            json!("m".repeat(crate::persistent_metrics::MAX_LABEL_LENGTH))
+        );
+    }
+}
+
+#[test]
 fn cache_only_turn_appends_history_point() {
     // Cache mode compresses nothing by design (`tokens_saved` 0), so the
     // old tokens-only gate dropped every history point on exactly the

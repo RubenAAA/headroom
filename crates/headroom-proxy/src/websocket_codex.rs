@@ -1396,9 +1396,14 @@ async fn connect_upstream_with_retry(
     Err(last_err)
 }
 
-/// Verbosity steering on a `response.create` frame, ahead of compression.
-/// No-op unless `--output-shaper` is on.
+/// Request-side rewrites on a `response.create` frame, ahead of compression.
+/// Every non-bypass create frame headed upstream passes here (first frame,
+/// which the HTTP fallback replays, and later frames). Drops `web_search_call`
+/// history the frame declares no tool for (see
+/// `drop_undeclared_web_search_calls`), then applies verbosity steering,
+/// a no-op unless `--output-shaper` is on.
 fn shape_create_frame(raw: String, state: &AppState, request_id: &str) -> String {
+    let raw = crate::handlers::responses::drop_undeclared_web_search_calls_frame(raw, request_id);
     if !state.config.output_shaper_enabled {
         return raw;
     }

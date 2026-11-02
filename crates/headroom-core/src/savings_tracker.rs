@@ -111,6 +111,16 @@ fn normalize_model(value: Option<&str>) -> String {
     }
 }
 
+/// The model name a history point stores. It comes from the request body, so
+/// it is clipped to [`crate::persistent_metrics::MAX_LABEL_LENGTH`] characters: unclipped, every point
+/// kept whatever length the client sent (upstream `33e5f674`).
+fn history_model(model: &str) -> String {
+    normalize_model(Some(model))
+        .chars()
+        .take(crate::persistent_metrics::MAX_LABEL_LENGTH)
+        .collect()
+}
+
 fn is_printable(c: char) -> bool {
     if c == ' ' {
         return true;
@@ -814,7 +824,7 @@ impl SavingsTracker {
         let entry = HistoryEntry {
             timestamp: to_utc_iso(ts),
             provider: normalize_provider(provider),
-            model: normalize_model(Some(model)),
+            model: history_model(model),
             agent: normalize_provider(None),
             total_tokens_saved: st.lifetime.tokens_saved,
             compression_savings_usd: st.lifetime.compression_savings_usd,
@@ -1007,7 +1017,7 @@ impl SavingsTracker {
             let entry = HistoryEntry {
                 timestamp: to_utc_iso(ts),
                 provider: normalize_provider(rec.provider),
-                model: normalize_model(Some(rec.model)),
+                model: history_model(rec.model),
                 agent: normalize_provider(rec.stack),
                 total_tokens_saved: st.lifetime.tokens_saved,
                 compression_savings_usd: st.lifetime.compression_savings_usd,

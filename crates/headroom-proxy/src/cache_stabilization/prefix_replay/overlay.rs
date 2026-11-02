@@ -301,6 +301,32 @@ pub fn overlay_cached_prefix_reported(
     continues_chain: bool,
     confirmed_frozen_count: Option<usize>,
 ) -> (Vec<Value>, Option<ReplaySkip>) {
+    overlay_cached_prefix_shaped(
+        optimized_messages,
+        current_original_messages,
+        previous_original_messages,
+        previous_forwarded_messages,
+        continues_chain,
+        confirmed_frozen_count,
+        true,
+    )
+}
+
+/// [`overlay_cached_prefix_reported`] with the `system` adjacency net made
+/// optional. Only Anthropic `messages` refuse a `system` message by position;
+/// an OpenAI chat body opens with one, so applying the net there declined
+/// every chat turn as [`ReplaySkip::SystemAdjacencyBroken`]. A changed chat
+/// system prompt still declines: it is message 0 and the content compare
+/// catches it.
+pub fn overlay_cached_prefix_shaped(
+    optimized_messages: Vec<Value>,
+    current_original_messages: &[Value],
+    previous_original_messages: Option<&[Value]>,
+    previous_forwarded_messages: Option<&[Value]>,
+    continues_chain: bool,
+    confirmed_frozen_count: Option<usize>,
+    anthropic_messages: bool,
+) -> (Vec<Value>, Option<ReplaySkip>) {
     let (prev_orig, prev_fwd) = match (previous_original_messages, previous_forwarded_messages) {
         (Some(o), Some(f)) if !o.is_empty() && !f.is_empty() => (o, f),
         _ => return (optimized_messages, Some(ReplaySkip::NoPreviousTurn)),
@@ -455,7 +481,7 @@ pub fn overlay_cached_prefix_reported(
                 }
             },
         };
-        if first_illegal_system_position(&out).is_some() {
+        if anthropic_messages && first_illegal_system_position(&out).is_some() {
             return (optimized_messages, Some(ReplaySkip::SystemAdjacencyBroken));
         }
         let skip = ReplaySkip::PrefixContentDiverged {
@@ -522,7 +548,7 @@ pub fn overlay_cached_prefix_reported(
             }
         },
     };
-    if first_illegal_system_position(&out).is_some() {
+    if anthropic_messages && first_illegal_system_position(&out).is_some() {
         return (optimized_messages, Some(ReplaySkip::SystemAdjacencyBroken));
     }
     (out, None)

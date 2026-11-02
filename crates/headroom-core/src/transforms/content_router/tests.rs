@@ -310,6 +310,50 @@ fn cache_stats() {
     assert_eq!(stats.skip_size, 1);
 }
 
+/// The cache used to have no cap at all: a long-lived proxy kept every
+/// compressed block it ever produced until its TTL ran out on a read.
+#[test]
+fn cache_evicts_least_recently_used_results_over_budget() {
+    let text = "0123456789";
+    let cost = text.len() + CACHE_ENTRY_OVERHEAD;
+    let cache = CompressionCache::with_limits(Duration::from_secs(1800), 3 * cost - 1);
+    cache.put(1, text, 0.5, "log");
+    cache.put(2, text, 0.5, "log");
+    assert!(matches!(cache.get(1), CacheLookup::Hit { .. }));
+    cache.put(3, text, 0.5, "log");
+    assert!(matches!(cache.get(2), CacheLookup::Miss));
+    assert!(matches!(cache.get(1), CacheLookup::Hit { .. }));
+    assert!(matches!(cache.get(3), CacheLookup::Hit { .. }));
+    assert_eq!(cache.size(), 2);
+    assert_eq!(cache.stats().evictions, 1);
+}
+
+#[test]
+fn cache_bounds_the_skip_set() {
+    let cache = CompressionCache::with_limits(Duration::from_secs(1800), 1);
+    for key in 0..=1000 {
+        cache.mark_skip(key);
+    }
+    assert_eq!(cache.skip_size(), 1000);
+    assert!(!cache.is_skipped(0));
+    assert!(cache.is_skipped(1000));
+}
+
+/// A result in steady use outlives its TTL: expiry counts idle time, not age,
+/// so a live session does not recompress its blocks every TTL.
+#[test]
+fn cache_hit_restarts_the_idle_clock() {
+    let cache =
+        CompressionCache::with_limits(Duration::from_millis(400), COMPRESSION_CACHE_MAX_BYTES);
+    cache.put(1, "compressed", 0.5, "log");
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(matches!(cache.get(1), CacheLookup::Hit { .. }));
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(matches!(cache.get(1), CacheLookup::Hit { .. }));
+    std::thread::sleep(Duration::from_millis(450));
+    assert!(matches!(cache.get(1), CacheLookup::Miss));
+}
+
 #[test]
 fn cache_clear() {
     let cache = CompressionCache::new(1800);

@@ -33,9 +33,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 /// A run must be at least this many lines AND this many chars to be worth a
-/// pointer. Small dups are left alone (fragmenting context is not worth it) —
-/// and a larger floor keeps the pointer comfortably shorter than the span it
-/// replaces, so a fold is always a net byte win.
+/// pointer. Small dups are left alone (fragmenting context is not worth it).
+/// The floor alone does not make a fold a net byte win (the pointer can still
+/// be as long as a short span); `dedup_blocks_with` checks UTF-8 sizes too.
 // Lowered with the compact pointer below: at ~100 chars a pointer made
 // sub-7-line folds net-negative, so the abundant short (2-4 line) re-read
 // repeats were left uncompressed. A ~35-char pointer plus MIN_LINES=3 lets
@@ -191,8 +191,9 @@ fn py_repr(s: &str) -> String {
 /// re-read whose line numbers all shifted by a constant still folds, and the
 /// shift is carried in the pointer so the original bytes stay recoverable.
 ///
-/// Mirrors Python's `^([1-9]\d*)(:|\t)(.*)$` — a leading zero does not count as
-/// a line number.
+/// Mirrors Python's `^([1-9]\d{0,17})(:|\t)(.*)$` — a leading zero does not
+/// count as a line number, and a run longer than 18 digits is not one either
+/// (the line keys on itself, as in Python).
 fn num_and_key(line: &str) -> (Option<i64>, &str, &str) {
     let bytes = line.as_bytes();
     if bytes
@@ -203,7 +204,7 @@ fn num_and_key(line: &str) -> (Option<i64>, &str, &str) {
         while i < bytes.len() && bytes[i].is_ascii_digit() {
             i += 1;
         }
-        if i < bytes.len() && (bytes[i] == b':' || bytes[i] == b'\t') {
+        if i <= 18 && i < bytes.len() && (bytes[i] == b':' || bytes[i] == b'\t') {
             // `i` indexes ASCII digits/separator, so these slices are on
             // char boundaries.
             return (line[..i].parse::<i64>().ok(), &line[i..], &line[i + 1..]);
@@ -360,9 +361,11 @@ pub fn dedup_blocks_with(
                 // Chars, not bytes — Python's `len()` gates on characters,
                 // so a multibyte span would otherwise clear the threshold
                 // in Rust while Python left it alone.
-                if span_text.chars().count() >= min_chars {
-                    let ref_turn = blocks[mbp].turn;
-                    let ptr = pointer(span, ref_turn, mdelta);
+                let ptr = pointer(span, blocks[mbp].turn, mdelta);
+                // Never fold when the pointer is not shorter than the span in
+                // UTF-8 bytes: with a long turn number or anchor it can be
+                // longer, and the fold would grow the request.
+                if span_text.chars().count() >= min_chars && ptr.len() < span_text.len() {
                     // Python's `len()` counts CHARACTERS. The pointer now
                     // contains `↑` (3 bytes, 1 char), so byte lengths would
                     // under-report the saving by 2 per fold and drift from
@@ -832,6 +835,34 @@ mod tests {
         assert_eq!(num_and_key("7\tbar"), (Some(7), "\tbar", "bar"));
         // A number with no separator is just text.
         assert_eq!(num_and_key("42"), (None, "42", "42"));
+        // Python caps the run at 18 digits (`[1-9]\d{0,17}`); a longer run is
+        // not a line number, so the line keys on itself.
+        let n18 = "123456789012345678:foo";
+        assert_eq!(
+            num_and_key(n18),
+            (Some(123_456_789_012_345_678), ":foo", "foo")
+        );
+        let n19 = "1234567890123456789:foo";
+        assert_eq!(num_and_key(n19), (None, n19, n19));
+        let n25 = "1234567890123456789012345:foo";
+        assert_eq!(num_and_key(n25), (None, n25, n25));
+    }
+
+    #[test]
+    fn no_fold_when_pointer_not_shorter_in_bytes() {
+        // 41-char span clears min_chars, but a 9-digit turn makes the pointer
+        // 46 bytes: folding would grow the block.
+        let span = "abcdefghijklm\nabcdefghijkln\nabcdefghijklo";
+        let blocks = vec![blk(span, 123_456_789), blk(span, 123_456_790)];
+        let (out, stats) = dedup_blocks(&blocks);
+        assert_eq!(out[1].text, span);
+        assert_eq!(stats.spans_folded, 0);
+
+        // Control: a short turn number gives a 38-byte pointer, which folds.
+        let blocks = vec![blk(span, 1), blk(span, 2)];
+        let (out, stats) = dedup_blocks(&blocks);
+        assert_eq!(out[1].text, "[↑3L same as msg 1: 'abcdefghijklm']");
+        assert_eq!(stats.spans_folded, 1);
     }
 
     #[test]

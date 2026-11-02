@@ -64,17 +64,39 @@ pub struct GeminiQuery {
 
 // ─── Gemini format conversion utilities ───────────────────────────────────
 
-/// Check if a Gemini content entry has non-text parts.
+/// Part keys the text round trip cannot rebuild. The REST API accepts both
+/// the camelCase JSON names and the snake_case proto names, and Google's own
+/// curl samples use snake_case; checking only camelCase let compression drop
+/// snake_case image and tool turns. `thought` / `thoughtSignature` parts must
+/// round-trip intact, and code-execution parts are echoed back on later turns.
+const NON_TEXT_PART_KEYS: &[&str] = &[
+    "inlineData",
+    "fileData",
+    "functionCall",
+    "functionResponse",
+    "executableCode",
+    "codeExecutionResult",
+    "thought",
+    "thoughtSignature",
+    "inline_data",
+    "file_data",
+    "function_call",
+    "function_response",
+    "executable_code",
+    "code_execution_result",
+    "thought_signature",
+];
+
+/// Check if a Gemini content entry has non-text parts, including a `text`
+/// that is not a string (the round trip would drop it).
 pub fn has_non_text_parts(content: &Value) -> bool {
     content
         .get("parts")
         .and_then(Value::as_array)
         .map(|parts| {
             parts.iter().any(|part| {
-                part.get("inlineData").is_some()
-                    || part.get("fileData").is_some()
-                    || part.get("functionCall").is_some()
-                    || part.get("functionResponse").is_some()
+                part.get("text").is_some_and(|t| !t.is_string())
+                    || NON_TEXT_PART_KEYS.iter().any(|k| part.get(*k).is_some())
             })
         })
         .unwrap_or(false)
@@ -1189,6 +1211,53 @@ mod tests {
         assert!(!has_non_text_parts(&json!({
             "parts": [{"text": "plain"}]
         })));
+    }
+
+    #[test]
+    fn has_non_text_parts_every_preserved_key() {
+        for key in NON_TEXT_PART_KEYS {
+            let content = json!({"parts": [{"text": "x"}, {*key: {}}]});
+            assert!(has_non_text_parts(&content), "{key} not detected");
+        }
+        assert!(has_non_text_parts(&json!({"parts": [{"text": null}]})));
+        assert!(has_non_text_parts(&json!({"parts": [{"text": ["a"]}]})));
+    }
+
+    /// Snake_case image and tool turns must survive compression rewriting the
+    /// text: before the fix they were not preserved, so the image vanished and
+    /// the text-less function_call / function_response turns were dropped.
+    #[test]
+    fn snake_case_parts_survive_compression_round_trip() {
+        let contents = vec![
+            json!({"role": "user", "parts": [
+                {"text": "Describe this image"},
+                {"inline_data": {"mime_type": "image/png", "data": "iVBORw0KGgo="}}
+            ]}),
+            json!({"role": "model", "parts": [{"function_call": {"name": "lookup", "args": {}}}]}),
+            json!({"role": "user", "parts": [
+                {"function_response": {"name": "lookup", "response": {"r": "ok"}}}
+            ]}),
+            json!({"role": "user", "parts": [{"text": "thanks ".repeat(100)}]}),
+        ];
+        let (messages, preserved) = gemini_contents_to_messages(&contents, None);
+        assert_eq!(preserved, HashSet::from([0, 1, 2]));
+
+        let mut optimized = messages.clone();
+        optimized.last_mut().unwrap()["content"] = json!("thanks (compressed)");
+        let (opt_contents, _) = messages_to_gemini_contents(&optimized);
+        let preserved_contents: HashMap<usize, Value> = preserved
+            .iter()
+            .map(|&i| (i, contents[i].clone()))
+            .collect();
+        let rebuilt =
+            rebuild_gemini_contents(&contents, &preserved, &preserved_contents, opt_contents);
+
+        assert_eq!(rebuilt.len(), 4);
+        assert_eq!(rebuilt[..3], contents[..3]);
+        assert_eq!(
+            rebuilt[3],
+            json!({"role": "user", "parts": [{"text": "thanks (compressed)"}]})
+        );
     }
 
     #[test]

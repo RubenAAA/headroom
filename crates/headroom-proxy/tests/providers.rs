@@ -41,6 +41,8 @@ mod integration_responses;
 
 #[path = "suites/providers/integration_responses_additional_tools.rs"]
 mod integration_responses_additional_tools;
+#[path = "suites/providers/integration_responses_web_search_history.rs"]
+mod integration_responses_web_search_history;
 
 #[path = "suites/providers/integration_count_tokens.rs"]
 mod integration_count_tokens;

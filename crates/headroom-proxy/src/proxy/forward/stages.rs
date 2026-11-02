@@ -99,6 +99,12 @@ pub(crate) fn prepare_replay_inputs(
 ) {
     let (buffered, additional_tools_restore_plan) =
         if matches!(endpoint, compression::CompressibleEndpoint::OpenAiResponses) {
+            // Before the lift, which moves `additional_tools` declarations:
+            // a Codex compaction holding `web_search_call` history and no
+            // web_search tool gets a dead in-band error upstream.
+            let buffered = crate::handlers::responses::drop_undeclared_web_search_calls_body(
+                buffered, request_id,
+            );
             crate::handlers::responses::lift_codex_additional_tools_body(buffered, request_id)
         } else {
             (buffered, None)
@@ -462,15 +468,10 @@ pub(crate) fn run_ttl_pin(
     // the observer, which saw the client markers before any stage
     // added or moved one; a turn that never reached the gate falls back
     // to pinning.
-    let pin_1h = state
-        .usage_observer
-        .client_ttl_for(request_id)
-        .is_none_or(|shape| {
-            cache_stabilization::cache_ttl::pin_1h_applies(
-                shape,
-                state.config.respect_client_5m_ttl,
-            )
-        });
+    let shape = state.usage_observer.client_ttl_for(request_id);
+    let pin_1h = shape.is_none_or(|shape| {
+        cache_stabilization::cache_ttl::pin_1h_applies(shape, state.config.respect_client_5m_ttl)
+    });
     if !pin_1h {
         tracing::info!(
             event = "ttl_1h_pin_skipped",
@@ -478,6 +479,23 @@ pub(crate) fn run_ttl_pin(
             "client asked 5m everywhere; leaving its tier alone (--respect-client-5m-ttl)"
         );
     }
+    // With --subagent-5m-ttl, a subagent body that names no TTL stays on the
+    // 5-minute default: it runs out within minutes, so a 1h write at 2x base
+    // input mostly dies unread. Other unmarked bodies (the main loop's last
+    // request before compaction) keep the pin.
+    let subagent_5m = pin_1h
+        && state.config.subagent_5m_ttl
+        && shape == Some(cache_stabilization::cache_ttl::ClientTtl::Unmarked)
+        && cache_stabilization::billing_header::is_subagent_body(&body_to_send);
+    if subagent_5m {
+        tracing::info!(
+            event = "ttl_1h_pin_skipped",
+            request_id = %request_id,
+            reason = "subagent",
+            "subagent body left on the 5m default (--subagent-5m-ttl)"
+        );
+    }
+    let pin_1h = pin_1h && !subagent_5m;
     if (state.config.force_1h_cache_ttl || state.config.split_cache_ttl)
         && pin_1h
         && auth_mode != AuthMode::Payg

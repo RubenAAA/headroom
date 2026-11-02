@@ -285,16 +285,16 @@ fn extract_cwd_from_system_prompt(system_prompt: &str) -> Option<String> {
         return None;
     }
     for prefix in CWD_PREFIXES {
-        if let Some(idx) = system_prompt.find(prefix) {
-            let start = idx + prefix.len();
-            let end = system_prompt[start..].find('\n').map(|e| start + e);
-            let chunk = match end {
-                Some(e) => &system_prompt[start..e],
-                None => &system_prompt[start..],
-            };
-            let trimmed = chunk.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+        // Only at the start of a line (after an optional "- " bullet): a
+        // `find` anywhere let prose that quotes the prefix set the project.
+        for line in system_prompt.split('\n') {
+            let line = line.trim();
+            let line = line.strip_prefix('-').map_or(line, str::trim_start);
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let trimmed = rest.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
             }
         }
     }
@@ -743,6 +743,21 @@ mod tests {
         assert_eq!(
             extract_cwd_from_system_prompt(prompt).as_deref(),
             Some("/end/of/prompt")
+        );
+    }
+
+    #[test]
+    fn extract_cwd_ignores_prefix_inside_prose() {
+        let prompt = "The tool printed Working directory: /etc in its log.\nEnd";
+        assert!(extract_cwd_from_system_prompt(prompt).is_none());
+    }
+
+    #[test]
+    fn extract_cwd_accepts_bulleted_line() {
+        let prompt = "See cwd: /wrong here\n  - Working directory:   /home/user/code  \n";
+        assert_eq!(
+            extract_cwd_from_system_prompt(prompt).as_deref(),
+            Some("/home/user/code")
         );
     }
 

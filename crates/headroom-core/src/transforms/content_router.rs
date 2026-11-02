@@ -2519,15 +2519,30 @@ pub fn plan_relevance_split(
 
 // ─── CompressionCache ────────────────────────────────────────────────────
 
-/// Two-tier compression cache with TTL. Thread-safe.
+/// Memory budget of the result tier: [`CompressionCache::new`] keeps the
+/// least recently used results within it. Upstream's default
+/// (`HEADROOM_COMPRESSION_CACHE_MB`).
+const COMPRESSION_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Bytes a result costs beyond its text (key, entry, map slot).
+const CACHE_ENTRY_OVERHEAD: usize = 256;
+/// Skip-tier entries kept per MB of budget (each is a key and a timestamp).
+const SKIP_ENTRIES_PER_MB: usize = 2000;
+
+/// Two-tier compression cache with idle expiry and a memory budget.
+/// Thread-safe.
 ///
 /// Tier 1 (skip set): content hashes that won't compress — instant skip.
 /// Tier 2 (result cache): compressed results for content that DID compress.
 ///
-/// Entries expire after TTL (default 30min).
+/// Without a cap a long-lived process kept every result until a read found
+/// it expired. Results are now kept least recently used first within a byte
+/// budget, the skip set within a matching entry count. A result expires TTL
+/// after it was last used, a skip entry TTL after it was marked. Eviction
+/// only costs a recompression, which yields the same bytes.
 pub struct CompressionCache {
-    results: Mutex<HashMap<i64, CacheEntry>>,
-    skip: Mutex<HashMap<i64, Instant>>,
+    results: Mutex<ResultTier>,
+    skip: Mutex<lru::LruCache<i64, Instant>>,
+    max_skip: usize,
     ttl: Duration,
     // Metrics
     hits: Mutex<u64>,
@@ -2591,7 +2606,28 @@ struct CacheEntry {
     compressed: String,
     ratio: f64,
     strategy: String,
-    created_at: Instant,
+    last_used: Instant,
+}
+
+impl CacheEntry {
+    fn cost(&self) -> usize {
+        self.compressed.len() + CACHE_ENTRY_OVERHEAD
+    }
+}
+
+/// Results, least recently used first, and what they cost against the budget.
+struct ResultTier {
+    entries: lru::LruCache<i64, CacheEntry>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl ResultTier {
+    fn remove(&mut self, key: i64) {
+        if let Some(entry) = self.entries.pop(&key) {
+            self.bytes -= entry.cost();
+        }
+    }
 }
 
 /// Result of a cache lookup.
@@ -2607,10 +2643,22 @@ pub enum CacheLookup {
 
 impl CompressionCache {
     pub fn new(ttl_seconds: u64) -> Self {
+        Self::with_limits(
+            Duration::from_secs(ttl_seconds),
+            COMPRESSION_CACHE_MAX_BYTES,
+        )
+    }
+
+    fn with_limits(ttl: Duration, max_bytes: usize) -> Self {
         Self {
-            results: Mutex::new(HashMap::new()),
-            skip: Mutex::new(HashMap::new()),
-            ttl: Duration::from_secs(ttl_seconds),
+            results: Mutex::new(ResultTier {
+                entries: lru::LruCache::unbounded(),
+                bytes: 0,
+                max_bytes,
+            }),
+            skip: Mutex::new(lru::LruCache::unbounded()),
+            max_skip: (max_bytes / (1024 * 1024) * SKIP_ENTRIES_PER_MB).max(1000),
+            ttl,
             hits: Mutex::new(0),
             misses: Mutex::new(0),
             skip_hits: Mutex::new(0),
@@ -2701,31 +2749,36 @@ impl CompressionCache {
         // Check skip set first
         {
             let mut skip = self.skip.lock().unwrap();
-            if let Some(ts) = skip.get(&key) {
+            if let Some(ts) = skip.peek(&key) {
                 if ts.elapsed() < self.ttl {
                     *self.skip_hits.lock().unwrap() += 1;
                     return CacheLookup::Skip;
                 } else {
-                    skip.remove(&key);
+                    skip.pop(&key);
                     *self.evictions.lock().unwrap() += 1;
                 }
             }
         }
 
-        // Check result cache
+        // Check result cache; a hit becomes the most recently used entry and
+        // restarts its idle clock.
         let mut results = self.results.lock().unwrap();
-        if let Some(entry) = results.get(&key) {
-            if entry.created_at.elapsed() < self.ttl {
+        let expired = match results.entries.get_mut(&key) {
+            Some(entry) if entry.last_used.elapsed() < self.ttl => {
+                entry.last_used = Instant::now();
                 *self.hits.lock().unwrap() += 1;
                 return CacheLookup::Hit {
                     compressed: entry.compressed.clone(),
                     ratio: entry.ratio,
                     strategy: entry.strategy.clone(),
                 };
-            } else {
-                results.remove(&key);
-                *self.evictions.lock().unwrap() += 1;
             }
+            Some(_) => true,
+            None => false,
+        };
+        if expired {
+            results.remove(key);
+            *self.evictions.lock().unwrap() += 1;
         }
 
         *self.misses.lock().unwrap() += 1;
@@ -2735,12 +2788,12 @@ impl CompressionCache {
     /// Check if content is known non-compressible (Tier 1).
     pub fn is_skipped(&self, key: i64) -> bool {
         let mut skip = self.skip.lock().unwrap();
-        if let Some(ts) = skip.get(&key) {
+        if let Some(ts) = skip.peek(&key) {
             if ts.elapsed() < self.ttl {
                 *self.skip_hits.lock().unwrap() += 1;
                 return true;
             } else {
-                skip.remove(&key);
+                skip.pop(&key);
                 *self.evictions.lock().unwrap() += 1;
             }
         }
@@ -2749,33 +2802,57 @@ impl CompressionCache {
 
     /// Store a compressed result (Tier 2).
     pub fn put(&self, key: i64, compressed: &str, ratio: f64, strategy: &str) {
-        let mut results = self.results.lock().unwrap();
-        results.insert(
-            key,
-            CacheEntry {
-                compressed: compressed.to_string(),
-                ratio,
-                strategy: strategy.to_string(),
-                created_at: Instant::now(),
-            },
-        );
+        let entry = CacheEntry {
+            compressed: compressed.to_string(),
+            ratio,
+            strategy: strategy.to_string(),
+            last_used: Instant::now(),
+        };
+        let mut evicted = 0;
+        {
+            let mut results = self.results.lock().unwrap();
+            results.remove(key);
+            results.bytes += entry.cost();
+            results.entries.push(key, entry);
+            // Least recently used first; the entry just added always stays.
+            while results.bytes > results.max_bytes && results.entries.len() > 1 {
+                if let Some((_, old)) = results.entries.pop_lru() {
+                    results.bytes -= old.cost();
+                    evicted += 1;
+                }
+            }
+        }
+        *self.evictions.lock().unwrap() += evicted;
     }
 
     /// Mark content as non-compressible (Tier 1).
     pub fn mark_skip(&self, key: i64) {
-        let mut skip = self.skip.lock().unwrap();
-        skip.insert(key, Instant::now());
+        self.insert_skip(key);
     }
 
     /// Move a result to skip set (threshold tightened).
     pub fn move_to_skip(&self, key: i64) {
-        self.results.lock().unwrap().remove(&key);
-        self.skip.lock().unwrap().insert(key, Instant::now());
+        self.results.lock().unwrap().remove(key);
+        self.insert_skip(key);
+    }
+
+    /// Add or re-stamp a skip entry, dropping the oldest marks over the cap.
+    fn insert_skip(&self, key: i64) {
+        let mut evicted = 0;
+        {
+            let mut skip = self.skip.lock().unwrap();
+            skip.put(key, Instant::now());
+            while skip.len() > self.max_skip {
+                skip.pop_lru();
+                evicted += 1;
+            }
+        }
+        *self.evictions.lock().unwrap() += evicted;
     }
 
     /// Number of cached results.
     pub fn size(&self) -> usize {
-        self.results.lock().unwrap().len()
+        self.results.lock().unwrap().entries.len()
     }
 
     /// Number of skipped entries.
@@ -2789,7 +2866,7 @@ impl CompressionCache {
         let misses = *self.misses.lock().unwrap();
         let skip_hits = *self.skip_hits.lock().unwrap();
         let evictions = *self.evictions.lock().unwrap();
-        let size = self.results.lock().unwrap().len();
+        let size = self.results.lock().unwrap().entries.len();
         let skip_size = self.skip.lock().unwrap().len();
         CacheStats {
             hits,
@@ -2803,7 +2880,11 @@ impl CompressionCache {
 
     /// Clear all entries.
     pub fn clear(&self) {
-        self.results.lock().unwrap().clear();
+        {
+            let mut results = self.results.lock().unwrap();
+            results.entries.clear();
+            results.bytes = 0;
+        }
         self.skip.lock().unwrap().clear();
         // Verdicts describe entries that no longer exist; keeping them would
         // pin decisions about content the cache has forgotten. Python wires

@@ -69,6 +69,7 @@ use crate::observability;
 use crate::proxy::{AppState, forward_http};
 
 const CODEX_ADDITIONAL_TOOLS_LIFT_ENV: &str = "HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT";
+const WEB_SEARCH_HISTORY_ENV: &str = "HEADROOM_WEB_SEARCH_HISTORY";
 
 #[derive(Debug, Clone)]
 struct AdditionalToolsCarrier {
@@ -307,6 +308,128 @@ pub(crate) fn restore_codex_additional_tools_body(
             body
         }
     }
+}
+
+fn is_item_type(item: &serde_json::Value, ty: &str) -> bool {
+    item.get("type").and_then(serde_json::Value::as_str) == Some(ty)
+}
+
+/// Drop hosted `web_search_call` items from a Responses request that cannot
+/// search (upstream `2a70d1281`).
+///
+/// Codex on a custom provider compacts locally by resending the whole history
+/// with `tools: []`. When that history holds a `web_search_call`, the ChatGPT
+/// backend answers 200 and then an in-band "response protection is
+/// unavailable" error; Codex ignores it, retries the same compaction before
+/// every prompt, and the session never answers again. The same body completes
+/// without those items. Only the search action leaves the history: the
+/// model's answer is a separate `message` item and stays.
+///
+/// A tool counts as declared in top-level `tools` or in a Codex
+/// `additional_tools` input item, under any `web_search*` type. A request
+/// continuing `previous_response_id` is left alone, since its declarations
+/// may live server-side. Returns the number of items dropped (0 = untouched).
+/// `HEADROOM_WEB_SEARCH_HISTORY=0` turns it off.
+pub(crate) fn drop_undeclared_web_search_calls(
+    payload: &mut serde_json::Value,
+    request_id: &str,
+) -> usize {
+    let Some(object) = payload.as_object_mut() else {
+        return 0;
+    };
+    if value_is_truthy(object.get("previous_response_id")) {
+        return 0;
+    }
+    let Some(items) = object.get("input").and_then(serde_json::Value::as_array) else {
+        return 0;
+    };
+    if !items
+        .iter()
+        .any(|item| is_item_type(item, "web_search_call"))
+    {
+        return 0;
+    }
+    let carried = items
+        .iter()
+        .filter(|item| is_item_type(item, "additional_tools"))
+        .filter_map(|item| item.get("tools").and_then(serde_json::Value::as_array))
+        .flatten();
+    let top = object
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten();
+    let declares_search = top.chain(carried).any(|tool| {
+        tool.get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|ty| ty.starts_with("web_search"))
+    });
+    if declares_search || !env_value_enabled(std::env::var(WEB_SEARCH_HISTORY_ENV).ok().as_deref())
+    {
+        return 0;
+    }
+    let kept: Vec<serde_json::Value> = items
+        .iter()
+        .filter(|item| !is_item_type(item, "web_search_call"))
+        .cloned()
+        .collect();
+    let dropped = items.len() - kept.len();
+    object.insert("input".to_string(), serde_json::Value::Array(kept));
+    tracing::info!(
+        event = "web_search_history",
+        %request_id,
+        dropped,
+        reason = "no_web_search_tool",
+        "dropped web_search_call history from a request with no web_search tool"
+    );
+    dropped
+}
+
+/// Skip the parse unless the bytes could hold a `web_search_call` item. JSON
+/// can spell the type with `\uXXXX` escapes, so any `\u` also parses.
+fn may_hold_web_search_call(raw: &[u8]) -> bool {
+    memchr::memmem::find(raw, b"\"web_search_call\"").is_some()
+        || memchr::memmem::find(raw, b"\\u").is_some()
+}
+
+/// [`drop_undeclared_web_search_calls`] on an HTTP `/v1/responses` body.
+/// Returns `body` unchanged unless items were dropped.
+pub(crate) fn drop_undeclared_web_search_calls_body(body: Bytes, request_id: &str) -> Bytes {
+    if !may_hold_web_search_call(&body) {
+        return body;
+    }
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    if drop_undeclared_web_search_calls(&mut payload, request_id) == 0 {
+        return body;
+    }
+    serde_json::to_vec(&payload)
+        .map(Bytes::from)
+        .unwrap_or(body)
+}
+
+/// [`drop_undeclared_web_search_calls`] on a Codex WS `response.create`
+/// frame, wrapped (`{"type":"response.create","response":{...}}`) or bare.
+/// Returns `raw` unchanged unless items were dropped.
+pub(crate) fn drop_undeclared_web_search_calls_frame(raw: String, request_id: &str) -> String {
+    if !may_hold_web_search_call(raw.as_bytes()) {
+        return raw;
+    }
+    let Ok(mut frame) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+    if !is_item_type(&frame, "response.create") {
+        return raw;
+    }
+    let dropped = match frame.get_mut("response") {
+        Some(inner) if inner.is_object() => drop_undeclared_web_search_calls(inner, request_id),
+        _ => drop_undeclared_web_search_calls(&mut frame, request_id),
+    };
+    if dropped == 0 {
+        return raw;
+    }
+    serde_json::to_string(&frame).unwrap_or(raw)
 }
 
 /// PR-C4: streaming pipeline confirmation. When the client asks
@@ -609,6 +732,155 @@ mod tests {
         let original = payload.clone();
         assert!(lift_codex_additional_tools(&mut payload, "req-test").is_none());
         assert_eq!(payload, original);
+    }
+
+    /// A Codex local-compaction request: full history, `tools: []`.
+    fn compaction_body() -> serde_json::Value {
+        json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "message", "role": "user", "content": "look this up"},
+                {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc"},
+                {"type": "web_search_call", "id": "ws_1", "status": "completed",
+                 "action": {"type": "search", "query": "query 1"}},
+                {"type": "web_search_call", "id": "ws_2", "status": "completed",
+                 "action": {"type": "search", "query": "query 2"}},
+                {"type": "message", "role": "assistant", "content": "found it"},
+                {"type": "message", "role": "user", "content": "Summarize."}
+            ],
+            "tools": [],
+            "stream": true
+        })
+    }
+
+    fn item_types(payload: &serde_json::Value) -> Vec<&str> {
+        payload["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn web_search_calls_dropped_when_no_web_search_tool_declared() {
+        for tools in [
+            json!([]),
+            serde_json::Value::Null,
+            json!([{"type": "function", "name": "shell"}]),
+            json!([{"type": "function", "name": "web_search"}]),
+        ] {
+            let mut payload = compaction_body();
+            if tools.is_null() {
+                payload.as_object_mut().unwrap().remove("tools");
+            } else {
+                payload["tools"] = tools.clone();
+            }
+            assert_eq!(
+                drop_undeclared_web_search_calls(&mut payload, "r"),
+                2,
+                "{tools}"
+            );
+            assert_eq!(
+                item_types(&payload),
+                ["message", "reasoning", "message", "message"],
+                "{tools}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_calls_kept_when_a_web_search_tool_is_declared() {
+        for tools in [
+            json!([{"type": "web_search"}]),
+            json!([{"type": "web_search_preview"}, {"type": "function", "name": "shell"}]),
+        ] {
+            let mut payload = compaction_body();
+            payload["tools"] = tools.clone();
+            let original = payload.clone();
+            assert_eq!(
+                drop_undeclared_web_search_calls(&mut payload, "r"),
+                0,
+                "{tools}"
+            );
+            assert_eq!(payload, original, "{tools}");
+        }
+    }
+
+    #[test]
+    fn web_search_calls_kept_when_declared_in_additional_tools_carrier() {
+        let mut payload = compaction_body();
+        payload["input"].as_array_mut().unwrap().insert(
+            0,
+            json!({"type": "additional_tools", "tools": [{"type": "web_search"}]}),
+        );
+        let original = payload.clone();
+        assert_eq!(drop_undeclared_web_search_calls(&mut payload, "r"), 0);
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn web_search_calls_kept_on_previous_response_id_continuation() {
+        let mut payload = compaction_body();
+        payload["previous_response_id"] = json!("resp_1");
+        let original = payload.clone();
+        assert_eq!(drop_undeclared_web_search_calls(&mut payload, "r"), 0);
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn web_search_body_without_search_items_is_byte_identical() {
+        let body = Bytes::from_static(br#"{"input":[{"type":"message"}],  "tools":[]}"#);
+        let out = drop_undeclared_web_search_calls_body(body.clone(), "r");
+        assert_eq!(out, body);
+        let declared = serde_json::to_vec(&{
+            let mut p = compaction_body();
+            p["tools"] = json!([{"type": "web_search"}]);
+            p
+        })
+        .unwrap();
+        let declared = Bytes::from(declared);
+        assert_eq!(
+            drop_undeclared_web_search_calls_body(declared.clone(), "r"),
+            declared
+        );
+    }
+
+    #[test]
+    fn web_search_body_drop_preserves_key_order() {
+        let body = Bytes::from(serde_json::to_vec(&compaction_body()).unwrap());
+        let out = drop_undeclared_web_search_calls_body(body, "r");
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(!text.contains("web_search_call"), "{text}");
+        assert!(
+            text.starts_with(r#"{"model":"gpt-5.5","input":["#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn web_search_frame_drop_handles_both_envelopes_and_escapes() {
+        let wrapped = json!({"type": "response.create", "response": compaction_body()}).to_string();
+        let out = drop_undeclared_web_search_calls_frame(wrapped, "r");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(item_types(&v["response"]).len(), 4);
+
+        let mut bare = compaction_body();
+        bare["type"] = json!("response.create");
+        let escaped = bare
+            .to_string()
+            .replace("\"web_search_call\"", "\"web_search\\u005fcall\"");
+        let out = drop_undeclared_web_search_calls_frame(escaped, "r");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(item_types(&v).len(), 4);
+
+        // Not a response.create: untouched even with a search item inside.
+        let other =
+            json!({"type": "response.cancel", "input": compaction_body()["input"]}).to_string();
+        assert_eq!(
+            drop_undeclared_web_search_calls_frame(other.clone(), "r"),
+            other
+        );
     }
 
     #[test]

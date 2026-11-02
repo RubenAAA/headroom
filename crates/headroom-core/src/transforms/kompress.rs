@@ -61,7 +61,9 @@
 // Everything below the config/result/error types is the loaded model, so
 // without the `ml` feature only `thiserror` is left in use here.
 #[cfg(feature = "ml")]
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+#[cfg(any(feature = "ml", test))]
+use std::collections::HashMap;
 #[cfg(feature = "ml")]
 use std::path::Path;
 #[cfg(any(feature = "ml", test))]
@@ -182,6 +184,47 @@ fn must_keep_re() -> &'static Regex {
         )
         .expect("MUST_KEEP_RE is a valid regex")
     })
+}
+
+/// Count the leading words of a chunk the model saw in full (Python
+/// `_words_seen_whole`).
+///
+/// A dense chunk (URLs, code, citation markers) tokenizes past
+/// [`MAX_SEQ_LEN`] and the tokenizer cuts it, possibly inside a word. Words
+/// past the cut got no score and used to be dropped. Once the chunk was cut
+/// (words missing from `word_ids`, or the cap hit) the last word present may
+/// be a prefix, so it does not count either.
+#[cfg(any(feature = "ml", test))]
+fn words_seen_whole(word_ids: &[Option<u32>], n_tokens: usize, n_words: usize) -> usize {
+    let Some(&last) = word_ids.iter().flatten().max() else {
+        return 0;
+    };
+    let last = last as usize;
+    let cut = last + 1 < n_words || n_tokens >= MAX_SEQ_LEN;
+    if cut { last } else { last + 1 }
+}
+
+/// Max token score per word, over the first `scored` words only: a word past
+/// `scored` is a prefix the cut left behind, rescored with the next chunk, and
+/// must not take a top-k slot here.
+#[cfg(any(feature = "ml", test))]
+fn max_score_per_word(
+    word_ids: &[Option<u32>],
+    scores: &[f32],
+    scored: usize,
+) -> HashMap<usize, f32> {
+    let mut word_scores: HashMap<usize, f32> = HashMap::new();
+    for (idx, wid) in word_ids.iter().enumerate() {
+        let Some(w) = wid.map(|w| w as usize).filter(|&w| w < scored) else {
+            continue;
+        };
+        let Some(&s) = scores.get(idx) else { continue };
+        let entry = word_scores.entry(w).or_insert(f32::MIN);
+        if s > *entry {
+            *entry = s;
+        }
+    }
+    word_scores
 }
 
 /// Env var to disable the must-keep safety net (set to "0" to disable).
@@ -582,14 +625,27 @@ impl Kompress {
             let end = (chunk_start + stride).min(n_words);
             let chunk_words = &words[chunk_start..end];
             match self.score_chunk(chunk_words) {
-                Ok(word_scores) => {
+                Ok((0, _)) => {
+                    // One word fills the 512-token window by itself (a long
+                    // URL or a minified line). The model cannot see it
+                    // whole: keep it.
+                    kept_ids.insert(chunk_start);
+                    chunk_start += 1;
+                }
+                Ok((scored, word_scores)) => {
+                    // Must-keep runs on the scored words only; the rest are
+                    // matched with the next chunk.
                     self.select_words(
                         &word_scores,
-                        chunk_words,
+                        &chunk_words[..scored],
                         chunk_start,
                         target_ratio,
                         &mut kept_ids,
                     );
+                    // Advance by the words the model saw whole, so words past
+                    // the token cut start the next chunk instead of being
+                    // dropped unscored.
+                    chunk_start += scored;
                 }
                 Err(_) => {
                     // A chunk that fails inference is treated as
@@ -598,7 +654,6 @@ impl Kompress {
                     return self.passthrough(content, n_words);
                 }
             }
-            chunk_start += stride;
         }
 
         if kept_ids.is_empty() {
@@ -627,12 +682,14 @@ impl Kompress {
         }
     }
 
-    /// Tokenize one chunk of words and return the **max score per word**
-    /// (`word_index -> score`). `word_index` is local to the chunk.
+    /// Tokenize one chunk of words and return how many leading words the
+    /// model saw whole ([`words_seen_whole`]) and the **max score per word**
+    /// among them (`word_index -> score`). `word_index` is local to the
+    /// chunk. A count of 0 skips inference.
     fn score_chunk(
         &self,
         chunk_words: &[&str],
-    ) -> Result<HashMap<usize, f32>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(usize, HashMap<usize, f32>), Box<dyn std::error::Error + Send + Sync>> {
         let seq_in: Vec<&str> = chunk_words.to_vec();
         let encoding = self
             .tokenizer
@@ -644,6 +701,12 @@ impl Kompress {
             .map(|&x| x as i64)
             .collect();
         let word_ids = encoding.get_word_ids();
+        // Real tokens, counted before any static-shape padding below.
+        let n_tokens = attn.iter().filter(|&&m| m != 0).count();
+        let scored = words_seen_whole(word_ids, n_tokens, chunk_words.len());
+        if scored == 0 {
+            return Ok((0, HashMap::new()));
+        }
         let mut ids = ids;
         let mut attn = attn;
 
@@ -683,16 +746,7 @@ impl Kompress {
             data.to_vec()
         };
 
-        let mut word_scores: HashMap<usize, f32> = HashMap::new();
-        for (idx, wid) in word_ids.iter().enumerate() {
-            let Some(w) = wid else { continue };
-            let Some(&s) = scores.get(idx) else { continue };
-            let entry = word_scores.entry(*w as usize).or_insert(f32::MIN);
-            if s > *entry {
-                *entry = s;
-            }
-        }
-        Ok(word_scores)
+        Ok((scored, max_score_per_word(word_ids, &scores, scored)))
     }
 
     /// Apply the threshold or top-k rule to one chunk's per-word scores,
@@ -935,6 +989,38 @@ fn hf_hub_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream 421d453c: words past the 512-token cut, and a word the cut
+    /// may have split, are not counted as seen; one word filling the window
+    /// gives 0 so the caller keeps it.
+    #[test]
+    fn words_seen_whole_stops_before_the_token_cut() {
+        // Whole chunk fits: every word was seen.
+        let ids = [None, Some(0), Some(0), Some(1), Some(2), None];
+        assert_eq!(words_seen_whole(&ids, ids.len(), 3), 3);
+        // Words 4 and 5 never reached the model, and word 3 may be a prefix.
+        let ids = [None, Some(0), Some(1), Some(2), Some(3), Some(3), None];
+        assert_eq!(words_seen_whole(&ids, MAX_SEQ_LEN, 6), 3);
+        // All words present but the cap was hit: the last may be cut short.
+        let ids = [None, Some(0), Some(1), Some(2), None];
+        assert_eq!(words_seen_whole(&ids, MAX_SEQ_LEN, 3), 2);
+        // One word fills the window by itself.
+        let mut ids = vec![Some(0); MAX_SEQ_LEN - 2];
+        ids.insert(0, None);
+        ids.push(None);
+        assert_eq!(words_seen_whole(&ids, MAX_SEQ_LEN, 5), 0);
+        assert_eq!(words_seen_whole(&[None, None], 2, 1), 0);
+    }
+
+    /// A split word's prefix score must not take a top-k slot from a whole
+    /// word: only words below `scored` get a score.
+    #[test]
+    fn max_score_per_word_skips_words_past_scored() {
+        let ids = [None, Some(0), Some(1), Some(1), Some(2), None];
+        let scores = [9.0, 0.1, 0.2, 0.3, 0.99, 9.0];
+        let got = max_score_per_word(&ids, &scores, 2);
+        assert_eq!(got, HashMap::from([(0, 0.1), (1, 0.3)]));
+    }
 
     #[test]
     fn config_defaults_match_kompress_v2_base() {

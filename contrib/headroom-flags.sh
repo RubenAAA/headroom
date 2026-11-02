@@ -338,6 +338,21 @@ HEADROOM_FLAGS=(
   # then settle with the same script in A/B mode across the flip epoch.
   # --respect-client-5m-ttl true
 
+  # OFF until measured. Claude Code stopped sending explicit 5m markers in
+  # September, so the flag above never fires. Subagents now arrive unmarked,
+  # with cc_is_subagent=true in the system[0] billing header. Over
+  # 2026-10-26..11-02 they wrote 6.3M 1h tokens a week and ran -10.5% against
+  # stock; main conversations ran +15.1%. When true, unmarked subagent bodies
+  # skip the pin. Main-loop bodies, including the unmarked last request
+  # before compaction, still pin.
+  #
+  # Expected: about 6% of a 5h window a week back, against ~0.1% lost on
+  # subagents relaunched after a 5-minute gap. Judge it by the meter, not by
+  # vs_stock, which prices 5m writes at an assumed weight and so shows a win
+  # by construction: run a week on, then refit with scripts/meter-fit/ and
+  # compare usage per subagent turn against the week before.
+  # --subagent-5m-ttl true
+
   # ON 2026-08-17. Holds the working-directory line in the system preamble to
   # the value each conversation opened with, and restates the live one at the
   # message tail where changing it costs nothing. The line sits inside every

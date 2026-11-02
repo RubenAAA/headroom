@@ -776,3 +776,73 @@ async fn response_create_frames_get_verbosity_steering() {
     let control = sent_frames(1.0, &frames).await;
     assert_eq!(control, frames, "control arm forwards client bytes");
 }
+
+/// A Codex local compaction (`tools: []`) holding `web_search_call` history
+/// gets an in-band error from the ChatGPT backend that kills the session.
+/// Those items leave the first frame and later frames; a frame that declares
+/// a web_search tool forwards its items.
+#[tokio::test]
+async fn response_create_frames_drop_undeclared_web_search_calls() {
+    let upstream = spawn_mock_upstream(vec![], false, vec![]).await;
+    let proxy = start_proxy_with(&format!("http://{}", upstream.addr), live_zone_config).await;
+    let mut req = format!("{}/v1/responses", proxy.ws_url())
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "authorization",
+        http::HeaderValue::from_static("Bearer sk-test-payg"),
+    );
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+
+    let frame = |tools: Value| {
+        json!({"type": "response.create", "response": {
+            "model": "gpt-5.4-codex",
+            "input": [
+                {"type": "message", "role": "user", "content": "look this up"},
+                {"type": "web_search_call", "id": "ws_1", "status": "completed",
+                 "action": {"type": "search", "query": "q"}},
+                {"type": "message", "role": "assistant", "content": "found it"}
+            ],
+            "tools": tools,
+            "stream": true
+        }})
+        .to_string()
+    };
+    let frames = [
+        frame(json!([])),
+        frame(json!([{"type": "web_search"}])),
+        frame(json!([])),
+    ];
+    for f in &frames {
+        ws.send(Message::Text(f.clone().into())).await.unwrap();
+    }
+    wait_for_frames(&upstream.frames, frames.len()).await;
+    let types: Vec<Vec<String>> = upstream
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| match m {
+            Message::Text(t) => {
+                let v: Value = serde_json::from_str(t).unwrap();
+                v["response"]["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["type"].as_str().unwrap().to_string())
+                    .collect()
+            }
+            other => panic!("expected text frame, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(types[0], ["message", "message"], "first frame");
+    assert_eq!(
+        types[1],
+        ["message", "web_search_call", "message"],
+        "declared web_search keeps its items"
+    );
+    assert_eq!(types[2], ["message", "message"], "later frame");
+
+    let _ = ws.close(None).await;
+    proxy.shutdown().await;
+}

@@ -119,3 +119,46 @@ fn store_only_populated_after_token_gate_admits() {
     .expect("dispatcher");
     assert_eq!(store.len(), 0, "no compression → no CCR put");
 }
+
+/// A store whose writes always fail, as a full disk or a dropped Redis
+/// connection does.
+struct RefusingStore;
+
+impl CcrStore for RefusingStore {
+    fn put(&self, _hash: &str, _payload: &str) -> bool {
+        false
+    }
+    fn get(&self, _hash: &str) -> Option<String> {
+        None
+    }
+    fn len(&self) -> usize {
+        0
+    }
+}
+
+#[test]
+fn failed_put_forwards_original_without_marker() {
+    // Upstream 185454be: a marker whose original never reached the store
+    // points the model at a hash it cannot fetch, so the dropped content
+    // is gone for good. Forward the block as it came instead.
+    let payload = large_json_array_payload();
+    let body = body_with_payload(&payload);
+
+    let outcome = compress_anthropic_live_zone_with_ccr(
+        &body,
+        0,
+        AuthMode::Payg,
+        DEFAULT_MODEL,
+        Some(&RefusingStore),
+        &DispatchConfig::default(),
+    )
+    .expect("dispatcher");
+
+    match &outcome {
+        LiveZoneOutcome::NoChange { .. } => {}
+        LiveZoneOutcome::Modified { new_body, .. } => panic!(
+            "a failed CCR write must leave the block as it came; body={}",
+            new_body.get()
+        ),
+    }
+}

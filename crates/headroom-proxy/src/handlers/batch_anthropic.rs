@@ -174,30 +174,41 @@ pub async fn anthropic_batch_create(
     let auth_mode = compression_auth_mode(&headers);
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // Per-item compression. Any per-item failure isolates: the original
-    // unmodified item is forwarded (mirrors Python's try/except append).
-    let mut compressed_requests = Vec::with_capacity(requests_list.len());
-    for (idx, batch_req) in requests_list.iter().enumerate() {
-        compressed_requests.push(compress_batch_item(
-            &state,
-            batch_req,
-            idx,
-            auth_mode,
-            &request_id,
-        ));
-    }
-    if let Some(obj) = parsed.as_object_mut() {
-        obj.insert("requests".to_string(), Value::Array(compressed_requests));
-    }
+    // `x-headroom-bypass` / `x-headroom-mode: passthrough` promise the
+    // client's exact bytes: skip compression and the re-serialization below,
+    // which would otherwise rewrite even an untouched body.
+    let outbound = if crate::headers::headroom_bypass_enabled(&headers) {
+        tracing::info!(
+            request_id = %request_id,
+            "anthropic batch create: compression skipped, reason=bypass_header"
+        );
+        body.clone()
+    } else {
+        // Per-item compression. Any per-item failure isolates: the original
+        // unmodified item is forwarded (mirrors Python's try/except append).
+        let mut compressed_requests = Vec::with_capacity(requests_list.len());
+        for (idx, batch_req) in requests_list.iter().enumerate() {
+            compressed_requests.push(compress_batch_item(
+                &state,
+                batch_req,
+                idx,
+                auth_mode,
+                &request_id,
+            ));
+        }
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("requests".to_string(), Value::Array(compressed_requests));
+        }
 
-    let outbound = match serde_json::to_vec(&parsed) {
-        Ok(b) => Bytes::from(b),
-        Err(_) => {
-            return anthropic_error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "An error occurred while processing your batch request. Please try again.",
-            );
+        match serde_json::to_vec(&parsed) {
+            Ok(b) => Bytes::from(b),
+            Err(_) => {
+                return anthropic_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "An error occurred while processing your batch request. Please try again.",
+                );
+            }
         }
     };
 
@@ -787,4 +798,59 @@ async fn run_anthropic_continuation(
     }
 
     current_response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A bypassed batch create must reach upstream as the client's exact
+    /// bytes. Before the fix the body was parsed, compressed per item and
+    /// re-serialized, so formatting and compressible content both changed.
+    #[tokio::test]
+    async fn create_with_bypass_forwards_original_bytes() {
+        for (name, value) in [
+            ("x-headroom-bypass", "true"),
+            ("x-headroom-mode", "passthrough"),
+        ] {
+            let upstream = MockServer::start().await;
+            let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
+            let sink = captured.clone();
+            Mock::given(method("POST"))
+                .and(path("/v1/messages/batches"))
+                .respond_with(move |req: &wiremock::Request| {
+                    *sink.lock().unwrap() = Some(req.body.clone());
+                    ResponseTemplate::new(200).set_body_string(r#"{"id":"batch_1"}"#)
+                })
+                .mount(&upstream)
+                .await;
+            let mut config = Config::for_test(upstream.uri().parse().unwrap());
+            config.compression_mode = CompressionMode::LiveZone;
+            let state = AppState::new(config).expect("app state");
+
+            let rows: Vec<Value> = (0..40)
+                .map(|i| json!({"id": i, "name": format!("entry_{i}"), "notes": "lorem ipsum dolor"}))
+                .collect();
+            let batch = json!({"requests": [{"custom_id": "r1", "params": {
+                "model": "claude-3-5-sonnet-20241022", "max_tokens": 16,
+                "messages": [{"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": "t1", "content": serde_json::to_string(&rows).unwrap()}]}]
+            }}]});
+            // Pretty-printed so any re-serialization shows up as a byte diff.
+            let original = Bytes::from(serde_json::to_vec_pretty(&batch).unwrap());
+
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", "application/json".parse().unwrap());
+            headers.insert(name, value.parse().unwrap());
+            let resp = anthropic_batch_create(State(state), headers, original.clone()).await;
+
+            assert_eq!(resp.status(), StatusCode::OK, "{name}");
+            let sent = captured.lock().unwrap().take().expect("upstream reached");
+            assert_eq!(sent, original.to_vec(), "{name}: bytes changed");
+        }
+    }
 }

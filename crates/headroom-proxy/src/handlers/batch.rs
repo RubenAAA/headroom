@@ -363,6 +363,13 @@ pub async fn google_batch_create(
         }
     };
 
+    // Bypass promises the client's exact bytes; the inline path below
+    // re-serializes the body even when no item compresses.
+    if crate::headers::headroom_bypass_enabled(&headers) {
+        return google_batch_passthrough(State(state), Path(model.to_string()), headers, body)
+            .await;
+    }
+
     let requests_opt = parsed
         .pointer_mut("/batch/input_config/requests/requests")
         .and_then(Value::as_array_mut);
@@ -561,7 +568,9 @@ pub async fn openai_batch_create(
         );
     };
 
-    if endpoint != "/v1/chat/completions" {
+    // Bypass must also skip the path below: it rewrites every JSONL line and
+    // uploads a new file, so the batch would point at a different file id.
+    if endpoint != "/v1/chat/completions" || crate::headers::headroom_bypass_enabled(&headers) {
         let upstream_headers = strip_headroom_headers(&headers);
         let url = upstream_url(&state, "/v1/batches");
         return match forward_to_upstream(&state, "POST", &url, upstream_headers, body).await {
@@ -862,6 +871,98 @@ mod tests {
         assert_eq!(stats.total_original_tokens, 0);
         assert_eq!(stats.total_compressed_tokens, 0);
         assert_eq!(stats.total_tokens_saved, 0);
+    }
+
+    /// Every upstream request seen, as `(path, body)`.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// Start a wiremock upstream that records every request and answers 200 `{}`.
+    async fn capturing_upstream() -> (wiremock::MockServer, Seen) {
+        let upstream = wiremock::MockServer::start().await;
+        let seen = Seen::default();
+        let sink = seen.clone();
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(move |req: &wiremock::Request| {
+                sink.lock()
+                    .unwrap()
+                    .push((req.url.path().to_string(), req.body.clone()));
+                wiremock::ResponseTemplate::new(200).set_body_string("{}")
+            })
+            .mount(&upstream)
+            .await;
+        (upstream, seen)
+    }
+
+    fn bypass_state_and_headers(upstream: &wiremock::MockServer) -> Vec<(AppState, HeaderMap)> {
+        [
+            ("x-headroom-bypass", "true"),
+            ("x-headroom-mode", "passthrough"),
+        ]
+        .into_iter()
+        .map(|(name, value)| {
+            let mut config = crate::config::Config::for_test(upstream.uri().parse().unwrap());
+            config.compression_mode = CompressionMode::LiveZone;
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers.insert(name, HeaderValue::from_static(value));
+            (AppState::new(config).expect("app state"), headers)
+        })
+        .collect()
+    }
+
+    /// A bypassed Google batch create must reach upstream as the client's
+    /// exact bytes; before the fix inline requests were compressed and the
+    /// body re-serialized.
+    #[tokio::test]
+    async fn google_batch_create_bypass_forwards_original_bytes() {
+        let rows: Vec<Value> = (0..40)
+            .map(|i| json!({"id": i, "name": format!("entry_{i}"), "notes": "lorem ipsum dolor"}))
+            .collect();
+        let batch = json!({"batch": {"input_config": {"requests": {"requests": [{
+            "request": {"contents": [{"role": "user", "parts": [
+                {"text": serde_json::to_string(&rows).unwrap()}
+            ]}]}
+        }]}}}});
+        let original = Bytes::from(serde_json::to_vec_pretty(&batch).unwrap());
+        let (upstream, seen) = capturing_upstream().await;
+        for (state, headers) in bypass_state_and_headers(&upstream) {
+            seen.lock().unwrap().clear();
+            let resp = google_batch_create(
+                State(state),
+                Path("gemini-2.5-flash:batchGenerateContent".to_string()),
+                headers,
+                original.clone(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(
+                seen[0].0,
+                "/v1beta/models/gemini-2.5-flash:batchGenerateContent"
+            );
+            assert_eq!(seen[0].1, original.to_vec(), "bytes changed");
+        }
+    }
+
+    /// A bypassed OpenAI chat batch create must forward the create body
+    /// as sent; before the fix it downloaded the input file, rewrote it and
+    /// tried to upload a replacement.
+    #[tokio::test]
+    async fn openai_batch_create_bypass_forwards_original_bytes() {
+        let original = Bytes::from_static(
+            b"{ \"input_file_id\": \"file-abc\",\n  \"endpoint\": \"/v1/chat/completions\",\n  \"completion_window\": \"24h\" }",
+        );
+        let (upstream, seen) = capturing_upstream().await;
+        for (state, headers) in bypass_state_and_headers(&upstream) {
+            seen.lock().unwrap().clear();
+            let resp = openai_batch_create(State(state), headers, original.clone()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "only the create call, no file download");
+            assert_eq!(seen[0].0, "/v1/batches");
+            assert_eq!(seen[0].1, original.to_vec(), "bytes changed");
+        }
     }
 
     #[test]

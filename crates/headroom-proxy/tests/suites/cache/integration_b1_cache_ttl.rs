@@ -159,3 +159,65 @@ async fn unmarked_blocks_do_not_gain_a_marker() {
         "an unmarked system block must stay unmarked"
     );
 }
+
+/// `payload()` as a Claude Code subagent sends it: the billing header in
+/// `system[0]` carries `cc_is_subagent=true`, and no marker names a TTL.
+fn subagent_payload(header: &str) -> Value {
+    let mut body = payload();
+    body["system"][0]["text"] = Value::String(header.to_string());
+    body
+}
+
+const SUBAGENT_HEADER: &str =
+    "x-anthropic-billing-header: cc_version=2.1.316.ea8; cc_entrypoint=cli; cc_is_subagent=true;";
+const MAIN_HEADER: &str = "x-anthropic-billing-header: cc_version=2.1.316.ea8; cc_entrypoint=cli;";
+
+async fn ttls_with_subagent_flag(on: bool, body: &Value) -> Vec<Option<String>> {
+    let upstream = MockServer::start().await;
+    let bodies = mount_recording_upstream(&upstream).await;
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.force_1h_cache_ttl = true;
+        c.subagent_5m_ttl = on;
+        c.compression = true;
+    })
+    .await;
+    post(&proxy.url(), OAUTH, body).await;
+    let seen = bodies.lock().unwrap();
+    ttls(&seen[0])
+}
+
+/// Subagents run start to finish in minutes, so an hour entry bought at
+/// 2x base input mostly dies unread. With the flag their markers stay on
+/// the 5-minute default.
+#[tokio::test]
+async fn subagent_flag_leaves_subagent_markers_on_5m() {
+    let got = ttls_with_subagent_flag(true, &subagent_payload(SUBAGENT_HEADER)).await;
+    assert_eq!(got, vec![None, None], "subagent markers must not be pinned");
+}
+
+/// Off by default: the same subagent body is pinned as before.
+#[tokio::test]
+async fn subagent_body_is_pinned_without_the_flag() {
+    let got = ttls_with_subagent_flag(false, &subagent_payload(SUBAGENT_HEADER)).await;
+    assert_eq!(got, vec![Some("1h".to_string()), Some("1h".to_string())]);
+}
+
+/// The main conversation's last request before compaction is also
+/// unmarked. It is not a subagent, and its prefix is read again after
+/// gaps of any length, so it keeps the pin.
+#[tokio::test]
+async fn subagent_flag_still_pins_unmarked_main_bodies() {
+    let got = ttls_with_subagent_flag(true, &subagent_payload(MAIN_HEADER)).await;
+    assert_eq!(got, vec![Some("1h".to_string()), Some("1h".to_string())]);
+}
+
+/// Only the billing header counts. A conversation that merely quotes the
+/// field name is not a subagent.
+#[tokio::test]
+async fn subagent_flag_ignores_the_field_outside_the_header() {
+    let mut body = subagent_payload(MAIN_HEADER);
+    body["messages"][0]["content"][0]["text"] =
+        Value::String("grep for cc_is_subagent=true; in the logs".to_string());
+    let got = ttls_with_subagent_flag(true, &body).await;
+    assert_eq!(got, vec![Some("1h".to_string()), Some("1h".to_string())]);
+}

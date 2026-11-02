@@ -23,8 +23,27 @@ use serde_json::{Map, Value, json};
 /// [`crate::request_outcome`], not duplicated here).
 pub use crate::request_outcome::summarize_transforms;
 
-/// Hard cap on retained cost entries (memory bound).
-pub const MAX_COST_ENTRIES: usize = 100_000;
+use crate::persistent_metrics::{MAX_LABEL_LENGTH, MAX_TRACKED_MODELS};
+
+/// Per-model key a request's model name folds into once the maps hold
+/// [`MAX_TRACKED_MODELS`] distinct names.
+pub const OTHER_MODEL: &str = "other";
+
+/// Key under which a client-supplied model name may enter a per-model map.
+///
+/// `model` comes from the request body: unbounded, every distinct string
+/// was a new entry in each map for the life of the process. It is clipped to
+/// [`MAX_LABEL_LENGTH`] characters, and a new name past
+/// [`MAX_TRACKED_MODELS`] keys in `tracked` (the map being written) folds
+/// into [`OTHER_MODEL`] (upstream `33e5f674`).
+pub fn bounded_model_key<V>(model: &str, tracked: &HashMap<String, V>) -> String {
+    let key: String = model.chars().take(MAX_LABEL_LENGTH).collect();
+    if tracked.contains_key(&key) || tracked.len() < MAX_TRACKED_MODELS {
+        key
+    } else {
+        OTHER_MODEL.to_string()
+    }
+}
 
 /// Provider cache discount multipliers: `(read_multiplier, write_multiplier,
 /// label)` — the fraction of the input price a cache read/write costs.
@@ -214,10 +233,19 @@ struct PerModel {
     /// `(model, long_context)` for the same reason as `output_tokens`.
     saved_write: HashMap<(String, bool), f64>,
     saved_list: HashMap<(String, bool), f64>,
+    /// Dollars of requests whose model folded into [`OTHER_MODEL`]. `stats()`
+    /// prices each map entry by its key and `other` has no price, so these
+    /// are priced once at record time with the same formulas.
+    folded_input_usd: f64,
+    folded_output_usd: f64,
+    folded_savings_usd: f64,
+    folded_cache_aware_savings_usd: f64,
 }
 
 struct Inner {
-    /// Costs inside the current budget period, oldest first.
+    /// Costs inside the current budget period, oldest first. Bounded by the
+    /// period (`expire`), not by a count: evicting an in-period cost would
+    /// drop spend that still counts against the budget (upstream #4416).
     costs: VecDeque<(DateTime<Local>, f64)>,
     /// Running sum of `costs`, so a budget check never scans them.
     period_cost: f64,
@@ -374,15 +402,16 @@ impl CostTracker {
         // excluded from the tier buckets below (never billed in any tier).
         let tool_schema_saved = rec.tool_schema_saved.max(0);
         let headline_saved = tokens_saved.saturating_add(tool_schema_saved);
-        *m.tokens_saved.entry(model.to_string()).or_default() += headline_saved;
-        *m.tool_schema_saved.entry(model.to_string()).or_default() += tool_schema_saved;
-        *m.tokens_sent.entry(model.to_string()).or_default() += rec.tokens_sent;
-        *m.requests.entry(model.to_string()).or_default() += 1;
-        *m.cache_read.entry(model.to_string()).or_default() += rec.cache_read_tokens;
-        *m.cache_write.entry(model.to_string()).or_default() += rec.cache_write_tokens;
-        *m.cache_write_5m.entry(model.to_string()).or_default() += rec.cache_write_5m_tokens;
-        *m.cache_write_1h.entry(model.to_string()).or_default() += rec.cache_write_1h_tokens;
-        *m.uncached.entry(model.to_string()).or_default() += rec.uncached_tokens;
+        let key = bounded_model_key(model, &m.requests);
+        *m.tokens_saved.entry(key.clone()).or_default() += headline_saved;
+        *m.tool_schema_saved.entry(key.clone()).or_default() += tool_schema_saved;
+        *m.tokens_sent.entry(key.clone()).or_default() += rec.tokens_sent;
+        *m.requests.entry(key.clone()).or_default() += 1;
+        *m.cache_read.entry(key.clone()).or_default() += rec.cache_read_tokens;
+        *m.cache_write.entry(key.clone()).or_default() += rec.cache_write_tokens;
+        *m.cache_write_5m.entry(key.clone()).or_default() += rec.cache_write_5m_tokens;
+        *m.cache_write_1h.entry(key.clone()).or_default() += rec.cache_write_1h_tokens;
+        *m.uncached.entry(key.clone()).or_default() += rec.uncached_tokens;
 
         // Which price tier the provider billed this turn in. A request the
         // provider reported no cache data for (or whose write counter was
@@ -396,8 +425,33 @@ impl CostTracker {
         let long_context = crate::pricing::is_long_context(billed_prompt.max(rec.tokens_sent));
 
         *m.output_tokens
-            .entry((model.to_string(), long_context))
+            .entry((key.clone(), long_context))
             .or_default() += rec.output_tokens.max(0);
+        let folded = key == OTHER_MODEL && model != OTHER_MODEL;
+        if folded {
+            if let Some((cr_p, cw_p, unc_p)) = Self::cache_prices(model, false) {
+                let (cr, cw, unc) = (
+                    rec.cache_read_tokens,
+                    rec.cache_write_tokens,
+                    rec.uncached_tokens,
+                );
+                m.folded_input_usd += if cr + cw + unc > 0 {
+                    cr as f64 * cr_p + cw as f64 * cw_p + unc as f64 * unc_p
+                } else {
+                    rec.tokens_sent as f64 * unc_p
+                };
+            }
+            if headline_saved > 0
+                && let Some(price) = Self::list_price_per_token(model)
+            {
+                m.folded_savings_usd += headline_saved as f64 * price;
+            }
+            if rec.output_tokens > 0
+                && let Some(p) = crate::pricing::lookup(model)
+            {
+                m.folded_output_usd += rec.output_tokens as f64 * p.output_rate(long_context);
+            }
+        }
 
         // Cache-aware counterfactual buckets for the removed tokens. Message
         // compression rewrites the live zone only — the frozen, cache-read
@@ -408,7 +462,13 @@ impl CostTracker {
         if tokens_saved > 0 {
             let (_, write_part, list_part) =
                 bucket_by_cache_mix(tokens_saved, 0, write_eff, rec.uncached_tokens.max(0));
-            let key = (model.to_string(), long_context);
+            if folded
+                && let Some((_, cw_price, uncached_price)) = Self::cache_prices(model, long_context)
+            {
+                m.folded_cache_aware_savings_usd +=
+                    write_part * cw_price + list_part * uncached_price;
+            }
+            let key = (key, long_context);
             *m.saved_write.entry(key.clone()).or_default() += write_part;
             *m.saved_list.entry(key).or_default() += list_part;
         }
@@ -418,11 +478,6 @@ impl CostTracker {
             self.expire(&mut inner, now);
             inner.costs.push_back((now, cost));
             inner.period_cost += cost;
-            while inner.costs.len() > MAX_COST_ENTRIES {
-                if let Some((_, c)) = inner.costs.pop_front() {
-                    inner.period_cost -= c;
-                }
-            }
         }
     }
 
@@ -519,7 +574,7 @@ impl CostTracker {
             );
         }
 
-        let mut cost_with_headroom = 0.0f64;
+        let mut cost_with_headroom = m.folded_input_usd;
         let mut total_input_tokens = 0i64;
         for model in m.tokens_saved.keys() {
             let sent = *m.tokens_sent.get(model).unwrap_or(&0);
@@ -542,7 +597,7 @@ impl CostTracker {
         // at the published $/token rate for its model. Not affected by cache mix.
         // Budget enforcement reads this figure, so it stays as-is; the
         // cache-aware valuation below is reported alongside it.
-        let mut savings_usd = 0.0f64;
+        let mut savings_usd = m.folded_savings_usd;
         for (model, &saved) in &m.tokens_saved {
             if saved <= 0 {
                 continue;
@@ -555,7 +610,7 @@ impl CostTracker {
         // Completion spend. The input-only figure above is what a budget and
         // the per-model table want; a card that says "spent" has to include
         // the tokens the model emitted, or the spend it shows isn't the bill.
-        let mut output_cost_usd = 0.0f64;
+        let mut output_cost_usd = m.folded_output_usd;
         for ((model, long_context), &out_tokens) in &m.output_tokens {
             if out_tokens <= 0 {
                 continue;
@@ -571,7 +626,7 @@ impl CostTracker {
         // this turn and list for the rest. Flat list pricing (`savings_usd`)
         // ignores the mix. Reported separately so budget enforcement keeps
         // its monotonic list-priced basis; the session summary prefers this one.
-        let mut cache_aware_savings_usd = 0.0f64;
+        let mut cache_aware_savings_usd = m.folded_cache_aware_savings_usd;
         for (key, &write_part) in &m.saved_write {
             let (model, long_context) = key;
             let list_part = m.saved_list.get(key).copied().unwrap_or(0.0);
@@ -1724,6 +1779,82 @@ mod tests {
         t.record_tokens("claude-sonnet-4", &rec);
         t.reset_runtime();
         assert_eq!(t.get_period_cost(), 0.0);
+    }
+
+    #[test]
+    fn budget_keeps_in_period_costs_past_entry_cap() {
+        // Upstream #4416: evicting the oldest in-period cost at the entry cap
+        // subtracted spend that still counts, so the budget never tripped.
+        let t = CostTracker::new(Some(1_000_000.0), "monthly");
+        {
+            let mut inner = t.inner.lock().unwrap();
+            let now = Local::now();
+            for _ in 0..100_000 {
+                inner.costs.push_back((now, 1.0));
+            }
+            inner.period_cost = 100_000.0;
+        }
+        let rec = TokenRecord {
+            tokens_sent: 1_000_000,
+            uncached_tokens: 1_000_000,
+            ..Default::default()
+        };
+        t.record_tokens("claude-sonnet-4", &rec);
+        let one = t
+            .estimate_cost("claude-sonnet-4", 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(t.inner.lock().unwrap().costs.len(), 100_001);
+        assert!((t.get_period_cost() - (100_000.0 + one)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn per_model_maps_bound_client_model_names() {
+        // Upstream 33e5f674: every distinct client model string was a new
+        // key in each per-model map, unbounded in count and length.
+        let t = CostTracker::new(None, "daily");
+        let long = "x".repeat(1000);
+        t.record_tokens(&long, &TokenRecord::default());
+        let s = t.stats();
+        let keys: Vec<&String> = s["per_model"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec![&"x".repeat(MAX_LABEL_LENGTH)]);
+
+        let rec = TokenRecord {
+            tokens_saved: 50_000,
+            tool_schema_saved: 3_000,
+            tokens_sent: 400_000,
+            cache_read_tokens: 300_000,
+            cache_write_tokens: 60_000,
+            uncached_tokens: 40_000,
+            output_tokens: 2_000,
+            ..Default::default()
+        };
+        let t = CostTracker::new(None, "daily");
+        for i in 0..MAX_TRACKED_MODELS {
+            t.record_tokens(&format!("client-model-{i}"), &TokenRecord::default());
+        }
+        t.record_tokens("claude-sonnet-4", &rec);
+        let s = t.stats();
+        let per_model = s["per_model"].as_object().unwrap();
+        assert_eq!(per_model.len(), MAX_TRACKED_MODELS + 1);
+        assert!(!per_model.contains_key("claude-sonnet-4"));
+        assert_eq!(per_model[OTHER_MODEL]["requests"], json!(1));
+        assert!(crate::pricing::lookup(OTHER_MODEL).is_none());
+
+        // Folded dollars are priced at record time: totals match a tracker
+        // that kept the name.
+        let solo = CostTracker::new(None, "daily");
+        solo.record_tokens("claude-sonnet-4", &rec);
+        let want = solo.stats();
+        for field in [
+            "cost_with_headroom_usd",
+            "output_cost_usd",
+            "total_cost_usd",
+            "savings_usd",
+            "cache_aware_savings_usd",
+        ] {
+            assert!(want[field].as_f64().unwrap() > 0.0, "{field}");
+            assert_eq!(s[field], want[field], "{field}");
+        }
     }
 
     #[test]

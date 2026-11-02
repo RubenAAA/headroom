@@ -295,10 +295,39 @@ pub struct MessageShape {
 /// `does_not_mutate_input` test in the module below pins this with a
 /// clone-and-compare assertion.
 pub fn compute_structural_hash(body: &serde_json::Value, kind: ApiKind) -> StructuralHash {
+    compute_structural_hash_with(body, kind, false)
+}
+
+/// [`compute_structural_hash`], leaving `defer_loading: true` tools out of
+/// the `tools` axis when `deferred_tools_unkeyed` is set and `kind` is
+/// Anthropic.
+///
+/// Set it only when those tools reach the provider still deferred
+/// (first-party Anthropic). The API keeps deferred tools out of the prompt
+/// it caches, and Claude Code appends each tool its ToolSearch loads still
+/// marked deferred. Hashing them called every load drift, which dropped the
+/// stored prefix and let offload rewrite history the provider still held —
+/// a full re-write of the message tier (upstream 18a588b3f: 12% of cache
+/// writes). Third-party upstreams get every tool eager, so a load there does
+/// change the provider's key and must keep counting.
+///
+/// Whether any tool is deferred still counts: Claude Code's own cache-break
+/// check names that flip ("defer_loading presence flipped") as a prompt
+/// change.
+pub fn compute_structural_hash_with(
+    body: &serde_json::Value,
+    kind: ApiKind,
+    deferred_tools_unkeyed: bool,
+) -> StructuralHash {
     let system_value = extract_system(body, kind);
     let system = hash_canonical(&system_value, false);
     let system_shape = system_shape(&system_value);
-    let tools = hash_canonical(&extract_tools(body), false);
+    let tools_value = if deferred_tools_unkeyed && matches!(kind, ApiKind::Anthropic) {
+        without_deferred_tools(extract_tools(body))
+    } else {
+        extract_tools(body)
+    };
+    let tools = hash_canonical(&tools_value, false);
     let (early_messages, early_shapes) = early_message_hashes(body, kind);
     StructuralHash {
         system,
@@ -506,6 +535,23 @@ fn extract_tools(body: &serde_json::Value) -> serde_json::Value {
     body.get("tools")
         .cloned()
         .unwrap_or(serde_json::Value::Null)
+}
+
+/// The tools the provider keys its cache on: every `defer_loading: true`
+/// entry dropped, plus one marker when any was present.
+fn without_deferred_tools(tools: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(items) = tools else {
+        return tools;
+    };
+    let deferred = |t: &serde_json::Value| {
+        t.get("defer_loading").and_then(serde_json::Value::as_bool) == Some(true)
+    };
+    let any_deferred = items.iter().any(deferred);
+    let mut kept: Vec<serde_json::Value> = items.into_iter().filter(|t| !deferred(t)).collect();
+    if any_deferred {
+        kept.push(serde_json::json!({"defer_loading": true}));
+    }
+    serde_json::Value::Array(kept)
 }
 
 /// Collect the conversation-scoped message items for `kind`: Anthropic
@@ -1951,6 +1997,79 @@ mod tests {
         assert_ne!(h1.tools, h2.tools);
         assert_eq!(h1.early_messages, h2.early_messages);
         assert_eq!(drift_dims(&h1, &h2), "tools");
+    }
+
+    /// Claude Code with its ToolSearch on: a placeholder deferred on every
+    /// request, and each loaded tool appended still `defer_loading: true`.
+    fn deferred_tools(loaded: &[&str]) -> serde_json::Value {
+        let mut tools = vec![
+            json!({"name": "Read", "input_schema": {"type": "object"}}),
+            json!({"name": "ToolSearch", "input_schema": {"type": "object"}}),
+            json!({"name": "DeferredToolPlaceholder", "input_schema": {"type": "object"}, "defer_loading": true}),
+        ];
+        tools.extend(loaded.iter().map(
+            |name| json!({"name": name, "input_schema": {"type": "object"}, "defer_loading": true}),
+        ));
+        serde_json::Value::Array(tools)
+    }
+
+    #[test]
+    fn deferred_tool_load_is_not_drift_when_it_reaches_the_provider_deferred() {
+        let before = anthropic_body("sys", deferred_tools(&[]), vec!["m1"]);
+        let after = anthropic_body("sys", deferred_tools(&["Monitor"]), vec!["m1", "m2"]);
+        let state = DriftState::new(8);
+        observe_drift(
+            &state,
+            "lane",
+            compute_structural_hash_with(&before, ApiKind::Anthropic, true),
+        );
+        assert_eq!(
+            observe_drift(
+                &state,
+                "lane",
+                compute_structural_hash_with(&after, ApiKind::Anthropic, true),
+            ),
+            None,
+            "the provider keys its cache without deferred tools; a load is not a rebuild"
+        );
+
+        // Third-party upstreams get every tool eager: there the load is drift.
+        let h1 = compute_structural_hash_with(&before, ApiKind::Anthropic, false);
+        let h2 = compute_structural_hash_with(&after, ApiKind::Anthropic, false);
+        assert_eq!(drift_dims(&h1, &h2), "tools");
+    }
+
+    #[test]
+    fn eager_tools_and_the_first_deferred_tool_still_drift_when_unkeyed() {
+        let hash = |tools: serde_json::Value| {
+            compute_structural_hash_with(
+                &anthropic_body("sys", tools, vec!["m1"]),
+                ApiKind::Anthropic,
+                true,
+            )
+        };
+        let base = hash(deferred_tools(&["Monitor"]));
+        // An eager tool is rendered into the prompt.
+        let mut added = deferred_tools(&["Monitor"]);
+        added
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "Bash", "input_schema": {"type": "object"}}));
+        assert_eq!(drift_dims(&base, &hash(added)), "tools");
+        // Un-deferring a loaded tool renders it too.
+        let mut undeferred = deferred_tools(&["Monitor"]);
+        undeferred[3]["defer_loading"] = json!(false);
+        assert_eq!(drift_dims(&base, &hash(undeferred)), "tools");
+        // No deferred tool at all, then one: the deferred-tool section appears.
+        let eager_only = json!([{"name": "Read", "input_schema": {"type": "object"}}]);
+        let mut first_deferred = eager_only.clone();
+        first_deferred.as_array_mut().unwrap().push(
+            json!({"name": "Monitor", "input_schema": {"type": "object"}, "defer_loading": true}),
+        );
+        assert_eq!(
+            drift_dims(&hash(eager_only), &hash(first_deferred)),
+            "tools"
+        );
     }
 
     #[test]

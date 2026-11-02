@@ -477,6 +477,70 @@ fn long_mcp_result_falls_through_to_dispatch() {
     );
 }
 
+/// Port of upstream `4ee61645` (#3590): a shell result under 2000
+/// characters stays verbatim. Same compressible JSON as the MCP test;
+/// lossy compression of short `ls` / `git status` / grep output dropped
+/// the lines the command was run for (measured on captured `Bash`
+/// results: the search compressor kept the grep lines and cut the
+/// summary counts above them). Aliases match case-insensitively.
+#[test]
+fn small_shell_result_stays_verbatim() {
+    let text = "{\"k\": \"v\", \"n\": 1}\n".repeat(60);
+    assert!(text.len() > 512 && text.len() < 2000);
+    for name in ["Bash", "run_terminal_command"] {
+        let b = body(json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": name,
+                     "input": {"command": "cat rows.jsonl"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": text}
+                ]},
+            ]
+        }));
+        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+        assert!(
+            matches!(out, LiveZoneOutcome::NoChange { .. }),
+            "{name}: small shell result must be forwarded unmodified, got {:?}",
+            outcome_block_actions(&out)
+        );
+        assert!(
+            outcome_block_actions(&out).iter().any(|a| matches!(
+                a,
+                BlockAction::Excluded {
+                    reason: ExclusionReason::SmallShellResult
+                }
+            )),
+            "{name}: got {:?}",
+            outcome_block_actions(&out)
+        );
+    }
+}
+
+/// Build and test logs past the shell floor still compress.
+#[test]
+fn long_shell_result_falls_through_to_dispatch() {
+    let text = "{\"k\": \"v\", \"n\": 1}\n".repeat(300);
+    assert!(text.len() > 2000);
+    let b = body(json!({
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash",
+                 "input": {"command": "cat rows.jsonl"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": text}
+            ]},
+        ]
+    }));
+    let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+    assert!(
+        matches!(out, LiveZoneOutcome::Modified { .. }),
+        "long shell result must compress, got {out:?}"
+    );
+}
+
 /// Exclusion wins over the MCP exemption (Python checks exclusion
 /// first): an MCP tool the operator excluded gets the exclusion
 /// treatment — a lossless fold — not the verbatim pass.
