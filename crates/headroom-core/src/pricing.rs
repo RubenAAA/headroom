@@ -232,6 +232,13 @@ static TABLE: &[(&str, ModelPricing)] = &[
     ("claude-3-7-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
     ("claude-3-5-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
     ("claude-3-sonnet", per_1m_ttl(3.0, 15.0, 0.3, 3.75, 6.0)),
+    // Haiku 5.5 would otherwise fall to the `claude-` catch-all at 30x its
+    // price. Its 5x card above 100K prompt tokens does not fit the 200k
+    // tier this table models, so long Haiku 5.5 turns price at base here.
+    (
+        "claude-haiku-5-5",
+        per_1m_ttl(0.10, 0.50, 0.01, 0.125, 0.20),
+    ),
     ("claude-haiku-4", per_1m_ttl(1.0, 5.0, 0.1, 1.25, 2.0)),
     ("claude-3-5-haiku", per_1m_ttl(0.8, 4.0, 0.08, 1.0, 1.6)),
     ("claude-3-haiku", per_1m_ttl(0.25, 1.25, 0.03, 0.30, 0.50)),
@@ -482,6 +489,13 @@ mod tests {
                 "{model} costs nothing whatever the token counts"
             );
         }
+    }
+
+    #[test]
+    fn haiku_5_5_has_its_own_rates() {
+        let p = lookup("claude-haiku-5-5").unwrap();
+        assert!((p.input_cost_per_token * 1_000_000.0 - 0.10).abs() < 1e-12);
+        assert!((p.output_cost_per_token * 1_000_000.0 - 0.50).abs() < 1e-12);
     }
 
     #[test]
