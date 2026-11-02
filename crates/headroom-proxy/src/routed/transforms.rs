@@ -40,13 +40,30 @@ fn inject_memory_tools(
     false
 }
 
+/// True when the client already registers the retrieval tool, under its own
+/// name or a default Headroom MCP alias (OpenCode's `headroom_headroom_retrieve`,
+/// `mcp__headroom__headroom_retrieve`, `mcp_headroom_headroom_retrieve`).
+/// Matching only the bare name added a second `headroom_retrieve` the client
+/// cannot execute. Another MCP server's tool of the same name does not count.
+pub(crate) fn client_has_retrieval_tool(tools: &[Value]) -> bool {
+    tools.iter().any(|t| {
+        t.get("name").and_then(Value::as_str).is_some_and(|name| {
+            name == "headroom_retrieve"
+                || matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "headroom_headroom_retrieve"
+                        | "mcp__headroom__headroom_retrieve"
+                        | "mcp_headroom_headroom_retrieve"
+                )
+        })
+    })
+}
+
 /// Extend an existing `tools` array with the `headroom_retrieve` tool
 /// (CCR-tool stage). Returns true when the tool was added.
 fn inject_ccr_retrieve_tool(parsed: &mut Value) -> bool {
     if let Some(tools) = parsed.get_mut("tools").and_then(|v| v.as_array_mut()) {
-        let already_has = tools
-            .iter()
-            .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("headroom_retrieve"));
+        let already_has = client_has_retrieval_tool(tools);
         if !already_has {
             tools.push(json!({
                 "name": "headroom_retrieve",
@@ -1353,6 +1370,43 @@ mod routed_request_tests {
             .filter(|t| t["name"] == "headroom_retrieve")
             .count();
         assert_eq!(count, 1);
+    }
+
+    /// A client that registers the retrieval tool under a Headroom MCP alias
+    /// already owns it; a second, bare copy is one it cannot execute.
+    #[tokio::test]
+    async fn ccr_tool_is_not_duplicated_for_a_client_mcp_alias() {
+        let state = test_state(|c| c.ccr_inject_tool = true);
+        let headers = HeaderMap::new();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        for alias in [
+            "headroom_headroom_retrieve",
+            "mcp__headroom__headroom_retrieve",
+            "mcp_headroom_headroom_retrieve",
+            "mcp__Headroom__headroom_retrieve",
+        ] {
+            let tools = json!([{"name": alias, "input_schema": {"type": "object"}}]);
+            let mut body = json!({
+                "model": "claude-codex-5.6",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools.clone()
+            });
+            apply_ctx_request_transforms(
+                &state, &mut body, &headers, &addr, "req-test", None, true,
+            )
+            .await;
+            assert_eq!(body["tools"], tools, "{alias}");
+        }
+
+        // Some other server's tool of the same name is not ours.
+        let mut body = json!({
+            "model": "claude-codex-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "mcp__other__headroom_retrieve", "input_schema": {"type": "object"}}]
+        });
+        apply_ctx_request_transforms(&state, &mut body, &headers, &addr, "req-test", None, true)
+            .await;
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
     }
 
     /// `--ccr-inject-tool` defaults to *true*, so the retrieve tool is the one
