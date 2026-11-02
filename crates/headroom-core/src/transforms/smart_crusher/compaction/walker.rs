@@ -144,8 +144,9 @@ fn walk_string(s: String, ctx: &DocumentCompactor) -> Value {
     // Long opaque blob: substitute with CCR marker (and stash the
     // original in the store if one is configured, so retrieval works).
     if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.clone()), &ctx.config.classify)
+        && let Some(marker) = emit_opaque_ccr_marker(&s, &kind, ctx.ccr_store.as_ref())
     {
-        return Value::String(emit_opaque_ccr_marker(&s, &kind, ctx.ccr_store.as_ref()));
+        return Value::String(marker);
     }
 
     Value::String(s)
@@ -169,6 +170,10 @@ pub fn try_parse_json_container(s: &str) -> Option<Value> {
 /// regardless of store presence — same input → same marker — so the
 /// runtime contract is stable across configurations.
 ///
+/// Returns `None` when the store refuses the write: a marker whose
+/// original never reached the store points the model at a hash it
+/// cannot fetch, so the caller keeps the payload instead.
+///
 /// Marker format: `<<ccr:HASH,KIND,SIZE>>` where HASH is the 12-char
 /// SHA-256 hex prefix of the payload bytes, KIND is `base64` / `string`
 /// / `html` / custom, SIZE is humanized (`123B`, `4.5KB`, `1.2MB`).
@@ -176,7 +181,7 @@ pub fn emit_opaque_ccr_marker(
     payload: &str,
     kind: &OpaqueKind,
     store: Option<&Arc<dyn CcrStore>>,
-) -> String {
+) -> Option<String> {
     let mut h = Sha256::new();
     h.update(payload.as_bytes());
     let hash: String = h
@@ -192,8 +197,9 @@ pub fn emit_opaque_ccr_marker(
             event = "ccr_put_failed",
             target = "ccr.walker",
             hash = %hash,
-            "ccr_put_failed; marker will point at an unretrievable hash"
+            "ccr_put_failed; keeping the original string"
         );
+        return None;
     }
     let kind_str = match kind {
         OpaqueKind::Base64Blob => "base64",
@@ -201,7 +207,12 @@ pub fn emit_opaque_ccr_marker(
         OpaqueKind::HtmlChunk => "html",
         OpaqueKind::Other(s) => s.as_str(),
     };
-    format!("<<ccr:{},{},{}>>", hash, kind_str, humanize(payload.len()))
+    Some(format!(
+        "<<ccr:{},{},{}>>",
+        hash,
+        kind_str,
+        humanize(payload.len())
+    ))
 }
 
 fn humanize(n: usize) -> String {
@@ -319,6 +330,19 @@ mod tests {
         let out = dc().compact(doc);
         let blob = out.pointer("/blob").and_then(|v| v.as_str()).unwrap();
         assert!(blob.starts_with("<<ccr:"), "got: {blob}");
+    }
+
+    #[test]
+    fn refused_opaque_string_stays_as_it_came() {
+        // A marker whose original never reached the store points the
+        // model at a hash it cannot fetch.
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let doc = json!({"id": 1, "blob": big});
+        let compactor = DocumentCompactor {
+            ccr_store: Some(Arc::new(crate::ccr::RefusingCcrStore)),
+            ..DocumentCompactor::default()
+        };
+        assert_eq!(compactor.compact(doc.clone()), doc);
     }
 
     #[test]

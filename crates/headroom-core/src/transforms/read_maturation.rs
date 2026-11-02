@@ -361,11 +361,15 @@ impl ReadMaturationManager {
         if let Some(ref store) = self.store
             && !store.put(&ccr_hash, content)
         {
+            // A marker whose original never reached the store points the
+            // model at a hash it cannot fetch. Keep the read; a later turn
+            // retries the write.
             tracing::warn!(
                 event = "ccr_store_failed",
                 tool_call_id = %tc_id,
-                "read_maturation: CCR store failed"
+                "read_maturation: CCR store failed; keeping the read verbatim"
             );
+            return (None, false);
         }
 
         let file_display = if file_path.is_empty() {
@@ -740,5 +744,24 @@ mod tests {
         assert!(first.contains("compressed after use"));
         assert!(second.contains("compressed after use"));
         assert_eq!(first, second);
+    }
+
+    /// A marker whose original never reached the store points the model at
+    /// a hash it cannot fetch. A refused write keeps the read verbatim.
+    #[test]
+    fn refused_store_write_keeps_read_verbatim() {
+        let lc = large_content();
+        let msgs: Vec<Value> = base_conv(&lc).into_iter().chain(quiet(5)).collect();
+        let cfg = ReadMaturationConfig {
+            enabled: true,
+            quiesce_turns: 5,
+            max_hold_turns: 25,
+            ..Default::default()
+        };
+        let store: Arc<dyn CcrStore> = Arc::new(crate::ccr::RefusingCcrStore);
+        let mut m = ReadMaturationManager::new(cfg, Some(store));
+        let res = m.apply(&msgs, 0);
+        assert_eq!(read_content(&res, 2), &lc);
+        assert_eq!(res.newly_matured, 0);
     }
 }

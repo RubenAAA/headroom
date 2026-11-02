@@ -391,11 +391,28 @@ impl SearchCompressor {
             } else if let Some(store) = store {
                 let key = md5_hex_24(content);
                 if !store.put(&key, content) {
+                    // A marker whose original never reached the store points
+                    // the model at a hash it cannot fetch, and the dropped
+                    // matches are lost. Return the input as it came.
                     tracing::warn!(
                         event = "ccr_put_failed",
                         target = "ccr.search_compressor",
                         hash = %key,
-                        "ccr_put_failed; marker will point at an unretrievable hash"
+                        "ccr_put_failed; returning the original search output"
+                    );
+                    stats.ccr_skip_reason = Some("ccr store refused the original");
+                    return (
+                        SearchCompressionResult {
+                            compressed: content.to_string(),
+                            original: content.to_string(),
+                            original_match_count: original_count,
+                            compressed_match_count: original_count,
+                            files_affected: scored.len(),
+                            compression_ratio: 1.0,
+                            cache_key: None,
+                            summaries: BTreeMap::new(),
+                        },
+                        stats,
                     );
                 }
                 let marker = format!(
@@ -1007,7 +1024,7 @@ fn md5_hex_24(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccr::InMemoryCcrStore;
+    use crate::ccr::{InMemoryCcrStore, RefusingCcrStore};
 
     fn parse_line(line: &str) -> Option<(String, u64, String)> {
         parse_match_line(line).map(|(f, n, c)| (f.to_string(), n, c.to_string()))
@@ -1552,6 +1569,28 @@ src/main.py-44-context line";
         // Round-trip via the store.
         let key = result.cache_key.as_ref().unwrap();
         assert_eq!(store.get(key).unwrap(), content);
+    }
+
+    #[test]
+    fn failed_ccr_put_returns_input_unchanged() {
+        // A marker whose original never reached the store points at a hash
+        // the model cannot fetch.
+        let compressor = SearchCompressor::new(SearchCompressorConfig {
+            max_matches_per_file: 2,
+            max_total_matches: 4,
+            min_matches_for_ccr: 5,
+            min_compression_ratio_for_ccr: 0.95,
+            ..Default::default()
+        });
+        let mut content = String::new();
+        for i in 1..=12 {
+            content.push_str(&format!("src/main.py:{}:line content {}\n", i, i));
+        }
+        let (result, stats) =
+            compressor.compress_with_store(&content, "", 1.0, Some(&RefusingCcrStore));
+        assert_eq!(result.compressed, content);
+        assert!(result.cache_key.is_none());
+        assert!(!stats.ccr_emitted);
     }
 
     #[test]

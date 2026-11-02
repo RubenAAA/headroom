@@ -179,3 +179,64 @@ async fn count_tokens_unrouted_model_forwards_byte_identical() {
     );
     proxy.shutdown().await;
 }
+
+/// A 4-page PDF costs ~1,500 tokens a page where the block reaches an
+/// Anthropic-protocol upstream, but translated and cursor routes send a
+/// one-line placeholder instead, so pricing its pages there would compact
+/// the client early.
+#[tokio::test]
+async fn count_tokens_prices_pdf_pages_only_where_the_pdf_is_sent() {
+    let upstream = MockServer::start().await;
+    let proxy = start_proxy_with(&upstream.uri(), |cfg| {
+        cfg.model_routes.push(spark_route(&upstream.uri()));
+        cfg.model_routes.push(cursor_route());
+        cfg.model_routes.push(ProviderRoute {
+            model_prefix: "claude-union-alpha".into(),
+            prefix_match: false,
+            upstream: Some(upstream.uri().parse().unwrap()),
+            translate: false,
+            cursor_agent: None,
+            target_model: Some("union-alpha".into()),
+            auth_env: Some("none".into()),
+            chat: false,
+        });
+    })
+    .await;
+    let pdf: &[u8] = b"%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+        2 0 obj << /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 >> endobj\n%%EOF\n";
+    let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pdf);
+
+    let client = reqwest::Client::new();
+    let count = |body: serde_json::Value| {
+        let client = client.clone();
+        let url = format!("{}/v1/messages/count_tokens", proxy.url());
+        async move {
+            let resp = client.post(url).json(&body).send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            body["input_tokens"].as_u64().expect("input_tokens number")
+        }
+    };
+    for (model, sent) in [
+        ("claude-muse-spark-1.3", false),
+        ("claude-grok-4.6", false),
+        ("claude-union-alpha", true),
+    ] {
+        let base = count(count_body(model)).await;
+        let mut with_pdf = count_body(model);
+        with_pdf["messages"].as_array_mut().unwrap().push(
+            serde_json::json!({"role": "user", "content": [{"type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": data}}]}),
+        );
+        let added = count(with_pdf).await - base;
+        if sent {
+            assert_eq!(added, 4 * 1500, "{model} receives the PDF");
+        } else {
+            assert!(
+                added > 0 && added < 20,
+                "{model} sends a placeholder: {added}"
+            );
+        }
+    }
+    proxy.shutdown().await;
+}
