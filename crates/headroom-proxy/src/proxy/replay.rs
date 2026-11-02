@@ -1036,7 +1036,7 @@ fn replay_prefix(
     markers: Option<(usize, bool)>,
 ) -> bytes::Bytes {
     use cache_stabilization::prefix_replay::{
-        overlay_cached_prefix_reported, strip_system_cache_control,
+        overlay_cached_prefix_shaped, strip_system_cache_control,
     };
 
     let Some((mut parsed, optimized)) = parse_replay_body(&body, request_id) else {
@@ -1060,7 +1060,7 @@ fn replay_prefix(
         Ok((o, f, chain_id)) => (Some(o), Some(f), None, chain_id),
         Err(miss) => (None, None, Some(miss), 0),
     };
-    let (overlaid, skip_reason) = overlay_cached_prefix_reported(
+    let (overlaid, skip_reason) = overlay_cached_prefix_shaped(
         optimized.clone(),
         &original_messages,
         prev_orig.as_deref(),
@@ -1076,6 +1076,9 @@ fn replay_prefix(
         // non-inflation bound still lets improvements through, and a cold
         // cache (count 0) lets every accumulated improvement land at once.
         Some(store.confirmed_frozen_count(session_key)),
+        // Breakpoint placement is the Anthropic path; `None` is chat, whose
+        // bodies open with a `system` message the Anthropic net refuses.
+        markers.is_some(),
     );
     let replayed_prefix = overlaid != optimized;
     // After the overlay, which would otherwise put last turn's digest back.
@@ -1272,8 +1275,6 @@ mod chat_breakpoint_tests {
     #[test]
     fn chat_replay_keeps_cache_control_within_four() {
         let store = SessionReplayStore::new(4);
-        // No leading `system` message: the overlay's Anthropic adjacency check
-        // declines any splice that starts with one.
         let sys = json!({"role": "user", "content": text("context", true)});
         let u1 = |m| json!({"role": "user", "content": text("first", m)});
         let a1 = |m: bool| {
@@ -1302,5 +1303,82 @@ mod chat_breakpoint_tests {
         // Oldest goes first; the newest is the one the client just placed.
         assert_eq!(markers(&msgs[0]), 0, "{fwd}");
         assert_eq!(markers(&msgs[4]), 1, "{fwd}");
+    }
+}
+
+#[cfg(test)]
+mod chat_system_replay_tests {
+    use super::*;
+    use crate::cache_stabilization::prefix_replay::SessionReplayStore;
+    use serde_json::{Value, json};
+
+    /// One chat turn: `original` is what the client sent, `forwarded` what
+    /// compression made of it. Returns the forwarded messages after replay.
+    fn turn(
+        store: &SessionReplayStore,
+        id: &str,
+        original: Vec<Value>,
+        forwarded: Vec<Value>,
+        anthropic: bool,
+    ) -> Vec<Value> {
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&json!({"model": "m", "messages": forwarded})).unwrap(),
+        );
+        let out = if anthropic {
+            apply_prefix_replay(store, "s", id, original, body, None, 1, 0, false)
+        } else {
+            apply_chat_prefix_replay(store, "s", id, original, body, 1)
+        };
+        store.complete(id, 1_000_000, 0);
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        out["messages"].as_array().unwrap().clone()
+    }
+
+    fn sys(text: &str) -> Value {
+        json!({"role": "system", "content": text})
+    }
+
+    /// Turn 1 forwards a compressed tool result; turn 2 sends it raw (it has
+    /// left the live zone). Returns turn 2's forwarded tool message.
+    fn second_turn_tool(system_one: &str, system_two: &str, anthropic: bool) -> Value {
+        let store = SessionReplayStore::new(4);
+        let user = json!({"role": "user", "content": "read the report"});
+        let call = json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]});
+        let raw = json!({"role": "tool", "tool_call_id": "c1", "content": "raw ".repeat(200)});
+        let packed = json!({"role": "tool", "tool_call_id": "c1", "content": "compressed"});
+        let next = json!({"role": "user", "content": "and now?"});
+        let one = vec![sys(system_one), user.clone(), call.clone()];
+        turn(
+            &store,
+            "t1",
+            [one.clone(), vec![raw.clone()]].concat(),
+            [one, vec![packed]].concat(),
+            anthropic,
+        );
+        let two = vec![sys(system_two), user, call, raw, next];
+        turn(&store, "t2", two.clone(), two, anthropic)[3].clone()
+    }
+
+    /// The normal OpenAI shape leads with a `system` message. The Anthropic
+    /// rule that refuses one at messages[0] declined every such chat turn.
+    #[test]
+    fn chat_turn_with_leading_system_replays() {
+        let tool = second_turn_tool("be brief", "be brief", false);
+        assert_eq!(tool["content"], "compressed", "{tool}");
+    }
+
+    /// A changed system prompt is a changed prefix: forward this turn's bytes.
+    #[test]
+    fn chat_turn_with_changed_system_declines() {
+        let tool = second_turn_tool("be brief", "be verbose", false);
+        assert_ne!(tool["content"], "compressed", "{tool}");
+    }
+
+    /// Anthropic `messages` may not open with `system`; the net stays there.
+    #[test]
+    fn anthropic_turn_with_leading_system_still_declines() {
+        let tool = second_turn_tool("be brief", "be brief", true);
+        assert_ne!(tool["content"], "compressed", "{tool}");
     }
 }
