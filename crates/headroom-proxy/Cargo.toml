@@ -175,9 +175,11 @@ tokio = { workspace = true, features = [
   "process",
 ] }
 tokio-stream = { workspace = true }
+# websocket.rs always supplies tls::websocket_tls_config(), which loads our
+# direct webpki-roots 1.x dependency plus native/additive roots. Do not enable
+# tungstenite's unused default webpki store: it pulls the obsolete 0.26 shim.
 tokio-tungstenite = { version = "0.30", default-features = false, features = [
   "connect",
-  "rustls-tls-webpki-roots",
   "rustls-tls-native-roots",
 ] }
 tokio-util = { version = "0.7" }

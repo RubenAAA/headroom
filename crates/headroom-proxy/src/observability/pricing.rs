@@ -135,22 +135,60 @@ impl ModelPrice {
 /// One table row: base rates plus long-context tiers, ascending by
 /// threshold. Each tier already carries the rates below it for any
 /// field the table leaves out.
-struct Entry {
+pub struct PriceCard {
     base: ModelPrice,
     tiers: Vec<(u64, ModelPrice)>,
 }
 
-impl Entry {
-    fn at(&self, prompt_tokens: u64) -> ModelPrice {
+impl PriceCard {
+    /// The rates a request with `prompt_tokens` of billed prompt
+    /// (uncached + cache read + cache write) pays.
+    pub fn at(&self, prompt_tokens: u64) -> ModelPrice {
         self.tiers
             .iter()
             .rev()
             .find(|(threshold, _)| prompt_tokens > *threshold)
             .map_or(self.base, |(_, p)| *p)
     }
+
+    /// USD compression saved on one request: what it would have cost
+    /// uncompressed minus what it did cost.
+    ///
+    /// Inside one tier that is the removed tokens at that tier's input
+    /// rate. When the uncompressed prompt would have crossed a
+    /// long-context threshold the forwarded one stays under, the
+    /// provider would have re-priced the whole request (every input
+    /// bucket and the output) at the higher tier, so the saving is the
+    /// difference of the two full bills.
+    pub fn compression_savings_usd(
+        &self,
+        uncached_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        tokens_saved: u64,
+    ) -> f64 {
+        let prompt = uncached_input_tokens
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_write_tokens);
+        let sent = self.at(prompt);
+        let unsent = self.at(prompt.saturating_add(tokens_saved));
+        if unsent == sent {
+            return sent.compression_savings_usd(tokens_saved);
+        }
+        let without = unsent.input_cost_usd(
+            uncached_input_tokens.saturating_add(tokens_saved),
+            cache_read_tokens,
+            cache_write_tokens,
+        ) + unsent.output_cost_usd(output_tokens);
+        let with =
+            sent.input_cost_usd(uncached_input_tokens, cache_read_tokens, cache_write_tokens)
+                + sent.output_cost_usd(output_tokens);
+        (without - with).max(0.0)
+    }
 }
 
-static BOOK: OnceLock<HashMap<String, Entry>> = OnceLock::new();
+static BOOK: OnceLock<HashMap<String, PriceCard>> = OnceLock::new();
 
 /// Bounded once-per-model warn set so an unknown model logs one WARN,
 /// not one per request. Capped so attacker-controlled model ids can't
@@ -169,11 +207,11 @@ pub fn warm() {
     let _ = book();
 }
 
-fn book() -> &'static HashMap<String, Entry> {
+fn book() -> &'static HashMap<String, PriceCard> {
     BOOK.get_or_init(parse_vendored)
 }
 
-fn parse_vendored() -> HashMap<String, Entry> {
+fn parse_vendored() -> HashMap<String, PriceCard> {
     let raw: serde_json::Value = serde_json::from_str(VENDORED_JSON)
         .expect("vendored LiteLLM JSON must parse — same invariant as model_limits");
     let mut out = HashMap::new();
@@ -213,7 +251,7 @@ fn parse_vendored() -> HashMap<String, Entry> {
         };
         out.insert(
             model_id.to_ascii_lowercase(),
-            Entry {
+            PriceCard {
                 base,
                 tiers: parse_tiers(
                     spec,
@@ -337,10 +375,16 @@ fn push_revision_trimmed(push: &mut impl FnMut(String), id: &str) {
 /// `None` means "not in the vendored table" — the caller records $0
 /// for USD fields and this module logs one WARN per distinct model id.
 pub fn lookup(model: &str, prompt_tokens: u64) -> Option<ModelPrice> {
+    lookup_card(model).map(|card| card.at(prompt_tokens))
+}
+
+/// Look up a model's whole rate card, every long-context tier
+/// included. `None` and the WARN behave as in [`lookup`].
+pub fn lookup_card(model: &str) -> Option<&'static PriceCard> {
     let table = book();
     for key in candidates(model) {
-        if let Some(entry) = table.get(&key) {
-            return Some(entry.at(prompt_tokens));
+        if let Some(card) = table.get(&key) {
+            return Some(card);
         }
     }
     warn_once(model);
