@@ -243,6 +243,21 @@ impl Inner {
         false
     }
 
+    /// True if `url` names this proxy: same scheme and port, host `localhost`
+    /// or the bind address, any path. An exact string match took
+    /// `http://localhost:{port}` or `.../v1` for a provider and looped
+    /// requests back into the proxy. `[::1]` is a different socket from a
+    /// `127.0.0.1` bind, so a provider there is still captured.
+    fn is_self(&self, url: &str) -> bool {
+        let (Ok(want), Ok(got)) = (Url::parse(&self.proxy_url), Url::parse(url)) else {
+            return false;
+        };
+        let host = got.host_str().unwrap_or("").to_ascii_lowercase();
+        (host == "localhost" || host == want.host_str().unwrap_or("").to_ascii_lowercase())
+            && got.scheme() == want.scheme()
+            && got.port_or_known_default() == want.port_or_known_default()
+    }
+
     /// One reconcile pass. Returns true if it rewrote settings.json.
     fn tick(&mut self) -> bool {
         let Some((obj, env)) = self.read_settings() else {
@@ -261,7 +276,7 @@ impl Inner {
         }
 
         // Already pointing at us: nothing to do (loop guard).
-        if url.trim_end_matches('/') == self.proxy_url {
+        if self.is_self(&url) {
             return false;
         }
 
@@ -385,6 +400,62 @@ mod tests {
         assert!(r.tick());
         // Atomic write rewrites base_url to proxy; second tick must be a no-op.
         assert!(!r.tick());
+    }
+
+    #[test]
+    fn test_proxy_own_url_spellings_are_not_captured() {
+        for url in [
+            "http://127.0.0.1:8787",
+            "http://127.0.0.1:8787/",
+            "http://127.0.0.1:8787/v1",
+            "http://localhost:8787",
+            "http://LOCALHOST:8787/v1/",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut r, du) = make_inner(tmp.path(), false);
+            write_settings(tmp.path(), json!({"env": {"ANTHROPIC_BASE_URL": url}}));
+            assert!(!r.tick(), "{url} is the proxy itself");
+            assert!(du.blocking_read().is_none(), "{url} captured");
+        }
+    }
+
+    #[test]
+    fn test_other_ports_and_hosts_are_still_captured() {
+        // `[::1]` is a different socket from the `127.0.0.1` the proxy binds.
+        for url in [
+            "http://127.0.0.1:8788",
+            "http://localhost:9999/v1",
+            "https://127.0.0.1:8787",
+            "http://[::1]:8787",
+            "https://api.deepseek.com/anthropic",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut r, du) = make_inner(tmp.path(), false);
+            write_settings(tmp.path(), json!({"env": {"ANTHROPIC_BASE_URL": url}}));
+            assert!(r.tick(), "{url} must be captured");
+            assert!(du.blocking_read().is_some(), "{url} not captured");
+        }
+    }
+
+    #[test]
+    fn test_ipv6_proxy_address_is_self_only_for_ipv6_bind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut r, du) = make_inner(tmp.path(), false);
+        r.proxy_url = "http://[::1]:8787".into();
+        write_settings(
+            tmp.path(),
+            json!({"env": {"ANTHROPIC_BASE_URL": "http://[::1]:8787"}}),
+        );
+        assert!(!r.tick());
+        write_settings(
+            tmp.path(),
+            json!({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}),
+        );
+        assert!(r.tick());
+        assert_eq!(
+            du.blocking_read().as_ref().unwrap().as_str(),
+            "http://127.0.0.1:8787/"
+        );
     }
 
     #[test]
