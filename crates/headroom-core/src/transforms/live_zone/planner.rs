@@ -104,6 +104,49 @@ pub(super) enum ToolGuard {
     /// request in `collect_tool_guards`, not once per block at the
     /// settle site.
     SmallMcpResult { min_chars: usize },
+    /// A shell tool's result, held for the same kind of length check:
+    /// under `min_chars` characters it stays verbatim (#3590).
+    SmallShellResult { min_chars: usize },
+}
+
+/// Env var tuning the small-shell-result exemption; `0` disables it.
+const SHELL_RESULT_MIN_CHARS_ENV: &str = "HEADROOM_SHELL_RESULT_MIN_CHARS";
+
+/// Below this many characters a shell result is never lossily compressed.
+/// Mirrors Python `_shell_result_min_chars`'s default.
+const DEFAULT_SHELL_RESULT_MIN_CHARS: usize = 2000;
+
+/// Shell tool names across harnesses, compared lowercase. Mirrors Python
+/// `ContentRouterConfig.bash_tool_names`.
+const SHELL_TOOL_NAMES: &[&str] = &[
+    "bash",
+    "shell",
+    "local_shell",
+    "run_shell_command",
+    "execute_command",
+    "exec_command",
+    "terminal",
+    "run_command",
+    "run_terminal_command",
+];
+
+/// The live threshold. Missing, blank or unparseable reads as the default;
+/// negatives clamp to 0 (off), like the MCP floor.
+fn shell_result_min_chars() -> usize {
+    match std::env::var(SHELL_RESULT_MIN_CHARS_ENV) {
+        Ok(s) if !s.trim().is_empty() => s
+            .trim()
+            .parse::<i64>()
+            .map(|v| v.max(0) as usize)
+            .unwrap_or(DEFAULT_SHELL_RESULT_MIN_CHARS),
+        _ => DEFAULT_SHELL_RESULT_MIN_CHARS,
+    }
+}
+
+fn is_shell_tool_name(name: &str) -> bool {
+    SHELL_TOOL_NAMES
+        .iter()
+        .any(|shell| shell.eq_ignore_ascii_case(name))
 }
 
 /// Map assistant `tool_use` ids to the guard their `tool_result` needs.
@@ -136,6 +179,7 @@ pub(super) fn collect_tool_guards(
     // mid-walk, and every `tool_use` would otherwise re-read the environment.
     let protect_reads = read_protection_enabled();
     let mcp_min_chars = mcp_result_min_chars();
+    let shell_min_chars = shell_result_min_chars();
     for msg in messages {
         let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
             continue;
@@ -187,6 +231,10 @@ pub(super) fn collect_tool_guards(
                 // like ProtectedRead.
                 ToolGuard::SmallMcpResult {
                     min_chars: mcp_min_chars,
+                }
+            } else if is_shell_tool_name(name) {
+                ToolGuard::SmallShellResult {
+                    min_chars: shell_min_chars,
                 }
             } else {
                 continue;
@@ -400,12 +448,18 @@ pub(super) fn plan_block_replacements(
             Some(ToolGuard::LosslessOnly)
             | Some(ToolGuard::ProtectedRead)
             | Some(ToolGuard::SmallMcpResult { .. })
+            | Some(ToolGuard::SmallShellResult { .. })
             | None => {}
         }
         let lossless_only = tool_guard == Some(ToolGuard::LosslessOnly);
         let protected_read = tool_guard == Some(ToolGuard::ProtectedRead);
-        let small_mcp_min = match tool_guard {
-            Some(ToolGuard::SmallMcpResult { min_chars }) => Some(min_chars),
+        let small_result_floor = match tool_guard {
+            Some(ToolGuard::SmallMcpResult { min_chars }) => {
+                Some((min_chars, ExclusionReason::SmallMcpResult))
+            }
+            Some(ToolGuard::SmallShellResult { min_chars }) => {
+                Some((min_chars, ExclusionReason::SmallShellResult))
+            }
             _ => None,
         };
 
@@ -516,17 +570,16 @@ pub(super) fn plan_block_replacements(
             continue;
         }
 
-        // The name said this was an MCP tool; the length decides whether it
-        // stays verbatim. The guard already proved the name, so only the
-        // size check runs here. Content at or past the threshold falls
-        // through to normal dispatch, like Python (#4003).
-        if small_mcp_min.is_some_and(|min| mcp_result_is_small(&unescaped, min)) {
+        // The name said this was an MCP or shell tool; the length decides
+        // whether it stays verbatim. The guard already proved the name, so
+        // only the size check runs here. Content at or past the threshold
+        // falls through to normal dispatch, like Python (#4003, #3590).
+        if let Some((min, reason)) = small_result_floor
+            && mcp_result_is_small(&unescaped, min)
+        {
             slots.push(PlanSlot {
                 block_index: block_idx,
-                kind: SlotKind::Excluded {
-                    block_type,
-                    reason: ExclusionReason::SmallMcpResult,
-                },
+                kind: SlotKind::Excluded { block_type, reason },
             });
             continue;
         }

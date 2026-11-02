@@ -213,6 +213,12 @@ pub enum ExclusionReason {
     /// stay verbatim (#4003). Runs after exclusion: an excluded MCP tool
     /// keeps its exclusion verdict, like Python.
     SmallMcpResult,
+    /// Block is a shell tool's result (`Bash`, `exec_command`, …) under
+    /// `HEADROOM_SHELL_RESULT_MIN_CHARS` (default 2000) characters. Lossy
+    /// compression of a short `ls`, `git status` or grep cut the lines the
+    /// command was run for, to save ~2% of those tokens (#3590). Build
+    /// and test logs past the floor still compress.
+    SmallShellResult,
     /// Text the caller wrote into a user message: the prompt, a
     /// continuation summary, a relayed message. Lossy compression here
     /// rewrote what the model was asked to do (upstream `aceff2ea`); live,
