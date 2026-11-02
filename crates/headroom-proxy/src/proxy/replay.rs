@@ -934,9 +934,10 @@ pub(crate) fn apply_prefix_replay(
 /// The live zone compresses only the newest tool or user message, so the
 /// next turn sends that message raw and the provider's automatic prefix
 /// cache misses from there on. Same overlay and store as the Anthropic path,
-/// but no `cache_control` is placed or removed: OpenAI caches without
-/// markers, and markers a client sends for a gateway (OpenRouter) stay as
-/// the client wrote them.
+/// but no `cache_control` is placed: OpenAI caches without markers, and
+/// markers a client sends for a gateway (OpenRouter) stay as the client wrote
+/// them, short of the oldest going once the total passes four
+/// ([`cap_chat_cache_control`]).
 pub(crate) fn apply_chat_prefix_replay(
     store: &SessionReplayStore,
     session_key: &str,
@@ -955,6 +956,70 @@ pub(crate) fn apply_chat_prefix_replay(
         uptime_seconds,
         None,
     )
+}
+
+/// Drop the oldest message `cache_control` markers until the chat request
+/// carries at most four, counting `tools` markers too.
+///
+/// Replay sends last turn's messages back with the markers the client put on
+/// them for its gateway (OpenRouter), while the client has since moved its
+/// marker to the new tail. They pile up past four and the upstream 400s. The
+/// newest markers are the ones the client just placed, so they stay. Markers
+/// on `tool_calls` entries count (upstream `55602fc1`).
+fn cap_chat_cache_control(
+    mut messages: Vec<serde_json::Value>,
+    tools_markers: usize,
+    request_id: &str,
+) -> Vec<serde_json::Value> {
+    use cache_stabilization::prefix_replay::ANTHROPIC_CACHE_CONTROL_LIMIT as LIMIT;
+    use serde_json::Value;
+
+    // Visits every value that can hold a marker, oldest first within the
+    // message: nested blocks, content blocks, tool calls, the message itself.
+    fn each_holder(message: &mut Value, f: &mut dyn FnMut(&mut Value)) {
+        if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            for block in blocks {
+                if let Some(inner) = block.get_mut("content").and_then(Value::as_array_mut) {
+                    inner.iter_mut().for_each(&mut *f);
+                }
+                f(block);
+            }
+        }
+        if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            calls.iter_mut().for_each(&mut *f);
+        }
+        f(message);
+    }
+
+    let mut before = tools_markers;
+    for message in &mut messages {
+        each_holder(message, &mut |v| {
+            before += usize::from(v.get("cache_control").is_some());
+        });
+    }
+    let mut excess = before.saturating_sub(LIMIT);
+    if excess == 0 {
+        return messages;
+    }
+    for message in &mut messages {
+        each_holder(message, &mut |v| {
+            if excess > 0
+                && let Some(obj) = v.as_object_mut()
+                && obj.remove("cache_control").is_some()
+            {
+                excess -= 1;
+            }
+        });
+    }
+    tracing::warn!(
+        event = "chat_cache_breakpoint_budget",
+        request_id = %request_id,
+        before,
+        dropped = before.saturating_sub(LIMIT) - excess,
+        "prefix replay: chat request carried more than four cache_control markers; \
+         dropped the oldest"
+    );
+    messages
 }
 
 /// `markers` is the Anthropic breakpoint placement: tail breakpoints and
@@ -1046,7 +1111,17 @@ fn replay_prefix(
         Some((tail_breakpoints, _)) => {
             place_replay_breakpoints(&mut parsed, overlaid, tail_breakpoints, request_id)
         }
-        None => (overlaid, 0, 0),
+        None => {
+            let tools = parsed
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, |t| {
+                    t.iter()
+                        .filter(|t| t.get("cache_control").is_some())
+                        .count()
+                });
+            (cap_chat_cache_control(overlaid, tools, request_id), 0, 0)
+        }
     };
     note_rewritten_messages(&original_messages, &normalized, request_id);
     // Only once a message breakpoint is in place. With none placed the client's
@@ -1150,5 +1225,82 @@ mod cold_fork_tests {
         assert_eq!(fork.ttl_desc, "300s");
         // Trivial messages: lossless passes fold nothing, input survives.
         assert_eq!(fork.messages, msgs());
+    }
+}
+
+#[cfg(test)]
+mod chat_breakpoint_tests {
+    use super::*;
+    use crate::cache_stabilization::prefix_replay::SessionReplayStore;
+    use serde_json::{Value, json};
+
+    fn markers(v: &Value) -> usize {
+        match v {
+            Value::Object(m) => {
+                usize::from(m.contains_key("cache_control"))
+                    + m.values().map(markers).sum::<usize>()
+            }
+            Value::Array(a) => a.iter().map(markers).sum(),
+            _ => 0,
+        }
+    }
+
+    fn cc() -> Value {
+        json!({"type": "ephemeral"})
+    }
+
+    fn text(t: &str, marked: bool) -> Value {
+        let mut block = json!({"type": "text", "text": t});
+        if marked {
+            block["cache_control"] = cc();
+        }
+        json!([block])
+    }
+
+    fn send(store: &SessionReplayStore, id: &str, messages: Vec<Value>) -> Value {
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&json!({"model": "m", "messages": messages.clone()})).unwrap(),
+        );
+        let out = apply_chat_prefix_replay(store, "chat-cc", id, messages, body, 1);
+        // A cache read confirms the prefix, so replay sends it back verbatim.
+        store.complete(id, 1_000_000, 0);
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    /// The client moves its tail marker each turn; replay puts last turn's
+    /// marker back, so markers pile up past four and the gateway 400s.
+    #[test]
+    fn chat_replay_keeps_cache_control_within_four() {
+        let store = SessionReplayStore::new(4);
+        // No leading `system` message: the overlay's Anthropic adjacency check
+        // declines any splice that starts with one.
+        let sys = json!({"role": "user", "content": text("context", true)});
+        let u1 = |m| json!({"role": "user", "content": text("first", m)});
+        let a1 = |m: bool| {
+            let mut call = json!({"id": "c1", "type": "function",
+                "function": {"name": "read", "arguments": "{}"}});
+            if m {
+                call["cache_control"] = cc();
+            }
+            json!({"role": "assistant", "content": null, "tool_calls": [call]})
+        };
+        let t1 = |m| json!({"role": "tool", "tool_call_id": "c1", "content": text("out", m)});
+        let u2 = |m| json!({"role": "user", "content": text("second", m)});
+
+        send(
+            &store,
+            "t1",
+            vec![sys.clone(), u1(true), a1(true), t1(true)],
+        );
+        let fwd = send(
+            &store,
+            "t2",
+            vec![sys.clone(), u1(true), a1(false), t1(false), u2(true)],
+        );
+        let msgs = fwd["messages"].as_array().unwrap();
+        assert_eq!(markers(&fwd), 4, "{fwd}");
+        // Oldest goes first; the newest is the one the client just placed.
+        assert_eq!(markers(&msgs[0]), 0, "{fwd}");
+        assert_eq!(markers(&msgs[4]), 1, "{fwd}");
     }
 }
