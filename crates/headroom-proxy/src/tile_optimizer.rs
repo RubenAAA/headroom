@@ -399,7 +399,9 @@ fn optimize_content_block_cached(item: &Value, provider: &str) -> Option<(Value,
     if let Ok(mut cache) = resize_cache().lock()
         && let Some(hit) = cache.get(&key)
     {
-        return hit.clone();
+        return hit
+            .clone()
+            .map(|(block, result)| (carry_marker(block, item), result));
     }
     // Resize outside the lock: it is the slow part and nothing else needs
     // serialising. A duplicate resize under contention is wasted work, not a
@@ -408,7 +410,29 @@ fn optimize_content_block_cached(item: &Value, provider: &str) -> Option<(Value,
     if let Ok(mut cache) = resize_cache().lock() {
         cache.put(key, computed.clone());
     }
-    computed
+    computed.map(|(block, result)| (carry_marker(block, item), result))
+}
+
+/// Give `block` the `cache_control` that `source` carries now, and no other.
+///
+/// The memo is keyed on the image bytes, so the stored block holds whatever
+/// marker the image wore the first time it was seen. Client breakpoints move
+/// every turn: replaying that stored marker puts a stale one back after
+/// placement has counted the budget, and the live one is lost. Observed
+/// 2026-11-04: a pasted screenshot kept its first-turn marker, the request
+/// carried 5 against Anthropic's limit of 4, and every later turn got a 400.
+fn carry_marker(mut block: Value, source: &Value) -> Value {
+    if let Some(obj) = block.as_object_mut() {
+        match source.get("cache_control") {
+            Some(marker) => {
+                obj.insert("cache_control".to_string(), marker.clone());
+            }
+            None => {
+                obj.remove("cache_control");
+            }
+        }
+    }
+    block
 }
 
 /// [`optimize_images_in_messages`], reusing previously resized images.
@@ -869,6 +893,32 @@ mod tests {
         assert_ne!(
             inner["source"]["data"], messages[0]["content"][0]["content"][0]["source"]["data"],
             "the nested block must actually be rewritten, not just counted"
+        );
+    }
+
+    #[test]
+    fn a_cached_resize_wears_this_turns_marker_not_the_first_turns() {
+        // The memo is keyed on the image bytes alone. Turn one marks the image
+        // (it was the newest block); turn two does not. The stale marker must
+        // not come back, or the request exceeds Anthropic's four-marker limit.
+        let image = image_block(1560, 1400);
+        let mut marked = image.clone();
+        marked["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+
+        let turn_one = vec![json!({ "role": "user", "content": [ marked ] })];
+        let turn_two = vec![json!({ "role": "user", "content": [ image ] })];
+
+        let (first, _) = optimize_images_in_messages_cached(&turn_one, "anthropic");
+        let (second, _) = optimize_images_in_messages_cached(&turn_two, "anthropic");
+
+        assert_eq!(
+            first[0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"}),
+            "a marker the client set must survive the resize"
+        );
+        assert!(
+            second[0]["content"][0].get("cache_control").is_none(),
+            "a marker from an earlier turn must not be replayed from the memo"
         );
     }
 
