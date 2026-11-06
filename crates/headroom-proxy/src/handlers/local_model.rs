@@ -398,6 +398,10 @@ pub async fn handle_messages(
     // plus the Zen rate-limit hold, so a 429 outlives the VPN rotation
     // instead of killing the turn.
     let is_zen = matches!(quirks, UpstreamKind::OpenCodeZen);
+    // Hold a Zen 429 only when the client named the Zen model. A turn the
+    // router moved here has its own model to fall back to, and the hold has
+    // no budget: it would wait on Zen's limit instead.
+    let zen_hold = identity_model.is_none();
     let send = send_with_retry(
         &state,
         &upstream_url,
@@ -408,6 +412,7 @@ pub async fn handle_messages(
         Some(&egress_lane_key),
         is_chatgpt_auth,
         is_zen,
+        zen_hold,
     )
     .await;
     let (upstream_resp, upstream_headers, attempt, replay_stripped_bytes, slow_probe, egress_slot) =
@@ -458,6 +463,7 @@ pub async fn handle_messages(
                 lane_key: Some(egress_lane_key.clone()),
                 is_chatgpt_auth,
                 is_zen,
+                zen_hold,
                 hold_bytes: state.config.retry_stream_hold_bytes,
                 max_resends: max_attempts.saturating_sub(1),
                 base_delay_ms: state.config.retry_base_delay_ms,

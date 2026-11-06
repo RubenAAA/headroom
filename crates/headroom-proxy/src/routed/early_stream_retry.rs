@@ -56,6 +56,8 @@ pub(crate) struct EarlyRetryCtx {
     pub lane_key: Option<String>,
     pub is_chatgpt_auth: bool,
     pub is_zen: bool,
+    /// Passed to `send_with_retry`; false on a turn the router moved.
+    pub zen_hold: bool,
     /// Bytes held back before the response counts as committed. Mirrors
     /// `retry_stream_hold_bytes` on the direct path.
     pub hold_bytes: usize,
@@ -245,6 +247,7 @@ pub(crate) fn wrap_streaming_body(
                 ctx.lane_key.as_deref(),
                 ctx.is_chatgpt_auth,
                 ctx.is_zen,
+                ctx.zen_hold,
             )
             .await;
             match send {

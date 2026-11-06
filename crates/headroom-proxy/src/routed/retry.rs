@@ -135,6 +135,11 @@ pub(crate) struct UpstreamSend {
 /// `retry_zen_hold_budget_ms`, instead of returning the fatal 429. The rate
 /// limit event carries the selected egress identity so an egress-aware
 /// rotation controller can rotate only the limited path.
+///
+/// `zen_hold` is false for a turn the model router moved onto Zen: the
+/// client never asked for Zen, so its 429 goes back to the handler, which
+/// re-sends on the client's own model. Held, it waited on a 14.9h
+/// rate limit with no budget, and the client hung (WebFetch, 2026-11-06).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_with_retry(
     state: &AppState,
@@ -146,8 +151,10 @@ pub(crate) async fn send_with_retry(
     lane_key: Option<&str>,
     is_chatgpt_auth: bool,
     is_zen: bool,
+    zen_hold: bool,
 ) -> Result<UpstreamSend, Response> {
     let (max_attempts, max_delay_ms) = retry_bounds(state);
+    let hold_zen_429 = is_zen && zen_hold && state.config.retry_zen_hold_enabled;
     let turn_started = std::time::Instant::now();
     let mut blobs_dropped = false;
     // `egress_guard` counts this turn against its Zen egress until the last
@@ -286,7 +293,7 @@ pub(crate) async fn send_with_retry(
                         &lane.gate_key,
                         request_id,
                         session_key,
-                        is_zen,
+                        hold_zen_429,
                     )
                     .await
                     {
@@ -329,7 +336,7 @@ pub(crate) async fn send_with_retry(
                         send
                     });
                 }
-                if status.as_u16() == 429 && is_zen && state.config.retry_zen_hold_enabled {
+                if status.as_u16() == 429 && hold_zen_429 {
                     drop(r);
                     match try_zen_hold(
                         state,
@@ -912,7 +919,7 @@ async fn backoff_retryable_status(
     egress_gate_key: &str,
     request_id: &str,
     session_key: Option<&str>,
-    is_zen: bool,
+    hold_zen_429: bool,
 ) -> StatusRetry {
     let status = r.status();
     // Upstream explicitly refuses the retry (#3992 half): `x-should-retry:
@@ -941,8 +948,7 @@ async fn backoff_retryable_status(
     // a long Retry-After skipped the hold entirely, and Zen's
     // header is a constant (~53568, read as 14.9h) that keeps
     // its value while the route serves other turns fine.
-    let zen_hold_owns_this =
-        is_zen && status.as_u16() == 429 && state.config.retry_zen_hold_enabled;
+    let zen_hold_owns_this = hold_zen_429 && status.as_u16() == 429;
     if !zen_hold_owns_this && retry_after_uncapped.is_some_and(|delay| delay > max_delay_ms as f64)
     {
         tracing::warn!(
@@ -1335,6 +1341,7 @@ mod tests {
             None,
             false,
             false,
+            true,
         )
         .await
         {
@@ -1398,6 +1405,7 @@ mod tests {
             None,
             false,
             true,
+            true,
         )
         .await
         .expect("hold must recover into Ok");
@@ -1454,6 +1462,7 @@ mod tests {
             None,
             None,
             false,
+            true,
             true,
         )
         .await
@@ -1521,6 +1530,7 @@ mod tests {
                 None,
                 Some("lane-a"),
                 false,
+                true,
                 true,
             )
             .await
@@ -1593,6 +1603,7 @@ mod tests {
             None,
             false,
             true,
+            true,
         )
         .await
         .expect("hold must recover into Ok");
@@ -1647,6 +1658,7 @@ mod tests {
             None,
             false,
             true,
+            true,
         )
         .await
         .expect("hold must recover into Ok");
@@ -1655,6 +1667,62 @@ mod tests {
             hits.load(Ordering::SeqCst),
             41,
             "forty refusals then recovery"
+        );
+    }
+
+    /// A turn the router moved onto Zen skips the hold, even with the
+    /// unbounded default: the 429 goes back so the handler can re-send on
+    /// the client's model. Held, WebFetch hung on 2026-11-06 behind a Zen
+    /// limit with a 14h Retry-After.
+    #[tokio::test]
+    async fn zen_hold_skipped_for_router_moved_turn() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                wiremock::ResponseTemplate::new(429)
+                    .insert_header("retry-after", "53568")
+                    .set_body_string("rate limited")
+            })
+            .mount(&mock)
+            .await;
+        let upstream: url::Url = mock.uri().parse().unwrap();
+        let mut config = crate::config::Config::for_test(upstream);
+        config.retry_enabled = true;
+        config.retry_max_attempts = 3;
+        config.retry_base_delay_ms = 1;
+        config.retry_max_delay_ms = 1;
+        config.retry_zen_hold_enabled = true;
+        config.retry_zen_hold_budget_ms = 0;
+        let state = AppState::new(config).expect("app state");
+        let send = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_with_retry(
+                &state,
+                &mock.uri(),
+                HeaderMap::new(),
+                Bytes::from("{}"),
+                "test-zen-rerouted-no-hold",
+                None,
+                None,
+                false,
+                true,
+                false,
+            ),
+        )
+        .await
+        .expect("a rerouted turn must not be held")
+        .expect("the 429 comes back as a response");
+        assert_eq!(send.resp.status(), 429);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "Retry-After past the cap returns at once"
         );
     }
 
@@ -1702,6 +1770,7 @@ mod tests {
             None,
             None,
             false,
+            true,
             true,
         )
         .await
@@ -1754,6 +1823,7 @@ mod tests {
             None,
             false,
             true,
+            true,
         )
         .await
         .expect("still-429 flows through as an Ok response, not an Err");
@@ -1802,6 +1872,7 @@ mod tests {
             None,
             false,
             false,
+            true,
         )
         .await
         .expect("429 comes back as Ok");
@@ -1835,6 +1906,7 @@ mod tests {
             None,
             false,
             false,
+            true,
         )
         .await
         .expect("passthrough is still Ok");
@@ -1897,6 +1969,7 @@ mod tests {
             None,
             false,
             false,
+            true,
         )
         .await
         .expect("strip retry must recover into Ok");
@@ -1949,6 +2022,7 @@ mod tests {
             None,
             false,
             false,
+            true,
         )
         .await
         .expect("plain 413 still returns Ok with the refusal");
@@ -2012,6 +2086,7 @@ mod tests {
             None,
             None,
             false,
+            true,
             true,
         )
         .await
@@ -2287,6 +2362,7 @@ mod tests {
             None,
             None,
             false,
+            true,
             true,
         )
         .await;
