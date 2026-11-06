@@ -349,6 +349,21 @@ pub(crate) fn analyze_buffered_session(
         } else {
             None
         };
+        // Hash the tools as they will be forwarded: the deferral in
+        // `maybe_inject_tool_search` puts most of them behind the search
+        // tool, outside the provider's cache key. Hashing the client's
+        // form called a change to a deferred tool a rebuild. On
+        // 2026-11-06 the Agent tool's agent list changed mid-session;
+        // the forwarded tools did not, yet the boundary dropped the
+        // stored prefix and prior thinking and re-wrote 203K tokens.
+        let tools_previewed = if deferred_tools_unkeyed
+            && matches!(kind, ApiKind::Anthropic)
+            && crate::tool_search_deferral::tool_search_enabled()
+        {
+            preview_tool_deferral(parsed)
+        } else {
+            None
+        };
         // A ToolSearch load that reaches the provider still deferred leaves
         // its cache key alone; counting it as drift dropped the stored
         // prefix. See `compute_structural_hash_with`.
@@ -357,6 +372,9 @@ pub(crate) fn analyze_buffered_session(
             kind,
             deferred_tools_unkeyed,
         );
+        if let (Some(original), Some(slot)) = (tools_previewed, parsed.get_mut("tools")) {
+            *slot = original;
+        }
         // Restore in reverse order: the sentence preview saw the
         // directory-held view, so its copy goes back first.
         if let (Some(original), Some(slot)) = (sentence_previewed, parsed.get_mut("system")) {
@@ -435,4 +453,68 @@ pub(crate) fn analyze_buffered_session(
         );
     }
     None
+}
+
+/// Swap `tools` for the deferred view `maybe_inject_tool_search` would
+/// forward, returning the client's array for the caller to put back.
+/// `None` (body untouched) when the deferral would change nothing.
+fn preview_tool_deferral(parsed: &mut serde_json::Value) -> Option<serde_json::Value> {
+    let tools = parsed.get("tools")?.as_array()?.clone();
+    let inject = crate::tool_search_deferral::inject_deferral(tools);
+    if !inject.changed {
+        return None;
+    }
+    let slot = parsed.get_mut("tools")?;
+    Some(std::mem::replace(
+        slot,
+        serde_json::Value::Array(inject.tools),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview_tool_deferral;
+    use crate::cache_stabilization::drift_detector::{ApiKind, compute_structural_hash_with};
+    use serde_json::{Value, json};
+
+    /// Claude Code's shape: core tools plus enough others to defer, with
+    /// the Agent tool's description carrying the agent list.
+    fn body(agent_desc: &str, bash_desc: &str) -> Value {
+        let mut tools = vec![
+            json!({"name": "Bash", "description": bash_desc, "input_schema": {"type": "object"}}),
+            json!({"name": "Read", "description": "read", "input_schema": {"type": "object"}}),
+            json!({"name": "Agent", "description": agent_desc, "input_schema": {"type": "object"}}),
+        ];
+        for i in 0..12 {
+            tools.push(json!({"name": format!("mcp__x__t{i}"), "description": "t",
+                              "input_schema": {"type": "object"}}));
+        }
+        json!({"model": "claude-opus-5-5", "tools": tools,
+               "messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    fn tools_hash(mut parsed: Value) -> [u8; 32] {
+        let before = parsed.clone();
+        let original = preview_tool_deferral(&mut parsed).expect("deferral applies");
+        let hash = compute_structural_hash_with(&parsed, ApiKind::Anthropic, true).tools;
+        parsed["tools"] = original;
+        assert_eq!(parsed, before, "the caller gets the client's tools back");
+        hash
+    }
+
+    #[test]
+    fn a_deferred_tool_change_is_not_drift() {
+        assert_eq!(
+            tools_hash(body("agents: spark, glm", "run")),
+            tools_hash(body("agents: codex", "run")),
+        );
+    }
+
+    #[test]
+    fn a_resident_tool_change_is_still_drift() {
+        assert_ne!(
+            tools_hash(body("agents: codex", "run")),
+            tools_hash(body("agents: codex", "run a command")),
+        );
+    }
 }
