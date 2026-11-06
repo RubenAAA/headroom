@@ -77,8 +77,21 @@ export HEADROOM_MEMORY_MODE=tool
 #                     that declares no budget never matches.
 #   from_models       restrict the rule to these client model ids.
 #   name              the label the decision log prints.
-export HEADROOM_MODEL_ROUTER_ENABLED=1
+#
+# OFF since 2026-11-06. Zen answered all 7,453 requests from Oct 30 to
+# Nov 6 with 429 `FreeUsageLimitError` ("Free models work in OpenCode"),
+# on every lane, so the rule served nothing. Worse, the 429 hold parked all
+# 881 rerouted turns until the client gave up: WebFetch hung. Re-enable
+# only after a 200 from the target.
+export HEADROOM_MODEL_ROUTER_ENABLED=0
 export HEADROOM_MODEL_ROUTES='[{"name": "no-tools->glm", "require_no_tools": true, "to_model": "claude-glm-5.3-flash"}]'
+
+# Zen 429 hold OFF, same date and evidence: 0 of 881 held turns recovered.
+# Zen's Retry-After counts down to 00:00 UTC (50525s at 09:57, 38547s at
+# 13:17), so it marks a daily quota, not a limit a VPN rotation outlives.
+# With the hold on, a `glm` or `spark` agent turn hangs; off, it fails in
+# about 2s with Zen's message.
+export HEADROOM_RETRY_ZEN_HOLD=false
 
 # How long a routed target is skipped after a turn had to fall back to the
 # client's own model, in seconds. Default 300, `0` disables the skip so every

@@ -7,6 +7,10 @@ retests), with status in the file.
 Measurement-led files (`recache-*`, `savings-*`, `proxy-*`) scope every
 number to its window; do not quote across windows.
 
+- [`zen-free-tier-refuses-proxy.md`](zen-free-tier-refuses-proxy.md):
+  Zen answered every routed request for a week with `FreeUsageLimitError`;
+  the unbounded 429 hold parked 881 turns and none recovered. Router and
+  hold off since 2026-11-06.
 - [`subscription-meter-weights.md`](subscription-meter-weights.md): the
   subscription meter, fitted per token class: output 39% of use, cache
   reads 33%, 1h writes 27%, fresh input 1%; forced 1h TTL rechecked.
