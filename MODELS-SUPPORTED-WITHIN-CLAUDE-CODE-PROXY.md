@@ -15,10 +15,10 @@ the proxy; the session, tools, and cache stay intact.
 | `claude-grok-4.6-low` | Grok 4.6 Low | Cursor subscription | `grok-low` |
 | `claude-grok-4.6` | Grok 4.6 (effort from `/effort`) | Cursor subscription | — |
 | `claude-grok-4.6-xhigh` | Grok 4.6 Extra High | Cursor subscription | `grok-xhigh` |
-| `claude-muse-spark-1.3` | Muse Spark 1.3 | OpenCode Zen, free tier | `spark`, `spark-explore` |
-| `claude-glm-5.3-flash` | GLM-5.3 Flash | OpenCode Zen, free tier | `glm`, `glm-explore` |
+| `claude-muse-spark-1.3` | Muse Spark 1.3 | OpenCode Zen, free tier (unavailable) | — |
+| `claude-glm-5.3-flash` | GLM-5.3 Flash | OpenCode Zen, free tier (unavailable) | — |
 | `claude-union-alpha` | Union Alpha Free | OpenCode Zen, Anthropic Messages | — |
-| `claude-deepseek-v4.1-flash` | DeepSeek V4.1 Flash | OpenCode Zen, free tier | — |
+| `claude-deepseek-v4.1-flash` | DeepSeek V4.1 Flash | OpenCode Zen, free tier (unavailable) | — |
 
 Anthropic model IDs supported by Claude Code pass through to Anthropic unchanged;
 that set follows Claude Code and Anthropic's current model catalog, rather than a
@@ -30,19 +30,13 @@ Notes:
   the OpenAI route (`contrib/headroom-flags.sh` `--extra-model-route` lines).
 - Grok aliases ride the Cursor subscription; there is also a
   `claude-grok-4.6` template alias taking an effort suffix.
-- Spark is free with no key spent, but the tier has dynamic unpublished rate
-  limits, and Meta may train on prompts/completions — keep sensitive files out
-  of spark sessions. `spark-explore` is read-only reconnaissance on the same
-  model.
-- Spark needs the OpenCode CLI, though no OpenCode account. Zen's free tier
-  serves only requests that carry a real OpenCode session, and the proxy
-  takes one from the CLI. `install.sh` installs it; without it `/models`
-  shows Spark as not connected.
-- DeepSeek V4.1 Flash is served by Zen only over Chat Completions, so its
-  route uses `:chat:` instead of `:openai:`. The Spark terms apply.
-- Zen retired free Muse Spark 1.3 on 2026-10-18 (410 "deprecated"). GLM-5.3
-  Flash is free too, Chat-only like DeepSeek, with a 200k-token window, a fifth
-  of Spark's. `glm-explore` is its read-only agent.
+- The Zen free tier serves none of its models through the proxy. Muse
+  Spark 1.3 answers "Model is unavailable". Since at least 2026-10-30, GLM-5.3
+  Flash and DeepSeek V4.1 Flash answer 429 `FreeUsageLimitError` ("Free
+  models work in OpenCode"). The `spark`, `spark-explore`, `glm` and
+  `glm-explore` agents were removed on 2026-11-06. The routes stay, so a
+  request names its own error. See
+  `docs/notes/learnings/zen-free-tier-refuses-proxy.md`.
 - Union Alpha uses Zen's Anthropic Messages endpoint with the
   `OPENCODE_API_KEY` environment variable. Its upstream model ID is `union-alpha`.
 - `/models` shows which of these this machine can use right now, read from

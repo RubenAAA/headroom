@@ -406,7 +406,7 @@ Two of these need their own worker to be useful (`review-gate.sh` and
 
 ## Claude Code agents and memory text
 
-`claude/agents/*.md` are the subagent definitions — `spark`, `spark-explore`,
+`claude/agents/*.md` are the subagent definitions —
 `codex-sol`, `codex-luna`, `codex-terra`, `codex-6-astra`, `codex-6-sol`,
 `codex-6-luna`, `grok-xhigh`, `grok-high`,
 `grok-low`. They install into `~/.claude/agents`, and into `~/.claude-work` and
