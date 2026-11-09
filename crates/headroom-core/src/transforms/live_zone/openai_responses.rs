@@ -204,7 +204,11 @@ pub fn compress_openai_responses_live_zone_with_config(
         match type_tag {
             "function_call_output" | "local_shell_call_output" | "apply_patch_call_output" => {
                 let call_id = item.get("call_id").and_then(Value::as_str);
-                if call_id.is_some_and(|id| headroom_retrieve_call_ids.contains(id)) {
+                if call_id.is_some_and(|id| {
+                    headroom_retrieve_call_ids.contains(id)
+                        || (!call_name_by_id.contains_key(id)
+                            && dispatch_config.known_retrieval_call_ids.contains(id))
+                }) {
                     continue;
                 }
                 output_candidates.push((idx, type_tag));

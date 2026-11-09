@@ -73,6 +73,7 @@ pub fn compress_openai_responses_request(
         request_id,
         exclude_tools,
         &crate::config::PhaseEPassPolicy::default(),
+        Default::default(),
     )
 }
 
@@ -80,7 +81,11 @@ pub fn compress_openai_responses_request(
 /// per-path policy. `effective_auth_mode` is the enforcement-folded
 /// mode: the F1-classified mode when
 /// `--auth-mode-policy-enforcement` is on, `Payg` otherwise. The
-/// forward and Codex WebSocket paths call this.
+/// forward and Codex WebSocket paths call this. `known_retrieval_call_ids`
+/// is [`DispatchConfig::known_retrieval_call_ids`]; only the WebSocket relay
+/// fills it.
+///
+/// [`DispatchConfig::known_retrieval_call_ids`]: headroom_core::transforms::live_zone::DispatchConfig::known_retrieval_call_ids
 pub fn compress_openai_responses_request_with_policy(
     body: &Bytes,
     mode: CompressionMode,
@@ -88,6 +93,7 @@ pub fn compress_openai_responses_request_with_policy(
     request_id: &str,
     exclude_tools: &[String],
     phase_e_passes: &crate::config::PhaseEPassPolicy,
+    known_retrieval_call_ids: std::sync::Arc<std::collections::HashSet<String>>,
 ) -> Outcome {
     if let Some(outcome) = mode_off_passthrough(&mode, body, request_id) {
         return outcome;
@@ -140,6 +146,7 @@ pub fn compress_openai_responses_request_with_policy(
         exclude_tools: exclude_tools.to_vec(),
         disable_kompress: headroom_core::transforms::kompress_disabled_for_openai(),
         lossless: headroom_core::transforms::lossless_only_enabled(),
+        known_retrieval_call_ids,
         ..Default::default()
     };
     match compress_openai_responses_live_zone_with_config(

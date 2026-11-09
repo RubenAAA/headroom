@@ -342,6 +342,7 @@ fn frame_non_json_passthrough() {
         RID,
         &[],
         &Default::default(),
+        Default::default(),
     );
     assert!(matches!(
         out,
@@ -359,6 +360,7 @@ fn frame_not_response_create_passthrough() {
         RID,
         &[],
         &Default::default(),
+        Default::default(),
     );
     assert!(matches!(
         out,
@@ -398,6 +400,7 @@ async fn bounded_frame_honours_phase_e_policy_and_enforcement() {
         AuthMode::OAuth,
         RID.into(),
         &state,
+        Some(Default::default()),
     );
     assert!(sorted(out.await), "enforcement off: OAuth counts as PAYG");
 
@@ -412,6 +415,7 @@ async fn bounded_frame_honours_phase_e_policy_and_enforcement() {
         AuthMode::Payg,
         RID.into(),
         &state,
+        Some(Default::default()),
     );
     assert!(!sorted(out.await), "E1 unlisted: no tool sort");
 }
@@ -426,6 +430,7 @@ fn frame_invalid_inner_payload_passthrough() {
         RID,
         &[],
         &Default::default(),
+        Default::default(),
     );
     assert!(matches!(
         out,
@@ -449,6 +454,7 @@ fn frame_mode_off_passthrough() {
         RID,
         &[],
         &Default::default(),
+        Default::default(),
     );
     assert!(matches!(
         out,
@@ -485,6 +491,7 @@ fn frame_wrapped_envelope_compresses_and_rewraps() {
         RID,
         &[],
         &Default::default(),
+        Default::default(),
     );
     match out {
         FrameCompression::Compressed {
@@ -538,6 +545,7 @@ fn frame_additional_tools_are_restored_for_stateful_sessions() {
         RID,
         &[],
         &Default::default(),
+        Default::default(),
     );
     let FrameCompression::Compressed { text, .. } = out else {
         panic!("expected compressed frame, got {out:?}");
@@ -569,6 +577,7 @@ fn frame_bare_envelope_compresses_in_place() {
         RID,
         &[],
         &Default::default(),
+        Default::default(),
     );
     match out {
         FrameCompression::Compressed { text, .. } => {

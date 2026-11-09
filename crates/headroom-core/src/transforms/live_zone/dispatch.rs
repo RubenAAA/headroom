@@ -79,6 +79,12 @@ pub struct DispatchConfig {
     /// points. `None` — the default — leaves dispatch unbounded, matching
     /// Python's `compress()`-without-`apply()` callers.
     pub ml_budget: Option<MlBudget>,
+    /// Responses `call_id`s a caller already knows are `headroom_retrieve`
+    /// calls. A Codex WebSocket continuation carries the outputs without
+    /// their calls, so the relay remembers retrieval ids from earlier
+    /// upstream output (upstream `682bf73f`). A call present in the current
+    /// frame wins over this set.
+    pub known_retrieval_call_ids: std::sync::Arc<std::collections::HashSet<String>>,
 }
 
 pub(super) fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {

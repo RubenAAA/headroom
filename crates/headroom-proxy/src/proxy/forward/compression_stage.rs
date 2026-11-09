@@ -348,6 +348,7 @@ pub(crate) fn dispatch_compression(
                 request_id,
                 &state.config.exclude_tools,
                 &state.config.phase_e_passes,
+                Default::default(),
             )
         }
     }

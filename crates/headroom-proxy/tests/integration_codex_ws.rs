@@ -846,3 +846,80 @@ async fn response_create_frames_drop_undeclared_web_search_calls() {
     let _ = ws.close(None).await;
     proxy.shutdown().await;
 }
+
+/// A continuation frame (`previous_response_id`) carries tool outputs without
+/// their calls. A `headroom_retrieve` output must still reach the upstream
+/// byte-for-byte, while an ordinary output in the same frame compresses
+/// (upstream `682bf73f`). The relay learns which ids were retrievals from the
+/// upstream's `response.output_item.done` events.
+#[tokio::test]
+async fn retrieval_output_in_a_continuation_frame_is_not_recompressed() {
+    let done = |id: &str, name: &str| {
+        json!({
+            "type": "response.output_item.done",
+            "item": {"type": "function_call", "call_id": id, "name": name, "arguments": "{\"hash\":\"abcdefabcdef\"}"}
+        })
+        .to_string()
+    };
+    let events = vec![done("call_r", "headroom_retrieve"), done("call_s", "shell")];
+    let upstream = spawn_mock_upstream(events, false, vec![]).await;
+    let proxy = start_proxy_with(&format!("http://{}", upstream.addr), live_zone_config).await;
+
+    let mut req = format!("{}/v1/responses", proxy.ws_url())
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "authorization",
+        http::HeaderValue::from_static("Bearer sk-test-payg"),
+    );
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws.send(Message::Text(big_response_create_frame().into()))
+        .await
+        .unwrap();
+    // The relay records an item before forwarding it, so once both events
+    // reach the client the ids are known.
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("upstream event")
+            .unwrap()
+            .unwrap();
+        assert!(msg.is_text(), "{msg:?}");
+    }
+
+    let blob =
+        "{\"level\": \"info\", \"msg\": \"request handled ok\", \"latency_ms\": 12}\n".repeat(400);
+    let continuation = json!({
+        "type": "response.create",
+        "response": {
+            "model": "gpt-5.4-codex",
+            "previous_response_id": "resp_1",
+            "input": [
+                {"type": "function_call_output", "call_id": "call_r", "output": blob},
+                {"type": "function_call_output", "call_id": "call_s", "output": blob}
+            ],
+            "stream": true
+        }
+    })
+    .to_string();
+    ws.send(Message::Text(continuation.into())).await.unwrap();
+    wait_for_frames(&upstream.frames, 2).await;
+    let got = match &upstream.frames.lock().unwrap()[1] {
+        Message::Text(t) => t.to_string(),
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let parsed: Value = serde_json::from_str(&got).unwrap();
+    let input = &parsed["response"]["input"];
+    assert_eq!(
+        input[0]["output"].as_str(),
+        Some(blob.as_str()),
+        "the retrieval output must reach the upstream unchanged"
+    );
+    assert!(
+        input[1]["output"].as_str().unwrap().len() < blob.len(),
+        "an ordinary output in the same frame still compresses"
+    );
+
+    let _ = ws.close(None).await;
+    proxy.shutdown().await;
+}

@@ -31,7 +31,7 @@
 //!   request path (conversation identity + drift dims captured pre-forward)
 //!   and has no natural WS analog — skipped rather than half-wired.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -389,6 +389,7 @@ fn compress_response_create_frame(
     request_id: &str,
     exclude_tools: &[String],
     phase_e_passes: &crate::config::PhaseEPassPolicy,
+    known_retrieval_call_ids: Arc<HashSet<String>>,
 ) -> FrameCompression {
     let Ok(mut parsed) = serde_json::from_str::<Value>(raw) else {
         return FrameCompression::Passthrough { reason: "non_json" };
@@ -437,6 +438,7 @@ fn compress_response_create_frame(
         request_id,
         exclude_tools,
         phase_e_passes,
+        known_retrieval_call_ids,
     ) {
         Outcome::Compressed {
             body,
@@ -661,6 +663,9 @@ struct SessionTotals {
     /// The latest `response.completed` reported its cache write; see
     /// `cache_inferred` in `emit_per_turn_outcome`.
     cache_write_reported: bool,
+    /// Retrieval call ids seen in upstream output, for continuation frames
+    /// that carry outputs without their calls.
+    retrieval_calls: retrieval_calls::RetrievalCalls,
 }
 
 impl SessionTotals {
@@ -1432,7 +1437,15 @@ async fn compress_frame_bounded(
     auth_mode: AuthMode,
     request_id: String,
     state: &AppState,
+    known_retrieval_call_ids: Option<Arc<HashSet<String>>>,
 ) -> CompressAttempt {
+    // Past the retrieval-id cap a retrieval output could be compressed into
+    // a marker again, so the frame goes upstream as sent (upstream `682bf73f`).
+    let Some(known_retrieval_call_ids) = known_retrieval_call_ids else {
+        return CompressAttempt::Done(FrameCompression::Passthrough {
+            reason: "retrieval_call_limit",
+        });
+    };
     // Same E-gate as the HTTP paths: `--auth-mode-policy-enforcement
     // disabled` treats every caller as PAYG, and `--phase-e-*-passes`
     // applies here too.
@@ -1444,7 +1457,15 @@ async fn compress_frame_bounded(
     let exclude_tools = state.config.exclude_tools.clone();
     let passes = state.config.phase_e_passes.clone();
     let handle = tokio::task::spawn_blocking(move || {
-        compress_response_create_frame(&raw, mode, auth_mode, &request_id, &exclude_tools, &passes)
+        compress_response_create_frame(
+            &raw,
+            mode,
+            auth_mode,
+            &request_id,
+            &exclude_tools,
+            &passes,
+            known_retrieval_call_ids,
+        )
     });
     match tokio::time::timeout(compression_timeout(), handle).await {
         Ok(Ok(result)) => CompressAttempt::Done(result),
@@ -1745,6 +1766,11 @@ async fn run_codex_session_inner(
                                 }
                                 let out = if is_create && !bypass {
                                     let text = shape_create_frame(text, &ctx_state, &request_id);
+                                    let known_retrieval_call_ids = totals
+                                        .lock()
+                                        .expect("totals lock")
+                                        .retrieval_calls
+                                        .snapshot();
                                     let comp_started = Instant::now();
                                     match compress_frame_bounded(
                                         text.clone(),
@@ -1752,6 +1778,7 @@ async fn run_codex_session_inner(
                                         auth_mode,
                                         request_id.clone(),
                                         &ctx_state,
+                                        known_retrieval_call_ids,
                                     )
                                     .await
                                     {
@@ -1870,6 +1897,17 @@ async fn run_codex_session_inner(
                                     t.ws_last_upstream_frame_type = Some(ty.clone());
                                     if ty == "response.created" {
                                         t.response_created_at = Some(Instant::now());
+                                    }
+                                    if ty == "response.output_item.done"
+                                        && let Some(item) = event.get("item")
+                                        && t.retrieval_calls.remember(item)
+                                    {
+                                        tracing::warn!(
+                                            event = "codex_ws_retrieval_call_limit",
+                                            request_id = %emit_ctx.request_id,
+                                            limit = retrieval_calls::RETRIEVAL_CALL_LIMIT,
+                                            "codex ws retrieval id limit reached; later frames on this connection go upstream uncompressed"
+                                        );
                                     }
                                     t.add_usage(&usage);
                                     if ty == "response.completed" {
@@ -2052,6 +2090,7 @@ async fn compress_first_frame(
         ctx.auth_mode,
         ctx.request_id.clone(),
         &ctx.state,
+        Some(Default::default()),
     )
     .await;
     let elapsed_ms = comp_started.elapsed().as_secs_f64() * 1000.0;
@@ -2394,6 +2433,8 @@ async fn ws_http_fallback(
 // ─────────────────────────────────────────────────────────────────────────
 // Unit tests (pure helpers)
 // ─────────────────────────────────────────────────────────────────────────
+
+mod retrieval_calls;
 
 #[cfg(test)]
 mod tests;
