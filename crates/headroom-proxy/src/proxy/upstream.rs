@@ -94,7 +94,7 @@ pub(super) async fn header_upstream_override(
                 tracing::warn!(
                     event = "upstream_override_rejected",
                     header = crate::headers::UPSTREAM_OVERRIDE_HEADER,
-                    value = %url,
+                    value = %loggable_url(&url),
                     "ignoring unsafe x-headroom-base-url; using default upstream"
                 );
             }
@@ -104,7 +104,6 @@ pub(super) async fn header_upstream_override(
             tracing::warn!(
                 event = "upstream_override_parse_failed",
                 header = crate::headers::UPSTREAM_OVERRIDE_HEADER,
-                value = %trimmed,
                 error = %e,
                 "ignoring malformed x-headroom-base-url; using default upstream"
             );
@@ -115,6 +114,17 @@ pub(super) async fn header_upstream_override(
 
 /// Build the upstream URL by joining the configured base with the incoming
 /// path-and-query. Preserves '?' and the query string verbatim.
+/// Scheme, host and port of a caller-supplied URL, for logs. Userinfo, path,
+/// query and fragment can all carry a credential, so none of them is logged
+/// (upstream `911c75ff`).
+fn loggable_url(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or("<host>");
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
+}
+
 pub(crate) fn build_upstream_url(base: &url::Url, uri: &Uri) -> Result<url::Url, ProxyError> {
     join_upstream_path(base, uri.path(), uri.query())
 }
