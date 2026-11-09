@@ -298,13 +298,26 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Whether `HEADROOM_BINARIES_ALLOW_UNVERIFIED` skips the sha256 check. Only
+/// `1`, `true`, `yes` or `on` (any case) do; `0`, `false` or a typo keep the
+/// check, so a value meant to turn the bypass off cannot turn it on
+/// (upstream `da6d9736`).
+fn allows_unverified(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 fn verify_sha256(path: &Path, expected: Option<&str>) -> Result<(), Error> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let Some(expected) = expected.filter(|s| !s.trim().is_empty()) else {
         // No pin means nothing but HTTPS vouches for the bytes, so refuse
         // unless the user opted out, and then say so on stderr: the logger is
         // often not set up yet when this runs (upstream 26a2c493).
-        if env(HEADROOM_BINARIES_ALLOW_UNVERIFIED).is_some() {
+        if allows_unverified(env(HEADROOM_BINARIES_ALLOW_UNVERIFIED).as_deref()) {
             eprintln!(
                 "headroom: WARNING: installing {name} without a sha256 check \
                  ({HEADROOM_BINARIES_ALLOW_UNVERIFIED} is set)"
@@ -823,6 +836,23 @@ mod tests {
         std::fs::write(&file, b"bytes").unwrap();
         let pin = sha256_file(&file).unwrap();
         verify_sha256(&file, Some(&pin)).unwrap();
+    }
+
+    #[test]
+    fn only_a_truthy_value_skips_verification() {
+        for on in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(allows_unverified(Some(on)), "{on:?}");
+        }
+        for off in [
+            None,
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+            Some("2"),
+        ] {
+            assert!(!allows_unverified(off), "{off:?}");
+        }
     }
 
     #[test]
