@@ -96,9 +96,14 @@ Departures in `0f46df44`:
   a bug: those blocks went upstream raw, and compressing them on a later turn
   would change bytes the provider has cached. Python does the same and says so
   at the budget branch of `content_router.py`. Leave it.
-- `--compression-max-body-bytes`: fixed for declared lengths in `9157ed3a`.
-  A chunked body still gets 413 past it, and the conversations, Vertex and
-  Foundry handlers buffer at the same limit.
+- `--compression-max-body-bytes`: `9157ed3a` fixed declared lengths; a
+  follow-up measures a chunked body up to `--max-body-bytes` first when the
+  two limits differ, and clamps the compression limit to the hard one (it
+  used to let the intercept arm take a body the hard limit refuses). The
+  conversations, Vertex and Foundry handlers still buffer at that limit.
+- Read protection checked for a heredoc before masking quotes, so a quoted
+  `<<` (`echo "a << b" && cat f.rs`) left the read unprotected. Upstream has
+  the same order. A newline still does not split commands, here or upstream.
 - Memory injection ignores cache mode: Python never injects in cache mode;
   ours appends to the live tail and leans on replay, so a replay miss after a
   restart shifts the prefix. Moot under `HEADROOM_MEMORY_MODE=tool`.
