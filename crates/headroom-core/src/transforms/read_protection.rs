@@ -239,13 +239,14 @@ pub fn is_read_command(command: &str) -> bool {
         return false;
     }
     let c = strip_cd_prefix(command);
-    if heredoc_re().is_match(&c) {
-        return false;
-    }
     // Split on the masked text and slice the original: a separator inside
     // quotes (`sed -n '/a;b/p' f.py`) is part of an argument (upstream
-    // `8cdce172`).
+    // `8cdce172`). The heredoc check reads the masked text too, so a quoted
+    // or commented `<<` does not rule the command out.
     let masked = mask_quoted(&c);
+    if heredoc_re().is_match(&masked) {
+        return false;
+    }
     let mut start = 0;
     let mut segments = Vec::new();
     for m in command_separator_re().find_iter(&masked) {
@@ -589,6 +590,8 @@ mod tests {
             // A write in a sibling segment does not unprotect the read.
             "cat a.py && echo done > marker",
             "cat a.py | head -40",
+            // A quoted `<<` is not a heredoc.
+            "echo \"literal << token\" && cat src/lib.rs",
         ] {
             assert!(is_read_command(c), "{c}");
         }
@@ -599,6 +602,7 @@ mod tests {
             "cat a.py | tee b.py; ls",
             // A heredoc body can hold separators; the whole command is out.
             "cat > f <<EOF\nx; cat g\nEOF",
+            "cat > f <<'EOF'\nx; cat g\nEOF",
             // `-n` in a sibling segment does not make a bare `sed` a range print.
             "sed 's/a/b/' f.py && wc -n",
             "ls && cat Cargo.lock",
