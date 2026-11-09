@@ -91,10 +91,11 @@ Departures in `0f46df44`:
 
 - Dispatch caches request-scoped declines for 30 minutes:
   `dispatch_compressor_with_config` calls `mark_skip` on every `NoOp`
-  (`transforms/live_zone/dispatch.rs:234`), including an ML budget refusal,
-  a Kompress deadline hit and "model not cached yet". Same content then skips
-  Kompress for 1800 s. Mark skip only when the compressor ran and
-  `declined_by` is `None`. Not measured.
+  (`transforms/live_zone/dispatch.rs:241`), including an ML budget refusal,
+  a Kompress deadline hit and "model not cached yet". This is deliberate, not
+  a bug: those blocks went upstream raw, and compressing them on a later turn
+  would change bytes the provider has cached. Python does the same and says so
+  at the budget branch of `content_router.py`. Leave it.
 - `--compression-max-body-bytes`: fixed for declared lengths in `9157ed3a`.
   A chunked body still gets 413 past it, and the conversations, Vertex and
   Foundry handlers buffer at the same limit.
