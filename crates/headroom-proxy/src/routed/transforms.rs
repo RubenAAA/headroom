@@ -42,6 +42,7 @@ fn inject_memory_tools(
 
 /// True when the client already registers the retrieval tool, under its own
 /// name or a default Headroom MCP alias (OpenCode's `headroom_headroom_retrieve`,
+/// Cline's `headroom__headroom_retrieve`,
 /// `mcp__headroom__headroom_retrieve`, `mcp_headroom_headroom_retrieve`).
 /// Matching only the bare name added a second `headroom_retrieve` the client
 /// cannot execute. Another MCP server's tool of the same name does not count.
@@ -52,6 +53,7 @@ pub(crate) fn client_has_retrieval_tool(tools: &[Value]) -> bool {
                 || matches!(
                     name.to_ascii_lowercase().as_str(),
                     "headroom_headroom_retrieve"
+                        | "headroom__headroom_retrieve"
                         | "mcp__headroom__headroom_retrieve"
                         | "mcp_headroom_headroom_retrieve"
                 )
@@ -1381,6 +1383,7 @@ mod routed_request_tests {
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         for alias in [
             "headroom_headroom_retrieve",
+            "headroom__headroom_retrieve",
             "mcp__headroom__headroom_retrieve",
             "mcp_headroom_headroom_retrieve",
             "mcp__Headroom__headroom_retrieve",

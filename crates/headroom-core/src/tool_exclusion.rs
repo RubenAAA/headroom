@@ -109,8 +109,9 @@ pub fn tool_name_aliases(name: &str) -> Vec<String> {
     let lname = name.to_ascii_lowercase();
 
     // OpenCode prefixes its server name onto the tool name (upstream
-    // `c7ebaedd`), so the retrieve tool arrives doubled.
-    if lname == "headroom_headroom_retrieve" {
+    // `c7ebaedd`), so the retrieve tool arrives doubled; Cline joins the two
+    // with a double underscore (upstream `1b9d296c`).
+    if lname == "headroom_headroom_retrieve" || lname == "headroom__headroom_retrieve" {
         aliases.push("headroom_retrieve".to_string());
     } else if lname.starts_with("mcp__") {
         let parts: Vec<&str> = name.splitn(3, "__").collect();
@@ -517,6 +518,7 @@ mod tests {
             "mcp__Headroom__headroom_retrieve",
             "mcp_Headroom_headroom_retrieve",
             "headroom_headroom_retrieve",
+            "headroom__headroom_retrieve",
         ] {
             assert!(
                 is_ccr_retrieve_tool(name),
