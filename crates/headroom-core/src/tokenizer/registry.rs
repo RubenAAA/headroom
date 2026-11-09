@@ -44,6 +44,7 @@ pub fn detect_backend(model: &str) -> Backend {
     if m.starts_with("gpt-6")
         || m.starts_with("gpt-5")
         || m.starts_with("gpt-4o")
+        || m.starts_with("chatgpt-4o-")
         || m.starts_with("gpt-4")
         || m.starts_with("gpt-3.5")
         || m.starts_with("o1")

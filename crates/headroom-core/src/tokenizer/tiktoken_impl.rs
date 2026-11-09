@@ -115,6 +115,9 @@ fn encoding_for(model: &str) -> Result<&'static str, TiktokenError> {
     // `get_encoding_for_model`.
     const PREFIX_ENCODINGS: &[(&str, &str)] = &[
         ("gpt-4o", "o200k_base"),
+        // `chatgpt-4o-latest` is gpt-4o under ChatGPT's alias (upstream
+        // `9648d2d8`); without it the model fell to estimation.
+        ("chatgpt-4o-", "o200k_base"),
         ("gpt-4.1", "o200k_base"),
         ("gpt-4.5", "o200k_base"),
         // Without this, gpt-5 fell through to cl100k_base and over-counted
@@ -233,6 +236,7 @@ mod tests {
             ("gpt-4o", "o200k_base"),
             ("gpt-4o-mini", "o200k_base"),
             ("gpt-4o-2024-08-06", "o200k_base"),
+            ("chatgpt-4o-latest", "o200k_base"),
             ("o1-preview", "o200k_base"),
             ("o3-mini", "o200k_base"),
             ("gpt-4", "cl100k_base"),
