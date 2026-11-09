@@ -96,6 +96,11 @@ pub fn init_ort_ep() {
 
     let ep = std::env::var("HEADROOM_ORT_EP").unwrap_or_default();
     let ep = ep.trim().to_lowercase();
+    // This commit wins over Magika's later one, so it must carry the same
+    // telemetry choice (upstream `31f13040`): off unless explicitly allowed.
+    let telemetry = transforms::magika_detector::ort_telemetry_opted_in(
+        std::env::var("ORT_DISABLE_TELEMETRY").ok().as_deref(),
+    );
 
     match ep.as_str() {
         "" | "cpu" => {
@@ -119,6 +124,7 @@ pub fn init_ort_ep() {
             }
             if ort::init()
                 .with_execution_providers([builder.build()])
+                .with_telemetry(telemetry)
                 .commit()
             {
                 tracing::info!(
@@ -138,6 +144,7 @@ pub fn init_ort_ep() {
         "cuda" => {
             if ort::init()
                 .with_execution_providers([CUDA::default().build()])
+                .with_telemetry(telemetry)
                 .commit()
             {
                 tracing::info!(ep = "cuda", "ORT execution provider: CUDA");

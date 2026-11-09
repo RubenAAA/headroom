@@ -59,6 +59,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if args.http_proxy.is_some() {
             std::env::remove_var("HEADROOM_HTTP_PROXY");
         }
+        // ONNX Runtime 1.31+ uploads usage telemetry to Microsoft unless this
+        // is set when the runtime loads. Upstream sets it on Python import;
+        // this binary has no Python, so default it here. An explicit value,
+        // `0` included, is kept (upstream `31f13040`).
+        if std::env::var_os("ORT_DISABLE_TELEMETRY").is_none() {
+            std::env::set_var("ORT_DISABLE_TELEMETRY", "1");
+        }
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

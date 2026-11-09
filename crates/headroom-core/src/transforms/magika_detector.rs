@@ -170,7 +170,7 @@ fn init_ort_from_path(path: &Path) -> Result<(), String> {
 /// treat as "disabled" (ORT disables on `1`/`true`/`yes`/`on`/`y`, case- and
 /// space-insensitive). So `ORT_DISABLE_TELEMETRY=0` turns it on for Rust-loaded
 /// models exactly as it does for Python ones, and unset stays off.
-fn ort_telemetry_opted_in(value: Option<&str>) -> bool {
+pub(crate) fn ort_telemetry_opted_in(value: Option<&str>) -> bool {
     match value {
         None => false,
         Some(raw) => !matches!(
