@@ -48,7 +48,7 @@ pub(super) fn syntax_breaker_enabled() -> bool {
     }
 }
 
-/// True while AST compression for `language` (a [`CodeLanguage::value`]) is
+/// True while AST compression for `language` (a [`CodeLanguage::value`](super::CodeLanguage::value)) is
 /// paused after repeat validation failures.
 pub(super) fn syntax_breaker_open(language: &str) -> bool {
     if !syntax_breaker_enabled() {
