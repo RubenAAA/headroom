@@ -204,6 +204,34 @@ fn ledger_provider(endpoint: compression::CompressibleEndpoint) -> &'static str 
     }
 }
 
+/// A declared body over `--compression-max-body-bytes` but within
+/// `--max-body-bytes` streams through unchanged, as the flag's help
+/// promises, rather than failing the buffer read with a 413 (upstream
+/// 50bf775e8). Past the hard limit it stays in the intercept arm, whose
+/// buffer read answers 413. A chunked body declares no length, so it still
+/// meets the buffer limit inside the arm. Logs the bypass when it applies.
+fn over_compression_limit(
+    state: &AppState,
+    body_bytes_hint: Option<u64>,
+    request_id: &str,
+    path_for_log: &str,
+) -> bool {
+    let over = body_bytes_hint.is_some_and(|len| {
+        len > state.config.compression_max_body_bytes && len <= state.config.max_body_bytes
+    });
+    if over {
+        tracing::info!(
+            event = "compression_body_bypass",
+            request_id = %request_id,
+            path = %path_for_log,
+            limit_bytes = state.config.compression_max_body_bytes,
+            content_length = body_bytes_hint,
+            "compression: body over --compression-max-body-bytes; forwarding unchanged"
+        );
+    }
+    over
+}
+
 pub(crate) async fn forward_http(
     state: AppState,
     client_addr: SocketAddr,
@@ -339,7 +367,9 @@ pub(crate) async fn forward_http(
     let is_llm_json_post = method == axum::http::Method::POST
         && compression::is_compressible_path(uri.path())
         && is_application_json(req.headers());
-    let should_intercept = gate_decision.should_compress && is_llm_json_post;
+    let should_intercept = gate_decision.should_compress
+        && is_llm_json_post
+        && !over_compression_limit(&state, body_bytes_hint, &request_id, &path_for_log);
 
     force_identity_encoding_for_parsers(&method, &uri, &mut outgoing_headers);
 

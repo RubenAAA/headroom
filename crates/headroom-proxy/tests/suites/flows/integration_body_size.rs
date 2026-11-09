@@ -8,6 +8,9 @@
 //!      immediately, body never consumed (cheap rejection).
 //!   2. `Content-Length` missing (chunked): buffer-then-fail; still
 //!      surfaces 413 once the cap is hit.
+//!
+//! Both trip `--max-body-bytes`. A body over `--compression-max-body-bytes`
+//! but within the hard limit is forwarded unchanged instead.
 
 use super::common;
 
@@ -30,7 +33,8 @@ async fn body_size_overflow_returns_413_not_400() {
 
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
-        c.compression_max_body_bytes = 1024; // 1 KB cap
+        c.max_body_bytes = 1024; // 1 KB cap
+        c.compression_max_body_bytes = 1024;
     })
     .await;
 
@@ -75,6 +79,7 @@ async fn body_size_overflow_with_content_length_header_returns_413_without_consu
 
     let proxy = start_proxy_with(&upstream.uri(), |c| {
         c.compression = true;
+        c.max_body_bytes = 1024;
         c.compression_max_body_bytes = 1024;
     })
     .await;
@@ -100,6 +105,45 @@ async fn body_size_overflow_with_content_length_header_returns_413_without_consu
         !upstream_hit.load(std::sync::atomic::Ordering::SeqCst),
         "Content-Length pre-check should reject before forwarding to upstream"
     );
+    proxy.shutdown().await;
+}
+
+/// `--compression-max-body-bytes` promises "forwarded unchanged" for a
+/// larger body, but the buffer read answered 413 until upstream 50bf775e8
+/// was ported. Within `--max-body-bytes` the body must reach upstream
+/// byte-for-byte, untouched by any transform.
+#[tokio::test]
+async fn body_over_compression_cap_but_under_hard_limit_is_forwarded_unchanged() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+        .mount(&upstream)
+        .await;
+
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.compression_max_body_bytes = 1024;
+    })
+    .await;
+
+    // Spacing and key order a transform would normalise, so any rewrite shows.
+    let big_text = "C".repeat(8192);
+    let body = format!(
+        r#"{{ "model": "claude-3-5-sonnet",  "max_tokens": 16, "messages": [ {{"role":"user","content":"{big_text}"}} ] }}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .header("content-length", body.len().to_string())
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let received = upstream.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].body, body.as_bytes());
     proxy.shutdown().await;
 }
 
