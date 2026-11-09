@@ -3214,9 +3214,13 @@ impl Config {
         } else {
             args.rewrite_host
         };
+        // Clamped: the buffer read is capped at this value, so one above
+        // `--max-body-bytes` would let the intercept arm take a body the hard
+        // limit refuses.
         let compression_max_body_bytes = args
             .compression_max_body_bytes
-            .unwrap_or(args.max_body_bytes);
+            .unwrap_or(args.max_body_bytes)
+            .min(args.max_body_bytes);
         // CTX features live inside the interception (body-buffering) path,
         // which `compression` gates. Enabling any `--ctx-*` flag without
         // `--compression` would otherwise be a silent no-op, so the ctx
@@ -4223,6 +4227,27 @@ mod ctx_implies_interception_tests {
         let mut argv = vec!["headroom-proxy", "--upstream", "https://api.anthropic.com"];
         argv.extend_from_slice(extra);
         Config::from_cli(CliArgs::try_parse_from(argv).unwrap())
+    }
+
+    /// The intercept arm buffers up to `compression_max_body_bytes`, so a
+    /// value above the hard limit would let it accept a body the hard limit
+    /// refuses.
+    #[test]
+    fn compression_max_body_bytes_never_exceeds_max_body_bytes() {
+        let c = cfg(&[
+            "--max-body-bytes",
+            "1024",
+            "--compression-max-body-bytes",
+            "2048",
+        ]);
+        assert_eq!(c.compression_max_body_bytes, 1024);
+        let c = cfg(&[
+            "--max-body-bytes",
+            "4096",
+            "--compression-max-body-bytes",
+            "1024",
+        ]);
+        assert_eq!(c.compression_max_body_bytes, 1024);
     }
 
     /// The default exclude list has to survive the trip from the constant

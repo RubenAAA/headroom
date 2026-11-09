@@ -147,6 +147,89 @@ async fn body_over_compression_cap_but_under_hard_limit_is_forwarded_unchanged()
     proxy.shutdown().await;
 }
 
+/// A chunked body has no `Content-Length` to judge by. Past
+/// `--compression-max-body-bytes` but within `--max-body-bytes` it must
+/// still reach upstream unchanged; it used to meet the compression buffer
+/// limit and get 413.
+#[tokio::test]
+async fn chunked_body_over_compression_cap_but_under_hard_limit_is_forwarded_unchanged() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+        .mount(&upstream)
+        .await;
+
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.max_body_bytes = 64 * 1024;
+        c.compression_max_body_bytes = 1024;
+    })
+    .await;
+
+    let big_text = "D".repeat(8192);
+    let body = format!(
+        r#"{{ "model": "claude-3-5-sonnet",  "max_tokens": 16, "messages": [ {{"role":"user","content":"{big_text}"}} ] }}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .body(chunked(&body))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let received = upstream.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].body, body.as_bytes());
+    proxy.shutdown().await;
+}
+
+/// The same chunked body past `--max-body-bytes` is still refused, and
+/// never reaches upstream.
+#[tokio::test]
+async fn chunked_body_over_hard_limit_returns_413_when_limits_differ() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+        .mount(&upstream)
+        .await;
+
+    let proxy = start_proxy_with(&upstream.uri(), |c| {
+        c.compression = true;
+        c.max_body_bytes = 4096;
+        c.compression_max_body_bytes = 1024;
+    })
+    .await;
+
+    let big_text = "E".repeat(8192);
+    let body = format!(
+        r#"{{"model":"claude-3-5-sonnet","messages":[{{"role":"user","content":"{big_text}"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", proxy.url()))
+        .header("content-type", "application/json")
+        .body(chunked(&body))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 413);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    proxy.shutdown().await;
+}
+
+/// A body reqwest sends with `Transfer-Encoding: chunked` and no
+/// `Content-Length`, in 1 KiB pieces.
+fn chunked(body: &str) -> reqwest::Body {
+    let pieces: Vec<Result<bytes::Bytes, std::io::Error>> = body
+        .as_bytes()
+        .chunks(1024)
+        .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+        .collect();
+    reqwest::Body::wrap_stream(futures::stream::iter(pieces))
+}
+
 /// A body past axum's 2 MiB default but under `--max-body-bytes` must reach
 /// upstream. Only the Bedrock sub-router carried a `DefaultBodyLimit`, so
 /// `/v1/messages` kept the framework default and answered 413 "Failed to

@@ -208,8 +208,8 @@ fn ledger_provider(endpoint: compression::CompressibleEndpoint) -> &'static str 
 /// `--max-body-bytes` streams through unchanged, as the flag's help
 /// promises, rather than failing the buffer read with a 413 (upstream
 /// 50bf775e8). Past the hard limit it stays in the intercept arm, whose
-/// buffer read answers 413. A chunked body declares no length, so it still
-/// meets the buffer limit inside the arm. Logs the bypass when it applies.
+/// buffer read answers 413. A chunked body is measured first, in
+/// [`decide_intercept`]. Logs the bypass when it applies.
 fn over_compression_limit(
     state: &AppState,
     body_bytes_hint: Option<u64>,
@@ -230,6 +230,47 @@ fn over_compression_limit(
         );
     }
     over
+}
+
+/// A chunked body declares no length, so [`over_compression_limit`] cannot
+/// see one past `--compression-max-body-bytes`, and the buffer read would
+/// answer 413 at that limit. When the two limits differ, read such a body
+/// up to `--max-body-bytes` first (413 past it) and hand back the request
+/// with its real length, so the bypass decides on the bytes, as upstream
+/// 50bf775e8 does. Equal limits, the default, leave the request untouched.
+///
+/// Returns the request, its length when known, and whether the intercept
+/// arm takes it: `wants_buffer` and not over the compression limit.
+async fn decide_intercept(
+    req: Request<Body>,
+    state: &AppState,
+    wants_buffer: bool,
+    body_bytes_hint: Option<u64>,
+    request_id: &str,
+    path_for_log: &str,
+) -> Result<(Request<Body>, Option<u64>, bool), ProxyError> {
+    if !wants_buffer {
+        return Ok((req, body_bytes_hint, false));
+    }
+    let (req, body_bytes_hint) = if body_bytes_hint.is_none()
+        && state.config.compression_max_body_bytes < state.config.max_body_bytes
+    {
+        let (parts, body) = req.into_parts();
+        let bytes = forward::read_buffered_body(
+            Request::new(body),
+            state.config.max_body_bytes as usize,
+            None,
+            request_id,
+            path_for_log,
+        )
+        .await?;
+        let len = bytes.len() as u64;
+        (Request::from_parts(parts, Body::from(bytes)), Some(len))
+    } else {
+        (req, body_bytes_hint)
+    };
+    let over = over_compression_limit(state, body_bytes_hint, request_id, path_for_log);
+    Ok((req, body_bytes_hint, !over))
 }
 
 pub(crate) async fn forward_http(
@@ -367,9 +408,15 @@ pub(crate) async fn forward_http(
     let is_llm_json_post = method == axum::http::Method::POST
         && compression::is_compressible_path(uri.path())
         && is_application_json(req.headers());
-    let should_intercept = gate_decision.should_compress
-        && is_llm_json_post
-        && !over_compression_limit(&state, body_bytes_hint, &request_id, &path_for_log);
+    let (req, body_bytes_hint, should_intercept) = decide_intercept(
+        req,
+        &state,
+        gate_decision.should_compress && is_llm_json_post,
+        body_bytes_hint,
+        &request_id,
+        &path_for_log,
+    )
+    .await?;
 
     force_identity_encoding_for_parsers(&method, &uri, &mut outgoing_headers);
 
@@ -380,11 +427,7 @@ pub(crate) async fn forward_http(
     // `req.into_body().into_data_stream()` (streaming branch); both
     // discard the headers along with the body. Snapshot here keeps
     // both branches clean.
-    let headers_snapshot = if should_intercept {
-        Some(req.headers().clone())
-    } else {
-        None
-    };
+    let headers_snapshot = should_intercept.then(|| req.headers().clone());
 
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| ProxyError::InvalidHeader(e.to_string()))?;
