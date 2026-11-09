@@ -438,7 +438,9 @@ pub fn parse_tool_call(tool_call: &Value, provider: &str) -> Option<String> {
         return None;
     }
 
-    Some(hash_key.to_string())
+    // Stores key entries by lowercase hex; a model that echoes the marker
+    // hash in uppercase must still hit (upstream `842d7e1a`, `3912c040`).
+    Some(hash_key.to_ascii_lowercase())
 }
 
 /// Bound on a `headroom_retrieve` keyword query. FTS tokenizes the input, so
@@ -654,6 +656,16 @@ mod tests {
         let tool_call = json!({
             "name": CCR_TOOL_NAME,
             "input": {"hash": "abc123def456abc123def456"}
+        });
+        let hash = parse_tool_call(&tool_call, "anthropic");
+        assert_eq!(hash, Some("abc123def456abc123def456".to_string()));
+    }
+
+    #[test]
+    fn parse_tool_call_lowercases_an_uppercase_hash() {
+        let tool_call = json!({
+            "name": CCR_TOOL_NAME,
+            "input": {"hash": "ABC123DEF456ABC123DEF456"}
         });
         let hash = parse_tool_call(&tool_call, "anthropic");
         assert_eq!(hash, Some("abc123def456abc123def456".to_string()));

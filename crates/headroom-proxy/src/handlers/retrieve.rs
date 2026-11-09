@@ -105,9 +105,11 @@ pub async fn handle_retrieve(
         .get("hash")
         .and_then(Value::as_str)
         .filter(|h| !h.is_empty())
+        .map(str::to_ascii_lowercase)
     else {
         return err(StatusCode::BAD_REQUEST, "hash required");
     };
+    let hash_key = hash_key.as_str();
     let status = store.entry_status(hash_key);
     if !matches!(status.state, CcrEntryState::Available) {
         return err(StatusCode::NOT_FOUND, format_retrieval_miss_detail(&status));
