@@ -962,6 +962,29 @@ impl TransformComparator for CodeCompressorComparator {
             "syntax_valid": result.syntax_valid,
         }))
     }
+
+    /// Two Rust fixtures were recorded before upstream `7c150ec6`, when
+    /// `#[derive(Debug)]` fell to the leftover sweep and trailed the output.
+    /// Both sides now keep it on `enum Color`, so move it there in the
+    /// expected output. The same rewrite as `with_upstream_fixes` in
+    /// `headroom-core`'s `code_compressor_parity` test.
+    fn project(&self, mut value: serde_json::Value) -> serde_json::Value {
+        const ORPHANED: &str = "\n\n#[derive(Debug)]";
+        let Some(compressed) = value.get("compressed").and_then(|v| v.as_str()) else {
+            return value;
+        };
+        // The orphan is either the last line or sits above a `// variant N` tail.
+        let detached = match compressed.strip_suffix(ORPHANED) {
+            Some(head) => head.to_string(),
+            None if compressed.contains("\n\n#[derive(Debug)]\n// variant") => {
+                compressed.replacen("\n\n#[derive(Debug)]\n", "\n\n", 1)
+            }
+            None => return value,
+        };
+        let fixed = detached.replacen("}\nenum Color {", "}\n#[derive(Debug)]\nenum Color {", 1);
+        value["compressed"] = serde_json::Value::String(fixed);
+        value
+    }
 }
 
 /// Every built-in comparator, in a stable order.
