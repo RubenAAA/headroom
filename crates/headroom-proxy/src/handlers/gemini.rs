@@ -676,7 +676,7 @@ async fn handle_generate_content_inner(
 
     // Extract usage from response
     let resp_status = response.status();
-    let resp_headers_map = response.headers().clone();
+    let resp_headers_map = crate::headers::filter_response_headers(response.headers());
     let resp_body = response.into_body();
     let resp_bytes = axum::body::to_bytes(resp_body, 10 * 1024 * 1024)
         .await
@@ -836,7 +836,7 @@ async fn handle_count_tokens_inner(
     match resp {
         Ok(r) => {
             let resp_status = r.status();
-            let resp_headers_map = r.headers().clone();
+            let resp_headers_map = crate::headers::filter_response_headers(r.headers());
             let resp_body = r.into_body();
             let resp_bytes = axum::body::to_bytes(resp_body, 10 * 1024 * 1024)
                 .await
@@ -1012,7 +1012,7 @@ async fn forward_to_upstream(
         .await
         .map_err(ProxyError::Upstream)?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let resp_headers = resp.headers().clone();
+    let resp_headers = crate::headers::filter_response_headers(resp.headers());
     let resp_body = resp.bytes().await.map_err(ProxyError::Upstream)?;
     let mut response = Response::builder().status(status);
     {
@@ -1045,7 +1045,7 @@ async fn forward_to_gemini_upstream(
     match forward_to_upstream(state, "POST", &url, headers.clone(), body, upstream_client).await {
         Ok(r) => {
             let status = r.status();
-            let resp_headers = r.headers().clone();
+            let resp_headers = crate::headers::filter_response_headers(r.headers());
             let resp_body = axum::body::to_bytes(r.into_body(), 10 * 1024 * 1024)
                 .await
                 .unwrap_or_default();
@@ -1131,7 +1131,7 @@ async fn forward_streaming(
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut resp_headers: HeaderMap = resp.headers().clone();
+    let mut resp_headers: HeaderMap = crate::headers::filter_response_headers(resp.headers());
     resp_headers.remove("content-length");
     resp_headers.insert(
         "x-headroom-tokens-before",

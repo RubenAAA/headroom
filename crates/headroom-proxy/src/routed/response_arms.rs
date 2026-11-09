@@ -812,10 +812,8 @@ pub(crate) async fn handle_passthrough(
                     .starts_with("text/event-stream")
             });
     let mut builder = Response::builder().status(status);
-    for (name, value) in resp_headers.iter() {
-        if !crate::headers::is_response_drop(name) {
-            builder = builder.header(name.clone(), value.clone());
-        }
+    for (name, value) in crate::headers::filter_response_headers(&resp_headers).iter() {
+        builder = builder.header(name.clone(), value.clone());
     }
     if is_sse {
         let mut booking = PassthroughStreamBooking {
@@ -860,10 +858,8 @@ pub(crate) async fn handle_passthrough(
     );
 
     let mut response = Response::builder().status(status);
-    for (name, value) in resp_headers.iter() {
-        if !crate::headers::is_response_drop(name) {
-            response = response.header(name.clone(), value.clone());
-        }
+    for (name, value) in crate::headers::filter_response_headers(&resp_headers).iter() {
+        response = response.header(name.clone(), value.clone());
     }
     response
         .body(Body::from(body_bytes))

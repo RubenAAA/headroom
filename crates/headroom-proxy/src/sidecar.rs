@@ -662,12 +662,9 @@ async fn forward(
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     if let Some(out) = builder.headers_mut() {
-        for (name, value) in upstream_resp.headers().iter() {
-            if crate::headers::is_response_drop(name) {
-                continue;
-            }
-            out.append(name.clone(), value.clone());
-        }
+        // Drops hop-by-hop headers and any the upstream's Connection names
+        // (upstream `3871b366`).
+        *out = crate::headers::filter_response_headers(upstream_resp.headers());
         // The body is re-framed as a stream, so any length the upstream
         // declared no longer describes what the client will read.
         out.remove(axum::http::header::CONTENT_LENGTH);
