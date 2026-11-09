@@ -85,12 +85,6 @@ fn command_separator_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\|\||&&|;").expect("separator pattern is valid"))
 }
 
-/// `sed -n`, as its own token.
-fn sed_quiet_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(^|\s)-n(\s|$)").expect("sed -n pattern is valid"))
-}
-
 /// Shells whose `-c` argument carries the command that actually runs.
 fn nested_shells() -> &'static HashSet<&'static str> {
     static SHELLS: OnceLock<HashSet<&'static str>> = OnceLock::new();
@@ -248,22 +242,99 @@ pub fn is_read_command(command: &str) -> bool {
     if heredoc_re().is_match(&c) {
         return false;
     }
-    command_separator_re()
-        .split(&c)
+    // Split on the masked text and slice the original: a separator inside
+    // quotes (`sed -n '/a;b/p' f.py`) is part of an argument (upstream
+    // `8cdce172`).
+    let masked = mask_quoted(&c);
+    let mut start = 0;
+    let mut segments = Vec::new();
+    for m in command_separator_re().find_iter(&masked) {
+        segments.push(&c[start..m.start()]);
+        start = m.end();
+    }
+    segments.push(&c[start..]);
+    segments
+        .into_iter()
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .any(segment_is_read)
 }
 
+/// `command` with quoted, escaped and commented characters replaced by `_`,
+/// byte for byte, so match offsets map back onto `command`. Quote marks are
+/// kept. A backslash-newline is a line continuation, so both become spaces;
+/// a `#` at the start of a word comments out the rest of the line. Port of
+/// upstream `_mask_quoted` (`8cdce172`).
+fn mask_quoted(command: &str) -> String {
+    let mut out = command.as_bytes().to_vec();
+    let mask = |out: &mut Vec<u8>, at: usize, ch: char| {
+        out[at..at + ch.len_utf8()].fill(b'_');
+    };
+    let mut chars = command.char_indices().peekable();
+    let mut quote: Option<char> = None;
+    let mut word_start = true;
+    while let Some((i, ch)) = chars.next() {
+        if ch == '\\' && quote != Some('\'') {
+            match chars.next() {
+                Some((j, '\n')) => {
+                    out[i] = b' ';
+                    out[j] = b' ';
+                    word_start = true;
+                }
+                Some((j, next)) => {
+                    out[i] = b'_';
+                    mask(&mut out, j, next);
+                    word_start = false;
+                }
+                None => {
+                    out[i] = b'_';
+                    word_start = false;
+                }
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                mask(&mut out, i, ch);
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            word_start = false;
+        } else if ch == '#' && word_start {
+            mask(&mut out, i, ch);
+            while let Some(&(j, next)) = chars.peek() {
+                if next == '\n' {
+                    break;
+                }
+                mask(&mut out, j, next);
+                chars.next();
+            }
+            word_start = true;
+        } else {
+            word_start = ch.is_whitespace() || ";&|()".contains(ch);
+        }
+    }
+    // Only whole characters were replaced, each by ASCII bytes.
+    String::from_utf8(out).expect("masking keeps UTF-8 valid")
+}
+
 /// [`is_read_command`] for one command with no `;`/`&&`/`||` in it.
 fn segment_is_read(segment: &str) -> bool {
-    // Checked on the whole pipeline: `cat a.py | tee b.py` writes.
-    if writes_a_file_re().is_match(segment) {
+    // Checked on the whole pipeline: `cat a.py | tee b.py` writes. Both checks
+    // run on the masked segment, so a `>` or `|` inside a quoted sed script
+    // (`sed -n '/x >/p' a.py`) is not shell syntax (upstream `8cdce172`).
+    let masked = mask_quoted(segment);
+    if writes_a_file_re().is_match(&masked) {
         return false;
     }
     // Only the first stage touches the file; `cat a.py | head -40` is a read,
     // `grep -n x a.py | head -40` is search output.
-    let c = segment.split('|').next().unwrap_or_default().trim();
+    let c = masked
+        .find('|')
+        .map_or(segment, |pipe| &segment[..pipe])
+        .trim();
     if c.is_empty() {
         return false;
     }
@@ -285,12 +356,148 @@ fn segment_is_read(segment: &str) -> bool {
         return false;
     }
     let is_read = READ_VERBS.contains(&prog.as_str())
-        // `sed -n '1,20p' file` prints a range; bare `sed` edits a stream.
-        || (prog == "sed" && sed_quiet_re().is_match(c));
+        // Quiet mode prints selected file contents; bare `sed` edits a stream.
+        || (prog == "sed" && sed_is_quiet_read(&rest));
     if !is_read {
         return false;
     }
     !lockfile_re().is_match(c)
+}
+
+/// `command` up to a `#` that starts an unquoted word; a `#` inside a word or
+/// quotes stays. Port of upstream `_strip_shell_comment` (`312ffec8`).
+fn strip_shell_comment(command: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut word_start = true;
+    for (i, ch) in command.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            word_start = false;
+        } else if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            word_start = false;
+        } else if ch == '#' && word_start {
+            return &command[..i];
+        } else {
+            word_start = ch.is_whitespace();
+        }
+    }
+    command
+}
+
+/// GNU sed long options, `true` when the option takes an argument.
+const SED_LONG_OPTIONS: &[(&str, bool)] = &[
+    ("quiet", false),
+    ("silent", false),
+    ("expression", true),
+    ("file", true),
+    ("line-length", true),
+    ("regexp-extended", false),
+    ("separate", false),
+    ("unbuffered", false),
+    ("null-data", false),
+    ("binary", false),
+    ("posix", false),
+    ("sandbox", false),
+    ("debug", false),
+    ("follow-symlinks", false),
+    ("in-place", false),
+];
+
+/// Whether sed's arguments select quiet mode (`-n`, `--quiet`, `--silent`)
+/// without editing in place. Parsed as options, so `sed -ne '1,20p' f` and
+/// `sed --quiet` count and a script argument never does. GNU `-l` takes a
+/// length and BSD `-l` does not, so both dialects are tried; an in-place
+/// reading in either wins. Port of upstream `_sed_is_quiet_read`
+/// (`312ffec8`), with Python's `getopt.gnu_getopt` inlined.
+fn sed_is_quiet_read(rest: &[String]) -> bool {
+    // `bash_program` splits on whitespace and keeps quotes; rebuild the words.
+    let Some(args) = shlex::split(strip_shell_comment(&rest.join(" "))) else {
+        return false;
+    };
+    let mut quiet = false;
+    for (flags, with_arg) in [("anErsuzbiI", "efl"), ("anErsuzbliI", "ef")] {
+        let Some(options) = sed_getopt(&args, flags, with_arg) else {
+            continue;
+        };
+        if options
+            .iter()
+            .any(|o| matches!(o.as_str(), "-i" | "-I" | "--in-place"))
+        {
+            return false;
+        }
+        quiet |= options
+            .iter()
+            .any(|o| matches!(o.as_str(), "-n" | "--quiet" | "--silent"));
+    }
+    quiet
+}
+
+/// The options in `args`, GNU-getopt style: operands are skipped, `--` ends
+/// options, long options match by unique prefix. `None` on any option getopt
+/// would reject.
+fn sed_getopt(args: &[String], flags: &str, with_arg: &str) -> Option<Vec<String>> {
+    let mut options = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        i += 1;
+        if arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            let exact = SED_LONG_OPTIONS.iter().find(|(o, _)| *o == name);
+            let mut prefixed = SED_LONG_OPTIONS.iter().filter(|(o, _)| o.starts_with(name));
+            let &(full, takes_arg) = match exact {
+                Some(found) => found,
+                None => match (prefixed.next(), prefixed.next()) {
+                    (Some(found), None) => found,
+                    _ => return None,
+                },
+            };
+            match (takes_arg, value) {
+                (false, Some(_)) => return None,
+                (true, None) => {
+                    args.get(i)?;
+                    i += 1;
+                }
+                _ => {}
+            }
+            options.push(format!("--{full}"));
+            continue;
+        }
+        let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.is_empty()) else {
+            continue; // an operand, or `-` for stdin
+        };
+        for (at, ch) in cluster.char_indices() {
+            if with_arg.contains(ch) {
+                if at + ch.len_utf8() == cluster.len() {
+                    args.get(i)?;
+                    i += 1;
+                }
+                options.push(format!("-{ch}"));
+                break;
+            }
+            if !flags.contains(ch) {
+                return None;
+            }
+            options.push(format!("-{ch}"));
+        }
+    }
+    Some(options)
 }
 
 /// Finalize read protection by content — protect unless this is clearly data.
@@ -532,5 +739,92 @@ mod tests {
             custom_tool_call_commands(script),
             vec!["echo exec_command(hi)".to_string()]
         );
+    }
+
+    /// Upstream's cases for `312ffec8` (sed quiet options, comments, literal
+    /// hashes) and `8cdce172` (operators inside quotes, line continuations).
+    #[test]
+    fn sed_options_and_quoted_operators_match_upstream() {
+        let cases: &[(&str, bool)] = &[
+            // Quiet sed reads, both dialects.
+            ("sed -n '1,60p' foo.py", true),
+            ("sed -ne '1,60p' foo.py", true),
+            ("sed -En '1,60p' foo.py", true),
+            ("sed --quiet '1,60p' foo.py", true),
+            ("sed --silent '1,60p' foo.py", true),
+            ("sed --quiet --expression='1,60p' foo.py", true),
+            ("timeout 30 sed -ne '1,60p' foo.py", true),
+            ("sed -n --follow-symlinks '1,60p' foo.py", true),
+            ("sed -a -n '1,60p' foo.py", true),
+            ("sed -n -e '1,60p' foo.py -l", true),
+            ("sed -l -n '1,60p' foo.py", true),
+            ("sed -ln '1,60p' foo.py", true),
+            ("sed -l 80 -n '1,60p' foo.py", true),
+            ("sed -nl80 '1,60p' foo.py", true),
+            // Not quiet reads.
+            ("sed 's/a/b/' foo.py", false),
+            ("sed -n1,60p foo.py", false),
+            ("sed -ni '1,60p' foo.py", false),
+            ("sed -n -i '1,60p' foo.py", false),
+            ("sed -n -I .bak '1,60p' foo.py", false),
+            ("sed -n -I '' '1,60p' foo.py", false),
+            ("sed -n -l -i '' '1,60p' foo.py", false),
+            ("sed -n -l -I .bak '1,60p' foo.py", false),
+            ("sed -in '1,60p' foo.py", false),
+            ("sed --quiet --in-place '1,60p' foo.py", false),
+            ("sed --quiet --in-place=.bak '1,60p' foo.py", false),
+            ("sed -e 's/a/ -n /' foo.py", false),
+            ("sed -e ' -n ' foo.py", false),
+            ("sed -- -n foo.py", false),
+            // Comments and literal hashes.
+            ("sed -n '1,60p' foo.py # avoid -i here", true),
+            ("sed -n '1,60p' foo.py # --unknown", true),
+            ("sed -n '1,60p' foo.py # author's note", true),
+            ("sed -n '1,60p' foo.py # unclosed \"quote", true),
+            ("sed -n '1,60p' 'foo#bar.py'", true),
+            ("sed -n \"1,60p\" \"foo#bar.py\"", true),
+            ("sed -n '1,60p' foo#bar.py", true),
+            (r"sed -n '1,60p' foo\#bar.py", true),
+            ("sed -n '/# marker/p' foo.py", true),
+            ("sed -n '1,60p' foo#bar.py -i", false),
+            ("sed -n '1,60p' 'foo#bar.py' -i", false),
+            (r"sed -n '1,60p' foo\#bar.py -i", false),
+            (r"sed -n '1,60p' foo\ #bar.py -i", false),
+            ("sed -n '/# marker/p' foo.py -i", false),
+            ("sed -n '1,60p' foo.py -i # --quiet", false),
+            ("sed -n 'unterminated # quote", false),
+            // Shell operators inside quotes are arguments.
+            ("sed -n '/x >/p' foo.py", true),
+            ("sed -n '/x >> y/p' foo.py", true),
+            ("sed -n \"/a > b/p\" foo.py", true),
+            ("sed -n '/a|b/p' foo.py", true),
+            ("sed -n '/a;b/p' foo.py", true),
+            ("sed -n '/a && b/p' foo.py", true),
+            ("sed -n '/ tee /p' foo.py", true),
+            ("cat 'a > b.py'", true),
+            (r"cat foo.py \> out", true),
+            ("sed -n '/x >/p' foo.py > out.txt", false),
+            ("sed -n '/a|b/p' foo.py | tee out.txt", false),
+            ("sed -n '/a;b/p' foo.py; echo done", true),
+            ("echo '>' && sed 's/a/b/' foo.py", false),
+            ("bash -lc \"cat foo.py > copy.py\"", false),
+            ("bash -lc \"cat foo.py | tee copy.py\"", false),
+            ("bash -lc \"cat foo.py\"", true),
+            // Line continuations and comments across lines.
+            ("cat foo.py \\\n> copy.py", false),
+            ("cat foo.py \\\n>> copy.py", false),
+            ("cat foo.py | \\\ntee copy.py", false),
+            ("sed -n '/x >/p' foo.py \\\n> out.txt", false),
+            ("sed -n '1,60p' \\\nfoo.py", true),
+            ("echo start # \" unclosed in comment\nls; cat foo.py", true),
+            ("echo hi # author's note\nls; cat foo.py", true),
+            ("cat foo.py # > not a redirect", true),
+            ("cat foo#bar.py > out.txt", false),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter(|(command, expected)| is_read_command(command) != *expected)
+            .collect();
+        assert!(wrong.is_empty(), "misclassified: {wrong:#?}");
     }
 }
