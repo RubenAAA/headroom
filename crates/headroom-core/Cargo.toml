@@ -50,7 +50,7 @@ blake3 = "1"
 # strings, and both stream without loading styles. Pure Rust (zip + quick-xml
 # under the hood), no system dep. The `dates` feature pulls chrono (already a
 # direct dep) so datetime cells render like Python's `str(datetime)`.
-calamine = { version = "0.37", features = ["dates"] }
+calamine = { version = "0.38", features = ["dates"] }
 # `chrono` for UTC timestamps + RFC3339 (ISO-8601) parse/format in the
 # subscription + savings-ledger ports. Python persists timezone-aware UTC
 # datetimes rendered with a `Z` suffix; chrono round-trips the same bytes so
