@@ -52,14 +52,14 @@ pub(crate) fn resolve_ctx_project(
         .unwrap_or_else(|| crate::ctx::projects::UNRESOLVED_PROJECT.to_string())
 }
 
-/// The latest user message's typed text. `<system-reminder>` blocks are
-/// skipped and the rest joined, as in `memory::handler::extract_user_query`:
+/// The latest user message's typed text. `<system-reminder>` spans are cut
+/// out and the rest joined, as in `memory::handler::extract_user_query`:
 /// Claude Code opens a user message with reminders, and taking the first text
 /// block matched CCR expansions against the reminder instead of the request.
 pub(crate) fn latest_user_query(body: &serde_json::Value) -> String {
     let typed = |text: &str| {
-        let text = text.trim();
-        (!text.is_empty() && !text.starts_with("<system-reminder")).then(|| text.to_string())
+        let text = crate::memory::handler::strip_system_reminders(text);
+        (!text.is_empty()).then_some(text)
     };
     body.get("messages")
         .and_then(serde_json::Value::as_array)

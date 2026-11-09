@@ -1655,12 +1655,12 @@ impl MemoryHandler {
 ///
 /// Claude Code opens a user message with `<system-reminder>` blocks, so taking
 /// the first text block searched on the reminder instead of what the user
-/// typed. Reminder blocks are skipped and the remaining text joined (upstream
-/// 4e5a67a3, f542b704).
+/// typed. Reminder spans are cut out and the remaining text joined (upstream
+/// 4e5a67a3, f542b704, 12dca26a).
 fn extract_user_query(messages: &[Value]) -> Option<String> {
     let typed = |text: &str| {
-        let text = text.trim();
-        (!text.is_empty() && !text.starts_with("<system-reminder")).then(|| text.to_string())
+        let text = strip_system_reminders(text);
+        (!text.is_empty()).then_some(text)
     };
     for msg in messages.iter().rev() {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
@@ -1683,6 +1683,43 @@ fn extract_user_query(messages: &[Value]) -> Option<String> {
         }
     }
     None
+}
+
+/// Remove complete `<system-reminder …>…</system-reminder>` spans and keep the
+/// text around them. A reminder can sit mid-block, after what the user typed,
+/// so dropping only blocks that start with one is not enough. An unclosed
+/// opener is kept as text. Port of upstream `_strip_system_reminders`
+/// (`12dca26a`).
+pub(crate) fn strip_system_reminders(text: &str) -> String {
+    static OPEN: OnceLock<regex_lite::Regex> = OnceLock::new();
+    static CLOSE: OnceLock<regex_lite::Regex> = OnceLock::new();
+    let open = OPEN.get_or_init(|| {
+        regex_lite::Regex::new(r"(?i)<system-reminder(?:\s[^<>]*)?>").expect("static regex")
+    });
+    let close = CLOSE.get_or_init(|| {
+        regex_lite::Regex::new(r"(?i)</system-reminder\s*>").expect("static regex")
+    });
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(opening) = open.find_at(text, cursor) {
+        let Some(closing) = close.find_at(text, opening.end()) else {
+            break;
+        };
+        out.push_str(&text[cursor..opening.start()]);
+        let end = closing.end();
+        // Keep two words that the reminder separated from running together.
+        let before = text[..opening.start()].chars().next_back();
+        let after = text[end..].chars().next();
+        if let (Some(b), Some(a)) = (before, after)
+            && !b.is_whitespace()
+            && !a.is_whitespace()
+        {
+            out.push(' ');
+        }
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out.trim().to_string()
 }
 
 fn format_memory_block_header(scope: Option<&ResolvedScope>) -> String {
@@ -1859,6 +1896,35 @@ mod tests {
         assert_eq!(
             extract_user_query(&msgs).as_deref(),
             Some("fix the parser\nthen run the tests")
+        );
+    }
+
+    /// A reminder buried mid-block is cut out; the words around it stay.
+    #[test]
+    fn strip_system_reminders_keeps_the_surrounding_text() {
+        assert_eq!(
+            strip_system_reminders(
+                "fix the parser\n<system-reminder>\nrules\n</system-reminder>\nnow"
+            ),
+            "fix the parser\n\nnow"
+        );
+        assert_eq!(
+            strip_system_reminders("a<SYSTEM-REMINDER data=1>x</system-reminder >b"),
+            "a b"
+        );
+        assert_eq!(
+            strip_system_reminders("<system-reminder>only</system-reminder>"),
+            ""
+        );
+        // Unclosed: kept as text, as upstream does.
+        assert_eq!(
+            strip_system_reminders("<system-reminder>open"),
+            "<system-reminder>open"
+        );
+        // A tag that merely shares the prefix is not a reminder.
+        assert_eq!(
+            strip_system_reminders("<system-reminders>x</system-reminder>"),
+            "<system-reminders>x</system-reminder>"
         );
     }
 
