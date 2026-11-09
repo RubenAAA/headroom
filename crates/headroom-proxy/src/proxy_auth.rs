@@ -143,6 +143,12 @@ fn health_probe_exempt(method: &Method, path: &str) -> bool {
     *method == Method::GET && AUTH_EXEMPT_PATHS.contains(&path)
 }
 
+/// `GET`/`HEAD /api/hello`, also under a `/p/<project>` prefix.
+fn is_hello_probe(method: &Method, path: &str) -> bool {
+    (*method == Method::GET || *method == Method::HEAD)
+        && crate::project_context::split_project_path(path).1 == "/api/hello"
+}
+
 /// Require `HEADROOM_PROXY_TOKEN` from non-loopback callers.
 ///
 /// Declines to act when no token is configured, which keeps the default
@@ -179,6 +185,14 @@ pub async fn proxy_auth_gate(
         // upstream exactly like a remote caller.
         scrub_proxy_token_headers(req.headers_mut(), expected);
         return next.run(req).await;
+    }
+
+    // Claude Code's `HEAD /api/hello` reachability probe never carries the
+    // proxy token, so every remote client logged one rejection per process.
+    // Answer it here with an empty 200: no log line, and never relayed
+    // upstream anonymously (upstream `673831a4`).
+    if is_hello_probe(req.method(), path) {
+        return StatusCode::OK.into_response();
     }
 
     // Accept either carrier independently. In particular, a provider bearer

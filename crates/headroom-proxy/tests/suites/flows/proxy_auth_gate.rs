@@ -130,6 +130,36 @@ async fn health_probes_stay_open() {
 
 /// The default single-user setup configures no token, and must keep working
 /// exactly as it did before the gate existed.
+/// Claude Code's reachability probe cannot carry the token. It gets a local
+/// empty 200 instead of a 401, and only for GET/HEAD on that one path.
+#[tokio::test]
+async fn the_hello_probe_is_answered_without_a_token() {
+    for (method, path) in [
+        ("HEAD", "/api/hello"),
+        ("GET", "/api/hello"),
+        ("HEAD", "/p/myproj/api/hello"),
+    ] {
+        let mut req = remote_request(path, &[]);
+        *req.method_mut() = method.parse().expect("method");
+        let resp = app_with_token(Some("s3cret"))
+            .oneshot(req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK, "{method} {path}");
+        let body = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("body");
+        assert!(body.is_empty(), "{method} {path}");
+    }
+    let mut post = remote_request("/api/hello", &[]);
+    *post.method_mut() = axum::http::Method::POST;
+    let resp = app_with_token(Some("s3cret"))
+        .oneshot(post)
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn no_configured_token_means_no_gate() {
     let resp = app_with_token(None)
