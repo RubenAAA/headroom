@@ -669,10 +669,16 @@ impl SavingsLedger {
 
     /// Load from disk, returning a fresh empty ledger on missing/corrupt file.
     pub fn load(path: &Path) -> SavingsLedger {
+        Self::load_reporting_migration(path).0
+    }
+
+    /// [`Self::load`], also saying whether the file predated the shaped-only
+    /// rule and was migrated in memory.
+    fn load_reporting_migration(path: &Path) -> (SavingsLedger, bool) {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return SavingsLedger::default();
+                return (SavingsLedger::default(), false);
             }
             Err(error) => {
                 tracing::warn!(
@@ -681,15 +687,16 @@ impl SavingsLedger {
                     path = %path.display(),
                     "output-savings ledger unreadable; starting empty"
                 );
-                return SavingsLedger::default();
+                return (SavingsLedger::default(), false);
             }
         };
         match serde_json::from_str::<SavingsLedger>(&text) {
             Ok(mut ledger) => {
-                if !ledger.shaped_only {
+                let migrated = !ledger.shaped_only;
+                if migrated {
                     ledger.migrate_to_shaped_only();
                 }
-                ledger
+                (ledger, migrated)
             }
             Err(error) => {
                 tracing::warn!(
@@ -698,7 +705,7 @@ impl SavingsLedger {
                     path = %path.display(),
                     "output-savings ledger corrupt; starting empty"
                 );
-                SavingsLedger::default()
+                (SavingsLedger::default(), false)
             }
         }
     }
@@ -795,7 +802,21 @@ struct RecorderState {
 
 impl SavingsRecorder {
     pub fn new(path: PathBuf, flush_every: u32) -> Self {
-        let ledger = SavingsLedger::load(&path);
+        let (ledger, migrated) = SavingsLedger::load_reporting_migration(&path);
+        // Write a migrated ledger back once. Otherwise every baseline reload
+        // (each /stats poll) migrates the stale file again and repeats the
+        // warning (upstream `96e81ac6`).
+        if migrated
+            && !process_is_stateless()
+            && let Err(error) = ledger.save(&path)
+        {
+            tracing::warn!(
+                event = "output_savings_ledger_rewrite_failed",
+                %error,
+                path = %path.display(),
+                "could not rewrite the migrated output-savings ledger"
+            );
+        }
         Self {
             path,
             flush_every,
@@ -1351,6 +1372,15 @@ mod tests {
         assert!(loaded.treatment.is_empty());
         assert!(loaded.control.is_empty());
         assert_eq!(loaded.baseline.total_samples(), 2);
+
+        // The recorder writes the migrated ledger back once, so later reloads
+        // (one per /stats poll) find nothing left to migrate.
+        let _rec = SavingsRecorder::new(path.clone(), 1_000);
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["shaped_only"], true);
+        assert_eq!(on_disk["treatment"], serde_json::json!({}));
+        assert_eq!(SavingsLedger::load(&path).baseline.total_samples(), 2);
     }
 
     #[test]
