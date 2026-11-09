@@ -38,9 +38,7 @@
 //! convention via the dispatcher. Parity fixtures are recorded with
 //! `enable_ccr=False` so the output is deterministic and store-independent.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::collections::{BTreeSet, HashMap};
 
 use tree_sitter::{Language, Node, Parser, Tree};
 
@@ -558,6 +556,10 @@ struct CodeStructure {
     function_bodies: Vec<(String, String, i64)>,
     top_level_code: Vec<String>,
     other: Vec<String>,
+    /// Start byte of the import node behind each `imports` entry, pushed by
+    /// `visit_import`. Only read for Python, where that arm is the sole
+    /// producer of `imports`, so the two stay index-aligned.
+    import_starts: Vec<usize>,
 }
 
 // ─── Symbol analysis ────────────────────────────────────────────────────
@@ -1054,176 +1056,9 @@ pub fn detect_language(code: &str) -> (CodeLanguage, f64) {
     (best.0, confidence)
 }
 
-// ─── Per-language syntax breaker ──────────────────────────────────────
-//
-// The AST pass validates its own output and discards anything that no longer
-// parses ("never serve broken code"), so a misbehaving grammar costs the full
-// compression latency and then throws the work away. When a language keeps
-// failing its own validation, stop attempting it for a cooldown instead of
-// burning the latency on every request.
-//
-// Process-global, deliberately: a failing grammar is a property of the
-// process's tree-sitter build, not of the caller. Opt out per-deployment
-// with `HEADROOM_CODE_SYNTAX_BREAKER=0` (also `false`/`off`), read live on
-// every call like the other kill-switches in this crate.
-const SYNTAX_BREAKER_WINDOW: usize = 20;
-const SYNTAX_BREAKER_MIN_FAILURES: usize = 10;
-const SYNTAX_BREAKER_COOLDOWN_SECS: u64 = 1800;
-const SYNTAX_BREAKER_ENV: &str = "HEADROOM_CODE_SYNTAX_BREAKER";
-
-#[derive(Debug, Default)]
-struct SyntaxBreakerState {
-    outcomes: HashMap<String, VecDeque<bool>>,
-    open_until: HashMap<String, Instant>,
-    trips: HashMap<String, u64>,
-    /// Attempts skipped because the input never parsed: input noise, not
-    /// compressor failure. Reported on the trip line so a trip with a high
-    /// skip count reads as "mostly fragments" rather than "broken grammar".
-    invalid_input_skips: HashMap<String, u64>,
-}
-
-fn syntax_breaker_state() -> &'static Mutex<SyntaxBreakerState> {
-    static STATE: OnceLock<Mutex<SyntaxBreakerState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(SyntaxBreakerState::default()))
-}
-
-/// False when the breaker is opted out via
-/// `HEADROOM_CODE_SYNTAX_BREAKER=0|false|off` (case-insensitive, trimmed).
-fn syntax_breaker_enabled() -> bool {
-    match std::env::var(SYNTAX_BREAKER_ENV) {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    }
-}
-
-/// True while AST compression for `language` (a [`CodeLanguage::value`]) is
-/// paused after repeat validation failures.
-fn syntax_breaker_open(language: &str) -> bool {
-    if !syntax_breaker_enabled() {
-        return false;
-    }
-    let state = syntax_breaker_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    state
-        .open_until
-        .get(language)
-        .is_some_and(|until| *until > Instant::now())
-}
-
-/// Track a validation outcome; trip the breaker on a failing window. The
-/// window clears on trip so a fresh run of failures must re-earn the next
-/// pause. Other languages are isolated.
-fn record_syntax_outcome(language: &str, valid: bool) {
-    if !syntax_breaker_enabled() {
-        return;
-    }
-    let mut tripped_failures = 0usize;
-    let mut tripped_skips = 0u64;
-    {
-        let mut state = syntax_breaker_state()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let failures = {
-            let window = state.outcomes.entry(language.to_string()).or_default();
-            if window.len() >= SYNTAX_BREAKER_WINDOW {
-                window.pop_front();
-            }
-            window.push_back(valid);
-            window.iter().filter(|&&ok| !ok).count()
-        };
-        if failures >= SYNTAX_BREAKER_MIN_FAILURES {
-            state.open_until.insert(
-                language.to_string(),
-                Instant::now() + Duration::from_secs(SYNTAX_BREAKER_COOLDOWN_SECS),
-            );
-            *state.trips.entry(language.to_string()).or_insert(0) += 1;
-            tripped_skips = state
-                .invalid_input_skips
-                .get(language)
-                .copied()
-                .unwrap_or(0);
-            // A fresh window after the cooldown must re-earn the next
-            // pause. Skips are kept: they describe the traffic mix, not
-            // this window, and resetting them would hide a
-            // fragments-dominated stream.
-            if let Some(window) = state.outcomes.get_mut(language) {
-                window.clear();
-            }
-            tripped_failures = failures;
-        }
-    }
-    if tripped_failures > 0 {
-        tracing::warn!(
-            event = "code_syntax_breaker_tripped",
-            language = language,
-            invalid_input_skipped = tripped_skips,
-            "Code compression for {language} paused for {} min: {tripped_failures} of the last {SYNTAX_BREAKER_WINDOW} attempts produced invalid syntax and were discarded (HEADROOM_CODE_SYNTAX_BREAKER=0 disables this breaker)",
-            SYNTAX_BREAKER_COOLDOWN_SECS / 60,
-        );
-    }
-}
-
-/// A fragment that never parsed is input noise, not a compressor failure:
-/// counted separately so the trip line can tell "broken grammar" apart from
-/// "mostly fragments". Never touches the failure window.
-fn record_syntax_input_skipped(language: &str) {
-    if !syntax_breaker_enabled() {
-        return;
-    }
-    let mut state = syntax_breaker_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    *state
-        .invalid_input_skips
-        .entry(language.to_string())
-        .or_insert(0) += 1;
-}
-
-/// Per-language breaker state for one language, surfaced on `/stats`.
-///
-/// While the breaker is open that language compresses at ratio 1.0, so
-/// savings drop with nothing in the payload explaining why. The map is empty
-/// until something trips, so a healthy install carries no extra keys.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct SyntaxBreakerLanguageStatus {
-    pub open: bool,
-    pub trips: u64,
-    pub reopens_in_seconds: f64,
-}
-
-/// Per-language breaker state keyed by language value, sorted. Empty until
-/// something trips.
-pub fn syntax_breaker_status() -> BTreeMap<String, SyntaxBreakerLanguageStatus> {
-    let now = Instant::now();
-    let state = syntax_breaker_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut out = BTreeMap::new();
-    let mut languages: Vec<&String> = state.trips.keys().chain(state.open_until.keys()).collect();
-    languages.sort();
-    languages.dedup();
-    for language in languages {
-        let until = state.open_until.get(language);
-        let open = until.is_some_and(|t| *t > now);
-        let remaining = until
-            .and_then(|t| t.checked_duration_since(now))
-            .map(|d| (d.as_secs_f64() * 10.0).round() / 10.0)
-            .unwrap_or(0.0);
-        out.insert(
-            language.clone(),
-            SyntaxBreakerLanguageStatus {
-                open,
-                trips: state.trips.get(language).copied().unwrap_or(0),
-                reopens_in_seconds: remaining,
-            },
-        );
-    }
-    out
-}
+mod syntax_breaker;
+use syntax_breaker::*;
+pub use syntax_breaker::{SyntaxBreakerLanguageStatus, syntax_breaker_status};
 
 // ─── Compressor ─────────────────────────────────────────────────────────
 
@@ -1949,65 +1784,116 @@ impl<'a> Ctx<'a> {
         // end before the first captured node: those are file headers and keep
         // their place at the top (see `CodeStructure::header_code`).
         let first_captured = captured.iter().map(|&(s, _)| s).min();
+        let python = self.language == CodeLanguage::Python;
+        let mut demoted: Vec<usize> = Vec::new();
+        let mut saw_top_level_code = false;
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
             let range = (child.start_byte(), child.end_byte());
-            if !captured.contains(&range) {
-                let text = self.node_text(child).trim();
-                if !text.is_empty() {
-                    if first_captured.is_some_and(|f| child.end_byte() <= f) {
-                        structure.header_code.push(text.to_string());
-                    } else {
-                        structure.top_level_code.push(text.to_string());
-                    }
+            let kind = child.kind();
+            if captured.contains(&range) {
+                // Python runs top-level statements in source order: in
+                // `import sys; sys.path.insert(0, 'vendor'); import plugin`
+                // hoisting the last import breaks it. Emit such imports in
+                // place with the rest of the top-level code (upstream
+                // 54f48fb1c). Its `reorder_unsafe` bail-out for declarations
+                // after top-level code is not ported: any module constant
+                // above the first def would forfeit compression.
+                if python
+                    && saw_top_level_code
+                    && self.lang.is_import(kind)
+                    && let Some(i) = structure
+                        .import_starts
+                        .iter()
+                        .position(|&s| s == child.start_byte())
+                {
+                    structure.top_level_code.push(structure.imports[i].clone());
+                    demoted.push(i);
+                }
+                continue;
+            }
+            // In Python a `;` between two statements on one line is a
+            // root-level anonymous token; emitted alone it becomes a bare `;`
+            // line and invalidates the output.
+            // Python only: upstream skips it for every language, but Perl
+            // keeps a statement's `;` as a separate root sibling, and dropping
+            // it joins two statements and forfeits the compression.
+            if python && !child.is_named() && (kind == ";" || kind == ",") {
+                continue;
+            }
+            let text = self.node_text(child).trim();
+            if !text.is_empty() {
+                if first_captured.is_some_and(|f| child.end_byte() <= f) {
+                    structure.header_code.push(text.to_string());
+                } else {
+                    structure.top_level_code.push(text.to_string());
+                    saw_top_level_code = true;
                 }
             }
+        }
+        if !demoted.is_empty() {
+            let mut i = 0;
+            structure.imports.retain(|_| {
+                let keep = !demoted.contains(&i);
+                i += 1;
+                keep
+            });
         }
         structure
     }
 
-    /// Collect contiguous doc-comment siblings immediately preceding `node`.
+    /// Collect contiguous comment and attribute siblings preceding `node`.
     ///
-    /// Doc comments are top-level SIBLINGS of the declaration they document,
-    /// not children of it. Left uncaptured they fall through to the leftover
-    /// top-level sweep and get grouped separately from the declaration they
-    /// describe, instead of staying attached to it. Only comments with no blank
-    /// line before the node (or before the next comment up) count as attached.
+    /// Doc comments and Rust outer attributes are top-level SIBLINGS of the
+    /// declaration they decorate, not children of it. Left uncaptured they
+    /// fall through to the leftover top-level sweep and get grouped away from
+    /// the declaration; an orphaned attribute at the end of the output makes
+    /// rustc fail with `expected item after attributes`, which tree-sitter
+    /// does not catch.
     ///
-    /// Records the comments' byte ranges in `captured` so the sweep skips them.
+    /// Comments attach only with no blank line before the node (or before the
+    /// next sibling down). Attributes always attach: Rust permits blank lines
+    /// and comments between an outer attribute and its item. A detached
+    /// comment is skipped, not captured, so an attribute behind it is still
+    /// reached. Mirrors `_get_leading_comment_text` (upstream 7c150ec6b).
+    ///
+    /// Records the captured byte ranges in `captured` so the sweep skips them.
     fn leading_comment_text(
         &self,
         node: Node,
         captured: &mut std::collections::HashSet<(usize, usize)>,
     ) -> String {
         const COMMENT_NODE_TYPES: [&str; 3] = ["comment", "line_comment", "block_comment"];
-        let mut comments: Vec<Node> = Vec::new();
+        const ATTACHED_NODE_TYPES: [&str; 1] = ["attribute_item"];
+        let mut preamble: Vec<Node> = Vec::new();
         let mut sibling = node.prev_sibling();
         let mut anchor_row = node.start_position().row;
         while let Some(sib) = sibling {
-            if !COMMENT_NODE_TYPES.contains(&sib.kind()) {
+            let attached = ATTACHED_NODE_TYPES.contains(&sib.kind());
+            if !attached && !COMMENT_NODE_TYPES.contains(&sib.kind()) {
                 break;
             }
             // `<= 1` means "no blank line between"; saturating because a
             // sibling can't start after the anchor, but underflow would wrap.
-            if anchor_row.saturating_sub(sib.end_position().row) > 1 {
-                break;
+            if attached || anchor_row.saturating_sub(sib.end_position().row) <= 1 {
+                preamble.push(sib);
+                anchor_row = sib.start_position().row;
             }
-            comments.push(sib);
-            anchor_row = sib.start_position().row;
             sibling = sib.prev_sibling();
         }
-        if comments.is_empty() {
+        if preamble.is_empty() {
             return String::new();
         }
-        comments.reverse();
+        preamble.reverse();
         let mut out = String::new();
-        for c in &comments {
+        for c in &preamble {
             captured.insert((c.start_byte(), c.end_byte()));
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str(self.node_text(*c));
+            // Rust line comments carry their trailing newline in the node
+            // text; strip it so joining does not add blank lines.
+            out.push_str(self.node_text(*c).trim_end_matches('\n'));
         }
         out.push('\n');
         out
@@ -2094,6 +1980,7 @@ impl<'a> Ctx<'a> {
         }
         let leading = self.leading_comment_text(node, captured);
         structure.imports.push(leading + self.node_text(node));
+        structure.import_starts.push(node.start_byte());
         captured.insert(range);
         true
     }
@@ -2145,6 +2032,7 @@ impl<'a> Ctx<'a> {
         if self.lang.decorator_node != Some(nt) {
             return false;
         }
+        let leading = self.leading_comment_text(node, captured);
         let mut decorator_text: Vec<String> = Vec::new();
         let mut definition_compressed: Option<String> = None;
         let mut has_class_child = false;
@@ -2164,14 +2052,14 @@ impl<'a> Ctx<'a> {
         }
         match definition_compressed {
             Some(def) if !decorator_text.is_empty() => {
-                let full_def = format!("{}\n{}", decorator_text.join("\n"), def);
+                let full_def = format!("{leading}{}\n{}", decorator_text.join("\n"), def);
                 if has_class_child {
                     structure.class_definitions.push(full_def);
                 } else {
                     structure.function_signatures.push(full_def);
                 }
             }
-            Some(def) => structure.function_signatures.push(def),
+            Some(def) => structure.function_signatures.push(leading + &def),
             None => {}
         }
         captured.insert(range);
@@ -2190,10 +2078,11 @@ impl<'a> Ctx<'a> {
         if !self.lang.is_function(nt) {
             return false;
         }
+        let leading = self.leading_comment_text(node, captured);
         let compressed = self.compress_function_ast(node);
         structure
             .function_signatures
-            .push(self.validated_candidate(node, compressed));
+            .push(leading + &self.validated_candidate(node, compressed));
         captured.insert(range);
         true
     }
@@ -2269,10 +2158,11 @@ impl<'a> Ctx<'a> {
         if !self.lang.is_class(nt) {
             return false;
         }
+        let leading = self.leading_comment_text(node, captured);
         let compressed = self.compress_class_ast(node);
         structure
             .class_definitions
-            .push(self.validated_candidate(node, compressed));
+            .push(leading + &self.validated_candidate(node, compressed));
         captured.insert(range);
         // Capture trailing semicolon on the same line (e.g., C++ `class Foo {} ;`).
         if let Some(next) = node.next_sibling()
@@ -2296,9 +2186,10 @@ impl<'a> Ctx<'a> {
         if !self.lang.is_type(nt) {
             return false;
         }
+        let leading = self.leading_comment_text(node, captured);
         structure
             .type_definitions
-            .push(self.node_text(node).to_string());
+            .push(leading + self.node_text(node));
         captured.insert(range);
         true
     }
@@ -2495,7 +2386,18 @@ impl<'a> Ctx<'a> {
             }
             body_stmts.push((child.start_position().row, child.end_position().row));
         }
-        body_stmts
+        // Statements can share a physical line (`a = 1; b = 2`). Lines are
+        // kept whole, so merge overlapping ranges: keeping both duplicates the
+        // shared line, dropping the later one loses continuation lines of a
+        // multi-line statement after the `;` (upstream 54f48fb1c).
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(body_stmts.len());
+        for (start, end) in body_stmts {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
     }
 
     /// Keep head statements within the body limit (always keeping at least
@@ -2686,8 +2588,14 @@ impl<'a> Ctx<'a> {
             // to the BODY node, so slicing at the body's start drops it and the
             // output no longer parses. Languages that put the brace on the
             // signature line (Java, Go) already have it inside `header`.
+            // A multi-line signature can also share the brace line with its
+            // last fragment (`where T: Debug {`, `implements Bar {`), so keep
+            // the line whenever the body starts with the brace (upstream
+            // 0d0cda22b).
+            let body_starts_with_brace =
+                !self.lang.uses_colon_after_signature && self.node_text(body_node).starts_with('{');
             if let Some(brace_line) = node_lines.get(sig_end)
-                && brace_line.trim_start().starts_with('{')
+                && (brace_line.trim_start().starts_with('{') || body_starts_with_brace)
             {
                 header.push(brace_line);
             }
@@ -2697,14 +2605,31 @@ impl<'a> Ctx<'a> {
         };
 
         let mut body_parts: Vec<String> = Vec::new();
+        let mut last_processed_end: Option<usize> = None;
         let mut bcursor = body_node.walk();
         for child in body_node.children(&mut bcursor) {
             if !child.is_named() {
                 continue;
             }
             let ck = child.kind();
-            let child_start = child.start_position().row;
-            let child_end = child.end_position().row;
+            let mut child_start = child.start_position().row;
+            let mut child_end = child.end_position().row;
+            if child.end_position().column == 0 && child_end > child_start {
+                child_end -= 1;
+            }
+            // Statements can share a physical line (`x = 1; y = 2`). The line
+            // slice already carries all of them; skip only rows already
+            // emitted, keeping any continuation lines of this node (upstream
+            // 54f48fb1c).
+            if let Some(last) = last_processed_end
+                && child_start <= last
+            {
+                child_start = last + 1;
+                if child_start > child_end {
+                    continue;
+                }
+            }
+            last_processed_end = Some(child_end);
             let child_text = self.lines_joined(child_start, child_end);
 
             if self.lang.is_function(ck) {

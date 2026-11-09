@@ -1,6 +1,7 @@
 //! Fork-only code compressor tests, moved out of `code_compressor.rs`.
 
 use super::*;
+use std::time::{Duration, Instant};
 
 // ─── Language coercion (upstream addition) ───────────────────────────
 
@@ -702,4 +703,259 @@ fn breaker_status_reports_open_languages_for_stats() {
     assert_eq!(reopened.trips, 1);
     assert_eq!(reopened.reopens_in_seconds, 0.0);
     reset_syntax_breaker();
+}
+
+// ─── Upstream 7c150ec6b: Rust attributes stay with their items ───────
+
+fn small_body_compressor(language: &str, max_body_lines: i64) -> CodeAwareCompressor {
+    CodeAwareCompressor::new(CodeCompressorConfig {
+        min_tokens_for_compression: 1,
+        max_body_lines,
+        enable_ccr: false,
+        fallback_to_kompress: false,
+        semantic_analysis: false,
+        language_hint: Some(language.to_string()),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn rust_attributes_stay_attached_to_their_items() {
+    let code = concat!(
+        "#[derive(Debug, Clone, PartialEq)]\n",
+        "pub struct Item {\n",
+        "    pub id: u64,\n",
+        "    pub name: String,\n",
+        "}\n",
+        "\n",
+        "#[inline]\n",
+        "#[cfg(feature = \"extra\")]\n",
+        "pub fn log_item(item: &Item, sink: &mut Vec<u64>) {\n",
+        "    sink.push(item.id);\n",
+        "    sink.push(item.id + 1);\n",
+        "    sink.push(item.id + 2);\n",
+        "    sink.push(item.id + 3);\n",
+        "}\n",
+    );
+    let r = small_body_compressor("rust", 1).compress(code);
+    assert!(r.compression_ratio < 1.0, "{}", r.compressed);
+    assert!(
+        r.compressed
+            .contains("#[derive(Debug, Clone, PartialEq)]\npub struct Item {"),
+        "{}",
+        r.compressed
+    );
+    assert!(
+        r.compressed
+            .contains("#[inline]\n#[cfg(feature = \"extra\")]\npub fn log_item"),
+        "{}",
+        r.compressed
+    );
+}
+
+#[test]
+fn rust_doc_comment_stays_ahead_of_attributes() {
+    let code = concat!(
+        "/// Records one item.\n",
+        "#[inline]\n",
+        "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n",
+        "    sink.push(item.id);\n",
+        "    sink.push(item.id + 1);\n",
+        "    sink.push(item.id + 2);\n",
+        "}\n",
+    );
+    let r = small_body_compressor("rust", 1).compress(code);
+    assert!(r.compression_ratio < 1.0, "{}", r.compressed);
+    assert!(
+        r.compressed
+            .contains("/// Records one item.\n#[inline]\npub fn record"),
+        "{}",
+        r.compressed
+    );
+}
+
+#[test]
+fn rust_attribute_attaches_across_blank_line_and_detached_comment() {
+    let across_blank = concat!(
+        "pub struct Item { pub id: u64 }\n",
+        "\n",
+        "#[inline]\n",
+        "\n",
+        "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n",
+        "    sink.push(item.id);\n",
+        "    sink.push(item.id + 1);\n",
+        "    sink.push(item.id + 2);\n",
+        "}\n",
+    );
+    let through_comment = concat!(
+        "pub struct Item { pub id: u64 }\n",
+        "\n",
+        "#[inline]\n",
+        "\n",
+        "// Keep with the function below.\n",
+        "\n",
+        "pub fn record(item: &Item, sink: &mut Vec<u64>) {\n",
+        "    sink.push(item.id);\n",
+        "    sink.push(item.id + 1);\n",
+        "    sink.push(item.id + 2);\n",
+        "    sink.push(item.id + 3);\n",
+        "}\n",
+    );
+    for code in [across_blank, through_comment] {
+        let r = small_body_compressor("rust", 1).compress(code);
+        assert!(r.compression_ratio < 1.0, "{}", r.compressed);
+        assert!(r.syntax_valid);
+        assert!(
+            r.compressed.contains("#[inline]\npub fn record"),
+            "{}",
+            r.compressed
+        );
+        assert!(
+            !r.compressed.trim_end().ends_with("#[inline]"),
+            "{}",
+            r.compressed
+        );
+    }
+}
+
+// ─── Upstream 0d0cda22b: multi-line class headers keep their brace ───
+
+#[test]
+fn opening_brace_line_survives_compression() {
+    let rust = concat!(
+        "impl<T> Wrapper<T>\n",
+        "where T: Debug + Clone {\n",
+        "    pub fn total(&self) -> u64 {\n",
+        "        let mut acc = 0;\n",
+        "        for item in &self.items {\n",
+        "            acc += item.id;\n",
+        "        }\n",
+        "        acc\n",
+        "    }\n",
+        "}\n",
+    );
+    let java = concat!(
+        "public class Calc\n",
+        "    extends Base\n",
+        "    implements Runnable {\n",
+        "    public int compute(int x) {\n",
+        "        int a = x + 1;\n",
+        "        int b = a * 2;\n",
+        "        int c = b - 3;\n",
+        "        return c;\n",
+        "    }\n",
+        "}\n",
+    );
+    for (language, code, header) in [
+        ("rust", rust, "where T: Debug + Clone {"),
+        ("java", java, "implements Runnable {"),
+    ] {
+        let r = small_body_compressor(language, 2).compress(code);
+        // A ratio of 1.0 means the syntax check rejected the output and the
+        // compressor returned the original untouched.
+        assert!(r.compression_ratio < 1.0, "{language}: {}", r.compressed);
+        assert!(
+            r.compressed.contains(header),
+            "{language}: {}",
+            r.compressed
+        );
+    }
+}
+
+// ─── Upstream 54f48fb1c: semicolon-separated statements ──────────────
+
+#[test]
+fn python_top_level_separator_does_not_become_a_bare_line() {
+    let code = concat!(
+        "import json\n",
+        "B='/tmp/'\n",
+        "v=json.load(open(B+'v.json')); m=json.load(open(B+'m.json'))\n",
+        "print('oe', m['order_expire']); print('pay', m['pay_url'])\n",
+    );
+    let r = small_body_compressor("python", 5).compress(code);
+    assert!(r.syntax_valid);
+    assert_ne!(r.compressed, code);
+    assert!(
+        !r.compressed.lines().any(|l| l.trim() == ";"),
+        "{}",
+        r.compressed
+    );
+    assert!(r.compressed.contains("v=json.load(open(B+'v.json'))"));
+    assert!(r.compressed.contains("m=json.load(open(B+'m.json'))"));
+}
+
+#[test]
+fn python_class_body_statements_are_kept_once() {
+    let r = small_body_compressor("python", 5).compress("class C:\n    x=1; y=2\n    z=3\n");
+    assert!(r.syntax_valid);
+    assert_eq!(
+        r.compressed.matches("x=1; y=2").count(),
+        1,
+        "{}",
+        r.compressed
+    );
+
+    let r = small_body_compressor("python", 5)
+        .compress("class C:\n    x=1; y=(2 +\n            3)\n    z=4\n");
+    assert!(r.syntax_valid);
+    assert_eq!(
+        r.compressed.matches("x=1; y=(2 +").count(),
+        1,
+        "{}",
+        r.compressed
+    );
+    assert_eq!(
+        r.compressed.matches("            3)").count(),
+        1,
+        "{}",
+        r.compressed
+    );
+    assert_eq!(r.compressed.matches("z=4").count(), 1, "{}", r.compressed);
+}
+
+#[test]
+fn python_import_after_statement_keeps_source_order() {
+    let code = "import sys; sys.path.insert(0, '/tmp/vendor'); import plugin\n";
+    let r = small_body_compressor("python", 5).compress(code);
+    assert!(r.syntax_valid);
+    assert_ne!(r.compressed, code);
+    let at = |s: &str| {
+        r.compressed
+            .find(s)
+            .unwrap_or_else(|| panic!("{s}: {}", r.compressed))
+    };
+    assert!(at("import sys") < at("sys.path.insert"), "{}", r.compressed);
+    assert!(
+        at("sys.path.insert") < at("import plugin"),
+        "{}",
+        r.compressed
+    );
+}
+
+#[test]
+fn python_function_body_keeps_each_line_once() {
+    let code = concat!(
+        "def f():\n",
+        "    x=1; y=(2 +\n",
+        "            3)\n",
+        "    a=3\n",
+        "    b=4\n",
+        "    c=5\n",
+        "    d=6\n",
+        "    e=7\n",
+        "    return x+y\n",
+    );
+    let r = small_body_compressor("python", 5).compress(code);
+    assert_eq!(
+        r.compressed.matches("x=1; y=(2 +").count(),
+        1,
+        "{}",
+        r.compressed
+    );
+    assert_eq!(
+        r.compressed.matches("            3)").count(),
+        1,
+        "{}",
+        r.compressed
+    );
 }
