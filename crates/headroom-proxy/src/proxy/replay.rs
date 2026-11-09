@@ -958,6 +958,83 @@ pub(crate) fn apply_chat_prefix_replay(
     )
 }
 
+/// Put each chat `cache_control` marker back where the client put it in this
+/// request (upstream `35ca9b835`).
+///
+/// Replay forwards last turn's messages with the markers they carried then,
+/// while the client has since moved its breakpoint forward. On each message,
+/// each `tool_calls` entry and each content block, keep the marker only if
+/// the client put one there now, as the client's own value (its `ttl` too).
+/// A client message that marks no block (a string, which replay may bring
+/// back in last turn's block form) drops every replayed block marker.
+///
+/// Never creates a marker on a holder the client left unmarked and never
+/// moves one to another block. Where message, call or block counts disagree
+/// with the client's, that part is left alone and the cap below still bounds
+/// the total. Without this, the cap dropped the oldest marker first: the
+/// client's system breakpoint, not the stale replayed one.
+fn mirror_client_chat_cache_control(
+    messages: &mut [serde_json::Value],
+    client_messages: &[serde_json::Value],
+) {
+    use serde_json::Value;
+
+    fn mirror(holder: &mut Value, client: Option<&Value>) {
+        let Some(obj) = holder.as_object_mut() else {
+            return;
+        };
+        match client
+            .and_then(|c| c.get("cache_control"))
+            .filter(|m| m.is_object())
+        {
+            Some(marker) => {
+                if obj.get("cache_control") != Some(marker) {
+                    obj.insert("cache_control".to_string(), marker.clone());
+                }
+            }
+            None => {
+                obj.remove("cache_control");
+            }
+        }
+    }
+
+    if messages.len() != client_messages.len() {
+        return;
+    }
+    for (message, client) in messages.iter_mut().zip(client_messages) {
+        if !message.is_object() {
+            continue;
+        }
+        mirror(message, Some(client));
+        if let (Some(calls), Some(client_calls)) = (
+            message.get_mut("tool_calls").and_then(Value::as_array_mut),
+            client.get("tool_calls").and_then(Value::as_array),
+        ) && calls.len() == client_calls.len()
+        {
+            for (call, client_call) in calls.iter_mut().zip(client_calls) {
+                mirror(call, Some(client_call));
+            }
+        }
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let client_blocks = client
+            .get("content")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let client_marks = client_blocks
+            .iter()
+            .any(|b| b.get("cache_control").is_some_and(Value::is_object));
+        if !client_marks {
+            blocks.iter_mut().for_each(|b| mirror(b, None));
+        } else if blocks.len() == client_blocks.len() {
+            for (block, client_block) in blocks.iter_mut().zip(client_blocks) {
+                mirror(block, Some(client_block));
+            }
+        }
+    }
+}
+
 /// Drop the oldest message `cache_control` markers until the chat request
 /// carries at most four, counting `tools` markers too.
 ///
@@ -1123,6 +1200,8 @@ fn replay_prefix(
                         .filter(|t| t.get("cache_control").is_some())
                         .count()
                 });
+            let mut overlaid = overlaid;
+            mirror_client_chat_cache_control(&mut overlaid, &original_messages);
             (cap_chat_cache_control(overlaid, tools, request_id), 0, 0)
         }
     };
@@ -1299,10 +1378,44 @@ mod chat_breakpoint_tests {
             vec![sys.clone(), u1(true), a1(false), t1(false), u2(true)],
         );
         let msgs = fwd["messages"].as_array().unwrap();
-        assert_eq!(markers(&fwd), 4, "{fwd}");
-        // Oldest goes first; the newest is the one the client just placed.
-        assert_eq!(markers(&msgs[0]), 0, "{fwd}");
+        // The replayed call and tool markers go: the client no longer puts
+        // them there. Its system breakpoint stays (upstream 35ca9b835).
+        assert_eq!(markers(&fwd), 3, "{fwd}");
+        assert_eq!(markers(&msgs[0]), 1, "{fwd}");
+        assert_eq!(markers(&msgs[2]), 0, "{fwd}");
+        assert_eq!(markers(&msgs[3]), 0, "{fwd}");
         assert_eq!(markers(&msgs[4]), 1, "{fwd}");
+    }
+
+    /// OpenCode V2 marks content blocks: two system blocks and the newest
+    /// user text. Replay brings back last turn's user block with its marker,
+    /// and once the client resends that turn as a string the block form comes
+    /// back too. Neither may keep a marker the client no longer sends.
+    #[test]
+    fn chat_replay_mirrors_client_block_markers() {
+        let store = SessionReplayStore::new(4);
+        let system = json!({"role": "system", "content": [
+            {"type": "text", "text": "rules", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            {"type": "text", "text": "env", "cache_control": cc()},
+        ]});
+        let u1_marked = json!({"role": "user", "content": text("first", true)});
+        let a1 = json!({"role": "assistant", "content": "ok"});
+        send(&store, "t1", vec![system.clone(), u1_marked]);
+        let fwd = send(
+            &store,
+            "t2",
+            vec![
+                system.clone(),
+                json!({"role": "user", "content": "first"}),
+                a1,
+                json!({"role": "user", "content": text("second", true)}),
+            ],
+        );
+        let msgs = fwd["messages"].as_array().unwrap();
+        assert_eq!(msgs[0], system, "{fwd}");
+        assert_eq!(markers(&msgs[1]), 0, "{fwd}");
+        assert_eq!(markers(&msgs[3]), 1, "{fwd}");
+        assert_eq!(markers(&fwd), 3, "{fwd}");
     }
 }
 
