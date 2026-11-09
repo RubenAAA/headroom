@@ -471,6 +471,26 @@ pub(crate) async fn inject_memory_context(
             }
         };
         if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
+            // A chat request that ends in tool results has no live user turn:
+            // the latest user message is already in the cached prefix, so
+            // memory appended there would break the cache. Skip the search
+            // too, so nothing is marked accessed (upstream `2568cbed`).
+            if matches!(
+                endpoint,
+                compression::CompressibleEndpoint::OpenAiChatCompletions
+            ) && messages
+                .last()
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                != Some("user")
+            {
+                tracing::debug!(
+                    request_id = %request_id,
+                    reason = "no_eligible_user_message",
+                    "memory: chat request does not end with a user message; not injecting"
+                );
+                return;
+            }
             let msgs: Vec<serde_json::Value> = messages.clone();
             let base_user_id = headers_snapshot
                 .as_ref()

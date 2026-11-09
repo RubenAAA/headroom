@@ -1602,17 +1602,33 @@ impl MemoryHandler {
             None => return (messages.to_vec(), 0),
         };
 
-        // Append context to the user message's content string
-        let content = new_messages[idx].get("content");
-        match content {
+        // Append to the content string, or to the first text part of a
+        // multimodal message. Replacing non-string content with the context
+        // dropped the user's own text and images. A message with no text
+        // part is left alone (Python `append_text_to_latest_user_chat_message`).
+        match new_messages[idx].get_mut("content") {
             Some(Value::String(s)) => {
-                let new_content = format!("{s}\n\n{context_text}");
-                new_messages[idx]["content"] = Value::String(new_content);
+                s.push_str("\n\n");
+                s.push_str(context_text);
             }
-            _ => {
-                // Non-string content — convert to string with context
-                new_messages[idx]["content"] = Value::String(context_text.to_string());
+            Some(Value::Array(parts)) => {
+                let Some(text) = parts
+                    .iter_mut()
+                    .filter(|part| {
+                        matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("text" | "input_text")
+                        )
+                    })
+                    .find_map(|part| part.as_object_mut())
+                else {
+                    return (messages.to_vec(), 0);
+                };
+                let existing = text.get("text").and_then(Value::as_str).unwrap_or("");
+                let joined = format!("{existing}\n\n{context_text}");
+                text.insert("text".to_string(), Value::String(joined));
             }
+            _ => return (messages.to_vec(), 0),
         }
 
         (new_messages, context_text.len())
@@ -2072,6 +2088,32 @@ mod tests {
             MemoryHandler::append_to_latest_user_tail(&msgs, "CTX", Provider::Openai, 0);
         assert_eq!(bytes, 3);
         assert!(new_msgs[0]["content"].as_str().unwrap().contains("CTX"));
+    }
+
+    /// Multimodal content keeps every part; the context joins the first text
+    /// part. Replacing the array with the context lost the user's text and
+    /// images.
+    #[test]
+    fn tail_openai_multimodal_content_keeps_its_parts() {
+        let image = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}});
+        let msgs = vec![json!({"role": "user", "content": [
+            image.clone(),
+            {"type": "text", "text": "what is this?"},
+        ]})];
+        let (new_msgs, bytes) =
+            MemoryHandler::append_to_latest_user_tail(&msgs, "CTX", Provider::Openai, 0);
+        assert_eq!(bytes, 3);
+        let parts = new_msgs[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], image);
+        assert_eq!(parts[1]["text"], "what is this?\n\nCTX");
+
+        // No text part: leave the message alone.
+        let msgs = vec![json!({"role": "user", "content": [image]})];
+        let (new_msgs, bytes) =
+            MemoryHandler::append_to_latest_user_tail(&msgs, "CTX", Provider::Openai, 0);
+        assert_eq!(bytes, 0);
+        assert_eq!(new_msgs, msgs);
     }
 
     #[test]
