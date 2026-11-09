@@ -902,8 +902,8 @@ fn apply_strategy_smart_crusher() {
         1.0,
     );
     assert!(!compressed.is_empty());
-    assert!(tokens <= 15); // SmartCrusher should compress
-    assert_eq!(chain, vec!["smart_crusher"]);
+    assert!(tokens <= 15); // the minifier drops the whitespace
+    assert_eq!(chain, vec!["json_minifier"]);
 }
 
 #[test]

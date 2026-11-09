@@ -14,6 +14,7 @@ Usage:
     headroom wrap antigravity               # Start proxy + print Antigravity config instructions
     headroom wrap grok-build                # Start proxy + configure Grok Build
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
+    headroom wrap hermes                    # Start proxy + Hermes agent
     headroom wrap claude --port 9999        # Custom proxy port
     headroom wrap claude -- --model opus    # Pass args to claude
 """
@@ -165,6 +166,12 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.droid import (
+    DEFAULT_FACTORY_API_URL,
+    canonical_factory_api_url,
+    resolve_factory_upstream,
+)
+from headroom.providers.droid import proxy_base_url as droid_proxy_base_url
 from headroom.providers.grok import (
     DEFAULT_API_URL as _GROK_DEFAULT_API_URL,
 )
@@ -177,6 +184,8 @@ from headroom.providers.grok_build.config import (
     inject_grok_provider_config,
     restore_grok_provider_config,
 )
+from headroom.providers.hermes import build_launch_env as _build_hermes_launch_env
+from headroom.providers.hermes import unsupported_provider_error as _hermes_provider_error
 from headroom.providers.kimi import build_launch_env as _build_kimi_launch_env
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.omp import build_launch_env as _build_omp_launch_env
@@ -765,6 +774,7 @@ def _start_proxy(
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
+    factory_api_url: str | None = None,
     proxy_extensions: list[str] | None = None,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
@@ -827,6 +837,8 @@ def _start_proxy(
     if vertex_api_url:
         cmd.extend(["--vertex-api-url", vertex_api_url])
 
+    if factory_api_url:
+        cmd.extend(["--factory-api-url", factory_api_url])
     # Extensions carried over from the proxy this one replaces (see
     # ``_dedicated_proxy_extensions``). The flag outranks the envvar in click,
     # so callers must not pass this when HEADROOM_PROXY_EXTENSIONS is set;
@@ -887,6 +899,8 @@ def _start_proxy(
         proxy_env.pop("VERTEX_TARGET_API_URL", None)
     if vertex_api_url:
         proxy_env["VERTEX_TARGET_API_URL"] = vertex_api_url
+    if factory_api_url:
+        proxy_env["FACTORY_TARGET_API_URL"] = factory_api_url
     # Pin the wrapper-validated Copilot token for this proxy instance only.
     # Injected into the subprocess env here (not the parent's os.environ) so it
     # never leaks into shared state. The proxy's CopilotTokenProvider honours
@@ -4268,9 +4282,9 @@ def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
 
 # Upstream-URL config keys that decide where a running proxy forwards
 # traffic. A running proxy is only reusable when every key matches the
-# requested value. This build's /health config payload only serializes the
-# first five keys; the augment/factory entries catch proxies built from
-# feature branches or other versions that DO expose them (exactly the
+# requested value. This build's /health config payload serializes the first
+# five keys plus factory_api_url; the augment entry catches proxies built from
+# feature branches or other versions that DO expose it (exactly the
 # mixed-fleet shape of the 2026-08-22 incident, where a 0.34-era proxy
 # reported augment_api_url). Keys absent from the running config simply
 # compare equal to an unrequested (None) value, so they are inert, never
@@ -4330,6 +4344,7 @@ def _effective_requested_proxy_routing(
     anthropic_api_url: str | None,
     vertex_api_url: str | None,
     clear_vertex_api_url: bool,
+    factory_api_url: str | None = None,
 ) -> tuple[str, dict[str, str | None]]:
     """Resolve the routing a newly started proxy would inherit."""
     from headroom.providers.registry import resolve_api_overrides
@@ -4350,7 +4365,7 @@ def _effective_requested_proxy_routing(
             "cloudcode_api_url": overrides.cloudcode,
             "vertex_api_url": None if clear_vertex_api_url else overrides.vertex,
             "augment_api_url": os.environ.get("AUGMENT_TARGET_API_URL"),
-            "factory_api_url": os.environ.get("FACTORY_TARGET_API_URL"),
+            "factory_api_url": factory_api_url or os.environ.get("FACTORY_TARGET_API_URL"),
         },
     )
 
@@ -4874,6 +4889,7 @@ def _ensure_proxy_unlocked(
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
+    factory_api_url: str | None = None,
 ) -> tuple[subprocess.Popen | None, int]:
     """Start or verify proxy. Returns (process_handle, actual_port).
 
@@ -4894,6 +4910,7 @@ def _ensure_proxy_unlocked(
         anthropic_api_url=anthropic_api_url,
         vertex_api_url=vertex_api_url,
         clear_vertex_api_url=clear_vertex_api_url,
+        factory_api_url=factory_api_url,
     )
     # Set True when the proxy on the requested port belongs to a persistent
     # deployment whose routing config does not match this wrap: the deployment
@@ -5348,6 +5365,7 @@ def _ensure_proxy_unlocked(
                     copilot_api_token=copilot_api_token,
                     copilot_refresh_oauth_token=copilot_refresh_oauth_token,
                     copilot_api_token_expires_at=copilot_api_token_expires_at,
+                    factory_api_url=factory_api_url,
                     proxy_extensions=proxy_extensions,
                 ),
             )
@@ -5363,6 +5381,26 @@ def _ensure_proxy_unlocked(
             running_config = _require_no_proxy_openai_upstream(port, openai_api_url)
             click.echo(f"  Proxy on port {port} already targets {openai_api_url}")
             _warn_proxy_mode_mismatch(running_config)
+        if factory_api_url is not None:
+            # Droid is pointed at this port unconditionally, so an unverified
+            # listener would receive its Factory credentials. Require a
+            # Headroom proxy that serves exactly the requested Factory upstream.
+            payload = helpers._query_proxy_health(port) if helpers._check_proxy(port) else None
+            running_config = helpers._proxy_health_config(payload)
+            if not (
+                isinstance(payload, dict)
+                and payload.get("service") == "headroom-proxy"
+                and running_config is not None
+                and _normalize_proxy_api_url(
+                    running_config.get("factory_api_url"), strip_provider_v1=False
+                )
+                == _normalize_proxy_api_url(factory_api_url, strip_provider_v1=False)
+            ):
+                raise click.ClickException(
+                    f"--no-proxy requires a Headroom proxy on port {port} serving Factory "
+                    f"upstream {factory_api_url}; start one with headroom proxy "
+                    f"--factory-api-url {factory_api_url} or omit --no-proxy."
+                )
         elif not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
         elif (
@@ -5619,6 +5657,7 @@ def _launch_tool(
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
+    factory_api_url: str | None = None,
     configure_launch: Callable[
         [int, tuple, dict[str, str], list[str]],
         tuple[tuple, dict[str, str], list[str]],
@@ -5662,12 +5701,17 @@ def _launch_tool(
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
+            factory_api_url=factory_api_url,
         )
         if actual_port != port:
             _unregister_proxy_client(port)
             _register_proxy_client(actual_port)
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
+
+        # Let Headroom commands launched inside the wrapped session target the
+        # proxy's actual port, including fallback/dedicated-session ports.
+        env["HEADROOM_PORT"] = str(actual_port)
 
         # If port fell back, update environment URLs to point at the actual port.
         if actual_port != port:
@@ -6376,6 +6420,7 @@ def claude(
         click.echo()
 
         env = os.environ.copy()
+        env["HEADROOM_PORT"] = str(actual_port)
         if use_vertex:
             # Claude Code stays in Vertex mode (keeps CLAUDE_CODE_USE_VERTEX,
             # ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION, ADC — all inherited);
@@ -8229,7 +8274,71 @@ def continue_dev(
 
 
 # =============================================================================
+# Hermes (Nous Research)
+# =============================================================================
 
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@proxy_port_option()
+@click.option("--code-graph", is_flag=True, help="Enable code graph indexing")
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--backend", default=None, help="API backend")
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("hermes_args", nargs=-1, type=click.UNPROCESSED)
+def hermes(
+    port: int,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    hermes_args: tuple,
+) -> None:
+    """Launch the Hermes agent through the Headroom proxy."""
+    if prepare_only:
+        return
+
+    hermes_bin = shutil.which("hermes")
+    if not hermes_bin:
+        click.echo("Error: 'hermes' not found in PATH.")
+        click.echo("Install Hermes: https://hermes-agent.nousresearch.com/")
+        raise SystemExit(1)
+
+    provider_error = _hermes_provider_error(hermes_args)
+    if provider_error:
+        click.echo(provider_error)
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_hermes_launch_env(port, os.environ)
+    _launch_tool(
+        binary=hermes_bin,
+        args=hermes_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="HERMES",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="hermes",
+        code_graph=code_graph,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+    )
+
+
+# =============================================================================
 # OpenClaw
 # =============================================================================
 
@@ -9100,14 +9209,14 @@ def omp(
     """Launch Oh My Pi (omp) through Headroom proxy.
 
     \b
-    Points omp's built-in `anthropic` provider at Headroom by injecting a
-    marker-fenced `providers.anthropic.baseUrl` override into
-    ~/.omp/agent/models.yml (pre-wrap file backed up byte-for-byte; undo with
-    `headroom unwrap omp`). omp resolves its Anthropic chat endpoint from
-    models.yml — ANTHROPIC_BASE_URL only affects its web-search helper — and a
-    same-ID override keeps omp's bundled model catalog and stored credentials.
-    omp's other providers (OpenAI-direct, Gemini, ...) keep their normal
-    endpoints; route those via your own custom provider in models.yml.
+    Points omp's built-in `anthropic`, `openai` (API-key), and `openai-codex`
+    (OAuth) providers at Headroom by injecting marker-fenced base-URL overrides
+    into ~/.omp/agent/models.yml (pre-wrap file backed up byte-for-byte; undo
+    with `headroom unwrap omp`). omp resolves these endpoints from models.yml —
+    ANTHROPIC_BASE_URL only affects its web-search helper — and same-ID
+    overrides keep omp's bundled model catalog and stored credentials. OMP
+    Codex appends `/codex/responses`, which Headroom already aliases. Gemini
+    and other providers keep their normal endpoints.
 
     \b
     Examples:
@@ -9174,6 +9283,95 @@ def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
     if not no_stop_proxy and status != "noop":
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
+
+
+# =============================================================================
+# Factory Droid
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@proxy_port_option()
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--factory-api-url",
+    default=None,
+    help=(
+        "Real Factory upstream the proxy forwards to (default: $FACTORY_API_BASE_URL, "
+        f"else {DEFAULT_FACTORY_API_URL})"
+    ),
+)
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("droid_args", nargs=-1, type=click.UNPROCESSED)
+def droid(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    factory_api_url: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    droid_args: tuple,
+) -> None:
+    """Launch Factory Droid through Headroom proxy.
+
+    \b
+    Sets FACTORY_API_BASE_URL for the droid process only, pointing it at the
+    proxy, which forwards to the real Factory upstream. The Anthropic-shaped
+    /api/llm/a/v1/messages route is compressed; every other /api/* path is
+    forwarded verbatim (OpenAI-shaped /api/llm/o/* traffic is not compressed
+    yet). Nothing durable is written: no Droid config, no customModels.
+
+    \b
+    Examples:
+        headroom wrap droid                          # Start proxy + droid
+        headroom wrap droid -- exec "fix the bug"    # Non-interactive run
+        headroom wrap droid --factory-api-url https://factory.example.com
+    """
+    upstream = canonical_factory_api_url(resolve_factory_upstream(factory_api_url))
+    if upstream is None:
+        raise click.ClickException(
+            "Factory upstream must be an http(s) URL with a non-loopback host and no "
+            "credentials, query or fragment (from --factory-api-url, else "
+            "FACTORY_API_BASE_URL). If FACTORY_API_BASE_URL still points at a local "
+            "proxy from an earlier session, unset it."
+        )
+
+    if prepare_only:
+        click.echo(f"FACTORY_API_BASE_URL={droid_proxy_base_url(port)}")
+        click.echo(f"upstream={upstream}")
+        return
+
+    droid_bin = shutil.which("droid")
+    if not droid_bin:
+        click.echo("Error: 'droid' not found in PATH.")
+        click.echo("Install Factory Droid: see https://docs.factory.ai")
+        raise SystemExit(1)
+
+    env = os.environ.copy()
+    env["FACTORY_API_BASE_URL"] = droid_proxy_base_url(port)
+    env_vars_display = [
+        f"FACTORY_API_BASE_URL={env['FACTORY_API_BASE_URL']}",
+        f"Factory upstream: {upstream}",
+    ]
+
+    _launch_tool(
+        binary=droid_bin,
+        args=droid_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="DROID",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="droid",
+        factory_api_url=upstream,
+    )
 
 
 # =============================================================================

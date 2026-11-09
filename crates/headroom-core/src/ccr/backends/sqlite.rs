@@ -48,7 +48,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::ccr::{CcrStore, max_lifetime_for};
+use crate::ccr::{CcrStore, max_lifetime_for, secs_i64};
 
 /// SQLite-backed CCR store.
 pub struct SqliteCcrStore {
@@ -160,7 +160,7 @@ impl SqliteCcrStore {
             "DELETE FROM ccr_entries
              WHERE last_accessed + ttl_seconds < ?1
                 OR created_at + ?2 < ?1",
-            params![now as i64, self.max_lifetime_seconds as i64],
+            params![secs_i64(now), secs_i64(self.max_lifetime_seconds)],
         )?;
         Ok(purged)
     }
@@ -195,7 +195,7 @@ impl SqliteCcrStore {
                  WHERE hash = ?1
                    AND last_accessed + ttl_seconds >= ?2
                    AND created_at + ?3 >= ?2",
-                params![hash, now as i64, self.max_lifetime_seconds as i64],
+                params![hash, secs_i64(now), secs_i64(self.max_lifetime_seconds)],
                 |r| r.get::<_, Vec<u8>>(0),
             )
             .optional()
@@ -215,7 +215,7 @@ impl SqliteCcrStore {
         // row's idle clock. Still under the same mutex as the lookup.
         if let Err(err) = conn.execute(
             "UPDATE ccr_entries SET last_accessed = ?2 WHERE hash = ?1",
-            params![hash, now as i64],
+            params![hash, secs_i64(now)],
         ) {
             tracing::warn!(
                 event = "ccr_sqlite_touch_failed",
@@ -247,8 +247,8 @@ impl CcrStore for SqliteCcrStore {
             params![
                 hash,
                 payload.as_bytes(),
-                now as i64,
-                self.default_ttl_seconds as i64,
+                secs_i64(now),
+                secs_i64(self.default_ttl_seconds),
             ],
         );
         // Loud-failure rule: surface as a structured warning. Caller
@@ -449,5 +449,14 @@ mod tests {
         assert!(matches!(expired.state, CcrEntryState::Expired));
         assert_eq!(expired.age_seconds, Some(7_200));
         assert_eq!(store.get("stale"), None, "status must purge expired rows");
+    }
+
+    #[test]
+    fn huge_ttl_means_keep_not_expire_immediately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteCcrStore::open(dir.path().join("ccr.sqlite"), u64::MAX)
+            .expect("open sqlite store");
+        store.put("k", "payload");
+        assert_eq!(store.get("k").as_deref(), Some("payload"));
     }
 }

@@ -2041,6 +2041,15 @@ pub fn apply_strategy_with_registry(
                 super::smart_crusher::SmartCrusher::without_compaction(crusher_cfg)
             };
             let result = crusher.crush(content, context, bias);
+            // SmartCrusher keeps the input bytes on a no-op; whitespace
+            // savings come from the minifier, which is lossless (upstream
+            // 93279f32).
+            if result.compressed == content
+                && let Ok(Some(minified)) = super::pipeline::JsonMinifier.minify(content)
+            {
+                let tokens = minified.split_whitespace().count();
+                return (minified, tokens, vec!["json_minifier".into()]);
+            }
             let compressed = result.compressed;
             let tokens = compressed.split_whitespace().count();
             if tokens >= original_tokens {

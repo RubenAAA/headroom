@@ -222,7 +222,7 @@ tracing = { workspace = true }
 # samples × 8 languages) confirmed 100% identical node-type + line-span
 # trees at these exact pins. Bumping any pin requires re-running the
 # canary and re-recording the code_aware_compressor fixtures.
-tree-sitter = "=0.27.0"
+tree-sitter = "=0.27.1"
 # Bash, like Perl and PHP, has no PyPI wheel pin — Python loads it from
 # `tree-sitter-language-pack`. The grammar is only used to VALIDATE (and to
 # compete in language detection); recognized shell is always returned

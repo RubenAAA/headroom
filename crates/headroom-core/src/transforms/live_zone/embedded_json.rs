@@ -114,6 +114,12 @@ pub(super) fn route_embedded_json(text: &str) -> Option<String> {
         let crushed = smart_crusher().crush(chunk, EMPTY_QUERY, DEFAULT_BIAS);
         if crushed.was_modified && crushed.compressed.len() < chunk.len() {
             repls.push((a, b, crushed.compressed));
+        } else if !crushed.was_modified
+            && let Ok(Some(minified)) = JsonMinifier.minify(chunk)
+        {
+            // SmartCrusher keeps an unchanged span's bytes; the minifier
+            // drops its whitespace instead (upstream 93279f32).
+            repls.push((a, b, minified));
         }
     }
     if repls.is_empty() {

@@ -112,6 +112,7 @@ use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 #[cfg(feature = "ml")]
 use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
+use super::pipeline::JsonMinifier;
 use super::read_protection::{
     is_read_command, read_output_should_be_protected, read_protection_enabled,
     tool_call_command_text,
@@ -142,6 +143,10 @@ const STRATEGY_CODE_COMPRESSOR: &str = "code_aware_compressor";
 const STRATEGY_KOMPRESS: &str = "kompress";
 /// Strategy tag emitted when SmartCrusher rewrote JSON embedded in a text block.
 const STRATEGY_EMBEDDED_JSON: &str = "embedded_json";
+/// Strategy tag emitted when SmartCrusher left a JSON array unchanged and the
+/// minifier dropped its whitespace. Lossless, so no CCR marker (upstream
+/// 93279f32).
+const STRATEGY_JSON_MINIFIER: &str = "json_minifier";
 /// Tier 1 of Python's `config_compressor`: the self-verified reversible fold.
 /// The comment-elision tier (which mints a CCR marker) and the schema fold are
 /// NOT ported — `headroom/transforms/config_compressor.py` still owns those.

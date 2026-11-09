@@ -38,6 +38,7 @@ impl CrushArrayResult {
             dropped_summary: String::new(),
             compacted: None,
             compaction_kind: None,
+            constant_fields_sentinel: false,
         }
     }
 }

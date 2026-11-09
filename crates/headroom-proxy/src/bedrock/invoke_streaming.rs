@@ -226,7 +226,7 @@ pub async fn handle_invoke_streaming(
         };
 
     // 3. Resolve credentials. No silent fallback.
-    let creds = match resolve_streaming_credentials(&state, &model_id, &request_id) {
+    let creds = match resolve_streaming_credentials(&state, &model_id, &request_id).await {
         Ok(c) => c,
         Err(resp) => {
             capture::finalize_rejected(pending_stats.take());
@@ -239,7 +239,7 @@ pub async fn handle_invoke_streaming(
         &headers,
         &upstream_url,
         &state.config.bedrock_region,
-        creds.as_ref(),
+        &creds,
         &outbound_body,
         &request_id,
         &model_id,
@@ -407,13 +407,13 @@ fn build_streaming_upstream_url(
 /// routed paths; boxing it would save nothing measurable and diverge
 /// from all of them.
 #[allow(clippy::result_large_err)]
-fn resolve_streaming_credentials(
+async fn resolve_streaming_credentials(
     state: &AppState,
     model_id: &str,
     request_id: &str,
-) -> Result<std::sync::Arc<aws_credential_types::Credentials>, Response> {
-    match state.bedrock_credentials.as_ref() {
-        Some(c) => Ok(c.clone()),
+) -> Result<aws_credential_types::Credentials, Response> {
+    let source = match state.bedrock_credentials.as_ref() {
+        Some(c) => c,
         None => {
             tracing::warn!(
                 event = "bedrock_credentials_missing",
@@ -421,13 +421,29 @@ fn resolve_streaming_credentials(
                 model_id = %model_id,
                 "bedrock invoke-streaming: refusing to forward without AWS credentials"
             );
-            Err(error_response(
+            return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_credentials_missing",
                 "AWS credentials not configured; refusing to forward unsigned",
-            ))
+            ));
         }
-    }
+    };
+    // The source asks the provider again once the cached credentials
+    // are near expiry (upstream adc67249).
+    source.get().await.map_err(|e| {
+        tracing::error!(
+            event = "bedrock_credentials_refresh_failed",
+            request_id = %request_id,
+            model_id = %model_id,
+            error = %e,
+            "bedrock invoke-streaming: AWS credentials refresh failed; refusing to forward unsigned"
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "bedrock_credentials_refresh_failed",
+            &e.to_string(),
+        )
+    })
 }
 
 /// Sign the request (SigV4) and build the outbound header map.

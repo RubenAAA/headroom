@@ -29,7 +29,7 @@
 
 use redis::Commands;
 
-use crate::ccr::{CcrStore, max_lifetime_for};
+use crate::ccr::{CcrStore, max_lifetime_for, secs_i64};
 
 /// Key prefix applied to every CCR entry. Configurable per-deployment
 /// so multiple proxies sharing one Redis don't collide.
@@ -197,7 +197,7 @@ impl CcrStore for RedisCcrStore {
             let _: redis::RedisResult<()> = conn.del(&key);
             return None;
         }
-        let rearm: redis::RedisResult<()> = conn.expire(&key, new_ttl as i64);
+        let rearm: redis::RedisResult<()> = conn.expire(&key, secs_i64(new_ttl));
         if let Err(err) = rearm {
             tracing::warn!(
                 event = "ccr_redis_ttl_rearm_failed",

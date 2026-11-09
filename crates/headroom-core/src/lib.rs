@@ -11,6 +11,7 @@ pub mod compression_policy;
 pub mod conversation_savings;
 pub mod cost_tracker;
 pub mod ctx;
+mod hf_cache;
 pub mod memory;
 pub mod meter_weights;
 pub mod offline;

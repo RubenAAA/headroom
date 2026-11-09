@@ -570,8 +570,13 @@ pub(super) fn compress_one_block(
             // stays honest — the marker costs ~6 tokens and we'd
             // rather forward the original than ship a bigger payload
             // for a 5-byte block.
+            // Minification is lossless: nothing to retrieve, so no marker.
             let (compressed_for_replacement, ccr_hash_emitted) =
-                maybe_inject_ccr_marker(content_text, &compressed, ccr_store);
+                if strategy == STRATEGY_JSON_MINIFIER {
+                    (compressed, None)
+                } else {
+                    maybe_inject_ccr_marker(content_text, &compressed, ccr_store)
+                };
             let compressed_bytes = compressed_for_replacement.len();
             // 3. Tokenizer-validated rejection. Per PR-B4 spec we
             //    count both the original and compressed strings

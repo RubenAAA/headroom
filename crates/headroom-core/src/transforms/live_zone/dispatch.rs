@@ -156,6 +156,7 @@ pub(super) fn intern_dispatch_strategy(strategy: &str) -> Option<&'static str> {
         STRATEGY_CONFIG_LOSSLESS,
         STRATEGY_KOMPRESS,
         STRATEGY_EMBEDDED_JSON,
+        STRATEGY_JSON_MINIFIER,
     ]
     .into_iter()
     .find(|known| *known == strategy)
@@ -270,6 +271,14 @@ pub(super) fn dispatch_compressor_uncached(
             // arrays, and returns the input.
             let result = smart_crusher().crush(text, EMPTY_QUERY, DEFAULT_BIAS);
             if !result.was_modified {
+                // SmartCrusher keeps the input bytes on a no-op; whitespace
+                // savings come from the minifier instead.
+                if let Ok(Some(minified)) = JsonMinifier.minify(text) {
+                    return DispatchResult::Compressed {
+                        strategy: STRATEGY_JSON_MINIFIER,
+                        compressed: minified,
+                    };
+                }
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
                     declined_by: None,
@@ -648,6 +657,7 @@ mod dispatch_cache_tests {
             STRATEGY_CONFIG_LOSSLESS,
             STRATEGY_KOMPRESS,
             STRATEGY_EMBEDDED_JSON,
+            STRATEGY_JSON_MINIFIER,
         ] {
             assert_eq!(intern_dispatch_strategy(known), Some(known));
         }

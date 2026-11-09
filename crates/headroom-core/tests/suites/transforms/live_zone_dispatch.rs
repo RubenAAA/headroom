@@ -330,7 +330,7 @@ fn main() {
 /// strictly (a differently-revisioned snapshot never substitutes), so the
 /// gate checks the same pinned snapshots the loader accepts.
 fn kompress_model_cached() -> bool {
-    use headroom_core::transforms::kompress::{PINNED_MODEL_REVISION, PINNED_TOKENIZER_REVISION};
+    use headroom_core::transforms::kompress::{DEFAULT_MODEL_REVISION, DEFAULT_TOKENIZER_REVISION};
     use std::path::Path;
     let Ok(home) = std::env::var("HOME") else {
         return false;
@@ -345,11 +345,11 @@ fn kompress_model_cached() -> bool {
     };
     has(
         "models--answerdotai--ModernBERT-base",
-        PINNED_TOKENIZER_REVISION,
+        DEFAULT_TOKENIZER_REVISION,
         &["tokenizer.json"],
     ) && has(
         "models--chopratejas--kompress-v2-base",
-        PINNED_MODEL_REVISION,
+        DEFAULT_MODEL_REVISION,
         &["onnx", "kompress-int8-wo.onnx"],
     )
 }

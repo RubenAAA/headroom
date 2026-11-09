@@ -24,6 +24,9 @@
 //! - **Missing credentials**: log
 //!   `event=bedrock_credentials_missing` at WARN, return `500` with
 //!   a JSON error body. NEVER forwards an unsigned request.
+//! - **Credentials refresh failure** (the provider errors when the
+//!   cached credentials are near expiry): log
+//!   `event=bedrock_credentials_refresh_failed`, return `500`.
 //! - **Envelope parse failure**: log `event=bedrock_envelope_parse_error`,
 //!   pass the bytes through unchanged. Bedrock will reject anyway,
 //!   but the failure is the customer's, not ours — we just route.
@@ -256,7 +259,7 @@ pub async fn handle_invoke(
     };
 
     // Resolve credentials. No silent fallback: missing creds → 5xx.
-    let creds = match resolve_invoke_credentials(&state, &model_id, &request_id) {
+    let creds = match resolve_invoke_credentials(&state, &model_id, &request_id).await {
         Ok(c) => c,
         Err(resp) => {
             capture::finalize_rejected(pending_stats.take());
@@ -270,7 +273,7 @@ pub async fn handle_invoke(
         &headers,
         &upstream_url,
         &state.config.bedrock_region,
-        creds.as_ref(),
+        &creds,
         &outbound_body,
         &request_id,
         &model_id,
@@ -426,13 +429,13 @@ fn build_invoke_upstream_url(
 /// routed paths; boxing it would save nothing measurable and diverge
 /// from all of them.
 #[allow(clippy::result_large_err)]
-fn resolve_invoke_credentials(
+async fn resolve_invoke_credentials(
     state: &AppState,
     model_id: &str,
     request_id: &str,
-) -> Result<std::sync::Arc<aws_credential_types::Credentials>, Response> {
-    match state.bedrock_credentials.as_ref() {
-        Some(c) => Ok(c.clone()),
+) -> Result<aws_credential_types::Credentials, Response> {
+    let source = match state.bedrock_credentials.as_ref() {
+        Some(c) => c,
         None => {
             tracing::warn!(
                 event = "bedrock_credentials_missing",
@@ -440,13 +443,29 @@ fn resolve_invoke_credentials(
                 model_id = %model_id,
                 "bedrock invoke: refusing to forward without AWS credentials"
             );
-            Err(error_response(
+            return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_credentials_missing",
                 "AWS credentials not configured; refusing to forward unsigned",
-            ))
+            ));
         }
-    }
+    };
+    // The source asks the provider again once the cached credentials
+    // are near expiry (upstream adc67249).
+    source.get().await.map_err(|e| {
+        tracing::error!(
+            event = "bedrock_credentials_refresh_failed",
+            request_id = %request_id,
+            model_id = %model_id,
+            error = %e,
+            "bedrock invoke: AWS credentials refresh failed; refusing to forward unsigned"
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "bedrock_credentials_refresh_failed",
+            &e.to_string(),
+        )
+    })
 }
 
 /// Sign the request (SigV4) and compose the outbound header map: the
